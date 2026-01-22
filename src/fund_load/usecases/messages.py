@@ -64,3 +64,10 @@ class Decision:
     idem_status: IdemStatus
     is_prime_id: bool
     is_canonical: bool
+
+
+@dataclass(frozen=True, slots=True)
+class OutputLine:
+    # OutputLine is produced by FormatOutput (docs/implementation/steps/07 FormatOutput.md).
+    line_no: int
+    json_text: str
