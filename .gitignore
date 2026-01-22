@@ -33,3 +33,4 @@ tests/kernel/__pycache__/*
 src/fund_load/config/__pycache__/*
 tests/config/__pycache__/*
 tests/usecases/__pycache__/*
+tests/integration/__pycache__/*

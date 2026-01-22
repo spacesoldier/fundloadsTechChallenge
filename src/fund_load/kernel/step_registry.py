@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
+
+from fund_load.kernel.step import Step
 
 
 # Errors are explicit for fast config feedback (Step Registry spec).
@@ -9,7 +12,10 @@ class UnknownStepError(KeyError):
     pass
 
 
-StepFactory = Callable[[dict[str, object], dict[str, object]], Callable[[object, object], list[object]]]
+# Step factories accept dynamic config + wiring and return a Step instance.
+# We intentionally use Any here: step input/output types vary per step, and
+# the registry sits at a dynamic boundary (docs/implementation/kernel/Step Registry Spec.md).
+StepFactory = Callable[[dict[str, object], dict[str, object]], Step[Any, Any]]
 
 
 @dataclass
