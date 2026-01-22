@@ -3,6 +3,7 @@ from .compute_time_keys import ComputeTimeKeys
 from .evaluate_policies import EvaluatePolicies
 from .idempotency_gate import IdempotencyGate
 from .parse_load_attempt import ParseLoadAttempt
+from .update_windows import UpdateWindows
 
 __all__ = [
     "ComputeFeatures",
@@ -10,4 +11,5 @@ __all__ = [
     "EvaluatePolicies",
     "IdempotencyGate",
     "ParseLoadAttempt",
+    "UpdateWindows",
 ]
