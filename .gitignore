@@ -30,3 +30,5 @@ tests/adapters/__pycache__/*
 tests/ports/__pycache__/*
 src/fund_load/kernel/__pycache__/*
 tests/kernel/__pycache__/*
+src/fund_load/config/__pycache__/*
+tests/config/__pycache__/*
