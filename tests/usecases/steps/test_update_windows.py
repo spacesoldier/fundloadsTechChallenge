@@ -3,13 +3,12 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
-from fund_load.usecases.steps.update_windows import UpdateWindows
-
 # UpdateWindows behavior is specified in docs/implementation/steps/06 UpdateWindows.md.
 from fund_load.adapters.window_store import InMemoryWindowStore
 from fund_load.domain.messages import IdemStatus
 from fund_load.domain.money import Money
 from fund_load.usecases.messages import Decision
+from fund_load.usecases.steps.update_windows import UpdateWindows
 
 
 def _decision(
