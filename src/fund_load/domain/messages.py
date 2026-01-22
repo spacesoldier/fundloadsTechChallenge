@@ -35,6 +35,21 @@ class LoadAttempt:
 
 
 @dataclass(frozen=True, slots=True)
+class WeekKey:
+    # WeekKey follows calendar week semantics per docs/implementation/steps/02 ComputeTimeKeys.md.
+    week_start_date: date
+    week_start: str
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptWithKeys:
+    # AttemptWithKeys bundles derived day/week keys with the original attempt (Step 02).
+    attempt: LoadAttempt
+    day_key: date
+    week_key: WeekKey
+
+
+@dataclass(frozen=True, slots=True)
 class Decision:
     # Decision carries fields needed by later steps (UpdateWindows/FormatOutput).
     line_no: int
