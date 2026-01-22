@@ -24,3 +24,7 @@ src/fund_load/domain/__pycache__/*
 tests/domain/__pycache__/*
 src/fund_load/usecases/steps/__pycache__/*
 src/fund_load/usecases/__pycache__/*
+src/fund_load/adapters/__pycache__/*
+src/fund_load/ports/__pycache__/*
+tests/adapters/__pycache__/*
+tests/ports/__pycache__/*

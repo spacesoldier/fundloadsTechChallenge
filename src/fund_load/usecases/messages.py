@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 
 from fund_load.domain.messages import IdemStatus, LoadAttempt
+from fund_load.domain.money import Money
 
 
 # NOTE: docs/implementation/domain/Message Types.md places these flow messages in domain,
@@ -31,3 +33,18 @@ class IdempotencyClassifiedAttempt:
     idem_status: IdemStatus
     fingerprint: str
     canonical_line_no: int
+
+
+@dataclass(frozen=True, slots=True)
+class Features:
+    # Features are derived in Step 04 (docs/implementation/steps/04 ComputeFeatures.md).
+    risk_factor: Decimal
+    effective_amount: Money
+    is_prime_id: bool
+
+
+@dataclass(frozen=True, slots=True)
+class EnrichedAttempt:
+    # EnrichedAttempt bundles idempotency output with derived features (Step 04).
+    base: IdempotencyClassifiedAttempt
+    features: Features
