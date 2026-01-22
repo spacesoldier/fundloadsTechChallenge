@@ -1,0 +1,51 @@
+[tool.poetry]
+name = "fund-load-tech-challenge"
+version = "0.1.0"
+description = "Fund load adjudication engine (tech challenge)"
+authors = ["Viacheslav Soldatov"]
+readme = "README.md"
+packages = [{ include = "fund_load", from = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+pydantic = "^2.12"
+pyyaml = "^6.0"
+rich = "^14.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.0"
+pytest-cov = "^7.0"
+ruff = "^0.14"
+mypy = "^1.19"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+  "-q",
+  "--strict-markers",
+  "--disable-warnings"
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_configs = true
+mypy_path = ["src"]
+exclude = ["^docs/", "^dist/", "^build/"]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

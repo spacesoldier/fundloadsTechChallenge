@@ -1,0 +1,9 @@
+src/fund_load/__pycache__/*
+
+.vscode/*
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/extensions.json
+
+.obsidian/*
+

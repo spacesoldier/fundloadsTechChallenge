@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="700" viewBox="0 0 980 640">
+  <style>
+    .ringLine { fill: none; stroke: #333; stroke-width: 2; }
+    .label { font-family: Arial, Helvetica, sans-serif; font-size: 18px; fill: #111; font-weight: 600; }
+    .small { font-family: Arial, Helvetica, sans-serif; font-size: 14px; fill: #222; }
+    .hint { font-family: Arial, Helvetica, sans-serif; font-size: 13px; fill: #333; }
+    .box { fill: #ffffff; stroke: #333; stroke-width: 2; rx: 12; }
+    .arrow { stroke: #333; stroke-width: 2; marker-end: url(#arrowhead); }
+  </style>
+
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#333"/>
+    </marker>
+  </defs>
+
+  <!-- Geometry -->
+  <!-- Center: cx=490 cy=330 -->
+  <!-- Radii: domain=55, contracts=110, kernel=170, ports=230, usecases=300 -->
+
+  <!-- Rings (donuts via stroke widths) -->
+
+  <!-- usecases ring 230..300 => mid=265 thickness=70 -->
+  <circle cx="490" cy="330" r="265" fill="none" stroke="#e9f3ff" stroke-width="70"/>
+
+  <!-- ports ring 170..230 => mid=200 thickness=60 -->
+  <circle cx="490" cy="330" r="200" fill="none" stroke="#eafff1" stroke-width="60"/>
+
+  <!-- kernel ring 110..170 => mid=140 thickness=60 -->
+  <circle cx="490" cy="330" r="140" fill="none" stroke="#fff3e6" stroke-width="60"/>
+
+  <!-- contracts ring 55..110 => mid=82.5 thickness=55 -->
+  <circle cx="490" cy="330" r="82.5" fill="none" stroke="#f2f7ff" stroke-width="55"/>
+
+  <!-- domain center -->
+  <circle cx="490" cy="330" r="55" fill="#f3eaff"/>
+
+  <!-- Boundary lines -->
+  <circle class="ringLine" cx="490" cy="330" r="55"/>
+  <circle class="ringLine" cx="490" cy="330" r="110"/>
+  <circle class="ringLine" cx="490" cy="330" r="170"/>
+  <circle class="ringLine" cx="490" cy="330" r="230"/>
+  <circle class="ringLine" cx="490" cy="330" r="300"/>
+
+  <!-- Core labels -->
+  <text class="label" x="490" y="336" text-anchor="middle">domain</text>
+
+  <!-- contracts label (inside its ring) -->
+  <text class="label" x="490" y="250" text-anchor="middle">contracts</text>
+  <text class="small" x="490" y="273" text-anchor="middle">canonical messages and types</text>
+
+  <!-- kernel label moved to lower part -->
+  <text class="label" x="490" y="200" text-anchor="middle">kernel</text>
+  <text class="small" x="490" y="458" text-anchor="middle">
+    <tspan x="490" dy="0">runtime execution model</tspan>
+    <tspan x="490" dy="16">context, tracing, orchestration</tspan>
+  </text>
+
+  <text class="label" x="490" y="122" text-anchor="middle">ports</text>
+  <text class="small" x="490" y="142" text-anchor="middle">interfaces for IO and state</text>
+
+  <text class="label" x="490" y="52" text-anchor="middle">usecases</text>
+  <text class="small" x="490" y="73" text-anchor="middle">scenario flow: steps + policy config</text>
+
+  <!-- Adapters + Service boxes -->
+  <rect class="box" x="40" y="70" width="260" height="110"/>
+  <text class="label" x="170" y="110" text-anchor="middle">adapters</text>
+  <text class="small" x="170" y="135" text-anchor="middle">external IO implementations</text>
+  <text class="small" x="170" y="155" text-anchor="middle">for port interfaces</text>
+
+  <rect class="box" x="680" y="70" width="260" height="110"/>
+  <text class="label" x="810" y="110" text-anchor="middle">service</text>
+  <text class="small" x="810" y="135" text-anchor="middle">composition root</text>
+  <text class="small" x="810" y="155" text-anchor="middle">selects and runs a usecase</text>
+
+  <!-- Arrows -->
+    <!-- adapters -> ports -->
+    <line class="arrow" x1="300" y1="130" x2="375" y2="170"/>
+    <text class="small" x="305" y="165"  text-anchor="start">
+        <tspan dx="0" dy="10">provide</tspan>
+        <tspan dx="-50" dy="20">implementations</tspan>
+    </text>
+
+    <!-- usecases -> ports -->
+    <line class="arrow" x1="600" y1="580" x2="565" y2="510"/>
+    <text class="small" x="595" y="560" text-anchor="start">use</text>
+
+    <!-- service -> usecases -->
+    <line class="arrow" x1="740" y1="180" x2="740" y2="350"/>
+    <text class="small" x="720" y="250" text-anchor="start">compose</text>
+  <!-- / Arrows -->
+
+  <!-- Dependency map + rules (combined) -->
+  <rect class="box" x="40" y="300" width="260" height="270"/>
+  <text class="label" x="160" y="328" text-anchor="middle">dependency rules</text>
+  <text class="small" x="60" y="352" text-anchor="start">
+    <tspan x="60" dy="0">- Allowed imports (inward): </tspan>
+    <tspan x="80" dy="16"> service → usecases → internals</tspan>
+    <tspan x="80" dy="16">(ports, kernel, contracts, domain)</tspan>
+  </text>
+  <text class="small" x="60" y="410" text-anchor="start">
+    <tspan x="60" dy="0">- Adapters depend on ports</tspan>
+    <tspan x="80" dy="16">(implementations live outside)</tspan>
+    <tspan x="80" dy="16"> Ports depend on stdlib only.</tspan>
+  </text>
+  <text class="small" x="60" y="470" text-anchor="start">
+    <tspan x="60" dy="0">- Domain is pure: stdlib only. </tspan>
+    <tspan x="60" dy="16">- Kernel is generic: stdlib only </tspan>
+    <tspan x="80" dy="16">(no business logic).</tspan>
+  </text>
+  <text class="small" x="60" y="520" text-anchor="start">
+    <tspan x="60" dy="0">- Rule of thumb: </tspan>
+    <tspan x="80" dy="16">change adapters freely</tspan>
+    <tspan x="80" dy="16">keep domain stable</tspan>
+  </text>
+</svg>
