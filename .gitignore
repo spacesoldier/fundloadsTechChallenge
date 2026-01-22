@@ -9,3 +9,18 @@ src/fund_load/__pycache__/*
 
 tests/__pycache__/*
 tests/usecases/steps/__pycache__/*
+
+.venv/*
+
+.pytest_cache/*
+
+.mypy_cache/*
+
+1/*
+poetry.lock
+.coverage
+
+src/fund_load/domain/__pycache__/*
+tests/domain/__pycache__/*
+src/fund_load/usecases/steps/__pycache__/*
+src/fund_load/usecases/__pycache__/*

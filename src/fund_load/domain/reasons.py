@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 
 
-# Reason codes are a stable internal contract per docs/implementation/domain/Reason Codes.md.
+# Stable internal reason codes are defined in docs/implementation/domain/Reason Codes.md.
 class ReasonCode(str, Enum):
     INPUT_PARSE_ERROR = "INPUT_PARSE_ERROR"
     INVALID_TIMESTAMP = "INVALID_TIMESTAMP"

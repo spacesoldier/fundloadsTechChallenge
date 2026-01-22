@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Mapping
 
 from .money import Money
 
 
 class IdemStatus(str, Enum):
+    # Idempotency status values match docs/implementation/domain/Message Types.md.
     CANONICAL = "CANONICAL"
     DUP_REPLAY = "DUP_REPLAY"
     DUP_CONFLICT = "DUP_CONFLICT"
@@ -18,14 +18,14 @@ class IdemStatus(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class RawLine:
-    # line_no preserves input order per Flow spec (docs/implementation/architecture/Flow spec.md).
+    # RawLine preserves input order via line_no (docs/implementation/architecture/Flow spec.md).
     line_no: int
     raw_text: str
 
 
 @dataclass(frozen=True, slots=True)
 class LoadAttempt:
-    # Immutable message per docs/implementation/domain/Message Types.md.
+    # LoadAttempt is immutable per docs/implementation/domain/Message Types.md.
     line_no: int
     id: str
     customer_id: str
