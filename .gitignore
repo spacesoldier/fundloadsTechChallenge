@@ -7,3 +7,4 @@ src/fund_load/__pycache__/*
 
 .obsidian/*
 
+.tests/__pycache__/*
