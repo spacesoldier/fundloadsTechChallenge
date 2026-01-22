@@ -43,13 +43,12 @@ def _load_app_config(name: str) -> AppConfig:
 
 
 def _steps_from_config(steps: Iterable[StepDecl], *, include_write_output: bool) -> list[dict[str, object]]:
-    # ScenarioBuilder expects "config" entries, but PipelineConfig uses "params" (StepDecl).
-    # This mismatch is not resolved in docs; we map params -> config here for integration coverage.
+    # ScenarioBuilder expects "config" entries; StepDecl exposes config as the canonical field.
     mapped: list[dict[str, object]] = []
     for step in steps:
         if not include_write_output and step.name == "write_output":
             continue
-        mapped.append({"name": step.name, "config": step.params})
+        mapped.append({"name": step.name, "config": step.config})
     return mapped
 
 

@@ -111,7 +111,7 @@ def test_step_registry_builds_scenario_from_config() -> None:
     registry = build_step_registry(cfg, wiring)
     scenario = ScenarioBuilder(registry).build(
         scenario_id=cfg.scenario.name,
-        steps=[{"name": step.name, "config": step.params} for step in cfg.pipeline.steps],
+        steps=[{"name": step.name, "config": step.config} for step in cfg.pipeline.steps],
         wiring=wiring,
     )
     assert [s.name for s in scenario.steps] == [
@@ -137,7 +137,7 @@ def test_wiring_compute_features_uses_config() -> None:
     registry = build_step_registry(cfg, wiring)
     scenario = ScenarioBuilder(registry).build(
         scenario_id=cfg.scenario.name,
-        steps=[{"name": step.name, "config": step.params} for step in cfg.pipeline.steps],
+        steps=[{"name": step.name, "config": step.config} for step in cfg.pipeline.steps],
         wiring=wiring,
     )
     compute_features = next(s.step for s in scenario.steps if s.name == "compute_features")
@@ -175,7 +175,7 @@ def test_wiring_write_output_uses_output_sink() -> None:
     registry = build_step_registry(cfg, wiring)
     scenario = ScenarioBuilder(registry).build(
         scenario_id=cfg.scenario.name,
-        steps=[{"name": step.name, "config": step.params} for step in cfg.pipeline.steps],
+        steps=[{"name": step.name, "config": step.config} for step in cfg.pipeline.steps],
         wiring=wiring,
     )
     write_output = next(s.step for s in scenario.steps if s.name == "write_output")

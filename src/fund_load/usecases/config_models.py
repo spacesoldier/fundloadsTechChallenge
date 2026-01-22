@@ -9,10 +9,10 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 class StepDecl(BaseModel):
-    # Step declaration mirrors pipeline.steps entries (ScenarioBuilder spec).
+    # Step declaration mirrors pipeline.steps entries and uses "config" to align with ScenarioBuilder spec.
     model_config = ConfigDict(extra="forbid")
     name: str
-    params: dict[str, Any] = Field(default_factory=dict)
+    config: dict[str, Any] = Field(default_factory=dict)
 
 
 class PipelineConfig(BaseModel):
