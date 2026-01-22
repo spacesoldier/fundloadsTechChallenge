@@ -1,4 +1,4 @@
-from .loader import ConfigError, StepConfig, load_config
+from .loader import ConfigError, load_config
 
 # Config exports are intentionally small.
-__all__ = ["ConfigError", "StepConfig", "load_config"]
+__all__ = ["ConfigError", "load_config"]

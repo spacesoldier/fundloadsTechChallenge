@@ -1,0 +1,51 @@
+version: 1
+
+scenario:
+  name: baseline
+  description: "Baseline velocity rules"
+
+pipeline:
+  steps:
+    - name: parse_load_attempt
+    - name: compute_time_keys
+    - name: idempotency_gate
+    - name: compute_features
+    - name: evaluate_policies
+    - name: update_windows
+    - name: format_output
+    - name: write_output
+
+features:
+  enabled: true
+  monday_multiplier:
+    enabled: false
+    multiplier: 2.0
+    apply_to: amount
+  prime_gate:
+    enabled: false
+    global_per_day: 1
+    amount_cap: 9999.00
+
+policies:
+  pack: baseline
+  evaluation_order:
+    - daily_attempt_limit
+    - daily_amount_limit
+    - weekly_amount_limit
+  limits:
+    daily_amount: 5000.00
+    weekly_amount: 20000.00
+    daily_attempts: 3
+
+windows:
+  daily_attempts:
+    enabled: true
+  daily_accepted_amount:
+    enabled: true
+  weekly_accepted_amount:
+    enabled: true
+  daily_prime_gate:
+    enabled: false
+
+output:
+  file: output.txt

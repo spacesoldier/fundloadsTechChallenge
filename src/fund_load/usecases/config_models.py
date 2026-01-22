@@ -97,9 +97,18 @@ class OutputConfig(BaseModel):
     file_path: str = Field(validation_alias=AliasChoices("file_path", "file"))
 
 
+class ScenarioConfig(BaseModel):
+    # Scenario config identifies the flow to build (Configuration spec).
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    description: str | None = None
+
+
 class AppConfig(BaseModel):
     # AppConfig is the top-level typed view of configuration.
     model_config = ConfigDict(extra="forbid")
+    version: int
+    scenario: ScenarioConfig
     pipeline: PipelineConfig
     policies: PoliciesConfig
     features: FeaturesConfig

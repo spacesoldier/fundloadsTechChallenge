@@ -13,6 +13,8 @@ def test_config_models_accept_minimal_sections() -> None:
     # Each required section is validated and parsed into a typed model.
     cfg = AppConfig.model_validate(
         {
+            "version": 1,
+            "scenario": {"name": "baseline"},
             "pipeline": {"steps": [{"name": "parse_load_attempt"}]},
             "policies": {
                 "pack": "baseline",
@@ -50,6 +52,8 @@ def test_config_models_reject_unknown_keys() -> None:
     with pytest.raises(ValidationError):
         AppConfig.model_validate(
             {
+                "version": 1,
+                "scenario": {"name": "baseline"},
                 "pipeline": {"steps": [{"name": "parse_load_attempt"}]},
                 "policies": {
                     "pack": "baseline",
@@ -78,6 +82,8 @@ def test_output_config_accepts_file_path_aliases() -> None:
     # We accept both, normalizing to file_path in the model.
     cfg = AppConfig.model_validate(
         {
+            "version": 1,
+            "scenario": {"name": "baseline"},
             "pipeline": {"steps": [{"name": "parse_load_attempt"}]},
             "policies": {
                 "pack": "baseline",
@@ -106,6 +112,8 @@ def test_windows_config_accepts_prime_gate_alias() -> None:
     # We accept both, normalizing to daily_prime_gate in the model.
     cfg = AppConfig.model_validate(
         {
+            "version": 1,
+            "scenario": {"name": "baseline"},
             "pipeline": {"steps": [{"name": "parse_load_attempt"}]},
             "policies": {
                 "pack": "baseline",
