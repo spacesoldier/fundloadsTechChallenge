@@ -201,9 +201,9 @@ Critically:
 
 ## 10. Related documents
 
-- [[Configuration spec|Configuration]]
-- [[Flow spec|Flow]]
-- [[Steps Index|Steps]]: `docs/implementation/steps/*.md`
+- [Configuration](./Configuration%20spec.md)
+- [Flow](./Flow%20spec.md)
+- [Steps](../steps/Steps%20Index.md): `docs/implementation/steps/*.md`
 - [Ports](../ports/Ports%20Index.md): `docs/implementation/ports/*.md`
 - [Domain](../domain/Domain%20docs%20index.md): `docs/implementation/domain/*.md`
 - [Analysis and reference outputs](../../analysis/data/Reference%20output%20generation.md)
