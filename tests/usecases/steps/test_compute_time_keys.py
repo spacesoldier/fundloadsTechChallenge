@@ -6,8 +6,11 @@ from decimal import Decimal
 import pytest
 
 # ComputeTimeKeys behavior is specified in docs/implementation/steps/02 ComputeTimeKeys.md.
-from fund_load.domain.messages import AttemptWithKeys, LoadAttempt
+from fund_load.domain.messages import LoadAttempt
 from fund_load.domain.money import Money
+# NOTE: Docs place flow message types in domain, but we keep step messages in usecases to
+# limit domain scope (explicit project direction); tests follow the chosen structure.
+from fund_load.usecases.messages import AttemptWithKeys
 from fund_load.usecases.steps.compute_time_keys import ComputeTimeKeys
 
 

@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 
-from fund_load.domain.messages import AttemptWithKeys, LoadAttempt, WeekKey
+from fund_load.domain.messages import LoadAttempt
+from fund_load.usecases.messages import AttemptWithKeys, WeekKey
 
 
 @dataclass(frozen=True, slots=True)
