@@ -28,3 +28,5 @@ src/fund_load/adapters/__pycache__/*
 src/fund_load/ports/__pycache__/*
 tests/adapters/__pycache__/*
 tests/ports/__pycache__/*
+src/fund_load/kernel/__pycache__/*
+tests/kernel/__pycache__/*
