@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 
-from fund_load.domain.messages import LoadAttempt
+from fund_load.domain.messages import IdemStatus, LoadAttempt
 
 
 # NOTE: docs/implementation/domain/Message Types.md places these flow messages in domain,
@@ -22,3 +22,12 @@ class AttemptWithKeys:
     attempt: LoadAttempt
     day_key: date
     week_key: WeekKey
+
+
+@dataclass(frozen=True, slots=True)
+class IdempotencyClassifiedAttempt:
+    # IdempotencyClassifiedAttempt is produced by Step 03 (docs/implementation/steps/03 IdempotencyGate.md).
+    base: AttemptWithKeys
+    idem_status: IdemStatus
+    fingerprint: str
+    canonical_line_no: int

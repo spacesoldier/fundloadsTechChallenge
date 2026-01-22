@@ -77,13 +77,16 @@ Fingerprint must be stable and deterministic and must reflect the payload fields
 
 Use the normalized values from `LoadAttempt`:
 
-- `id` (string)
 - `customer_id` (string)
 - `amount` (normalized Money, e.g. cents)
 - `ts` (UTC timestamp, ISO string or epoch)
 
+Note: this doc previously listed `id`, but `docs/analysis/data/Input data analysis - idempotency.md`
+explicitly excludes `id` from the fingerprint; we align to that analysis to keep replay vs conflict
+classification stable across duplicates.
+
 Suggested canonical string (example):  
-`"{id}|{customer_id}|{amount_cents}|{ts_iso}"`
+`"{customer_id}|{amount_cents}|{ts_iso}"`
 
 Fingerprint algorithm:
 - `sha256(canonical_string).hexdigest()` (or other stable hash)
