@@ -48,3 +48,19 @@ class EnrichedAttempt:
     # EnrichedAttempt bundles idempotency output with derived features (Step 04).
     base: IdempotencyClassifiedAttempt
     features: Features
+
+
+@dataclass(frozen=True, slots=True)
+class Decision:
+    # Decision mirrors Step 05 output but lives in usecases to keep domain minimal.
+    line_no: int
+    id: str
+    customer_id: str
+    accepted: bool
+    reasons: tuple[str, ...]
+    day_key: date
+    week_key: date
+    effective_amount: Money
+    idem_status: IdemStatus
+    is_prime_id: bool
+    is_canonical: bool
