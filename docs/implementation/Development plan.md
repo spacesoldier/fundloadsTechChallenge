@@ -5,6 +5,8 @@ This document defines how we will implement the challenge solution in a way that
 
 The primary unit of understanding is **the left-to-right data flow**, not “what happens inside a function”.
 
+[The report written after the development completion](./Implementation%20report.md)
+
 ---
 
 ## 1. Principles (non-negotiable)
