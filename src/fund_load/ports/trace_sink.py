@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from fund_load.kernel.trace import TraceRecord
+if TYPE_CHECKING:
+    from fund_load.kernel.trace import TraceRecord
 
 
 # TraceSink is a port-like interface for trace adapters (Trace and Context Change Log spec §6).
 @runtime_checkable
 class TraceSink(Protocol):
-    def emit(self, record: TraceRecord) -> None:
+    def emit(self, record: "TraceRecord") -> None:
         """Consume one TraceRecord."""
         raise NotImplementedError("TraceSink is a port; use a concrete adapter.")
 

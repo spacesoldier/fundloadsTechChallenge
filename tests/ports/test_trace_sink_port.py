@@ -7,15 +7,8 @@ from fund_load.ports.trace_sink import TraceSink
 
 
 class _PortOnly(TraceSink):
-    # Port-only stub with no implementation.
-    def emit(self, record: object) -> None:
-        raise NotImplementedError("port-only stub")
-
-    def flush(self) -> None:
-        raise NotImplementedError("port-only stub")
-
-    def close(self) -> None:
-        raise NotImplementedError("port-only stub")
+    # Port-only stub; we rely on default Protocol methods to raise (Trace spec §6).
+    pass
 
 
 def test_trace_sink_port_raises_on_direct_use() -> None:

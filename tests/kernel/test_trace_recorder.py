@@ -220,3 +220,104 @@ def test_trace_snapshot_truncates_long_strings() -> None:
     truncated_value = record.ctx_before["trace_id"]
     assert isinstance(truncated_value, str)
     assert truncated_value.endswith("...(truncated)")
+
+
+def test_trace_context_diff_debug_includes_full_snapshot() -> None:
+    # Debug mode snapshots full context (Trace spec §4.2).
+    ctx = _context()
+    ctx.tags["a"] = "1"
+    recorder = TraceRecorder(signature_mode="type_only", context_diff_mode="debug")
+    span = recorder.begin(
+        ctx=ctx,
+        step_name="step-a",
+        step_index=0,
+        work_index=0,
+        msg_in=_Msg(id="1"),
+    )
+    ctx.tags["b"] = "2"
+    record = recorder.finish(
+        ctx=ctx,
+        span=span,
+        msg_out=[_Msg(id="1")],
+        status="ok",
+        error=None,
+    )
+    assert record.ctx_before is not None
+    assert record.ctx_after is not None
+    assert "tags" in record.ctx_before
+    assert "tags" in record.ctx_after
+
+
+def test_trace_context_diff_handles_none_snapshot() -> None:
+    # When snapshots are None, diff should be empty (Trace spec §11.5).
+    ctx = _context()
+    recorder = TraceRecorder(signature_mode="type_only", context_diff_mode="none")
+    span = recorder.begin(
+        ctx=ctx,
+        step_name="step-a",
+        step_index=0,
+        work_index=0,
+        msg_in=_Msg(id="1"),
+    )
+    record = recorder.finish(
+        ctx=ctx,
+        span=span,
+        msg_out=[_Msg(id="1")],
+        status="ok",
+        error=None,
+    )
+    assert record.ctx_before is None
+    assert record.ctx_after is None
+    assert record.ctx_diff is None
+
+
+def test_trace_signature_without_id_returns_none_identity() -> None:
+    # Messages without id should not expose identity (Trace spec §4.1).
+    class _NoId:
+        value = "x"
+
+    ctx = _context()
+    recorder = TraceRecorder(signature_mode="type_and_identity", context_diff_mode="none")
+    span = recorder.begin(
+        ctx=ctx,
+        step_name="step-a",
+        step_index=0,
+        work_index=0,
+        msg_in=_NoId(),
+    )
+    record = recorder.finish(
+        ctx=ctx,
+        span=span,
+        msg_out=[_NoId()],
+        status="ok",
+        error=None,
+    )
+    assert record.msg_in.identity is None
+
+
+def test_trace_hash_uses_dataclass_snapshot() -> None:
+    # Dataclass snapshots should hash deterministically (Trace spec §4.1).
+    @dataclass(frozen=True, slots=True)
+    class _Data:
+        id: str
+        value: str
+
+    ctx = _context()
+    recorder = TraceRecorder(signature_mode="hash", context_diff_mode="none")
+    msg = _Data(id="9", value="x")
+    span = recorder.begin(
+        ctx=ctx,
+        step_name="step-a",
+        step_index=0,
+        work_index=0,
+        msg_in=msg,
+    )
+    record = recorder.finish(
+        ctx=ctx,
+        span=span,
+        msg_out=[msg],
+        status="ok",
+        error=None,
+    )
+    assert record.msg_in.hash is not None
+    assert record.msg_in.identity == "9"

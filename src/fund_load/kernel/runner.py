@@ -6,6 +6,8 @@ from typing import Protocol
 
 from fund_load.kernel.context import Context, ContextFactory
 from fund_load.kernel.scenario import Scenario
+from fund_load.kernel.trace import ErrorInfo, TraceRecorder
+from fund_load.ports.trace_sink import TraceSink
 
 
 class OutputSink(Protocol):
@@ -20,6 +22,8 @@ class Runner:
     scenario: Scenario
     context_factory: ContextFactory
     on_error: Callable[[Context, Exception], None] | None = None
+    trace_recorder: TraceRecorder | None = None
+    trace_sink: TraceSink | None = None
 
     def run(self, inputs: Iterable[object], *, output_sink: OutputSink) -> None:
         # Depth-first execution per input ensures deterministic state updates.
@@ -27,11 +31,49 @@ class Runner:
             ctx = self.context_factory.new(line_no=getattr(raw, "line_no", None))
             work: list[object] = [raw]
             try:
-                for step_spec in self.scenario.steps:
+                for step_index, step_spec in enumerate(self.scenario.steps):
                     next_work: list[object] = []
-                    for msg in work:
-                        out_iter = step_spec.step(msg, ctx)
-                        next_work.extend(list(out_iter))
+                    for work_index, msg in enumerate(work):
+                        span = None
+                        if self.trace_recorder is not None:
+                            span = self.trace_recorder.begin(
+                                ctx=ctx,
+                                step_name=step_spec.name,
+                                step_index=step_index,
+                                work_index=work_index,
+                                msg_in=msg,
+                            )
+                        try:
+                            out_iter = step_spec.step(msg, ctx)
+                            out_list = list(out_iter)
+                        except Exception as exc:  # noqa: BLE001 - trace + rethrow for runner policy
+                            if self.trace_recorder is not None and span is not None:
+                                record = self.trace_recorder.finish(
+                                    ctx=ctx,
+                                    span=span,
+                                    msg_out=[],
+                                    status="error",
+                                    error=ErrorInfo(
+                                        type=type(exc).__name__,
+                                        message=str(exc),
+                                        where=step_spec.name,
+                                        stack=None,
+                                    ),
+                                )
+                                if self.trace_sink is not None:
+                                    self.trace_sink.emit(record)
+                            raise
+                        if self.trace_recorder is not None and span is not None:
+                            record = self.trace_recorder.finish(
+                                ctx=ctx,
+                                span=span,
+                                msg_out=out_list,
+                                status="ok",
+                                error=None,
+                            )
+                            if self.trace_sink is not None:
+                                self.trace_sink.emit(record)
+                        next_work.extend(out_list)
                     work = next_work
                     if not work:
                         break
@@ -43,3 +85,8 @@ class Runner:
 
             for msg in work:
                 output_sink(msg)
+
+        if self.trace_sink is not None:
+            # Best-effort flush/close at end of run (Trace spec §6.1).
+            self.trace_sink.flush()
+            self.trace_sink.close()

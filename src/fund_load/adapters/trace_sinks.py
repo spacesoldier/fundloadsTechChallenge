@@ -8,9 +8,10 @@ from dataclasses import asdict, is_dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
-from fund_load.kernel.trace import TraceRecord
+if TYPE_CHECKING:
+    from fund_load.kernel.trace import TraceRecord
 from fund_load.ports.trace_sink import TraceSink
 
 
@@ -34,7 +35,7 @@ class JsonlTraceSink(TraceSink):
         self._buffer: list[str] = []
         self._handle = self._path.open("a", encoding="utf-8")
 
-    def emit(self, record: TraceRecord) -> None:
+    def emit(self, record: "TraceRecord") -> None:
         # Serialize with stable keys and UTF-8 JSONL (Trace spec §7.2).
         line = json.dumps(
             _trace_to_dict(record),
@@ -74,7 +75,7 @@ class JsonlTraceSink(TraceSink):
 
 class StdoutTraceSink(TraceSink):
     # StdoutTraceSink prints one JSON record per line (Trace spec §6.2).
-    def emit(self, record: TraceRecord) -> None:
+    def emit(self, record: "TraceRecord") -> None:
         line = json.dumps(
             _trace_to_dict(record),
             separators=(",", ":"),
@@ -90,7 +91,7 @@ class StdoutTraceSink(TraceSink):
         self.flush()
 
 
-def _trace_to_dict(record: TraceRecord) -> dict[str, object]:
+def _trace_to_dict(record: "TraceRecord") -> dict[str, object]:
     # Build dict with stable key order and explicit field mapping (Trace spec §7.2).
     return {
         "trace_id": record.trace_id,

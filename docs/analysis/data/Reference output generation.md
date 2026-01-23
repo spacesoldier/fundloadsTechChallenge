@@ -737,6 +737,18 @@ ORDER BY line_no ASC;
 	FROM fund_load_decisions_stream
 	ORDER BY line_no
 ) TO '/actual/path/to/output.txt';
+
+-- strict formatting keeping the fields order as expected
+\copy (
+  SELECT format(
+    '{"id":"%s","customer_id":"%s","accepted":%s}',
+    id_num::text,
+    customer_id::text,
+    CASE WHEN status = 'APPROVED' THEN 'true' ELSE 'false' END
+  )
+  FROM fund_load_decisions_stream
+  ORDER BY line_no
+) TO 'output.txt';
 ```
 
 ---
@@ -1305,12 +1317,12 @@ Output export:
 -- ============================================================
 
 \copy (
-SELECT
-	jsonb_build_object(
-		'id', id_num::text,
-		'customer_id', customer_id::text,
-		'accepted', (status = 'APPROVED')
-	)::text
+SELECT format(
+	'{"id":"%s","customer_id":"%s","accepted":%s}',
+	id_num::text,
+	customer_id::text,
+	CASE WHEN status = 'APPROVED' THEN 'true' ELSE 'false' END
+)
 	FROM fund_load_decisions_stream_exp_mp
 	ORDER BY line_no
 ) TO 'output_exp_mp.txt';

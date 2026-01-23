@@ -54,3 +54,22 @@ windows:
 
 output:
   file: output.txt
+
+tracing:
+  enabled: false
+  signature:
+    mode: type_only
+  context_diff:
+    mode: whitelist
+    whitelist:
+      - line_no
+      - tags
+      - metrics
+      - errors
+  sink:
+    kind: jsonl
+    jsonl:
+      path: trace.jsonl
+      write_mode: line
+      flush_every_n: 1
+      fsync_every_n: null

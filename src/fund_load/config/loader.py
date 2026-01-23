@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from fund_load.usecases.config_models import AppConfig
 
+
 # ConfigError is raised for invalid configuration (Configuration spec: fail fast).
 class ConfigError(ValueError):
     pass
