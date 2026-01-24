@@ -6,6 +6,8 @@ This document also clarifies how the runner relates to **Step Registry**: the ru
 
 ---
 
+**Implementation:** [runner.py](../../../src/fund_load/kernel/runner.py)
+
 ## 1. Responsibilities
 
 The runner:

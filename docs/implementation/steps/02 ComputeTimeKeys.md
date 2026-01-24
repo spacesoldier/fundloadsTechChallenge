@@ -2,6 +2,7 @@
 
 **Step name (registry):** `compute_time_keys`  
 **File:** `docs/implementation/steps/02 ComputeTimeKeys.md`  
+**Implementation:** [compute_time_keys.py](../../../src/fund_load/usecases/steps/compute_time_keys.py)  
 **Responsibility:** Derive deterministic **UTC day/week keys** from a normalized `LoadAttempt`.
 
 This step is pure: it performs no I/O and no state updates.

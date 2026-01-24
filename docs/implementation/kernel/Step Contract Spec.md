@@ -2,6 +2,7 @@
 
 **Status:** Draft (implementation-target)  
 **Scope:** Kernel contracts (runtime), not business logic  
+**Implementation:** [step.py](../../../src/fund_load/kernel/step.py)  
 **Goal:** define what a “step” is, how it is executed, what it may return, and how we test it.
 
 A **Step** is the smallest executable unit in a Scenario.  

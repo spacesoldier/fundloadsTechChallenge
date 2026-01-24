@@ -29,6 +29,19 @@ Implementations live in **adapters** and may change freely without affecting:
 
 ---
 
+## Implementation sources
+
+- [ports/input_source.py](../../../src/fund_load/ports/input_source.py)
+- [adapters/input_source.py](../../../src/fund_load/adapters/input_source.py)
+- [ports/output_sink.py](../../../src/fund_load/ports/output_sink.py)
+- [adapters/output_sink.py](../../../src/fund_load/adapters/output_sink.py)
+- [ports/prime_checker.py](../../../src/fund_load/ports/prime_checker.py)
+- [adapters/prime_checker.py](../../../src/fund_load/adapters/prime_checker.py)
+- [ports/window_store.py](../../../src/fund_load/ports/window_store.py)
+- [adapters/window_store.py](../../../src/fund_load/adapters/window_store.py)
+
+---
+
 ## Design rules (quick)
 
 - Ports are **stable**: change ports rarely.

@@ -2,6 +2,7 @@
 
 **Step name (registry):** `write_output`  
 **File:** `docs/implementation/steps/08 WriteOutput.md`  
+**Implementation:** [write_output.py](../../../src/fund_load/usecases/steps/write_output.py)  
 **Responsibility:** Persist the stream of `OutputLine` objects into `output.txt` exactly in input order, as required by the challenge.
 
 This step performs I/O and is the final sink of the pipeline.

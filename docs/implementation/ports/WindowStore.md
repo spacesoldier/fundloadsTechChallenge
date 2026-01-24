@@ -15,6 +15,11 @@ The core rule:
 
 ---
 
+**Port implementation:** [window_store.py](../../../src/fund_load/ports/window_store.py)  
+**Adapter (in-memory):** [window_store.py](../../../src/fund_load/adapters/window_store.py)
+
+---
+
 ## 1. Purpose and scope
 
 The WindowStore boundary provides two capabilities:
@@ -355,4 +360,3 @@ This layer is where “RSpec-like” behavior tests live.
 - parsing of amounts/time (covered by Step 01/02 tests)
 - correctness of prime detection algorithm (covered by feature tests)
 - formatting/output I/O (Steps 07/08 tests)
-

@@ -6,6 +6,8 @@ Tracing is **observability-only**. It must not affect business decisions.
 
 ---
 
+**Implementation:** [trace.py](../../../src/fund_load/kernel/trace.py)
+
 ## 1. Goals
 
 Tracing must provide:
@@ -485,4 +487,3 @@ With a fake sink capturing written lines:
 - Tracing must not change business behavior (side-effect only).
 - JSONL sink is the default for the challenge due to simplicity and grep-friendly output.
 - OTel sink is an optional adapter for future integration.
-

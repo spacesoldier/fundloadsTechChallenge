@@ -2,6 +2,7 @@
 
 **Step name (registry):** `parse_load_attempt`  
 **File:** `docs/implementation/steps/01 ParseLoadAttempt.md`  
+**Implementation:** [parse_load_attempt.py](../../../src/fund_load/usecases/steps/parse_load_attempt.py)  
 **Responsibility:** Parse one raw input line into a normalized `LoadAttempt` message (or emit an immediate declined `Decision` on irrecoverable parse/normalization errors).
 
 This step is the **only** place where raw line text is interpreted as JSON and normalized into domain types.

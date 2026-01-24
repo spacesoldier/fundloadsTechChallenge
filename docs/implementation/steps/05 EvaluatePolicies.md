@@ -2,6 +2,7 @@
 
 **Step name (registry):** `evaluate_policies`  
 **File:** `docs/implementation/steps/05 EvaluatePolicies.md`  
+**Implementation:** [evaluate_policies.py](../../../src/fund_load/usecases/steps/evaluate_policies.py)  
 **Responsibility:** Produce an acceptance decision for each enriched attempt by evaluating the configured policy pack against current window snapshots and global gates.
 
 This step:

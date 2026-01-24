@@ -2,6 +2,8 @@
 
 A **Scenario** is a fully constructed, executable flow: an ordered list of steps + the configuration that binds those steps together for a specific run (baseline vs experiment).
 
+**Implementation:** [scenario.py](../../../src/fund_load/kernel/scenario.py)
+
 The kernel executes _a scenario_. The service (composition root) _builds_ a scenario.
 
 ---

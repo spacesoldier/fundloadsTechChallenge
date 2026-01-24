@@ -2,6 +2,7 @@
 
 **Step name (registry):** `format_output`  
 **File:** `docs/steps/07 FormatOutput.md`  
+**Implementation:** [format_output.py](../../../src/fund_load/usecases/steps/format_output.py)  
 **Responsibility:** Convert an internal `Decision` into the exact JSON object required by the challenge output format, without performing any file I/O.
 
 This step is pure and deterministic.

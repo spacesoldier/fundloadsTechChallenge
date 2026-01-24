@@ -8,6 +8,11 @@ The prime logic is treated as a **feature provider**:
 
 ---
 
+**Port implementation:** [prime_checker.py](../../../src/fund_load/ports/prime_checker.py)  
+**Adapter (sieve):** [prime_checker.py](../../../src/fund_load/adapters/prime_checker.py)
+
+---
+
 ## 1. Scope and intent
 
 The challenge introduces an artificial rule:

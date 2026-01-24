@@ -1,6 +1,7 @@
 
 **Status:** Draft (implementation-target)  
 **Scope:** Kernel / runtime (not business domain)  
+**Implementation:** [context.py](../../../src/fund_load/kernel/context.py)  
 
 The **Context** (`Context`, `Ctx`) is a **mutable**, **per-input-event** runtime object that carries execution metadata through the scenario steps.
 

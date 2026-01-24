@@ -2,6 +2,8 @@
 
 The **Step Registry** is a kernel-adjacent facility used by the **service composition root** to build a `Scenario` from configuration.
 
+**Implementation:** [step_registry.py](../../../src/fund_load/kernel/step_registry.py)
+
 It maps a _stable step key_ (string) to:
 
 - the step implementation (callable),

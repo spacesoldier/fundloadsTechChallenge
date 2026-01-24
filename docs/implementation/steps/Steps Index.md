@@ -16,6 +16,20 @@ The flow is designed to be **left-to-right**, deterministic, and configuration-d
 
 ---
 
+## Implementation sources
+
+- [parse_load_attempt.py](../../../src/fund_load/usecases/steps/parse_load_attempt.py)
+- [compute_time_keys.py](../../../src/fund_load/usecases/steps/compute_time_keys.py)
+- [idempotency_gate.py](../../../src/fund_load/usecases/steps/idempotency_gate.py)
+- [compute_features.py](../../../src/fund_load/usecases/steps/compute_features.py)
+- [evaluate_policies.py](../../../src/fund_load/usecases/steps/evaluate_policies.py)
+- [update_windows.py](../../../src/fund_load/usecases/steps/update_windows.py)
+- [format_output.py](../../../src/fund_load/usecases/steps/format_output.py)
+- [write_output.py](../../../src/fund_load/usecases/steps/write_output.py)
+- [messages.py](../../../src/fund_load/usecases/messages.py)
+
+---
+
 ## Flow overview (Mermaid)
 
 ```mermaid

@@ -2,6 +2,8 @@
 
 This document specifies **ScenarioBuilder**: the component responsible for constructing a runnable `Scenario` from configuration by instantiating steps through the `StepRegistry` and wiring dependencies (ports, config sections, feature flags).
 
+**Implementation:** [scenario_builder.py](../../../src/fund_load/kernel/scenario_builder.py)
+
 `ScenarioBuilder` runs in the **composition/build phase** (startup time), not during message processing.
 
 ---

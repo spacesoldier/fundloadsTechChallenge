@@ -2,6 +2,7 @@
 
 **Step name (registry):** `idempotency_gate`  
 **File:** `docs/implementation/steps/03 IdempotencyGate.md`  
+**Implementation:** [idempotency_gate.py](../../../src/fund_load/usecases/steps/idempotency_gate.py)  
 **Responsibility:** Enforce deterministic idempotency semantics for repeated `id` values in the input stream.
 
 This dataset contains duplicate `id`s, including **conflicting duplicates** (same id, different payload).

@@ -6,6 +6,8 @@ The composition root is **not** a runtime component. It runs once at startup and
 
 ---
 
+**Implementation:** [composition_root.py](../../../src/fund_load/kernel/composition_root.py)
+
 ## 1. Purpose
 
 The composition root exists to enforce two rules:

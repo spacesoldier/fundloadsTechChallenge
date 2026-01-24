@@ -2,6 +2,7 @@
 
 **Step name (registry):** `update_windows`  
 **File:** `docs/implementation/steps/06 UpdateWindows.md`  
+**Implementation:** [update_windows.py](../../../src/fund_load/usecases/steps/update_windows.py)  
 **Responsibility:** Mutate window state based on the `Decision`, according to configured window semantics, while preserving strict input order.
 
 This step is the **only** place where window state is updated:

@@ -2,6 +2,7 @@
 
 **Step name (registry):** `compute_features`  
 **File:** `docs/implementation/steps/04 ComputeFeatures.md`  
+**Implementation:** [compute_features.py](../../../src/fund_load/usecases/steps/compute_features.py)  
 **Responsibility:** Compute deterministic **derived features** required by policy evaluation, without performing any decisions or state access.
 
 Features currently required by the challenge:

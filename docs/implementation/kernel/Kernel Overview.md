@@ -2,6 +2,16 @@
 This document defines the **kernel**: a small, generic runtime that executes a configured scenario over a stream of messages.  
 The kernel owns orchestration, context lifecycle, and observability hooks. It contains **no business rules**.
 
+**Implementation sources:**
+- [context.py](../../../src/fund_load/kernel/context.py)
+- [step.py](../../../src/fund_load/kernel/step.py)
+- [scenario.py](../../../src/fund_load/kernel/scenario.py)
+- [scenario_builder.py](../../../src/fund_load/kernel/scenario_builder.py)
+- [step_registry.py](../../../src/fund_load/kernel/step_registry.py)
+- [runner.py](../../../src/fund_load/kernel/runner.py)
+- [composition_root.py](../../../src/fund_load/kernel/composition_root.py)
+- [trace.py](../../../src/fund_load/kernel/trace.py)
+
 ---
 
 ## 1. Kernel responsibilities
