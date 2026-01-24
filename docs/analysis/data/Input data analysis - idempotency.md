@@ -15,6 +15,12 @@ This format naturally suggests **streaming processing**:
 - evaluate sequentially,
 - produce output per event without needing to load the entire file into memory.
 
+We also validated the streaming assumption on the actual dataset: within each
+`customer_id`, `event_time` is non-decreasing when ordered by `line_no` (the
+input order). The verification SQL is documented in
+`docs/analysis/data/Reference output generation.md` (section 0.1), and the
+result was zero inversions for this dataset.
+
 ### 2.2 Duplicate `id` values exist
 During input inspection, we found that the dataset contains **repeated values of `id`**, and importantly:
 - at least some duplicates have **different `load_amount` values**.

@@ -58,11 +58,18 @@ This README serves only as an entry point; detailed explanations are provided in
 - **Data analysis**
 	- [duplicates and conflicting uploads](./docs/analysis/data/Input%20data%20analysis%20-%20idempotency.md)
 	- [reference output](./docs/analysis/data/Reference%20output%20generation.md)
+- **Reasoning and assumptions**  
+  [architectural reasoning and explicit assumptions](./docs/analysis/Reasoning%20and%20assumptions.md)
 - **Detailed guide**
 	- [table of contents](./docs/guide/Ruby-Friendly%20Python%20for%20Streaming%20Systems.md)
+- **Pipeline steps**
+  - [step index (pipeline reference)](./docs/implementation/steps/Steps%20Index.md)
 - **Implementation**
   - [structure overview](./docs/implementation/Documentation%20structure.md)
-  - [architecture overview](Architecture%20overview.md)
+  - [architecture overview](./docs/implementation/architecture/Architecture%20overview.md)
+  - [implementation report](./docs/implementation/Implementation%20report.md)
+- **Roadmap**
+  - [development plan](./docs/implementation/Development%20plan.md)
 
 ---
 
@@ -73,8 +80,79 @@ This README serves only as an entry point; detailed explanations are provided in
 - The focus is on clarity, correctness, and maintainability rather than feature breadth.
 - **Using [Obsidian](https://obsidian.md/download) is strongly recommended** for better navigation across the project contents
 
+## Prerequisites (minimal)
+
+- Python 3.12+ installed (recommended via `pyenv` but not required).
+- Poetry installed (`https://python-poetry.org/docs/#installation`).
+
+
+
+### Example setup on Ubuntu / WSL (minimal)
+
+```
+sudo apt update
+sudo apt install -y python3.12 python3.12-venv python3-pip curl
+curl -sSL https://install.python-poetry.org | python3 -
+export PATH="$HOME/.local/bin:$PATH"
+poetry install
+```
+
+## How to run (CLI)
+
+The CLI is exposed via the module entry point. Example commands:
+
+Baseline (default rules):
+```
+poetry run python -m fund_load \
+  --config src/fund_load/baseline_config.yml \
+  --input docs/analysis/data/assets/input.txt \
+  --output output.txt
+```
+
+Experimental (Monday multiplier + prime-id gate):
+```
+poetry run python -m fund_load \
+  --config src/fund_load/experiment_config.yml \
+  --input docs/analysis/data/assets/input.txt \
+  --output output_exp_mp.txt
+```
+
+Optional tracing (overrides config):
+```
+poetry run python -m fund_load \
+  --config src/fund_load/baseline_config.yml \
+  --input docs/analysis/data/assets/input.txt \
+  --output output.txt \
+  --tracing enable \
+  --trace-path trace.jsonl
+```
+
+## Verify against reference output
+
+Baseline:
+```
+diff -u output.txt docs/analysis/data/assets/output.txt
+```
+
+Experimental:
+```
+diff -u output_exp_mp.txt docs/analysis/data/assets/output_exp_mp.txt
+```
+
+If you need JSON normalization for diffing (should not be required):
+```
+jq -c . output.txt > output.normalized.txt
+jq -c . docs/analysis/data/assets/output.txt > output.ref.normalized.txt
+diff -u output.normalized.txt output.ref.normalized.txt
+```
+
+## Run tests
+
+```
+poetry run pytest --cov=src -q
+```
+
 ## Reproducing reference output (SQL-based baseline)
 Scripts live under:
 - `docs/analysis/data/scripts/generate_ref_outs.sql`
 - `docs/analysis/data/scripts/docker-compose.yml`
-

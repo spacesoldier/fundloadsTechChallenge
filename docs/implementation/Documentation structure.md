@@ -9,13 +9,13 @@ This document fixes the **documentation structure** (“architecture pack”) an
 
 ## 1. Reading order
 
-1) **[Architecture Overview](Architecture%20overview.md)** — the big picture, one flow + config-driven behavior  
-2) **[Configuration Spec](Configuration%20spec.md)** — what can be configured and how (composition vs meaning)  
-3) **[Flow Spec](Flow%20spec.md)** — the left-to-right data path as a sequence of steps  
-4) [**Domain**](./domain/Domain%20docs%20index.md) — Message Types, semantics (time/money), reason codes  
-5) **[[Steps Index|Steps]]** — one spec per step, single responsibility, explicit contracts  
-6) [**Ports**](./ports/Ports%20Index.md) — interfaces and semantics for state and I/O  
-7) **[Analysis](../analysis/data/Reference%20output%20generation.md)** — input data workup, reference outputs, and fixtures (already completed)
+1) **[Analysis](../analysis/data/Reference%20output%20generation.md)** — input data workup, reference outputs, and fixtures (already completed)
+2) **[Architecture Overview](Architecture%20overview.md)** — the big picture, one flow + config-driven behavior  
+3) **[Configuration Spec](Configuration%20spec.md)** — what can be configured and how (composition vs meaning)  
+4) **[Flow Spec](./architecture/Flow%20spec.md)** — the left-to-right data path as a sequence of steps  
+5) **[Domain](./domain/Domain%20docs%20index.md)** — Message Types, semantics (time/money), reason codes  
+6) **[Steps](./steps/Steps%20Index.md)** — one spec per step, single responsibility, explicit contracts  
+7) **[Ports](./ports/Ports%20Index.md)** — interfaces and semantics for state and I/O  
 
 ---
 

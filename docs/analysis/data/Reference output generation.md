@@ -25,8 +25,6 @@ We intentionally designed the data workup around these guarantees:
 4. **Order preservation**  
    The output is emitted **in the same order as the input file**.
 
----
-
 ## 1. Staging the raw input
 
 ### 1.1 Why we used a staging table
@@ -327,6 +325,51 @@ FROM ranked
 ON CONFLICT (line_no) DO NOTHING;
 
 ```
+
+---
+
+### 4.3 Streaming order sanity check (per customer)
+
+The input arrives as NDJSON, which suggests streaming. To verify this assumption
+on the dataset itself, we check whether `event_time` is non-decreasing within
+each `customer_id` when ordered by `line_no` (input order).
+
+Run these checks after `fund_load_stream_enriched` is created and populated:
+
+```sql
+-- count inversions inside each customer stream
+WITH ordered AS (
+  SELECT
+    customer_id,
+    line_no,
+    event_time,
+    lag(event_time) OVER (PARTITION BY customer_id ORDER BY line_no) AS prev_time
+  FROM fund_load_stream_enriched
+)
+SELECT count(*) AS inversions
+FROM ordered
+WHERE prev_time IS NOT NULL
+  AND event_time < prev_time;
+
+-- inspect samples if needed
+WITH ordered AS (
+  SELECT
+    customer_id,
+    line_no,
+    event_time,
+    lag(event_time) OVER (PARTITION BY customer_id ORDER BY line_no) AS prev_time
+  FROM fund_load_stream_enriched
+)
+SELECT customer_id, line_no, event_time, prev_time
+FROM ordered
+WHERE prev_time IS NOT NULL
+  AND event_time < prev_time
+ORDER BY customer_id, line_no
+LIMIT 50;
+```
+
+For the provided dataset these checks returned zero inversions, so **the input is
+stream-ordered per customer**.
 
 ---
 
