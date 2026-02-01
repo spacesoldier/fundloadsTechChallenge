@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 # Composition root wiring is documented in docs/implementation/kernel/Composition Root Spec.md.
-from fund_load.kernel.composition_root import build_runtime
+from stream_kernel.kernel.composition_root import build_runtime
 
 
 def test_composition_root_builds_runtime(tmp_path: Path) -> None:

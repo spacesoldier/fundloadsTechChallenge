@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
-    from fund_load.kernel.trace import TraceRecord
+    from stream_kernel.kernel.trace import TraceRecord
 from fund_load.ports.trace_sink import TraceSink
 
 

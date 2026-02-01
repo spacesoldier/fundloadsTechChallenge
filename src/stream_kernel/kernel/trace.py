@@ -10,7 +10,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Literal
 
-from fund_load.kernel.context import Context
+from stream_kernel.kernel.context import Context
 
 
 @dataclass(frozen=True, slots=True)

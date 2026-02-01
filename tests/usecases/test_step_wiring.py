@@ -7,7 +7,7 @@ from decimal import Decimal
 from fund_load.adapters.window_store import InMemoryWindowStore
 from fund_load.domain.messages import IdemStatus, LoadAttempt
 from fund_load.domain.money import Money
-from fund_load.kernel.scenario_builder import ScenarioBuilder
+from stream_kernel.kernel.scenario_builder import ScenarioBuilder
 from fund_load.usecases.config_models import AppConfig
 from fund_load.usecases.messages import (
     AttemptWithKeys,

@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 # TraceRecorder behavior is specified in docs/implementation/kernel/Trace and Context Change Log Spec.md.
-from fund_load.kernel.context import Context
-from fund_load.kernel.trace import TraceRecorder
+from stream_kernel.kernel.context import Context
+from stream_kernel.kernel.trace import TraceRecorder
 
 
 @dataclass(frozen=True, slots=True)

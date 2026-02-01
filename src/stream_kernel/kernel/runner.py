@@ -5,9 +5,9 @@ from dataclasses import dataclass
 from typing import Protocol
 
 # Kernel runtime types (see docs/implementation/kernel/Runner (Orchestrator) Spec.md).
-from fund_load.kernel.context import Context, ContextFactory
-from fund_load.kernel.scenario import Scenario
-from fund_load.kernel.trace import ErrorInfo, TraceRecorder
+from stream_kernel.kernel.context import Context, ContextFactory
+from stream_kernel.kernel.scenario import Scenario
+from stream_kernel.kernel.trace import ErrorInfo, TraceRecorder
 from fund_load.ports.trace_sink import TraceSink
 
 

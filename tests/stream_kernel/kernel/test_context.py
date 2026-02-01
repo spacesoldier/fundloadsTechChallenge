@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 import pytest
 
 # Context contract is documented in docs/implementation/kernel/Context Spec.md.
-from fund_load.kernel.context import Context, ContextFactory
+from stream_kernel.kernel.context import Context, ContextFactory
 
 
 def test_context_factory_sets_required_fields() -> None:

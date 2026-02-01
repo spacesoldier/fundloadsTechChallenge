@@ -3,12 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from fund_load.kernel.context import ContextFactory
-from fund_load.kernel.runner import Runner
-from fund_load.kernel.scenario import Scenario
-from fund_load.kernel.scenario_builder import ScenarioBuilder
-from fund_load.kernel.step_registry import StepRegistry
-from fund_load.kernel.trace import TraceRecorder
+from stream_kernel.kernel.context import ContextFactory
+from stream_kernel.kernel.runner import Runner
+from stream_kernel.kernel.scenario import Scenario
+from stream_kernel.kernel.scenario_builder import ScenarioBuilder
+from stream_kernel.kernel.step_registry import StepRegistry
+from stream_kernel.kernel.trace import TraceRecorder
 from fund_load.usecases.config_models import AppConfig, TracingConfig
 from fund_load.usecases.wiring import build_step_registry
 from fund_load.adapters.trace_sinks import JsonlTraceSink, StdoutTraceSink

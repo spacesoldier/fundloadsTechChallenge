@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
-from fund_load.kernel.step_registry import StepRegistry
+from stream_kernel.kernel.step_registry import StepRegistry
 from fund_load.usecases.config_models import AppConfig
 from fund_load.usecases.steps import (
     ComputeFeatures,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 # StepRegistry contract is documented in docs/implementation/kernel/Step Registry Spec.md.
-from fund_load.kernel.step_registry import StepRegistry, UnknownStepError
+from stream_kernel.kernel.step_registry import StepRegistry, UnknownStepError
 
 
 def test_step_registry_resolves_known_key() -> None:

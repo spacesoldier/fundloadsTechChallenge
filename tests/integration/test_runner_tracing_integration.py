@@ -6,10 +6,10 @@ from pathlib import Path
 
 # Integration tracing behavior is specified in docs/implementation/kernel/Trace and Context Change Log Spec.md.
 from fund_load.adapters.trace_sinks import JsonlTraceSink
-from fund_load.kernel.context import Context, ContextFactory
-from fund_load.kernel.runner import Runner
-from fund_load.kernel.scenario import Scenario, StepSpec
-from fund_load.kernel.trace import TraceRecorder
+from stream_kernel.kernel.context import Context, ContextFactory
+from stream_kernel.kernel.runner import Runner
+from stream_kernel.kernel.scenario import Scenario, StepSpec
+from stream_kernel.kernel.trace import TraceRecorder
 
 
 @dataclass(frozen=True, slots=True)

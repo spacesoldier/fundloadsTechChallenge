@@ -11,9 +11,9 @@ from fund_load.adapters.input_source import FileInputSource
 from fund_load.adapters.prime_checker import SievePrimeChecker
 from fund_load.adapters.window_store import InMemoryWindowStore
 from fund_load.config.loader import load_config
-from fund_load.kernel.context import ContextFactory
-from fund_load.kernel.runner import Runner
-from fund_load.kernel.scenario_builder import ScenarioBuilder
+from stream_kernel.kernel.context import ContextFactory
+from stream_kernel.kernel.runner import Runner
+from stream_kernel.kernel.scenario_builder import ScenarioBuilder
 from fund_load.usecases.config_models import AppConfig, StepDecl
 from fund_load.usecases.messages import OutputLine
 from fund_load.usecases.wiring import build_step_registry

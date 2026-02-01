@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from fund_load.kernel.step import Step
+from stream_kernel.kernel.step import Step
 
 
 # Errors are explicit for fast config feedback (Step Registry spec).

@@ -3,7 +3,7 @@ from __future__ import annotations
 # Step contract is documented in docs/implementation/kernel/Step Contract Spec.md.
 import pytest
 
-from fund_load.kernel.step import Filter, Map, Step, Tap
+from stream_kernel.kernel.step import Filter, Map, Step, Tap
 
 
 def test_map_outputs_one_value() -> None:

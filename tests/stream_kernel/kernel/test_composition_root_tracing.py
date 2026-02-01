@@ -12,11 +12,11 @@ from fund_load.adapters.prime_checker import SievePrimeChecker
 from fund_load.adapters.window_store import InMemoryWindowStore
 from fund_load.config.loader import load_config
 from fund_load.domain.messages import RawLine
-from fund_load.kernel.composition_root import build_runtime_from_app_config
+from stream_kernel.kernel.composition_root import build_runtime_from_app_config
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    return Path(__file__).resolve().parents[3]
 
 
 @dataclass(frozen=True, slots=True)

@@ -3,13 +3,13 @@ from __future__ import annotations
 import pytest
 
 # ScenarioBuilder contract is documented in docs/implementation/kernel/ScenarioBuilder Spec.md.
-from fund_load.kernel.scenario_builder import (
+from stream_kernel.kernel.scenario_builder import (
     InvalidScenarioConfigError,
     ScenarioBuilder,
     StepBuildError,
     UnknownStepError,
 )
-from fund_load.kernel.step_registry import StepRegistry
+from stream_kernel.kernel.step_registry import StepRegistry
 
 
 def test_scenario_builder_builds_steps_in_order() -> None:

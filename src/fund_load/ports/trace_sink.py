@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from fund_load.kernel.trace import TraceRecord
+    from stream_kernel.kernel.trace import TraceRecord
 
 
 # TraceSink is a port-like interface for trace adapters (Trace and Context Change Log spec §6).

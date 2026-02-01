@@ -36,3 +36,7 @@ tests/usecases/__pycache__/*
 tests/integration/__pycache__/*
 tests/cli/__pycache__/*
 src/fund_load/app/__pycache__/*
+src/stream_kernel/__pycache__/*
+src/stream_kernel/kernel/__pycache__/*
+tests/stream_kernel/kernel/__pycache__/*
+

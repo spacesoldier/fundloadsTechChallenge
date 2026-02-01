@@ -3,10 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 # Runner semantics are documented in docs/implementation/kernel/Runner (Orchestrator) Spec.md.
-from fund_load.kernel.context import ContextFactory
-from fund_load.kernel.runner import Runner
-from fund_load.kernel.scenario import Scenario, StepSpec
-from fund_load.kernel.trace import TraceRecorder
+from stream_kernel.kernel.context import ContextFactory
+from stream_kernel.kernel.runner import Runner
+from stream_kernel.kernel.scenario import Scenario, StepSpec
+from stream_kernel.kernel.trace import TraceRecorder
 
 
 @dataclass(frozen=True, slots=True)

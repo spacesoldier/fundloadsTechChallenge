@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from fund_load.kernel.scenario import Scenario, StepSpec
-from fund_load.kernel.step_registry import StepRegistry, UnknownStepError
+from stream_kernel.kernel.scenario import Scenario, StepSpec
+from stream_kernel.kernel.step_registry import StepRegistry, UnknownStepError
 
 
 class InvalidScenarioConfigError(ValueError):

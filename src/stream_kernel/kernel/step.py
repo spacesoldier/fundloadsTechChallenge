@@ -4,7 +4,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar
 
-from fund_load.kernel.context import Context
+from stream_kernel.kernel.context import Context
 
 # Protocol variance: inputs are contravariant, outputs are covariant (mypy requirement).
 TIn = TypeVar("TIn", contravariant=True)

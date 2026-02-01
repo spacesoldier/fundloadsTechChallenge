@@ -11,10 +11,10 @@ from fund_load.adapters.window_store import InMemoryWindowStore
 from fund_load.config.loader import load_config
 from fund_load.domain.messages import RawLine
 from fund_load.domain.reasons import ReasonCode
-from fund_load.kernel.context import Context, ContextFactory
-from fund_load.kernel.runner import Runner
-from fund_load.kernel.scenario_builder import ScenarioBuilder
-from fund_load.kernel.trace import TraceRecorder
+from stream_kernel.kernel.context import Context, ContextFactory
+from stream_kernel.kernel.runner import Runner
+from stream_kernel.kernel.scenario_builder import ScenarioBuilder
+from stream_kernel.kernel.trace import TraceRecorder
 from fund_load.usecases.messages import Decision
 from fund_load.usecases.wiring import build_step_registry
 

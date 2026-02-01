@@ -11,7 +11,7 @@ import pytest
 # Trace sinks are specified in docs/implementation/kernel/Trace and Context Change Log Spec.md.
 import fund_load.adapters.trace_sinks as trace_sinks
 from fund_load.adapters.trace_sinks import JsonlTraceSink, StdoutTraceSink
-from fund_load.kernel.trace import MessageSignature, TraceRecord
+from stream_kernel.kernel.trace import MessageSignature, TraceRecord
 
 
 def _record(step_name: str, step_index: int) -> TraceRecord:
