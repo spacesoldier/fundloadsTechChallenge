@@ -1,4 +1,6 @@
 # Funds Load tech challenge
+
+[![Tests & Coverage](https://github.com/spacesoldier/fundloadsTechChallenge/actions/workflows/coverage.yml/badge.svg?branch=main)](https://github.com/spacesoldier/fundloadsTechChallenge/actions/workflows/coverage.yml)
 ## Overview
 
 This repository contains a solution to a technical challenge that models a **stream-oriented decision engine** for adjudicating fund load attempts under a set of regulatory and risk-control constraints.
