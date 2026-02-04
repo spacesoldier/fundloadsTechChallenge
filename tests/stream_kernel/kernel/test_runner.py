@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pytest
+
 # Runner semantics are documented in docs/implementation/kernel/Runner (Orchestrator) Spec.md.
 from stream_kernel.kernel.context import ContextFactory
-from stream_kernel.kernel.runner import Runner
+from stream_kernel.kernel.runner import Runner, OutputSink
 from stream_kernel.kernel.scenario import Scenario, StepSpec
 from stream_kernel.kernel.trace import TraceRecorder
 
@@ -225,3 +227,47 @@ def test_runner_tracing_records_error_status() -> None:
     assert trace[0].status == "error"
     assert trace[0].error is not None
     assert errors == ["boom"]
+
+
+def test_output_sink_protocol_raises_when_called_directly() -> None:
+    # Protocol method raises if invoked directly (Runner spec: output sink is a callback).
+    class _Sink(OutputSink):
+        pass
+
+    with pytest.raises(NotImplementedError):
+        _Sink().__call__("msg")
+
+
+def test_runner_emits_trace_to_sink_on_error() -> None:
+    # Error traces should be emitted to the configured sink (Trace spec §11.7).
+    records: list[object] = []
+
+    def boom(msg, ctx):
+        raise ValueError("boom")
+
+    scenario = Scenario(
+        scenario_id="test",
+        steps=[StepSpec(name="boom", step=boom)],
+    )
+    recorder = TraceRecorder(signature_mode="type_only", context_diff_mode="none")
+
+    class _Sink:
+        def emit(self, record) -> None:
+            records.append(record)
+
+        def flush(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    runner = Runner(
+        scenario=scenario,
+        context_factory=ContextFactory("run", "test"),
+        trace_recorder=recorder,
+        trace_sink=_Sink(),
+        on_error=lambda *_a, **_k: None,
+    )
+    runner.run([_Input(1)], output_sink=lambda _: None)
+
+    assert len(records) == 1

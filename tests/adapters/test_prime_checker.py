@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # Prime checker semantics and suggested cases are documented in
 # docs/implementation/ports/PrimeChecker.md.
-from fund_load.adapters.prime_checker import SievePrimeChecker
+from fund_load.adapters.prime_checker import SievePrimeChecker, _is_prime_trial_division
 
 
 def test_prime_checker_basic_values() -> None:
@@ -32,3 +32,16 @@ def test_prime_checker_outside_range_fallback() -> None:
     checker = SievePrimeChecker.from_max(30)
     assert checker.is_prime(97) is True
     assert checker.is_prime(99) is False
+
+
+def test_prime_checker_negative_range_is_clamped() -> None:
+    # Negative max range is clamped to 0 per PrimeChecker spec.
+    checker = SievePrimeChecker.from_range(0, -5)
+    assert checker.is_prime(2) is True
+
+
+def test_prime_checker_trial_division_edge_cases() -> None:
+    # Trial division handles n<=1, n==2, and even numbers (PrimeChecker spec).
+    assert _is_prime_trial_division(1) is False
+    assert _is_prime_trial_division(2) is True
+    assert _is_prime_trial_division(4) is False

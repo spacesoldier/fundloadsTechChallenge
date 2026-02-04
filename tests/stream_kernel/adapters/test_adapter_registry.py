@@ -40,6 +40,33 @@ def test_adapter_registry_unknown_kind_fails() -> None:
         registry.build("input_source", {"kind": "kafka", "settings": {}})
 
 
+def test_adapter_registry_rejects_duplicate_registration() -> None:
+    # Registry must reject duplicate (role, kind) registrations (Adapter registry spec).
+    registry = AdapterRegistry()
+    registry.register("input_source", "file", lambda settings: _FileInput(Path(settings["path"])))
+
+    with pytest.raises(AdapterRegistryError):
+        registry.register("input_source", "file", lambda settings: _FileInput(Path(settings["path"])))
+
+
+def test_adapter_registry_requires_mapping_config() -> None:
+    # Adapter config is validated as a mapping (Configuration spec §2.1).
+    registry = AdapterRegistry()
+    registry.register("input_source", "file", lambda settings: _FileInput(Path(settings["path"])))
+
+    with pytest.raises(AdapterRegistryError):
+        registry.build("input_source", "nope")  # type: ignore[arg-type]
+
+
+def test_adapter_registry_requires_kind_string() -> None:
+    # Adapter kind must be explicit and string-typed (Configuration spec §2.1).
+    registry = AdapterRegistry()
+    registry.register("input_source", "file", lambda settings: _FileInput(Path(settings["path"])))
+
+    with pytest.raises(AdapterRegistryError):
+        registry.build("input_source", {"kind": 1, "settings": {}})
+
+
 def test_adapter_registry_requires_settings_mapping() -> None:
     registry = AdapterRegistry()
     registry.register("input_source", "file", lambda settings: _FileInput(Path(settings["path"])))

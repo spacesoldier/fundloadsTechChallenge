@@ -46,6 +46,38 @@ def test_auto_discover_raises_on_missing_root(monkeypatch: pytest.MonkeyPatch) -
     with pytest.raises(ContextBuildError):
         ctx.auto_discover()
 
+
+def test_auto_discover_requires_env_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    # APP_CONTEXT_ROOT must be set to enable auto-discovery (Auto-discovery policy).
+    monkeypatch.delenv("APP_CONTEXT_ROOT", raising=False)
+    ctx = ApplicationContext()
+    with pytest.raises(ContextBuildError):
+        ctx.auto_discover()
+
+
+def test_auto_discover_rejects_non_package_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Root must be a package with __path__ (Auto-discovery policy).
+    monkeypatch.setenv("APP_CONTEXT_ROOT", "stream_kernel.kernel.node")
+    ctx = ApplicationContext()
+    with pytest.raises(ContextBuildError):
+        ctx.auto_discover()
+
+
+def test_auto_discover_raises_on_import_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Import errors inside the package should surface as ContextBuildError (Auto-discovery policy).
+    pkg = tmp_path / "fakeapp_err"
+    _write_file(pkg / "__init__.py", "")
+    _write_file(pkg / "bad.py", "raise RuntimeError('boom')\n")
+
+    sys.path.insert(0, str(tmp_path))
+    monkeypatch.setenv("APP_CONTEXT_ROOT", "fakeapp_err")
+
+    ctx = ApplicationContext()
+    with pytest.raises(ContextBuildError):
+        ctx.auto_discover()
+
+    sys.path.remove(str(tmp_path))
+
 def test_auto_discover_excludes_module_prefixes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Excluded module prefixes should be skipped during scanning.
     pkg = tmp_path / "fakeapp2"

@@ -5,7 +5,8 @@ from decimal import Decimal
 import pytest
 
 # Money parsing rules follow docs/implementation/domain/Time and Money Semantics.md and Step 01 spec.
-from fund_load.domain.money import MoneyParseError, parse_money
+from fund_load.domain.money import Money, MoneyParseError, parse_money
+from decimal import InvalidOperation
 from fund_load.domain.reasons import ReasonCode
 
 
@@ -36,11 +37,18 @@ def test_parse_money_rejects_negative_amount() -> None:
     with pytest.raises(ValueError):
         parse_money("$-1.00")
 
+def test_money_rejects_negative_amount_on_init() -> None:
+    # Money.__post_init__ guards invariants beyond parse_money (Time/Money semantics doc).
+    with pytest.raises(ValueError):
+        Money(currency="USD", amount=Decimal("-1.00"))
 
-# NOTE: Coverage for src/fund_load/domain/money.py is intentionally <100% right now.
-# - Money.__post_init__ has a negative-amount guard that is *not* reachable via parse_money,
-#   because parse_money rejects negatives before constructing Money.
-# - The Decimal(…) InvalidOperation branch is also effectively unreachable because the
-#   regex enforces a strict numeric format (^\d+\.\d{2}$) before Decimal parsing.
-# This is by design per Step 01 + Time/Money semantics; we keep the guards to prevent
-# misuse when Money is constructed directly, even though those lines are not executed here.
+
+def test_parse_money_reports_invalid_decimal(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Defensive path: Decimal conversion failures surface as MoneyParseError.
+    def _boom(_: str) -> Decimal:
+        raise InvalidOperation("boom")
+
+    monkeypatch.setattr("fund_load.domain.money.Decimal", _boom)
+
+    with pytest.raises(MoneyParseError):
+        parse_money("1.00")

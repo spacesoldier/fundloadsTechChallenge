@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -387,3 +388,123 @@ def test_run_with_config_fails_without_pipeline() -> None:
             discovery_modules=[],
             argv_overrides={},
         )
+
+
+def test_run_with_config_rejects_runtime_mapping() -> None:
+    # runtime must be a mapping for run_with_config (Configuration spec §2.1).
+    cfg = {"scenario": {"name": "baseline"}, "runtime": "nope", "adapters": {}}
+    registry = AdapterRegistry()
+    with pytest.raises(ValueError):
+        run_with_config(
+            cfg,
+            adapter_registry=registry,
+            adapter_bindings={},
+            discovery_modules=[],
+        )
+
+
+def test_run_with_config_rejects_adapters_mapping() -> None:
+    # adapters must be a mapping for run_with_config (Configuration spec §2.1).
+    cfg = {"scenario": {"name": "baseline"}, "runtime": {"pipeline": []}, "adapters": "nope"}
+    registry = AdapterRegistry()
+    with pytest.raises(ValueError):
+        run_with_config(
+            cfg,
+            adapter_registry=registry,
+            adapter_bindings={},
+            discovery_modules=[],
+        )
+
+
+def test_run_rejects_invalid_runtime_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Runtime mapping is required (Configuration spec §2.1).
+    cfg = {"scenario": {"name": "baseline"}, "runtime": "nope", "adapters": {}}
+    monkeypatch.setattr(
+        "stream_kernel.app.runtime.parse_args",
+        lambda _argv: SimpleNamespace(config="x", input=None, output=None, tracing=None, trace_path=None),
+    )
+    monkeypatch.setattr("stream_kernel.app.runtime.load_yaml_config", lambda _path: cfg)
+    monkeypatch.setattr("stream_kernel.app.runtime.validate_newgen_config", lambda raw: raw)
+
+    with pytest.raises(ValueError):
+        run(["--config", "cfg.yml"])
+
+
+def test_run_rejects_invalid_discovery_modules(monkeypatch: pytest.MonkeyPatch) -> None:
+    # discovery_modules must be a list of strings (Configuration spec §2.1).
+    cfg = {"scenario": {"name": "baseline"}, "runtime": {"discovery_modules": "nope"}, "adapters": {}}
+    monkeypatch.setattr(
+        "stream_kernel.app.runtime.parse_args",
+        lambda _argv: SimpleNamespace(config="x", input=None, output=None, tracing=None, trace_path=None),
+    )
+    monkeypatch.setattr("stream_kernel.app.runtime.load_yaml_config", lambda _path: cfg)
+    monkeypatch.setattr("stream_kernel.app.runtime.validate_newgen_config", lambda raw: raw)
+
+    with pytest.raises(ValueError):
+        run(["--config", "cfg.yml"])
+
+
+def test_run_rejects_non_mapping_adapters(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Adapter configs must be a mapping (Configuration spec §2.1).
+    cfg = {
+        "scenario": {"name": "baseline"},
+        "runtime": {"discovery_modules": []},
+        "adapters": "nope",
+    }
+    monkeypatch.setattr(
+        "stream_kernel.app.runtime.parse_args",
+        lambda _argv: SimpleNamespace(config="x", input=None, output=None, tracing=None, trace_path=None),
+    )
+    monkeypatch.setattr("stream_kernel.app.runtime.load_yaml_config", lambda _path: cfg)
+    monkeypatch.setattr("stream_kernel.app.runtime.validate_newgen_config", lambda raw: raw)
+    monkeypatch.setattr("stream_kernel.app.runtime.apply_cli_overrides", lambda *_a, **_k: None)
+
+    with pytest.raises(ValueError):
+        run(["--config", "cfg.yml"])
+
+
+def test_run_rejects_invalid_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
+    # runtime.pipeline must be a list of step names (Configuration spec §2.1).
+    cfg = {
+        "scenario": {"name": "baseline"},
+        "runtime": {"discovery_modules": [], "pipeline": "nope"},
+        "adapters": {},
+    }
+    monkeypatch.setattr(
+        "stream_kernel.app.runtime.parse_args",
+        lambda _argv: SimpleNamespace(config="x", input=None, output=None, tracing=None, trace_path=None),
+    )
+    monkeypatch.setattr("stream_kernel.app.runtime.load_yaml_config", lambda _path: cfg)
+    monkeypatch.setattr("stream_kernel.app.runtime.validate_newgen_config", lambda raw: raw)
+    monkeypatch.setattr("stream_kernel.app.runtime.apply_cli_overrides", lambda *_a, **_k: None)
+    monkeypatch.setattr("stream_kernel.app.runtime.ApplicationContext", lambda: type("C", (), {"discover": lambda *_a, **_k: None, "build_scenario": lambda *_a, **_k: type("S", (), {"steps": []})()})())
+    monkeypatch.setattr("stream_kernel.app.runtime.Runner", lambda **_k: type("R", (), {"run": lambda *_a, **_k: None})())
+
+    with pytest.raises(ValueError):
+        run(["--config", "cfg.yml"])
+
+
+def test_run_requires_input_source_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
+    # input_source adapter is mandatory for reading stream inputs (Framework boundaries doc).
+    cfg = {
+        "scenario": {"name": "baseline"},
+        "runtime": {"discovery_modules": [], "pipeline": []},
+        "adapters": {
+            "output_sink": {
+                "factory": "builtins:dict",
+                "settings": {},
+                "binds": [],
+            }
+        },
+    }
+    monkeypatch.setattr(
+        "stream_kernel.app.runtime.parse_args",
+        lambda _argv: SimpleNamespace(config="x", input=None, output=None, tracing=None, trace_path=None),
+    )
+    monkeypatch.setattr("stream_kernel.app.runtime.load_yaml_config", lambda _path: cfg)
+    monkeypatch.setattr("stream_kernel.app.runtime.validate_newgen_config", lambda raw: raw)
+    monkeypatch.setattr("stream_kernel.app.runtime.ApplicationContext", lambda: type("C", (), {"discover": lambda *_a, **_k: None, "build_scenario": lambda *_a, **_k: type("S", (), {"steps": []})()})())
+    monkeypatch.setattr("stream_kernel.app.runtime.Runner", lambda **_k: type("R", (), {"run": lambda *_a, **_k: None})())
+
+    with pytest.raises(ValueError):
+        run(["--config", "cfg.yml"])

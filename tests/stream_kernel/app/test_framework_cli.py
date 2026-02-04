@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from stream_kernel.app.cli import apply_cli_overrides, build_parser, parse_args
 
 
@@ -66,3 +68,55 @@ def test_build_parser_declares_known_flags() -> None:
     assert "output" in flags
     assert "tracing" in flags
     assert "trace_path" in flags
+
+
+def test_apply_cli_overrides_requires_adapters_mapping() -> None:
+    # CLI overrides must validate config structure (Configuration spec §2.1).
+    args = SimpleNamespace(input="in.txt", output=None, tracing=None, trace_path=None)
+    with pytest.raises(ValueError):
+        apply_cli_overrides({"adapters": "nope"}, args)
+
+
+def test_apply_cli_overrides_requires_runtime_mapping_when_tracing() -> None:
+    # Tracing overrides expect runtime/tracing mappings (Trace runtime spec).
+    args = SimpleNamespace(input=None, output=None, tracing="enable", trace_path=None)
+    with pytest.raises(ValueError):
+        apply_cli_overrides({"adapters": {}, "runtime": "nope"}, args)
+
+
+def test_apply_cli_overrides_requires_tracing_mapping() -> None:
+    # runtime.tracing must be a mapping when tracing overrides are applied.
+    args = SimpleNamespace(input=None, output=None, tracing="enable", trace_path=None)
+    cfg = {"adapters": {}, "runtime": {"tracing": "nope"}}
+    with pytest.raises(ValueError):
+        apply_cli_overrides(cfg, args)
+
+
+def test_apply_cli_overrides_requires_tracing_sink_mapping() -> None:
+    # Trace sink must be a mapping when trace-path is provided (Trace runtime spec).
+    args = SimpleNamespace(input=None, output=None, tracing=None, trace_path="trace.jsonl")
+    cfg = {"adapters": {}, "runtime": {"tracing": {"sink": "nope"}}}
+    with pytest.raises(ValueError):
+        apply_cli_overrides(cfg, args)
+
+
+def test_apply_cli_overrides_requires_jsonl_mapping() -> None:
+    # Trace jsonl config must be a mapping when sink.kind=jsonl (Trace runtime spec).
+    args = SimpleNamespace(input=None, output=None, tracing=None, trace_path="trace.jsonl")
+    cfg = {"adapters": {}, "runtime": {"tracing": {"sink": {"kind": "jsonl", "jsonl": "nope"}}}}
+    with pytest.raises(ValueError):
+        apply_cli_overrides(cfg, args)
+
+
+def test_apply_cli_overrides_requires_adapter_entry_mapping() -> None:
+    # Adapter entries must be mappings for path override (Configuration spec §2.1).
+    args = SimpleNamespace(input="in.txt", output=None, tracing=None, trace_path=None)
+    with pytest.raises(ValueError):
+        apply_cli_overrides({"adapters": {"input_source": "nope"}}, args)
+
+
+def test_apply_cli_overrides_requires_adapter_settings_mapping() -> None:
+    # Adapter settings must be a mapping for path override (Configuration spec §2.1).
+    args = SimpleNamespace(input="in.txt", output=None, tracing=None, trace_path=None)
+    with pytest.raises(ValueError):
+        apply_cli_overrides({"adapters": {"input_source": {"settings": "nope"}}}, args)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 
 # TraceRecorder behavior is specified in docs/implementation/kernel/Trace and Context Change Log Spec.md.
 from stream_kernel.kernel.context import Context
@@ -321,3 +322,91 @@ def test_trace_hash_uses_dataclass_snapshot() -> None:
     )
     assert record.msg_in.hash is not None
     assert record.msg_in.identity == "9"
+
+
+def test_trace_message_snapshot_supports_dict_and_fallback() -> None:
+    # Hash mode should accept dict snapshots and fallback to string for non-objects (Trace spec §4.1).
+    ctx = _context()
+    recorder = TraceRecorder(signature_mode="hash", context_diff_mode="none")
+
+    span_dict = recorder.begin(
+        ctx=ctx,
+        step_name="step-a",
+        step_index=0,
+        work_index=0,
+        msg_in={"id": "1", "value": "x"},
+    )
+    record_dict = recorder.finish(
+        ctx=ctx,
+        span=span_dict,
+        msg_out=[{"id": "1", "value": "x"}],
+        status="ok",
+        error=None,
+    )
+    assert record_dict.msg_in.hash is not None
+
+    span_fallback = recorder.begin(
+        ctx=ctx,
+        step_name="step-b",
+        step_index=1,
+        work_index=0,
+        msg_in=123,
+    )
+    record_fallback = recorder.finish(
+        ctx=ctx,
+        span=span_fallback,
+        msg_out=[123],
+        status="ok",
+        error=None,
+    )
+    assert record_fallback.msg_in.hash is not None
+
+
+def test_trace_diff_with_missing_snapshots_is_empty_dict() -> None:
+    # Internal diff helper should yield empty dict when before/after is None (Trace spec §11.5).
+    recorder = TraceRecorder(signature_mode="type_only", context_diff_mode="none")
+    assert recorder._diff_context(None, None) == {}
+
+
+def test_trace_hash_json_default_handles_datetime_and_decimal() -> None:
+    # Hashing should support datetime/Decimal via JSON default (Trace spec §4.1).
+    ctx = _context()
+    recorder = TraceRecorder(signature_mode="hash", context_diff_mode="none")
+    payload = {"id": "1", "when": ctx.received_at, "amount": Decimal("1.23")}
+    span = recorder.begin(
+        ctx=ctx,
+        step_name="step-a",
+        step_index=0,
+        work_index=0,
+        msg_in=payload,
+    )
+    record = recorder.finish(
+        ctx=ctx,
+        span=span,
+        msg_out=[payload],
+        status="ok",
+        error=None,
+    )
+    assert record.msg_in.hash is not None
+
+
+def test_trace_hash_json_default_falls_back_to_string() -> None:
+    # Non-serializable objects should fall back to string conversion (Trace spec §4.1).
+    ctx = _context()
+    recorder = TraceRecorder(signature_mode="hash", context_diff_mode="none")
+    payload = {"id": "1", "value": object()}
+    span = recorder.begin(
+        ctx=ctx,
+        step_name="step-a",
+        step_index=0,
+        work_index=0,
+        msg_in=payload,
+    )
+    record = recorder.finish(
+        ctx=ctx,
+        span=span,
+        msg_out=[payload],
+        status="ok",
+        error=None,
+    )
+    assert record.msg_in.hash is not None

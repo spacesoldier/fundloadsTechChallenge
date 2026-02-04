@@ -50,3 +50,4 @@ src/stream_kernel/application_context/__pycache__/*
 src/stream_kernel/adapters/__pycache__/*
 src/stream_kernel/app/__pycache__/*
 src/stream_kernel/config/__pycache__/*
+tests/fund_load/__pycache__/*

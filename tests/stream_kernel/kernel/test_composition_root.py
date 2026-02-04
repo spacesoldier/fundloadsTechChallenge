@@ -33,3 +33,9 @@ def test_composition_root_unknown_step_fails() -> None:
     }
     with pytest.raises(KeyError):
         build_runtime(config=config, wiring={"steps": {}})
+
+
+def test_composition_root_requires_scenario_id_and_steps() -> None:
+    # Composition root validates scenario_id + steps list (Composition Root spec).
+    with pytest.raises(ValueError):
+        build_runtime(config={"scenario_id": 1, "steps": "nope"}, wiring={})

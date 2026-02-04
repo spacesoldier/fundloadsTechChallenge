@@ -53,3 +53,20 @@ def test_scenario_builder_wraps_factory_error() -> None:
     builder = ScenarioBuilder(registry)
     with pytest.raises(StepBuildError):
         builder.build(scenario_id="test", steps=[{"name": "bad"}], wiring={})
+
+
+def test_scenario_builder_requires_step_name_string() -> None:
+    # Step name must be a string (ScenarioBuilder spec).
+    registry = StepRegistry()
+    builder = ScenarioBuilder(registry)
+    with pytest.raises(InvalidScenarioConfigError):
+        builder.build(scenario_id="test", steps=[{"name": 1}], wiring={})
+
+
+def test_scenario_builder_requires_step_config_mapping() -> None:
+    # Step config must be a mapping when present (ScenarioBuilder spec).
+    registry = StepRegistry()
+    registry.register("a", lambda cfg, wiring: lambda msg, ctx: [msg])
+    builder = ScenarioBuilder(registry)
+    with pytest.raises(InvalidScenarioConfigError):
+        builder.build(scenario_id="test", steps=[{"name": "a", "config": "nope"}], wiring={})

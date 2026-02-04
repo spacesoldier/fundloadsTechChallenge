@@ -95,3 +95,69 @@ def test_validate_newgen_config_requires_adapter_binds_list() -> None:
     }
     with pytest.raises(ConfigError):
         validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_requires_runtime_mapping() -> None:
+    # runtime must be a mapping if provided (Configuration spec §2.1).
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": "nope",
+        "nodes": {},
+        "adapters": {"output_sink": {"factory": "x", "binds": []}},
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_requires_nodes_mapping() -> None:
+    # nodes must be a mapping if provided (Configuration spec §2.1).
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "nodes": "nope",
+        "adapters": {"output_sink": {"factory": "x", "binds": []}},
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_requires_adapters_mapping() -> None:
+    # adapters must be a mapping if provided (Configuration spec §2.1).
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "adapters": "nope",
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_requires_output_sink_settings_mapping() -> None:
+    # output_sink.settings must be a mapping (Configuration spec §2.1).
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "adapters": {"output_sink": {"factory": "x", "binds": [], "settings": "nope"}},
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_defensive_output_sink_type_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Defensive check: output_sink must remain a mapping after helper (validator internal guard).
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "adapters": {"output_sink": {"factory": "x", "binds": []}},
+    }
+
+    def _require_mapping(root: dict[str, object], key: str) -> dict[str, object]:
+        if key == "scenario":
+            return {"name": "baseline"}
+        return "nope"  # type: ignore[return-value]
+
+    monkeypatch.setattr("stream_kernel.config.validator._require_mapping", _require_mapping)
+
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)

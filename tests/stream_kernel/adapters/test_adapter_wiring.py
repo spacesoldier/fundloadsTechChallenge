@@ -59,6 +59,24 @@ def test_build_injection_registry_unknown_kind_fails() -> None:
         build_injection_registry(adapters_cfg, adapter_registry, bindings)
 
 
+def test_build_injection_registry_requires_adapters_mapping() -> None:
+    # Adapter wiring expects a mapping root (Configuration spec §2.1).
+    adapter_registry = AdapterRegistry()
+    bindings = {"output_sink": ("stream", _OutputPort)}
+
+    with pytest.raises(AdapterWiringError):
+        build_injection_registry("nope", adapter_registry, bindings)  # type: ignore[arg-type]
+
+
+def test_build_injection_registry_requires_role_mapping() -> None:
+    # Each adapter role must point at a mapping with kind/settings (Configuration spec §2.1).
+    adapter_registry = AdapterRegistry()
+    bindings = {"output_sink": ("stream", _OutputPort)}
+
+    with pytest.raises(AdapterWiringError):
+        build_injection_registry({"output_sink": "nope"}, adapter_registry, bindings)
+
+
 def test_build_injection_registry_supports_multiple_bindings_for_role() -> None:
     adapter_registry = AdapterRegistry()
     adapter_registry.register(
