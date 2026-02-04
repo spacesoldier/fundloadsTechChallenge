@@ -19,6 +19,10 @@ A **node** is a discoverable, callable processing unit.
 - Side effects are allowed only if the node is explicitly an IO node.
 - Node identity is defined by a **unique name**.
 
+Function nodes may also act as **factories** (see Factory model): when a
+function node is treated as a factory, it is invoked once per scenario to
+produce the callable step.
+
 ### 1.2 Metadata (NodeMeta)
 
 Required:
@@ -101,6 +105,7 @@ stages:
 - nodes are **instantiated per scenario**
 - no global singleton assumption
 - lifecycle beyond per-scenario is out of scope for this stage
+- function factories (when enabled) are called once per scenario to produce a step
 
 ---
 

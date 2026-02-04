@@ -139,3 +139,37 @@ Implementation tests: [tests/stream_kernel/application_context/test_application_
 3) **Scenario build**
    - step order matches config list (until DAG mode is introduced).
    - missing step in config produces a clear error.
+
+---
+
+## 9) Factory resolution rules (function nodes)
+
+Function nodes may be **plain steps** or **factories**. The framework decides
+at **build time** how to interpret them.
+
+### 9.1 Factory contract
+
+- `(cfg: dict[str, object]) -> step`
+- called **once per scenario**
+- returned step is used for the entire stream
+
+**Resolution rule (current):**
+
+- the framework **attempts to call** the function with `cfg`
+- if the call raises `TypeError`, the function is treated as a **plain step**
+- if the call succeeds, the return value **must be callable**
+
+### 9.2 Why build-time resolution
+
+Resolution happens in ApplicationContext/ScenarioBuilder to:
+
+- keep runtime deterministic (no per-message factory calls)
+- avoid side effects during module import
+- centralize validation of factory output (must be callable)
+
+### 9.3 Injection and factories
+
+Dependencies are injected **after** step construction via `@inject`.
+Factories receive **config only**, not wiring.
+
+See: [Factory and injection model](./Factory%20and%20injection%20model.md)

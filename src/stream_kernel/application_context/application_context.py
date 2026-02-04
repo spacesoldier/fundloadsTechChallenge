@@ -1,20 +1,23 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields, is_dataclass
 import importlib
 import os
 import pkgutil
+from dataclasses import dataclass, field, fields, is_dataclass
 from types import ModuleType
 
-from stream_kernel.kernel.discovery import discover_nodes
-from stream_kernel.kernel.scenario import Scenario
-from stream_kernel.kernel.scenario_builder import ScenarioBuilder, InvalidScenarioConfigError
-from stream_kernel.kernel.step_registry import StepRegistry, UnknownStepError
-from stream_kernel.kernel.node import NodeDef
-from stream_kernel.kernel.stage import StageDef
+from stream_kernel.application_context.config_inject import ConfigScope, ConfigValue
 from stream_kernel.application_context.inject import Injected
-from stream_kernel.application_context.config_inject import ConfigValue, ConfigScope
-from stream_kernel.application_context.injection_registry import InjectionRegistry, InjectionRegistryError
+from stream_kernel.application_context.injection_registry import (
+    InjectionRegistry,
+    InjectionRegistryError,
+)
+from stream_kernel.kernel.discovery import discover_nodes
+from stream_kernel.kernel.node import NodeDef
+from stream_kernel.kernel.scenario import Scenario
+from stream_kernel.kernel.scenario_builder import InvalidScenarioConfigError, ScenarioBuilder
+from stream_kernel.kernel.stage import StageDef
+from stream_kernel.kernel.step_registry import StepRegistry, UnknownStepError
 
 
 class ContextBuildError(RuntimeError):
@@ -83,8 +86,17 @@ class ApplicationContext:
             container_attr = discovered.container_attr
 
             def _factory(cfg: dict[str, object], wiring: dict[str, object], *, _t=target):  # type: ignore[override]
-                # Default factory: instantiate classes with no args or pass through callables.
-                return _t() if isinstance(_t, type) else _t
+                # Default factory: instantiate classes with no args or treat functions as factories.
+                if isinstance(_t, type):
+                    return _t()
+                # Function nodes: if callable with cfg, treat as factory; otherwise treat as step.
+                try:
+                    step = _t(cfg) # pyright: ignore[reportCallIssue]
+                except TypeError:
+                    return _t
+                if not callable(step):
+                    raise ContextBuildError("Function node factory must return a callable step")
+                return step
 
             if container_cls is not None and container_attr is not None:
                 def _factory(cfg: dict[str, object], wiring: dict[str, object], *, _c=container_cls, _a=container_attr):  # type: ignore[override]

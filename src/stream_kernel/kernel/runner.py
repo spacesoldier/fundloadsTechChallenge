@@ -4,11 +4,12 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Protocol
 
+from fund_load.ports.trace_sink import TraceSink
+
 # Kernel runtime types (see docs/implementation/kernel/Runner (Orchestrator) Spec.md).
 from stream_kernel.kernel.context import Context, ContextFactory
 from stream_kernel.kernel.scenario import Scenario
 from stream_kernel.kernel.trace import ErrorInfo, TraceRecorder
-from fund_load.ports.trace_sink import TraceSink
 
 
 class OutputSink(Protocol):

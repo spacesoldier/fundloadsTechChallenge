@@ -9,6 +9,7 @@ and strict mode based on the 8-point discussion and follow-up clarifications.
 
 - **Class node**: a class with `__call__` (or `_call` if we later normalize).
 - **Function node**: a plain callable marked with `@node`.
+  - Function nodes **may be factories** (see §2.1), returning a step callable configured for the scenario.
 
 Discovery collects both. Instantiation happens **after discovery**.
 
@@ -21,6 +22,26 @@ Factories live in the **framework**:
 - discovery finds the node declarations,
 - the framework instantiates them per scenario,
 - no manual wiring per step in the project.
+
+### 2.1 Function factories (Spring-style)
+
+When a `@node` is attached to a **function**, the framework may treat it as a **factory**:
+
+- **Factory contract**: `(cfg: dict[str, object]) -> step`
+- The factory is called **once per scenario** (build time),
+- The returned `step` is used for the whole stream (run time).
+
+This allows "Spring-style" bean factories without introducing new decorators:
+the framework decides at build time whether a function is a step or a factory.
+
+**Important**: dependency injection is handled separately via `@inject` (see §4),
+so factories receive **config only**, not wiring.
+
+**Resolution rule (current):**
+
+- The framework **tries to call** the function with `cfg`.
+- If that call raises `TypeError`, the function is treated as a **plain step**.
+- If the call succeeds, the return value **must be callable** (or it is an error).
 
 ---
 
@@ -132,4 +153,4 @@ Failure behavior depends on strict mode.
 - E2E tests for multiple scenarios (overlapping and disjoint node sets).
 - Function-node wrapping should be covered by unit tests.
 
-Implementation tests (representative): [tests/stream_kernel/discovery/test_node_decorator.py](../../../../tests/stream_kernel/discovery/test_node_decorator.py), [tests/stream_kernel/application_context/test_inject_decorator.py](../../../../tests/stream_kernel/application_context/test_inject_decorator.py), [tests/stream_kernel/application_context/test_application_context.py](../../../../tests/stream_kernel/application_context/test_application_context.py), [tests/stream_kernel/integration/test_injection_integration.py](../../../../tests/stream_kernel/integration/test_injection_integration.py)
+Implementation tests (representative): [tests/stream_kernel/discovery/test_node_decorator.py](../../../../tests/stream_kernel/discovery/test_node_decorator.py), [tests/stream_kernel/application_context/test_inject_decorator.py](../../../../tests/stream_kernel/application_context/test_inject_decorator.py), [tests/stream_kernel/application_context/test_application_context.py](../../../../tests/stream_kernel/application_context/test_application_context.py), [tests/stream_kernel/application_context/test_factory_nodes.py](../../../../tests/stream_kernel/application_context/test_factory_nodes.py), [tests/stream_kernel/integration/test_injection_integration.py](../../../../tests/stream_kernel/integration/test_injection_integration.py)
