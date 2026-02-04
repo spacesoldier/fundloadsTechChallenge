@@ -45,37 +45,19 @@ This step:
 
 ## 2. Configuration dependencies
 
-From `docs/Configuration Spec.md`:
+From `docs/implementation/architecture/Configuration spec.md` (newgen):
 
 ```yaml
-policies:
-  pack: "baseline"          # baseline | exp_mp
-  evaluation_order:
-    - "IDEMPOTENCY"
-    - "DAILY_ATTEMPTS"
-    - "PRIME_GATE"
-    - "DAILY_AMOUNT"
-    - "WEEKLY_AMOUNT"
-  limits:
-    daily_amount: 5000.00
-    weekly_amount: 20000.00
-    daily_attempts: 3
-
-  prime_gate:
-    enabled: false
-    global_per_day: 1
-    amount_cap: 9999.00
-
-windows:
-  daily_attempts:
-    enabled: true
-    count_all_attempts: true       # canonical attempts count regardless of approval
-  daily_accepted_amount:
-    enabled: true
-  weekly_accepted_amount:
-    enabled: true
-  daily_prime_gate:
-    enabled: false                 # exp_mp only
+nodes:
+  evaluate_policies:
+    limits:
+      daily_amount: 5000.00
+      weekly_amount: 20000.00
+      daily_attempts: 3
+    prime_gate:
+      enabled: false
+      global_per_day: 1
+      amount_cap: 9999.00
 ```
 
 Notes:

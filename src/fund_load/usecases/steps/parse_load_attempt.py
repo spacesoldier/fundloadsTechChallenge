@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from fund_load.domain.messages import Decision, LoadAttempt, RawLine
 from fund_load.domain.money import MoneyParseError, parse_money
 from fund_load.domain.reasons import ReasonCode
+from stream_kernel.kernel.node import node
 
 
 class _RawLoadAttempt(BaseModel):
@@ -21,6 +22,8 @@ class _RawLoadAttempt(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
+# Discovery: mark step as a node so ApplicationContext can auto-register it (docs/implementation/steps/01 ParseLoadAttempt.md).
+@node(name="parse_load_attempt")
 class ParseLoadAttempt:
     def __call__(self, msg: RawLine, ctx: object | None) -> list[LoadAttempt | Decision]:
         # Step 01 requires exactly one output per input line (docs/implementation/steps/01 ParseLoadAttempt.md).

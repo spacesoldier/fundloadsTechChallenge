@@ -5,8 +5,11 @@ from dataclasses import dataclass, field
 
 from fund_load.domain.messages import IdemStatus
 from fund_load.usecases.messages import AttemptWithKeys, IdempotencyClassifiedAttempt
+from stream_kernel.kernel.node import node
 
 
+# Discovery: register step name for pipeline assembly (docs/implementation/steps/03 IdempotencyGate.md).
+@node(name="idempotency_gate")
 @dataclass
 class IdempotencyGate:
     # Step 03 enforces deterministic replay/conflict classification (docs/implementation/steps/03 IdempotencyGate.md).

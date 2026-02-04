@@ -69,9 +69,14 @@ steps:
   - id: 04.features
     uses: ComputeFeatures
     with:
-      features:
-        - prime_id
-        - monday_multiplier
+      monday_multiplier:
+        enabled: false
+        multiplier: 2.0
+        apply_to: amount
+      prime_gate:
+        enabled: false
+        global_per_day: 1
+        amount_cap: 9999.00
   - id: 05.policies
     uses: EvaluatePolicies
     with:
@@ -79,10 +84,15 @@ steps:
         daily_amount: 5000
         weekly_amount: 20000
         daily_attempts: 3
+      prime_gate:
+        enabled: false
+        global_per_day: 1
+        amount_cap: 9999.00
   - id: 06.windows
     uses: UpdateWindows
     with:
-      update_attempts_always: true
+      daily_prime_gate:
+        enabled: false
   - id: 07.format
     uses: FormatOutput
     with:

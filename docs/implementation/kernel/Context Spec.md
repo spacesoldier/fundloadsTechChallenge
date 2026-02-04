@@ -234,6 +234,8 @@ Below are the **required test cases** for Context.
 Use a minimal test framework (`pytest` recommended).  
 For each test, build the Context via `ContextFactory` unless specified.
 
+Implementation tests: [tests/stream_kernel/kernel/test_context.py](../../../tests/stream_kernel/kernel/test_context.py)
+
 ### 8.1 `test_context_factory_sets_required_fields`
 **Given:** raw event + line_no  
 **Expect:**

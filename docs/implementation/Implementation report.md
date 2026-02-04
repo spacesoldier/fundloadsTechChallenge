@@ -35,7 +35,7 @@ Notable decisions and doc conflicts (explicitly handled)
 - JSON output spacing: compact (no extra spaces) for byte-for-byte diff.
 - jsonb output in Postgres is non-deterministic in key order and spacing; the
   reference SQL now uses explicit format(...) to lock ordering/spacing.
-- Tracing is configured via AppConfig; CLI flags override config.
+- Tracing is configured via `runtime.tracing`; CLI flags override config.
 
 Verification commands
 ---------------------
@@ -49,7 +49,7 @@ poetry run pytest --cov=src -q
 
 ```
 poetry run python -m fund_load \
-  --config src/fund_load/baseline_config.yml \
+  --config src/fund_load/baseline_config_newgen.yml \
   --input docs/analysis/data/assets/input.txt \
   --output output.txt
 ```
@@ -58,7 +58,7 @@ poetry run python -m fund_load \
 
 ```
 poetry run python -m fund_load \
-  --config src/fund_load/baseline_config.yml \
+  --config src/fund_load/baseline_config_newgen.yml \
   --input docs/analysis/data/assets/input.txt \
   --output output.txt \
   --tracing enable \
@@ -93,12 +93,11 @@ spacing, which aligns with the program output.
 
 Files of interest
 -----------------
-- CLI: `src/fund_load/app/cli.py`
-- Composition root: `src/fund_load/kernel/composition_root.py`
-- Tracing: `src/fund_load/kernel/trace.py`
+- CLI/runtime: `src/stream_kernel/app/runtime.py`
+- CLI flags: `src/stream_kernel/app/cli.py`
+- Tracing: `src/stream_kernel/kernel/trace.py`
 - Output formatting: `src/fund_load/usecases/steps/format_output.py`
-- Baseline config: `src/fund_load/baseline_config.yml`
-- Experimental config: `src/fund_load/experiment_config.yml`
+- Baseline config: `src/fund_load/baseline_config_newgen.yml`
+- Experimental config: `src/fund_load/experiment_config_newgen.yml`
 - Reference outputs: `docs/analysis/data/assets/output.txt`,
   `docs/analysis/data/assets/output_exp_mp.txt`
-

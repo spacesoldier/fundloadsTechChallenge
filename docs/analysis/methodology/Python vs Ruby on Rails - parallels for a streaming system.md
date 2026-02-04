@@ -96,6 +96,12 @@ Rails shops often add:
 - higher-level acceptance tests for pipelines (fixtures, golden outputs)
 - emphasis on behavior/spec, not internal implementation
 
+Implementation tests (Python repo):
+- Unit/step tests: [tests/usecases/steps](../../../tests/usecases/steps)
+- Domain tests: [tests/domain](../../../tests/domain)
+- Port/adapter tests: [tests/ports](../../../tests/ports), [tests/adapters](../../../tests/adapters)
+- Integration tests: [tests/integration](../../../tests/integration)
+
 ---
 
 ## 3) Key difference in philosophy
@@ -253,4 +259,3 @@ Rails gives you a big default shell; serious teams carve out a clean core.
 Python gives you nothing by default; serious teams build a small shell to protect the core.
 
 ---
-

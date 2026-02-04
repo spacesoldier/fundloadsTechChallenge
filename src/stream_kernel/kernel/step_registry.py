@@ -31,3 +31,7 @@ class StepRegistry:
         if name not in self._factories:
             raise UnknownStepError(name)
         return self._factories[name]
+
+    def names(self) -> list[str]:
+        # Expose registered names for testing/inspection.
+        return list(self._factories.keys())

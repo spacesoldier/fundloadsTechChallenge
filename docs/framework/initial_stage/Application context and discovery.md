@@ -9,31 +9,35 @@ developer experience.
 
 ---
 
-## 1) What wiring.py does today (baseline behavior)
+See also: [Scenario vs node axes](./Scenario%20vs%20node%20axes.md), [Node and stage specifications](./Node%20and%20stage%20specifications.md), [Auto-discovery policy](./Auto-discovery%20policy.md), [Factory and injection model](./Factory%20and%20injection%20model.md), [Injection and strict mode](./Injection%20and%20strict%20mode.md), [Injection registry](./Injection%20registry.md)
 
-`src/fund_load/usecases/wiring.py` currently:
+---
+
+## 1) What manual wiring does today (baseline behavior)
+
+In a manually wired project, the wiring module typically:
 
 - builds a `StepRegistry`
 - registers every step explicitly by name
 - injects dependencies (ports/services) from a `wiring` dict
-- pulls config values from `AppConfig` (features, policies, windows)
+- pulls config values from an app config model
 
-### Steps registered today
+### Example steps (generic)
 
-- `parse_load_attempt` → `ParseLoadAttempt()`
-- `compute_time_keys` → `ComputeTimeKeys(week_start=...)`
-- `idempotency_gate` → `IdempotencyGate()`
-- `compute_features` → `ComputeFeatures(...)` (uses `prime_checker`)
+- `parse_input` → `ParseInput()`
+- `compute_time_keys` → `ComputeTimeKeys(...)`
+- `deduplicate` → `Deduplicate(...)`
+- `compute_features` → `ComputeFeatures(...)` (uses `feature_checker`)
 - `evaluate_policies` → `EvaluatePolicies(...)` (uses `window_store`)
-- `update_windows` → `UpdateWindows(...)` (uses `window_store`)
+- `update_state` → `UpdateState(...)`
 - `format_output` → `FormatOutput()`
 - `write_output` → `WriteOutput(output_sink=...)`
 
-### Dependencies used
+### Dependencies used (generic)
 
-- `prime_checker` (from wiring)
-- `window_store` (from wiring)
-- `output_sink` (from wiring)
+- `feature_checker`
+- `window_store`
+- `output_sink`
 
 ---
 
@@ -64,8 +68,8 @@ imports. Example:
 ```yaml
 discovery:
   modules:
-    - fund_load.usecases.steps
-    - fund_load.adapters
+    - example_app.usecases.steps
+    - example_app.adapters
 ```
 
 ---
@@ -95,7 +99,7 @@ Adapters stay thin: validate/map, then delegate to framework infrastructure.
 
 - `wiring.py` becomes a thin call to `ApplicationContext.discover(...)`.
 - Registry population is automatic based on decorators.
-- Dependencies are resolved by name (same keys as today: `prime_checker`,
+- Dependencies are resolved by name (e.g., `feature_checker`,
   `window_store`, `output_sink`).
 - Configuration is applied by the context, not by hand-coded lambdas.
 
@@ -106,3 +110,32 @@ Adapters stay thin: validate/map, then delegate to framework infrastructure.
 This approach overrides the earlier **no-magic** rule for the purposes of
 framework extraction. If adopted, the project-level wiring will be simplified
 to module discovery + config-driven composition.
+
+---
+
+## 7) Implementation references
+
+- Application context assembly: [src/stream_kernel/application_context/application_context.py](../../../../src/stream_kernel/application_context/application_context.py)
+- Discovery and metadata: [src/stream_kernel/kernel/discovery.py](../../../../src/stream_kernel/kernel/discovery.py), [src/stream_kernel/kernel/node.py](../../../../src/stream_kernel/kernel/node.py), [src/stream_kernel/kernel/stage.py](../../../../src/stream_kernel/kernel/stage.py)
+- Scenario build + registry: [src/stream_kernel/kernel/scenario_builder.py](../../../../src/stream_kernel/kernel/scenario_builder.py), [src/stream_kernel/kernel/step_registry.py](../../../../src/stream_kernel/kernel/step_registry.py)
+- Injection/config: [src/stream_kernel/application_context/inject.py](../../../../src/stream_kernel/application_context/inject.py), [src/stream_kernel/application_context/injection_registry.py](../../../../src/stream_kernel/application_context/injection_registry.py), [src/stream_kernel/application_context/config_inject.py](../../../../src/stream_kernel/application_context/config_inject.py)
+
+---
+
+## 8) Test coverage methodology
+
+Tests should validate:
+
+Implementation tests: [tests/stream_kernel/application_context/test_application_context.py](../../../../tests/stream_kernel/application_context/test_application_context.py), [tests/stream_kernel/application_context/test_application_context_registry.py](../../../../tests/stream_kernel/application_context/test_application_context_registry.py), [tests/stream_kernel/application_context/test_application_context_scenario.py](../../../../tests/stream_kernel/application_context/test_application_context_scenario.py), [tests/stream_kernel/application_context/test_application_context_stages.py](../../../../tests/stream_kernel/application_context/test_application_context_stages.py)
+
+1) **Discovery path**
+   - modules are scanned and annotated nodes are found.
+   - duplicate node names fail fast.
+
+2) **Context assembly**
+   - dependencies are validated (`requires` are present).
+   - registry is built from discovered nodes.
+
+3) **Scenario build**
+   - step order matches config list (until DAG mode is introduced).
+   - missing step in config produces a clear error.

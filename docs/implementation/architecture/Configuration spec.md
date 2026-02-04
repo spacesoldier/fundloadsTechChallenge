@@ -20,8 +20,8 @@ The same executable + the same flow composition can produce different outputs by
 ## 1. Config files and conventions
 
 ### 1.1 Files
-- `config/baseline.yml`
-- `config/exp_mp.yml`
+- `src/fund_load/baseline_config_newgen.yml`
+- `src/fund_load/experiment_config_newgen.yml`
 
 ### 1.2 General conventions
 - YAML is preferred for readability.
@@ -39,90 +39,101 @@ If config is invalid, the program fails immediately with a clear error.
 
 ---
 
-## 2. Top-level structure
+## 2. Top-level structure (newgen, node-centric, runtime-first)
+
+Legacy configs are preserved in `docs/legacy/` for reference only.
+The runtime uses the newgen structure below.
+
+This project is introducing a **newgen** config that aligns with the
+framework model: **global runtime settings**, **per-node parameters**,
+and **adapter declarations**.
+
+Key differences vs legacy:
+- No `pipeline` block (order is derived elsewhere or remains transitional).
+- Per-step parameters live under `nodes.<step_name>`.
+- Runtime features (e.g., tracing, strict mode) live under `runtime.*`.
+
+Example:
 
 ```yaml
 version: 1
 
-pipeline:
-  steps:
-    - name: parse_load_attempt
-    - name: compute_time_keys
-    - name: idempotency_gate
-    - name: compute_features
-    - name: evaluate_policies
-    - name: update_windows
-    - name: format_output
-    - name: write_output
-
 scenario:
-  name: baseline            # baseline | exp_mp
-  description: "Baseline velocity rules"
+  name: baseline
 
-domain:
-  money:
-    rounding: "half_up"     # fixed rounding rule if decimals ever appear
-    currency: "USD"         # challenge uses USD
-  time:
-    timezone: "UTC"
-    day_key: "utc_date"     # fixed
-    week_key:
-      mode: "calendar"      # calendar | rolling
-      week_start: "MON"     # if calendar
-      days: 7               # if rolling
+runtime:
+  strict: true
+  tracing:
+    enabled: false
+  pipeline:
+    - parse_load_attempt
+    - compute_time_keys
+    - idempotency_gate
+    - compute_features
+    - evaluate_policies
+    - update_windows
+    - format_output
+    - write_output
+  discovery_modules:
+    - fund_load.usecases.steps
 
-idempotency:
-  mode: "canonical_first"   # canonical_first
-  on_conflict: "decline"    # decline
-  decision_for_noncanonical: "decline"  # always decline duplicates
-  conflict_reason_code: "ID_CONFLICT"   # optional for diagnostics
+nodes:
+  compute_time_keys:
+    week_start: MON
+  compute_features:
+    monday_multiplier:
+      enabled: false
+      multiplier: 2.0
+      apply_to: amount
+    prime_gate:
+      enabled: false
+      global_per_day: 1
+      amount_cap: 9999.00
+  evaluate_policies:
+    limits:
+      daily_amount: 5000.00
+      weekly_amount: 20000.00
+      daily_attempts: 3
+    prime_gate:
+      enabled: false
+      global_per_day: 1
+      amount_cap: 9999.00
+  update_windows:
+    daily_prime_gate:
+      enabled: false
 
-features:
-  enabled: true
-  monday_multiplier:
-    enabled: false          # baseline: false, exp_mp: true
-    multiplier: 2.0
-    apply_to: "amount"      # amount | limits (default: amount)
-  prime_gate:
-    enabled: false          # baseline: false, exp_mp: true
-    global_per_day: 1
-    amount_cap: 9999.00
-    prime_range:
-      mode: "dataset_minmax"  # dataset_minmax | fixed
-      fixed_max: 100000        # used only if mode=fixed
-
-policies:
-  pack: "baseline"          # baseline | exp_mp
-  evaluation_order:
-    - daily_attempt_limit
-    - prime_global_gate
-    - daily_amount_limit
-    - weekly_amount_limit
-  limits:
-    daily_amount: 5000.00
-    weekly_amount: 20000.00
-    daily_attempts: 3
-
-windows:
-  daily_attempts:
-    enabled: true
-  daily_accepted_amount:
-    enabled: true
-  weekly_accepted_amount:
-    enabled: true
-  prime_daily_global_gate:
-    enabled: false          # baseline false, exp_mp true
-
-output:
-  file: "output.txt"
-  json:
-    pretty: false
-    ensure_ascii: false
-  ordering:
-    preserve_input_order: true
+adapters:
+  input_source:
+    factory: fund_load.adapters.factory:file_input_source
+    settings:
+      path: input.txt
+    binds:
+      - port_type: stream
+        type: fund_load.ports.input_source:InputSource
+  output_sink:
+    factory: fund_load.adapters.factory:file_output_sink
+    settings:
+      path: output.txt
+    binds:
+      - port_type: stream
+        type: fund_load.ports.output_sink:OutputSink
+  window_store:
+    factory: fund_load.adapters.factory:window_store_memory
+    settings: {}
+    binds:
+      - port_type: kv
+        type: fund_load.ports.window_store:WindowReadPort
+      - port_type: kv
+        type: fund_load.ports.window_store:WindowWritePort
+  prime_checker:
+    factory: fund_load.adapters.factory:prime_checker_stub
+    settings:
+      strategy: sieve
+      max_id: 50000
+    binds:
+      - port_type: kv
+        type: fund_load.ports.prime_checker:PrimeChecker
 ```
-
----
 
 ## 3. Step registry and step configuration
 

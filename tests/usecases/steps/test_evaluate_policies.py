@@ -58,6 +58,7 @@ def _enriched_attempt(
 
 def _policy_step(store: InMemoryWindowStore, *, prime_enabled: bool = False) -> EvaluatePolicies:
     # Helper builds EvaluatePolicies with baseline limits and optional prime gate.
+    # Prime config comes from nodes.evaluate_policies.prime_gate in newgen config.
     return EvaluatePolicies(
         window_store=store,
         daily_attempt_limit=3,

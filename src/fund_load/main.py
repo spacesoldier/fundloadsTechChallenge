@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from fund_load.app.cli import run
+from stream_kernel.app import run
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    # Delegate to CLI runner for a single, testable entrypoint (Composition Root spec §6.1).
-    return run(argv)
+    # Single-line entrypoint delegating to framework runtime.
+    return run(list(argv) if argv is not None else None)

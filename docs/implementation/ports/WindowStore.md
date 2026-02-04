@@ -264,6 +264,8 @@ If they do (programming error), fail fast.
 
 We test WindowStore at two levels:
 
+Implementation tests: [tests/ports/test_window_store_port.py](../../../tests/ports/test_window_store_port.py), [tests/adapters/test_window_store.py](../../../tests/adapters/test_window_store.py), [tests/usecases/steps/test_update_windows.py](../../../tests/usecases/steps/test_update_windows.py)
+
 ### 15.1 Unit tests: store behavior in isolation
 
 Goal: prove the store implements the port semantics exactly.

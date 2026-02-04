@@ -157,6 +157,8 @@ It must be:
 
 ## 8. Testing strategy
 
+Implementation tests: [tests/ports/test_prime_checker_port.py](../../../tests/ports/test_prime_checker_port.py), [tests/adapters/test_prime_checker.py](../../../tests/adapters/test_prime_checker.py)
+
 ### 8.1 Unit tests for primality semantics
 - `is_prime(0) == False`
 - `is_prime(1) == False`

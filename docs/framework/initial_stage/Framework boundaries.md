@@ -9,6 +9,10 @@ It is intentionally minimal and may evolve as the extraction proceeds.
 
 ---
 
+See also: [Application context and discovery](./Application%20context%20and%20discovery.md), [Node and stage specifications](./Node%20and%20stage%20specifications.md), [Injection registry](./Injection%20registry.md)
+
+---
+
 ## 1) Guiding principles
 
 - Kernel and generic infrastructure belong to the framework.
@@ -66,6 +70,31 @@ planned framework adapters.
 
 ---
 
+### 2.4 Adapter registry (initial stage)
+
+The framework owns a **registry** that maps adapter roles to concrete kinds.
+
+Initial scope:
+
+- **stream input**: `file` → stream source
+- **stream output**: `file` → stream sink
+
+Adapters are declared under `adapters.*` with `kind` and `settings`.
+At runtime, the registry uses these settings to construct concrete adapters
+and bind them into the InjectionRegistry.
+
+---
+
+### 2.5 Test coverage methodology (adapter registry)
+
+Tests should validate:
+
+1) Adapter registry resolves known kinds (file input/output).
+2) Adapter registry rejects unknown kinds with clear errors.
+3) Settings are passed to adapters (e.g., file path).
+
+---
+
 ## 3) Project owns (initial scope)
 
 - Domain model and parsing rules
@@ -100,3 +129,28 @@ We plan to add decorators as **registration sugar** only:
 - `@step(name=...)`
 
 Decorators must not hide wiring or introduce side effects at import time.
+
+---
+
+## 6) Implementation references
+
+- Kernel runtime: [src/stream_kernel/kernel/runner.py](../../../../src/stream_kernel/kernel/runner.py), [src/stream_kernel/kernel/scenario.py](../../../../src/stream_kernel/kernel/scenario.py), [src/stream_kernel/kernel/scenario_builder.py](../../../../src/stream_kernel/kernel/scenario_builder.py), [src/stream_kernel/kernel/step_registry.py](../../../../src/stream_kernel/kernel/step_registry.py)
+- Application context + discovery: [src/stream_kernel/application_context/application_context.py](../../../../src/stream_kernel/application_context/application_context.py), [src/stream_kernel/kernel/discovery.py](../../../../src/stream_kernel/kernel/discovery.py)
+- Nodes/stages metadata: [src/stream_kernel/kernel/node.py](../../../../src/stream_kernel/kernel/node.py), [src/stream_kernel/kernel/stage.py](../../../../src/stream_kernel/kernel/stage.py)
+- Injection/config helpers: [src/stream_kernel/application_context/inject.py](../../../../src/stream_kernel/application_context/inject.py), [src/stream_kernel/application_context/injection_registry.py](../../../../src/stream_kernel/application_context/injection_registry.py), [src/stream_kernel/application_context/config_inject.py](../../../../src/stream_kernel/application_context/config_inject.py)
+
+---
+
+## 7) Test coverage methodology
+
+The boundary decisions should be reflected by tests that:
+
+Implementation tests (representative): [tests/stream_kernel/application_context/test_auto_discovery.py](../../../../tests/stream_kernel/application_context/test_auto_discovery.py), [tests/stream_kernel/application_context/test_application_context.py](../../../../tests/stream_kernel/application_context/test_application_context.py)
+
+1) **Framework vs project split**
+   - kernel + generic ports/adapters are under framework package.
+   - project-only code (domain/usecases) does not import framework internals.
+
+2) **Compatibility checks**
+   - discovery finds framework annotations without requiring project wiring.
+   - removing project wiring does not break runtime assembly.

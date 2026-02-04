@@ -40,3 +40,13 @@ src/stream_kernel/__pycache__/*
 src/stream_kernel/kernel/__pycache__/*
 tests/stream_kernel/kernel/__pycache__/*
 
+tests/stream_kernel/discovery/__pycache__/*
+tests/stream_kernel/integration/__pycache__/*
+tests/stream_kernel/application_context/__pycache__/*
+tests/stream_kernel/adapters/__pycache__/*
+tests/stream_kernel/app/__pycache__/*
+tests/stream_kernel/config/__pycache__/*
+src/stream_kernel/application_context/__pycache__/*
+src/stream_kernel/adapters/__pycache__/*
+src/stream_kernel/app/__pycache__/*
+src/stream_kernel/config/__pycache__/*

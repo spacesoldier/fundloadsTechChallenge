@@ -41,22 +41,13 @@ This step is stateful and writes through the **WindowWritePort**.
 
 ## 2. Configuration dependencies
 
-From `docs/Configuration Spec.md`:
+From `docs/implementation/architecture/Configuration spec.md` (newgen):
 
 ```yaml
-windows:
-  daily_attempts:
-    enabled: true
-    count_all_attempts: true        # canonical attempts are counted regardless of approval
-  daily_accepted_amount:
-    enabled: true
-  weekly_accepted_amount:
-    enabled: true
-  daily_prime_gate:
-    enabled: false                  # baseline: false, exp_mp: true
-
-idempotency:
-  canonical_only_updates: true      # only canonical events may mutate state
+nodes:
+  update_windows:
+    daily_prime_gate:
+      enabled: false                # baseline: false, exp_mp: true
 ```
 
 ---

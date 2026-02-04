@@ -197,6 +197,12 @@ Testing is behavior-driven, even if the tool is pytest.
 Critically:
 **docs → tests → code** is enforced by repository conventions.
 
+Implementation tests (representative):
+- Step/unit tests: [tests/usecases/steps](../../../tests/usecases/steps)
+- Domain tests: [tests/domain](../../../tests/domain)
+- Port/adapter tests: [tests/ports](../../../tests/ports), [tests/adapters](../../../tests/adapters)
+- Integration tests: [tests/integration](../../../tests/integration)
+
 ---
 
 ## 10. Related documents

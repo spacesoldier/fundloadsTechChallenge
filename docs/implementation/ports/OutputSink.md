@@ -120,6 +120,8 @@ In those cases:
 
 ## 6. Testing strategy
 
+Implementation tests: [tests/ports/test_output_sink_port.py](../../../tests/ports/test_output_sink_port.py), [tests/adapters/test_output_sink.py](../../../tests/adapters/test_output_sink.py), [tests/usecases/steps/test_write_output.py](../../../tests/usecases/steps/test_write_output.py)
+
 ### 6.1 Unit tests with in-memory sink
 Provide a `CollectingOutputSink` for tests:
 - stores received lines in a list

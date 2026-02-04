@@ -134,4 +134,6 @@ This ensures:
 - New codes may be added, but existing codes must not change meaning.
 - Tests should assert the code for representative scenarios.
 
+Implementation tests: [tests/domain/test_reasons.py](../../../tests/domain/test_reasons.py), [tests/usecases/steps/test_parse_load_attempt.py](../../../tests/usecases/steps/test_parse_load_attempt.py), [tests/usecases/steps/test_evaluate_policies.py](../../../tests/usecases/steps/test_evaluate_policies.py)
+
 ---

@@ -6,7 +6,7 @@ The composition root is **not** a runtime component. It runs once at startup and
 
 ---
 
-**Implementation:** [composition_root.py](../../../src/fund_load/kernel/composition_root.py)
+**Implementation:** [runtime.py](../../../src/stream_kernel/app/runtime.py)
 
 ## 1. Purpose
 
@@ -24,7 +24,7 @@ It prevents “hidden coupling” where domain/usecases start importing adapters
 The composition root must:
 
 - Load and validate configuration (YAML/JSON/etc.)
-- Instantiate **adapters** (file reader, file writer, in-memory stores, etc.)
+- Instantiate **adapters** from config-declared factories
 - Expose adapters to the application as **ports** (interfaces / contracts)
 - Build a `Scenario` using:
   - `ScenarioBuilder`
@@ -50,7 +50,7 @@ The composition root must not:
 
 ### 3.1 Inputs
 
-- `AppConfig` (parsed config file)
+- Validated config mapping (newgen structure)
 - Environment overrides (optional, minimal)
 - CLI arguments (input path, output path, config path, mode selection)
 
@@ -62,7 +62,7 @@ A) `AppRuntime` object (recommended)
 - `runner: Runner`
 - `scenario: Scenario`
 - `ports: PortsBundle` (optional exposure for diagnostics)
-- `config: AppConfig` (optional exposure for debugging)
+- `config: dict` (optional exposure for debugging)
 
 or
 
@@ -119,9 +119,9 @@ Practical enforcement:
 1. Read CLI args and env
 2. Load config file
 3. Validate config
-4. Build adapters (Input/Output, stores, prime checker)
-5. Build ports bundle
-6. Create step registry
+4. Build adapters from config factories
+5. Build ports/injection registry from adapter bindings
+6. Create step registry (from discovery)
 7. Build scenario (ScenarioBuilder)
 8. Construct runner
 9. Return runtime (or run it)

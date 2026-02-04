@@ -4,13 +4,21 @@ from dataclasses import dataclass
 
 from fund_load.ports.window_store import WindowWritePort
 from fund_load.usecases.messages import Decision
+from stream_kernel.application_context.config_inject import config
+from stream_kernel.application_context.inject import inject
+from stream_kernel.kernel.node import node
 
 
+# Discovery: register step name for pipeline assembly (docs/implementation/steps/06 UpdateWindows.md).
+@node(name="update_windows")
 @dataclass(frozen=True, slots=True)
 class UpdateWindows:
     # Step 06 mutates window state based on Decision (docs/implementation/steps/06 UpdateWindows.md).
-    window_store: WindowWritePort
-    prime_gate_enabled: bool
+    # Dependency injection: WindowStore write port is provided by the runtime wiring.
+    # We use the generic "kv" port_type as a service bucket in this initial stage.
+    window_store: WindowWritePort = inject.kv(WindowWritePort)
+    # Config-driven toggle comes from nodes.update_windows.daily_prime_gate.enabled (newgen config).
+    prime_gate_enabled: bool = config.value("daily_prime_gate.enabled", default=False)
 
     def __call__(self, msg: Decision, ctx: object | None) -> list[Decision]:
         # Non-canonical attempts must not mutate any windows (Step 06 invariant).

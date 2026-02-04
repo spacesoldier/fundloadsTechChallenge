@@ -182,6 +182,8 @@ No random ordering, no iteration over dict keys without sorting when order matte
 
 Tests should be **small and fail-fast**, no integration IO.
 
+Implementation tests: [tests/stream_kernel/kernel/test_scenario_builder.py](../../../tests/stream_kernel/kernel/test_scenario_builder.py)
+
 ### 9.1 Happy path: builds scenario in order
 
 **Given**

@@ -106,7 +106,7 @@ The CLI is exposed via the module entry point. Example commands:
 Baseline (default rules):
 ```
 poetry run python -m fund_load \
-  --config src/fund_load/baseline_config.yml \
+  --config src/fund_load/baseline_config_newgen.yml \
   --input docs/analysis/data/assets/input.txt \
   --output output.txt
 ```
@@ -114,7 +114,7 @@ poetry run python -m fund_load \
 Experimental (Monday multiplier + prime-id gate):
 ```
 poetry run python -m fund_load \
-  --config src/fund_load/experiment_config.yml \
+  --config src/fund_load/experiment_config_newgen.yml \
   --input docs/analysis/data/assets/input.txt \
   --output output_exp_mp.txt
 ```
@@ -122,7 +122,7 @@ poetry run python -m fund_load \
 Optional tracing (overrides config):
 ```
 poetry run python -m fund_load \
-  --config src/fund_load/baseline_config.yml \
+  --config src/fund_load/baseline_config_newgen.yml \
   --input docs/analysis/data/assets/input.txt \
   --output output.txt \
   --tracing enable \

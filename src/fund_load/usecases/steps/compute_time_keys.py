@@ -5,12 +5,19 @@ from datetime import date
 
 from fund_load.domain.messages import LoadAttempt
 from fund_load.usecases.messages import AttemptWithKeys, WeekKey
+from stream_kernel.application_context.config_inject import config
+from stream_kernel.kernel.node import node
 
 
+# Discovery: register this step by name for the pipeline (docs/implementation/steps/02 ComputeTimeKeys.md).
+@node(name="compute_time_keys")
 @dataclass(frozen=True, slots=True)
 class ComputeTimeKeys:
     # Step 02 derives UTC day/week keys per docs/implementation/steps/02 ComputeTimeKeys.md.
-    week_start: str = "MON"
+    # Config source: domain.time.week_key.week_start (Configuration Spec §2.2).
+    # If config is missing, default to MON (Step 02 default for this challenge).
+    # Node-slice config: compute_time_keys.week_start (newgen).
+    week_start: str = config.value("week_start", default="MON")
 
     def __call__(self, msg: LoadAttempt, ctx: object | None) -> list[AttemptWithKeys]:
         # Day key is the UTC date derived from the already-normalized timestamp.

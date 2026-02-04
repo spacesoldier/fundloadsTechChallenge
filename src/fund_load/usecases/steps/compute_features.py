@@ -7,16 +7,24 @@ from decimal import Decimal
 from fund_load.domain.money import Money
 from fund_load.ports.prime_checker import PrimeChecker
 from fund_load.usecases.messages import EnrichedAttempt, Features, IdempotencyClassifiedAttempt
+from stream_kernel.application_context.config_inject import config
+from stream_kernel.application_context.inject import inject
+from stream_kernel.kernel.node import node
 
 
+# Discovery: register step name for pipeline assembly (docs/implementation/steps/04 ComputeFeatures.md).
+@node(name="compute_features")
 @dataclass(frozen=True, slots=True)
 class ComputeFeatures:
     # Step 04 computes risk_factor/effective_amount/is_prime_id (docs/implementation/steps/04 ComputeFeatures.md).
-    monday_multiplier_enabled: bool
-    monday_multiplier: Decimal
-    apply_to: str
-    prime_checker: PrimeChecker
-    prime_enabled: bool
+    # Config-driven fields come from nodes.compute_features.* (newgen config).
+    monday_multiplier_enabled: bool = config.value("monday_multiplier.enabled", default=False)
+    monday_multiplier: Decimal = config.value("monday_multiplier.multiplier", default=Decimal("1"))
+    apply_to: str = config.value("monday_multiplier.apply_to", default="amount")
+    prime_enabled: bool = config.value("prime_gate.enabled", default=False)
+    # Dependency is injected by type: PrimeChecker is bound in the injection registry.
+    # We use the generic "kv" port_type as a service bucket in this initial stage.
+    prime_checker: PrimeChecker = inject.kv(PrimeChecker)
 
     def __call__(self, msg: IdempotencyClassifiedAttempt, ctx: object | None) -> list[EnrichedAttempt]:
         # Monday detection uses UTC timestamp per Time and Money Semantics doc.

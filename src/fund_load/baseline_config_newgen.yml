@@ -1,0 +1,87 @@
+version: 1
+
+scenario:
+  name: baseline
+  description: "Baseline velocity rules (newgen config)"
+
+runtime:
+  strict: true
+  tracing:
+    enabled: false
+  pipeline:
+    - parse_load_attempt
+    - compute_time_keys
+    - idempotency_gate
+    - compute_features
+    - evaluate_policies
+    - update_windows
+    - format_output
+    - write_output
+  discovery_modules:
+    - fund_load.usecases.steps
+
+nodes:
+  compute_time_keys:
+    week_start: MON
+
+  compute_features:
+    monday_multiplier:
+      enabled: false
+      multiplier: 2.0
+      apply_to: amount
+    prime_gate:
+      enabled: false
+      global_per_day: 1
+      amount_cap: 9999.00
+
+  evaluate_policies:
+    limits:
+      daily_amount: 5000.00
+      weekly_amount: 20000.00
+      daily_attempts: 3
+    prime_gate:
+      enabled: false
+      global_per_day: 1
+      amount_cap: 9999.00
+
+  update_windows:
+    daily_attempts:
+      enabled: true
+    daily_accepted_amount:
+      enabled: true
+    weekly_accepted_amount:
+      enabled: true
+    daily_prime_gate:
+      enabled: false
+
+adapters:
+  input_source:
+    factory: fund_load.adapters.factory:file_input_source
+    settings:
+      path: input.txt
+    binds:
+      - port_type: stream
+        type: fund_load.ports.input_source:InputSource
+  output_sink:
+    factory: fund_load.adapters.factory:file_output_sink
+    settings:
+      path: output.txt
+    binds:
+      - port_type: stream
+        type: fund_load.ports.output_sink:OutputSink
+  window_store:
+    factory: fund_load.adapters.factory:window_store_memory
+    settings: {}
+    binds:
+      - port_type: kv
+        type: fund_load.ports.window_store:WindowReadPort
+      - port_type: kv
+        type: fund_load.ports.window_store:WindowWritePort
+  prime_checker:
+    factory: fund_load.adapters.factory:prime_checker_stub
+    settings:
+      strategy: sieve
+      max_id: 50000
+    binds:
+      - port_type: kv
+        type: fund_load.ports.prime_checker:PrimeChecker

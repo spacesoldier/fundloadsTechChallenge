@@ -35,22 +35,19 @@ This step is pure (no external I/O). It may use precomputed in-memory lookup tab
 
 ## 2. Configuration dependencies
 
-From `docs/Configuration Spec.md`:
+From `docs/implementation/architecture/Configuration spec.md` (newgen):
 
 ```yaml
-features:
-  enabled: true
-  monday_multiplier:
-    enabled: false            # baseline: false, exp_mp: true
-    multiplier: 2.0
-    apply_to: "amount"        # amount | limits (default: amount)
-  prime_gate:
-    enabled: false            # baseline: false, exp_mp: true
-    global_per_day: 1
-    amount_cap: 9999.00
-    prime_range:
-      mode: "dataset_minmax"  # dataset_minmax | fixed
-      fixed_max: 100000
+nodes:
+  compute_features:
+    monday_multiplier:
+      enabled: false            # baseline: false, exp_mp: true
+      multiplier: 2.0
+      apply_to: "amount"        # amount | limits (default: amount)
+    prime_gate:
+      enabled: false            # baseline: false, exp_mp: true
+      global_per_day: 1
+      amount_cap: 9999.00
 ```
 
 Notes:

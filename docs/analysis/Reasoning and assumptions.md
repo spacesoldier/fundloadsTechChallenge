@@ -179,6 +179,10 @@ Test scope emphasizes:
 - prime-id global/day behavior,
 - separation between raw and counted amounts.
 
+Implementation tests (representative):
+- Step/unit tests: [tests/usecases/steps](../../tests/usecases/steps)
+- Integration tests: [tests/integration](../../tests/integration)
+
 ## 8. Non-goals (explicitly out of scope)
 To keep the solution aligned with the challenge, the following are not modeled:
 - distributed state replication / consensus
