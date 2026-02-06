@@ -32,17 +32,24 @@ Required:
 Optional:
 
 - `stage: str` (default is inferred if not provided)
-- `requires: list[str]` (names of upstream nodes)
-- `provides: list[str]` (names/tokens of outputs)
+- `consumes: list[type]` (type tokens the node accepts)
+- `emits: list[type]` (type tokens the node outputs)
 
-Duplicates in `requires` or `provides` are invalid.
+Duplicates in `consumes` or `emits` are invalid.
+`consumes/emits` are the only supported names in the framework docs and code.
 
 ### 1.3 Decorator
 
 Nodes are declared with a decorator:
 
 ```
-@node(name="compute_time_keys", stage="time", requires=["parse"])
+class LoadAttempt:
+    pass
+
+class AttemptWithKeys:
+    pass
+
+@node(name="compute_time_keys", stage="time", consumes=[LoadAttempt], emits=[AttemptWithKeys])
 class ComputeTimeKeys:
     def __call__(self, msg, ctx): ...
 ```

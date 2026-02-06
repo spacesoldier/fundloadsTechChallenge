@@ -13,7 +13,8 @@ from stream_kernel.kernel.node import node
 
 
 # Discovery: register step name for pipeline assembly (docs/implementation/steps/05 EvaluatePolicies.md).
-@node(name="evaluate_policies")
+# consumes/emits are used for DAG construction (docs/framework/initial_stage/DAG construction.md).
+@node(name="evaluate_policies", consumes=[EnrichedAttempt], emits=[Decision])
 @dataclass(frozen=True, slots=True)
 class EvaluatePolicies:
     # Step 05 applies policy order and produces Decision (docs/implementation/steps/05 EvaluatePolicies.md).

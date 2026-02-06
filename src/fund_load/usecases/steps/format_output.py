@@ -8,7 +8,8 @@ from stream_kernel.kernel.node import node
 
 
 # Discovery: register step name for pipeline assembly (docs/implementation/steps/07 FormatOutput.md).
-@node(name="format_output")
+# consumes/emits are used for DAG construction (docs/framework/initial_stage/DAG construction.md).
+@node(name="format_output", consumes=[Decision], emits=[OutputLine])
 class FormatOutput:
     # Step 07 formats Decision into JSON with deterministic key order (docs/implementation/steps/07 FormatOutput.md).
     def __call__(self, msg: Decision, ctx: object | None) -> list[OutputLine]:

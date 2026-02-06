@@ -7,9 +7,13 @@ from stream_kernel.app.runtime import (
     _build_adapter_instances,
     _build_injection_registry,
     _build_tracing,
+    _detect_implicit_sinks,
+    _emit_implicit_sink_diagnostics,
     _resolve_symbol,
     _scenario_name,
 )
+from stream_kernel.kernel.scenario import StepSpec
+from stream_kernel.kernel.trace import TraceRecorder, TraceRecord
 from stream_kernel.application_context.injection_registry import InjectionRegistry
 
 
@@ -158,3 +162,80 @@ def test_build_tracing_unknown_sink_kind_returns_none_sink() -> None:
 def test_scenario_name_falls_back_when_missing() -> None:
     # Scenario name fallback should be deterministic (Configuration spec §2.1).
     assert _scenario_name({"scenario": "nope"}) == "scenario"
+
+
+class _Token:
+    pass
+
+
+class _OtherToken:
+    pass
+
+
+def test_detect_implicit_sink_when_adapter_not_injected() -> None:
+    # Adapters that consume but are not injected become implicit sinks (Ports and adapters model §5.2).
+    adapters = {"sink": {"consumes": [_Token]}}
+    instances = {"sink": object()}
+    steps = [StepSpec(name="noop", step=lambda msg, ctx: [])]
+    implicit = _detect_implicit_sinks(adapters, instances, steps)
+    assert implicit == [("sink", [_Token])]
+
+
+def test_detect_implicit_sink_ignores_injected_adapter() -> None:
+    # If an adapter instance is injected into a step, it is not implicit.
+    adapter = object()
+
+    class _Step:
+        def __init__(self, sink: object) -> None:
+            self.sink = sink
+
+        def __call__(self, msg: object, ctx: object | None) -> list[object]:
+            return []
+
+    adapters = {"sink": {"consumes": [_Token]}}
+    instances = {"sink": adapter}
+    steps = [StepSpec(name="uses_adapter", step=_Step(adapter))]
+    implicit = _detect_implicit_sinks(adapters, instances, steps)
+    assert implicit == []
+
+
+def test_detect_implicit_sink_rejects_invalid_consumes() -> None:
+    # consumes must be a list when provided (Ports and adapters model §5.1).
+    adapters = {"sink": {"consumes": "nope"}}
+    instances = {"sink": object()}
+    steps = [StepSpec(name="noop", step=lambda msg, ctx: [])]
+    with pytest.raises(ValueError):
+        _detect_implicit_sinks(adapters, instances, steps)
+
+
+def test_emit_implicit_sink_diagnostic_to_trace_sink() -> None:
+    # Diagnostics should emit a trace record when a sink is implicit.
+    class _Sink:
+        def __init__(self) -> None:
+            self.records: list[TraceRecord] = []
+
+        def emit(self, record: TraceRecord) -> None:
+            self.records.append(record)
+
+        def flush(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    adapters = {"sink": {"consumes": [_OtherToken]}}
+    instances = {"sink": object()}
+    steps = [StepSpec(name="noop", step=lambda msg, ctx: [])]
+    sink = _Sink()
+    _emit_implicit_sink_diagnostics(
+        {"adapters": adapters},
+        steps,
+        adapter_instances=instances,
+        trace_recorder=TraceRecorder(),
+        trace_sink=sink,
+        run_id="run",
+        scenario_id="scenario",
+    )
+    assert len(sink.records) == 1
+    assert sink.records[0].error is not None
+    assert "Implicit sink adapter" in sink.records[0].error.message

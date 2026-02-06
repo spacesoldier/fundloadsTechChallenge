@@ -9,7 +9,8 @@ from stream_kernel.kernel.node import node
 
 
 # Discovery: register step name for pipeline assembly (docs/implementation/steps/03 IdempotencyGate.md).
-@node(name="idempotency_gate")
+# consumes/emits are used for DAG construction (docs/framework/initial_stage/DAG construction.md).
+@node(name="idempotency_gate", consumes=[AttemptWithKeys], emits=[IdempotencyClassifiedAttempt])
 @dataclass
 class IdempotencyGate:
     # Step 03 enforces deterministic replay/conflict classification (docs/implementation/steps/03 IdempotencyGate.md).

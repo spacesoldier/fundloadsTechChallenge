@@ -81,7 +81,8 @@ discovery:
 Marks a class/function as a pipeline step:
 
 - `name`: registry key
-- optional: `requires` (dependency names)
+- optional: `consumes` (data types/tokens accepted)
+- optional: `emits` (data types/tokens produced)
 - optional: `config` (step-local config schema key)
 
 ### 4.2 `@adapter`
@@ -133,7 +134,7 @@ Implementation tests: [tests/stream_kernel/application_context/test_application_
    - duplicate node names fail fast.
 
 2) **Context assembly**
-   - dependencies are validated (`requires` are present).
+   - data contracts are validated (`consumes/emits` are coherent).
    - registry is built from discovered nodes.
 
 3) **Scenario build**

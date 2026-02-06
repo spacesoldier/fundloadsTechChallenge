@@ -24,7 +24,7 @@ def _collect_nodes(values: list[object], *, default_stage: str | None = None) ->
         stage = meta.stage or (default_stage or "")
         found.append(
             NodeDef(
-                meta=NodeMeta(name=meta.name, stage=stage, requires=meta.requires, provides=meta.provides),
+                meta=NodeMeta(name=meta.name, stage=stage, consumes=meta.consumes, emits=meta.emits),
                 target=value,
             )
         )
@@ -58,8 +58,8 @@ def discover_nodes(modules: list[ModuleType]) -> list[NodeDef]:
                             meta=NodeMeta(
                                 name=meta.name,
                                 stage=stage,
-                                requires=meta.requires,
-                                provides=meta.provides,
+                                consumes=meta.consumes,
+                                emits=meta.emits,
                             ),
                             target=attr_value,
                             container_cls=value,
@@ -72,8 +72,8 @@ def discover_nodes(modules: list[ModuleType]) -> list[NodeDef]:
                             meta=NodeMeta(
                                 name=meta.name,
                                 stage=stage,
-                                requires=meta.requires,
-                                provides=meta.provides,
+                                consumes=meta.consumes,
+                                emits=meta.emits,
                             ),
                             target=attr_value,
                         )

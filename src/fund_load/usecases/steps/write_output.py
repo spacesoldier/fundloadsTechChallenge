@@ -9,7 +9,8 @@ from stream_kernel.kernel.node import node
 
 
 # Discovery: register step name for pipeline assembly (docs/implementation/steps/08 WriteOutput.md).
-@node(name="write_output")
+# consumes/emits are used for DAG construction (docs/framework/initial_stage/DAG construction.md).
+@node(name="write_output", consumes=[OutputLine], emits=[])
 @dataclass(frozen=True, slots=True)
 class WriteOutput:
     # Step 08 writes formatted output via OutputSink (docs/implementation/steps/08 WriteOutput.md).

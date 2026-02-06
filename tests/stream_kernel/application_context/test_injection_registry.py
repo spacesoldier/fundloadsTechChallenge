@@ -64,3 +64,12 @@ def test_registry_errors_on_duplicate_binding() -> None:
     reg.register_factory("stream", EventA, lambda: _StreamPort("A"))
     with pytest.raises(InjectionRegistryError):
         reg.register_factory("stream", EventA, lambda: _StreamPort("B"))
+
+
+def test_registry_tracks_async_capability() -> None:
+    # Registry should expose async capability for planning (Execution planning §8).
+    reg = InjectionRegistry()
+    reg.register_factory("stream", EventA, lambda: _StreamPort("A"), is_async=True)
+    reg.register_factory("stream", EventB, lambda: _StreamPort("B"), is_async=False)
+    assert reg.is_async_binding("stream", EventA) is True
+    assert reg.is_async_binding("stream", EventB) is False

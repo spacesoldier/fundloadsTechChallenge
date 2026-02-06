@@ -51,3 +51,8 @@ src/stream_kernel/adapters/__pycache__/*
 src/stream_kernel/app/__pycache__/*
 src/stream_kernel/config/__pycache__/*
 tests/fund_load/__pycache__/*
+src/stream_kernel/execution/__pycache__/*
+src/stream_kernel/integration/__pycache__/*
+src/stream_kernel/routing/__pycache__/*
+tests/stream_kernel/execution/__pycache__/*
+tests/stream_kernel/routing/__pycache__/*

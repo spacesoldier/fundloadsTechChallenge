@@ -12,6 +12,8 @@ from stream_kernel.application_context.injection_registry import (
     InjectionRegistry,
     InjectionRegistryError,
 )
+from stream_kernel.integration.consumer_registry import InMemoryConsumerRegistry
+from stream_kernel.kernel.dag import Dag, NodeContract, build_dag
 from stream_kernel.kernel.discovery import discover_nodes
 from stream_kernel.kernel.node import NodeDef
 from stream_kernel.kernel.scenario import Scenario
@@ -64,20 +66,32 @@ class ApplicationContext:
 
         self.discover(modules)
 
-    def validate_dependencies(self) -> None:
-        # Ensure that all declared requires are provided by some node name.
-        names = {n.meta.name for n in self.nodes}
+    def validate_dependencies(
+        self,
+        *,
+        strict: bool = False,
+        external_tokens: list[type[object]] | None = None,
+    ) -> None:
+        # Optional validation: ensure consumed tokens are provided by some node unless external.
+        if not strict:
+            return
+        external = set(external_tokens or [])
+        providers: set[type[object]] = set()
+        for node in self.nodes:
+            providers.update(node.meta.emits)
+
         missing: set[str] = set()
         for node in self.nodes:
-            for required in node.meta.requires:
-                if required not in names:
-                    missing.add(required)
+            for token in node.meta.consumes:
+                if token in providers or token in external:
+                    continue
+                missing.add(_token_label(token))
         if missing:
-            raise ContextBuildError(f"Missing node dependencies: {sorted(missing)}")
+            raise ContextBuildError(f"Missing token providers: {sorted(missing)}")
 
-    def build_registry(self) -> StepRegistry:
+    def build_registry(self, *, strict: bool = False) -> StepRegistry:
         # Build a StepRegistry from discovered nodes (ApplicationContext spec).
-        self.validate_dependencies()
+        self.validate_dependencies(strict=strict)
         registry = StepRegistry()
 
         for discovered in self.nodes:
@@ -107,6 +121,26 @@ class ApplicationContext:
             registry.register(discovered.meta.name, _factory)
 
         return registry
+
+    def build_consumer_registry(self) -> InMemoryConsumerRegistry:
+        # Build ConsumerRegistry from discovery output (Execution runtime + routing integration §4.2).
+        mapping: dict[type, list[str]] = {}
+        for node_def in self.nodes:
+            for token in node_def.meta.consumes:
+                mapping.setdefault(token, []).append(node_def.meta.name)
+        return InMemoryConsumerRegistry(mapping)
+
+    def build_dag(self, *, external_tokens: list[type[object]] | None = None) -> Dag:
+        # Build analytic DAG from consumes/emits contracts (DAG construction §3–§4).
+        contracts = [
+            NodeContract(
+                name=node_def.meta.name,
+                consumes=list(node_def.meta.consumes),
+                emits=list(node_def.meta.emits),
+            )
+            for node_def in self.nodes
+        ]
+        return build_dag(contracts, external_tokens=external_tokens)
 
     def build_scenario(
         self,
@@ -232,6 +266,11 @@ def _build_config_scope(cfg: dict[str, object], node_name: str) -> ConfigScope:
     if not global_cfg:
         global_cfg = cfg
     return ConfigScope(node_cfg=node_cfg, global_cfg=global_cfg, root_cfg=cfg)
+
+
+def _token_label(token: type[object]) -> str:
+    # Best-effort label for error reporting (type tokens are preferred).
+    return getattr(token, "__name__", repr(token))
 
 
 def _iter_injected_fields(obj: object):

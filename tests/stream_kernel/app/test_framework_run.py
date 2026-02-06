@@ -477,7 +477,18 @@ def test_run_rejects_invalid_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("stream_kernel.app.runtime.load_yaml_config", lambda _path: cfg)
     monkeypatch.setattr("stream_kernel.app.runtime.validate_newgen_config", lambda raw: raw)
     monkeypatch.setattr("stream_kernel.app.runtime.apply_cli_overrides", lambda *_a, **_k: None)
-    monkeypatch.setattr("stream_kernel.app.runtime.ApplicationContext", lambda: type("C", (), {"discover": lambda *_a, **_k: None, "build_scenario": lambda *_a, **_k: type("S", (), {"steps": []})()})())
+    monkeypatch.setattr(
+        "stream_kernel.app.runtime.ApplicationContext",
+        lambda: type(
+            "C",
+            (),
+            {
+                "discover": lambda *_a, **_k: None,
+                "build_scenario": lambda *_a, **_k: type("S", (), {"steps": []})(),
+                "build_consumer_registry": lambda *_a, **_k: type("R", (), {"list_tokens": lambda *_a: []})(),
+            },
+        )(),
+    )
     monkeypatch.setattr("stream_kernel.app.runtime.Runner", lambda **_k: type("R", (), {"run": lambda *_a, **_k: None})())
 
     with pytest.raises(ValueError):
@@ -503,7 +514,18 @@ def test_run_requires_input_source_adapter(monkeypatch: pytest.MonkeyPatch) -> N
     )
     monkeypatch.setattr("stream_kernel.app.runtime.load_yaml_config", lambda _path: cfg)
     monkeypatch.setattr("stream_kernel.app.runtime.validate_newgen_config", lambda raw: raw)
-    monkeypatch.setattr("stream_kernel.app.runtime.ApplicationContext", lambda: type("C", (), {"discover": lambda *_a, **_k: None, "build_scenario": lambda *_a, **_k: type("S", (), {"steps": []})()})())
+    monkeypatch.setattr(
+        "stream_kernel.app.runtime.ApplicationContext",
+        lambda: type(
+            "C",
+            (),
+            {
+                "discover": lambda *_a, **_k: None,
+                "build_scenario": lambda *_a, **_k: type("S", (), {"steps": []})(),
+                "build_consumer_registry": lambda *_a, **_k: type("R", (), {"list_tokens": lambda *_a: []})(),
+            },
+        )(),
+    )
     monkeypatch.setattr("stream_kernel.app.runtime.Runner", lambda **_k: type("R", (), {"run": lambda *_a, **_k: None})())
 
     with pytest.raises(ValueError):

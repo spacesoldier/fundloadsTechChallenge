@@ -23,7 +23,8 @@ class _RawLoadAttempt(BaseModel):
 
 
 # Discovery: mark step as a node so ApplicationContext can auto-register it (docs/implementation/steps/01 ParseLoadAttempt.md).
-@node(name="parse_load_attempt")
+# consumes/emits are used for DAG construction (docs/framework/initial_stage/DAG construction.md).
+@node(name="parse_load_attempt", consumes=[RawLine], emits=[LoadAttempt, Decision])
 class ParseLoadAttempt:
     def __call__(self, msg: RawLine, ctx: object | None) -> list[LoadAttempt | Decision]:
         # Step 01 requires exactly one output per input line (docs/implementation/steps/01 ParseLoadAttempt.md).

@@ -10,7 +10,8 @@ from stream_kernel.kernel.node import node
 
 
 # Discovery: register this step by name for the pipeline (docs/implementation/steps/02 ComputeTimeKeys.md).
-@node(name="compute_time_keys")
+# consumes/emits are used for DAG construction (docs/framework/initial_stage/DAG construction.md).
+@node(name="compute_time_keys", consumes=[LoadAttempt], emits=[AttemptWithKeys])
 @dataclass(frozen=True, slots=True)
 class ComputeTimeKeys:
     # Step 02 derives UTC day/week keys per docs/implementation/steps/02 ComputeTimeKeys.md.

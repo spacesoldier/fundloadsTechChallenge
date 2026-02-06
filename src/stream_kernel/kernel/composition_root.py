@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+
 from stream_kernel.kernel.context import ContextFactory
 from stream_kernel.kernel.runner import Runner
 from stream_kernel.kernel.scenario import Scenario

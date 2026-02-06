@@ -1,0 +1,356 @@
+# Execution runtime and routing integration
+
+This document describes how **Runner** and **Router** work together to execute
+nodes, and how their integration is provided through ports/adapters.
+
+It complements:
+
+- [Routing semantics](Routing%20semantics.md)
+- [Router + DAG roadmap](Router%20and%20DAG%20roadmap.md)
+
+---
+
+## 1) Why split Runner and Router
+
+**Router** is pure routing logic:
+
+- given an `Envelope` and a registry of consumers,
+- decide which node(s) should receive the message,
+- without executing any business logic.
+
+**Runner** is execution logic:
+
+- fetch a message from a queue,
+- call the node,
+- send outputs back to routing.
+
+This split enables **multiple Runner implementations** (sync, async, distributed)
+while keeping **one Router contract**.
+
+---
+
+## 2) Integration diagram (default)
+
+```
+inputs → WorkQueue → Runner → Node → outputs → Router → WorkQueue
+```
+
+- `WorkQueue` is a port.  
+- Router produces routing decisions.  
+- Runner executes nodes and re‑enqueues outputs.
+
+The loop terminates when the queue is empty (or at a max‑hops policy).
+
+---
+
+## 3) Source/sink adapter nodes (IO boundaries)
+
+Adapter nodes are the **entry/exit points** of the graph:
+
+- **Source node** emits a model type (`emits=[RawLine]`)
+- **Sink node** consumes a model type (`consumes=[OutputLine]`)
+
+Adapters remain **payload‑only**; the runner wraps/un‑wraps `Envelope`.
+
+### 3.1 Implicit sink adapters
+
+If an adapter consumes a model but is **not injected** into any node, it is
+attached as an **implicit sink**:
+
+- the adapter still receives routed messages for its consumed type
+- the runtime emits a **diagnostic note** (warning/trace)
+
+This is always on; strict mode does not change this behavior.
+
+### 3.2 Pull‑mode
+
+The sync runtime pulls one item at a time from the source adapter:
+
+1. runner requests next item (`read()` / `poll(1)`)
+2. wraps into `Envelope`
+3. enqueues into `WorkQueue`
+
+This preserves deterministic ordering and makes backpressure trivial.
+
+### 3.3 Push‑mode
+
+Async runtimes may let adapters push into queues:
+
+- adapter produces payloads and enqueues via `WorkQueue.push`
+- backpressure is enforced by queue capacity or a gate
+- adapter may implement `ack()` / `commit()` semantics
+
+### 3.4 Open‑end rule (no external tokens)
+
+We do **not** introduce special “external input” tokens.  
+Instead, the graph is required to be closed:
+
+- every consumed token must be emitted by some node,
+- if a token has no provider, a **source adapter node** must be attached,
+- otherwise the build fails fast (missing provider / missing adapter).
+
+---
+
+## 4) Ports (core)
+
+### 4.1 WorkQueue (message transport)
+
+Minimal port contract:
+
+- `push(envelope)`
+- `pop() -> envelope | None`
+- optional `size()` / `ack()`
+
+#### WorkQueue behavior (logic)
+
+- **FIFO** by default (deterministic for baseline runs).
+- **Single message** per `pop()` call.
+- **Empty pop** returns `None` (non-blocking default).
+- **Backpressure hooks** (optional): enqueue limits or reject policy.
+- **Partitioning** (future): queues per node or per pool.
+
+### 4.2 ConsumerRegistry (routing registry)
+
+The consumer registry is a **service port** that owns the dynamic mapping
+between **message types** and **consumer nodes**.
+
+Minimal contract:
+
+- `get_consumers(token) -> list[node_name]`
+- `has_node(name) -> bool`
+- `list_tokens() -> list[type]`
+
+This keeps **routing data** separate from both Router and Runner.
+
+### 4.3 ContextStore
+
+ContextStore is required because **some nodes may access context** (trace,
+retries, aggregation state). The runner resolves context for each envelope and
+passes a **metadata view** to the node on invocation. Nodes are free to ignore it.
+
+- `get(trace_id)`
+- `put(trace_id, ctx)`
+- `delete(trace_id)`
+
+This keeps execution state portable across runtimes and ensures node-level
+context is always available.
+
+#### ContextStore behavior (logic)
+
+- Stores per‑message execution context (trace, retry metadata).
+- Keyed by `trace_id` (or `msg_id` if no trace).
+- **Idempotent** put/update expected.
+- Optional TTL for cleanup in external stores.
+
+#### Envelope ↔ Context aggregation
+
+- Every `Envelope` must carry a **context key** (e.g., `trace_id`).
+- Runner retrieves context from ContextStore before invoking a node.
+- Node receives `payload` plus a **metadata section** (via `ctx`), not the full
+  internal context object. This avoids accidental coupling to tracing internals.
+- Full-context access (including tracing internals) is **not** exposed by
+  default; it can be added later behind an explicit opt‑in API.
+- Outputs inherit the same context key unless explicitly overridden.
+
+---
+
+## 5) Adapter variants
+
+### 4.1 In‑memory (default)
+
+- `WorkQueue` backed by `collections.deque`
+- `ConsumerRegistry` backed by in‑memory dict(s)
+- `ContextStore` backed by an in‑memory dict
+- Best for tests, local runs, and deterministic CI
+
+### 4.2 External (Redis, etc.)
+
+- `WorkQueue` backed by Redis lists/streams
+- `ConsumerRegistry` backed by Redis / external registry
+- `ContextStore` backed by Redis hashes
+- Enables multi‑process scaling and recovery
+
+Adapters live in the **framework**, but are wired by config.
+
+---
+
+## 6) Runner variants
+
+### 5.1 SyncRunner (baseline)
+
+- single‑threaded, processes queue until empty
+- deterministic ordering
+- ideal for baseline reference outputs
+
+### 5.2 AsyncRunner
+
+- `asyncio` based
+- awaits IO‑bound nodes (HTTP, DB, MCP)
+- same router contract
+
+### 5.3 DistributedRunner
+
+- integrates with Celery/worker pools
+- work items serialized through queue adapter
+- context store required
+
+### 5.4 Runner interface (contract)
+
+All runners implement a shared interface (`RunnerPort`):
+
+- `run() -> None`
+- consumes from WorkQueue until empty (or until a stop policy triggers)
+
+This allows swapping runners without changing routing or application wiring.
+
+---
+
+## 7) Routing integration points
+
+Runner responsibilities:
+
+1. Pull `Envelope` from queue
+2. Execute node
+3. Normalize outputs into `Envelope` list
+4. Ask **RoutingPort** for destinations
+5. Push new envelopes into queue
+
+RoutingPort responsibilities:
+
+1. Normalize outputs to `Envelope`
+2. Pull consumer map from `ConsumerRegistry`
+3. Delegate pure routing to Router
+
+Router responsibilities (pure logic):
+
+1. If `Envelope.target` → deliver only to target(s)
+2. Else route by `consumes/emits` (type fan‑out)
+
+All **routing policy** lives in the Router.  
+All **execution policy** lives in the Runner.
+
+---
+
+## 8) Test methodology (TDD)
+
+### 7.1 Router‑only unit tests
+
+- default fan‑out by type
+- targeted routing override
+- multi‑target order
+- mixed outputs
+
+### 7.1.1 ConsumerRegistry tests
+
+- registration returns consumers by token
+- unknown token returns empty list
+- `has_node(name)` works for present/absent nodes
+
+### 7.2 Runner + Router integration tests
+
+- one input → expected fan‑out across nodes
+- deterministic ordering with deque
+- strict‑mode behavior for unknown targets
+
+### 7.3 Adapter tests
+
+- in‑memory queue behavior
+- external adapter contract (Redis stubbed)
+
+---
+
+## 9) Detailed test cases (TDD)
+
+### 8.1 WorkQueue (in‑memory deque)
+
+1. **FIFO order**
+   - push A, then B
+   - pop → A, then B
+2. **Empty pop**
+   - pop on empty queue → `None`
+3. **Push after empty**
+   - pop empty, then push A
+   - pop → A
+
+4. **FIFO under mixed producers**
+   - push A, B, C (interleaved)
+   - pop order matches push order
+
+5. **Optional size**
+   - size starts at 0
+   - size increments on push
+   - size decrements on pop
+
+### 8.2 ContextStore (in‑memory dict)
+
+1. **Put/Get/Delete**
+   - put `trace_id=1`
+   - get returns stored ctx
+   - delete removes it
+2. **Get missing**
+   - get unknown id → `None`
+
+3. **Idempotent update**
+   - put ctx1
+   - put ctx2 under same key
+   - get returns ctx2
+
+### 8.3 Router + Runner (sync) — baseline
+
+1. **Single node, single input**
+   - input → node consumes → emits one output
+   - output delivered to sink exactly once
+2. **Context lookup**
+   - envelope carries `trace_id`
+   - runner loads context before invoking node
+   - node sees expected context values
+3. **Fan‑out via router**
+   - node emits `X`
+   - two nodes consume `X`
+   - both nodes receive the same payload in deterministic order
+4. **Target override**
+   - node emits `Envelope(target="C")`
+   - only `C` receives it; `B` does not
+5. **Mixed outputs**
+   - output list with one targeted and one default
+   - targeted → only target, default → fan‑out
+
+### 8.4 Strict‑mode errors
+
+1. **Unknown target**
+   - `Envelope(target="Missing")` → error
+2. **Incompatible type**
+   - targeted payload type not consumed by target → error
+
+### 8.5 Non‑strict mode (future)
+
+1. **Unknown target**
+   - warn + drop
+2. **Incompatible type**
+   - warn + drop
+
+### 8.6 External queue adapter (Redis stub)
+
+1. **Contract compliance**
+   - push/pop round‑trip using stubbed backend
+2. **Persistence boundary**
+   - separate runner instances can pop what another pushed
+
+### 8.7 ContextStore external adapter (Redis stub)
+
+1. **Put/Get round‑trip**
+   - put ctx by key
+   - get returns same ctx
+2. **Overwrite**
+   - put ctx1, then ctx2
+   - get returns ctx2
+
+---
+
+## 9) Implementation references (to be added)
+
+- `stream_kernel.routing.router` (routing logic)
+- `stream_kernel.integration.routing_port` (routing adapter)
+- `stream_kernel.integration.work_queue` (deque adapter)
+- `stream_kernel.integration.context_store` (in‑memory store)
+- `stream_kernel.execution` (runners, planned)

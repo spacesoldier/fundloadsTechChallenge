@@ -13,7 +13,8 @@ from stream_kernel.kernel.node import node
 
 
 # Discovery: register step name for pipeline assembly (docs/implementation/steps/04 ComputeFeatures.md).
-@node(name="compute_features")
+# consumes/emits are used for DAG construction (docs/framework/initial_stage/DAG construction.md).
+@node(name="compute_features", consumes=[IdempotencyClassifiedAttempt], emits=[EnrichedAttempt])
 @dataclass(frozen=True, slots=True)
 class ComputeFeatures:
     # Step 04 computes risk_factor/effective_amount/is_prime_id (docs/implementation/steps/04 ComputeFeatures.md).

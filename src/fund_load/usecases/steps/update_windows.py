@@ -10,7 +10,8 @@ from stream_kernel.kernel.node import node
 
 
 # Discovery: register step name for pipeline assembly (docs/implementation/steps/06 UpdateWindows.md).
-@node(name="update_windows")
+# consumes/emits are used for DAG construction (docs/framework/initial_stage/DAG construction.md).
+@node(name="update_windows", consumes=[Decision], emits=[Decision])
 @dataclass(frozen=True, slots=True)
 class UpdateWindows:
     # Step 06 mutates window state based on Decision (docs/implementation/steps/06 UpdateWindows.md).
