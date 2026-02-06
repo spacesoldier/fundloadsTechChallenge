@@ -75,10 +75,11 @@ At runtime, the framework:
 1) Reads `runtime.tracing`.
 2) Builds `TraceRecorder` from `signature` + `context_diff`.
 3) Builds a trace sink (JSONL or stdout).
-4) Injects both into the `Runner`.
+4) Injects both into the execution runtime (`SyncRunner` path via runtime node wrappers).
 
 Implementation:
 - Runtime wiring: `src/stream_kernel/app/runtime.py`
+- Execution engine: `src/stream_kernel/execution/runner.py`
 - Trace sinks: `src/fund_load/adapters/trace_sinks.py`
 
 ---

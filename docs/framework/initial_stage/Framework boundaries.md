@@ -126,7 +126,7 @@ The project implements window semantics on top of that.
 We plan to add decorators as **registration sugar** only:
 
 - `@adapter(type=..., flow=...)`
-- `@step(name=...)`
+- `@node(name=...)`
 
 Decorators must not hide wiring or introduce side effects at import time.
 
@@ -134,7 +134,7 @@ Decorators must not hide wiring or introduce side effects at import time.
 
 ## 6) Implementation references
 
-- Kernel runtime: [src/stream_kernel/kernel/runner.py](../../../../src/stream_kernel/kernel/runner.py), [src/stream_kernel/kernel/scenario.py](../../../../src/stream_kernel/kernel/scenario.py), [src/stream_kernel/kernel/scenario_builder.py](../../../../src/stream_kernel/kernel/scenario_builder.py), [src/stream_kernel/kernel/step_registry.py](../../../../src/stream_kernel/kernel/step_registry.py)
+- Kernel + execution runtime: [src/stream_kernel/execution/runner.py](../../../../src/stream_kernel/execution/runner.py), [src/stream_kernel/execution/runner_port.py](../../../../src/stream_kernel/execution/runner_port.py), [src/stream_kernel/kernel/scenario.py](../../../../src/stream_kernel/kernel/scenario.py), [src/stream_kernel/kernel/scenario_builder.py](../../../../src/stream_kernel/kernel/scenario_builder.py), [src/stream_kernel/kernel/step_registry.py](../../../../src/stream_kernel/kernel/step_registry.py)
 - Application context + discovery: [src/stream_kernel/application_context/application_context.py](../../../../src/stream_kernel/application_context/application_context.py), [src/stream_kernel/kernel/discovery.py](../../../../src/stream_kernel/kernel/discovery.py)
 - Nodes/stages metadata: [src/stream_kernel/kernel/node.py](../../../../src/stream_kernel/kernel/node.py), [src/stream_kernel/kernel/stage.py](../../../../src/stream_kernel/kernel/stage.py)
 - Injection/config helpers: [src/stream_kernel/application_context/inject.py](../../../../src/stream_kernel/application_context/inject.py), [src/stream_kernel/application_context/injection_registry.py](../../../../src/stream_kernel/application_context/injection_registry.py), [src/stream_kernel/application_context/config_inject.py](../../../../src/stream_kernel/application_context/config_inject.py)

@@ -1,6 +1,5 @@
 from .context import Context, ContextFactory, CtxError
 from .composition_root import AppRuntime, build_runtime
-from .runner import Runner
 from .scenario import Scenario, StepSpec
 from .scenario_builder import ScenarioBuilder
 from .step import Filter, Map, Step, Tap
@@ -14,7 +13,6 @@ __all__ = [
     "CtxError",
     "AppRuntime",
     "build_runtime",
-    "Runner",
     "Scenario",
     "ScenarioBuilder",
     "StepSpec",

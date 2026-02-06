@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from stream_kernel.kernel.context import ContextFactory
-from stream_kernel.kernel.runner import Runner
+from stream_kernel.execution.runner_port import RunnerPort
 from stream_kernel.kernel.scenario import Scenario
 from stream_kernel.kernel.scenario_builder import ScenarioBuilder
 from stream_kernel.kernel.step_registry import StepRegistry
@@ -12,8 +11,15 @@ from stream_kernel.kernel.step_registry import StepRegistry
 @dataclass(frozen=True, slots=True)
 class AppRuntime:
     # AppRuntime is a small bundle for runner + scenario (Composition Root spec).
-    runner: Runner
+    runner: RunnerPort
     scenario: Scenario
+
+
+@dataclass(frozen=True, slots=True)
+class NoopRunner:
+    # Transitional composition-root runner placeholder while runtime owns execution wiring.
+    def run(self) -> None:
+        return None
 
 
 def build_runtime(*, config: dict[str, object], wiring: dict[str, object]) -> AppRuntime:
@@ -33,5 +39,5 @@ def build_runtime(*, config: dict[str, object], wiring: dict[str, object]) -> Ap
         steps=steps_cfg,
         wiring=wiring,
     )
-    runner = Runner(scenario=scenario, context_factory=ContextFactory("run", scenario_id))
+    runner = NoopRunner()
     return AppRuntime(runner=runner, scenario=scenario)

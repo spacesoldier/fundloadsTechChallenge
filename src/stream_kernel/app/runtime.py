@@ -15,10 +15,14 @@ from stream_kernel.application_context import ApplicationContext
 from stream_kernel.application_context.injection_registry import InjectionRegistry
 from stream_kernel.config.loader import load_yaml_config
 from stream_kernel.config.validator import validate_newgen_config
-from stream_kernel.kernel.context import ContextFactory
-from stream_kernel.kernel.runner import Runner
+from stream_kernel.execution.runner import SyncRunner
+from stream_kernel.integration.context_store import InMemoryContextStore
+from stream_kernel.integration.routing_port import RoutingPort
+from stream_kernel.integration.work_queue import InMemoryWorkQueue
+from stream_kernel.kernel.context import Context, ContextFactory
 from stream_kernel.kernel.trace import ErrorInfo, MessageSignature, TraceRecord, TraceRecorder
 from stream_kernel.kernel.scenario import StepSpec
+from stream_kernel.routing.envelope import Envelope
 
 
 def run_with_config(
@@ -88,13 +92,17 @@ def run_with_config(
         run_id=run_id,
         scenario_id=scenario_name,
     )
-    runner = Runner(
+    strict = bool(runtime.get("strict", True))
+    _run_with_sync_runner(
         scenario=scenario,
-        context_factory=ContextFactory(run_id, scenario_name),
+        inputs=inputs,
+        consumer_registry=consumer_registry,
+        strict=strict,
+        run_id=run_id,
+        scenario_id=scenario_name,
         trace_recorder=trace_recorder,
         trace_sink=trace_sink,
     )
-    runner.run(inputs, output_sink=lambda _: None)
     return 0
 
 
@@ -173,14 +181,200 @@ def run(argv: list[str] | None) -> int:
         run_id="run",
         scenario_id=scenario_name,
     )
-    runner = Runner(
+    strict = bool(runtime.get("strict", True))
+    inputs = input_source.read()
+    _run_with_sync_runner(
         scenario=scenario,
-        context_factory=ContextFactory("run", scenario_name),
+        inputs=inputs,
+        consumer_registry=consumer_registry,
+        strict=strict,
+        run_id="run",
+        scenario_id=scenario_name,
         trace_recorder=trace_recorder,
         trace_sink=trace_sink,
     )
-    runner.run(input_source.read(), output_sink=lambda _: None)
     return 0
+
+
+def _run_with_sync_runner(
+    *,
+    scenario,
+    inputs,
+    consumer_registry,
+    strict: bool,
+    run_id: str,
+    scenario_id: str,
+    trace_recorder: TraceRecorder | None,
+    trace_sink: TraceSink | None,
+) -> None:
+    # Build execution components (Execution runtime and routing integration §6).
+    work_queue = InMemoryWorkQueue()
+    context_store = InMemoryContextStore()
+    routing_port = RoutingPort(registry=consumer_registry, strict=strict)
+
+    trace_contexts: dict[str, Context] = {}
+    nodes = _build_targeted_nodes(
+        scenario.steps,
+        run_id=run_id,
+        scenario_id=scenario_id,
+        trace_recorder=trace_recorder,
+        trace_sink=trace_sink,
+        trace_contexts=trace_contexts,
+    )
+    runner = SyncRunner(
+        nodes=nodes,
+        work_queue=work_queue,
+        context_store=context_store,
+        routing_port=routing_port,
+    )
+    first_step = scenario.steps[0].name if scenario.steps else None
+    if first_step is None:
+        return
+
+    # Preserve legacy semantics: each input message is processed end-to-end before next input.
+    for index, payload in enumerate(inputs, start=1):
+        trace_id = _trace_id(run_id, payload, index)
+        context_store.put(trace_id, _initial_context(payload, trace_id))
+        work_queue.push(Envelope(payload=payload, target=first_step, trace_id=trace_id))
+        runner.run()
+    if trace_sink is not None:
+        # Mirror legacy runner behavior: flush/close trace sink at end of run.
+        trace_sink.flush()
+        trace_sink.close()
+
+
+def _build_targeted_nodes(
+    step_specs: list[StepSpec],
+    *,
+    run_id: str,
+    scenario_id: str,
+    trace_recorder: TraceRecorder | None,
+    trace_sink: TraceSink | None,
+    trace_contexts: dict[str, Context],
+) -> dict[str, object]:
+    # Preserve configured pipeline order by auto-targeting each step to the next step.
+    nodes: dict[str, object] = {}
+    for idx, spec in enumerate(step_specs):
+        next_name = step_specs[idx + 1].name if idx + 1 < len(step_specs) else None
+
+        def _make_step(step: object, step_name: str, step_index: int, downstream: str | None):
+            def _wrapped(msg: object, ctx: object | None) -> list[object]:
+                raw_ctx = ctx if isinstance(ctx, dict) else {}
+                node_ctx = _node_ctx(raw_ctx)
+                trace_ctx: Context | None = None
+                span = None
+                if trace_recorder is not None:
+                    trace_id = _extract_trace_id(raw_ctx)
+                    if trace_id is not None:
+                        line_no = _extract_line_no(raw_ctx)
+                        trace_ctx = trace_contexts.setdefault(
+                            trace_id,
+                            Context(
+                                trace_id=trace_id,
+                                run_id=run_id,
+                                scenario_id=scenario_id,
+                                line_no=line_no,
+                                received_at=datetime.now(tz=UTC),
+                            ),
+                        )
+                        span = trace_recorder.begin(
+                            ctx=trace_ctx,
+                            step_name=step_name,
+                            step_index=step_index,
+                            work_index=0,
+                            msg_in=msg,
+                        )
+
+                try:
+                    outputs = list(step(msg, node_ctx))
+                except Exception as exc:
+                    if trace_recorder is not None and span is not None and trace_ctx is not None:
+                        record = trace_recorder.finish(
+                            ctx=trace_ctx,
+                            span=span,
+                            msg_out=[],
+                            status="error",
+                            error=ErrorInfo(
+                                type=type(exc).__name__,
+                                message=str(exc),
+                                where=step_name,
+                                stack=None,
+                            ),
+                        )
+                        if trace_sink is not None:
+                            trace_sink.emit(record)
+                    raise
+
+                if trace_recorder is not None and span is not None and trace_ctx is not None:
+                    record = trace_recorder.finish(
+                        ctx=trace_ctx,
+                        span=span,
+                        msg_out=outputs,
+                        status="ok",
+                        error=None,
+                    )
+                    if trace_sink is not None:
+                        trace_sink.emit(record)
+
+                if downstream is None:
+                    return outputs
+                routed: list[object] = []
+                for item in outputs:
+                    if isinstance(item, Envelope):
+                        if item.target is None:
+                            routed.append(
+                                Envelope(
+                                    payload=item.payload,
+                                    trace_id=item.trace_id,
+                                    target=downstream,
+                                    topic=item.topic,
+                                )
+                            )
+                        else:
+                            routed.append(item)
+                        continue
+                    routed.append(Envelope(payload=item, target=downstream))
+                return routed
+
+            return _wrapped
+
+        nodes[spec.name] = _make_step(spec.step, spec.name, idx, next_name)
+    return nodes
+
+
+def _trace_id(run_id: str, payload: object, index: int) -> str:
+    # Keep per-message trace ids deterministic for context lookups.
+    line_no = getattr(payload, "line_no", None)
+    if isinstance(line_no, int):
+        return f"{run_id}:{line_no}"
+    return f"{run_id}:{index}"
+
+
+def _initial_context(payload: object, trace_id: str) -> dict[str, object]:
+    # Minimal metadata view exposed to nodes via ContextStore.
+    line_no = getattr(payload, "line_no", None)
+    if isinstance(line_no, int):
+        return {"line_no": line_no, "__trace_id": trace_id}
+    return {"__trace_id": trace_id}
+
+
+def _extract_trace_id(ctx: dict[str, object]) -> str | None:
+    trace_id = ctx.get("__trace_id")
+    if isinstance(trace_id, str) and trace_id:
+        return trace_id
+    return None
+
+
+def _extract_line_no(ctx: dict[str, object]) -> int | None:
+    line_no = ctx.get("line_no")
+    if isinstance(line_no, int):
+        return line_no
+    return None
+
+
+def _node_ctx(ctx: dict[str, object]) -> dict[str, object]:
+    # Hide framework-internal metadata from user nodes.
+    return {key: value for key, value in ctx.items() if not key.startswith("__")}
 
 
 def _resolve_symbol(path: str) -> object:

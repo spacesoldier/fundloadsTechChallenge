@@ -10,7 +10,7 @@ This plan tracks the move from fixed `runtime.pipeline` ordering to
 - Replace manual pipeline order with **runtime routing** based on `consumes/emits`.
 - Keep a **DAG graph** for analytics, cycle detection, and trace inspection.
 - Make routing deterministic and testable.
-- Migrate execution away from the legacy `kernel.runner` to the new execution layer.
+- Migrate execution away from the legacy `kernel.runner` to the new execution layer. ✅
 - Treat **adapters as source/sink nodes** so entry/exit points are explicit in the graph.
 
 ---
@@ -107,21 +107,19 @@ This plan tracks the move from fixed `runtime.pipeline` ordering to
 
 ### Steps
 
-1. **Audit dependencies**
-   - Identify all imports of `stream_kernel.kernel.runner`.
-   - List tests that rely on the legacy runner.
+1. **Audit dependencies** ✅
+   - Imports of `stream_kernel.kernel.runner` identified and cleaned up.
+   - Legacy runner tests identified and migrated/removed.
 2. **Introduce execution interface**
    - `RunnerPort` interface (done).
    - `SyncRunner` implementation (done).
 3. **Bridge execution to routing**
    - Use `WorkQueue`, `RoutingPort`, `ContextStore`.
    - Adapters remain **payload-only**; runner wraps outputs into `Envelope`.
-4. **Migrate runtime wiring**
-   - Replace legacy runner usage in `app/runtime.py`.
-   - Provide a compatibility shim if needed.
-5. **Test migration**
-   - New integration tests for runner+router+context.
-   - Remove or rewrite legacy runner tests.
-6. **Deprecate legacy runner**
-   - Mark docs/specs as legacy.
-   - Remove `kernel.runner` after migration passes.
+4. **Migrate runtime wiring** ✅
+   - Legacy runner usage in `app/runtime.py` replaced by execution runtime path.
+5. **Test migration** ✅
+   - Integration tests for runner+router+context are in place.
+   - Legacy runner tests removed/replaced.
+6. **Deprecate legacy runner** ✅
+   - `kernel.runner` removed from code.

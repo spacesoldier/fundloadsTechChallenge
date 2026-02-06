@@ -23,7 +23,7 @@ from stream_kernel.kernel.node import node
 DECISIONS: list[Decision] = []
 
 
-@node(name="record_decisions")
+@node(name="record_decisions", consumes=[Decision], emits=[Decision])
 def record_decisions(msg: Decision, ctx: object | None) -> list[Decision]:
     # Test-only node: capture Decisions after EvaluatePolicies (Step 05).
     DECISIONS.append(msg)

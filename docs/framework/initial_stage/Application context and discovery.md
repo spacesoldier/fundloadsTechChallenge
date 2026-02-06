@@ -46,7 +46,7 @@ In a manually wired project, the wiring module typically:
 **ApplicationContext** is a framework-level component that:
 
 1) imports configured modules (usecases + adapters),
-2) discovers decorators (`@step`, `@adapter`, etc.),
+2) discovers decorators (`@node`, `@stage`, `@adapter`, etc.),
 3) builds a registry of steps/adapters/services,
 4) injects config + dependencies,
 5) returns a ready runtime graph for the composition root.
@@ -76,9 +76,9 @@ discovery:
 
 ## 4) Decorators (initial plan)
 
-### 4.1 `@step`
+### 4.1 `@node`
 
-Marks a class/function as a pipeline step:
+Marks a class/function as a pipeline node:
 
 - `name`: registry key
 - optional: `consumes` (data types/tokens accepted)

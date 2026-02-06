@@ -489,7 +489,10 @@ def test_run_rejects_invalid_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
             },
         )(),
     )
-    monkeypatch.setattr("stream_kernel.app.runtime.Runner", lambda **_k: type("R", (), {"run": lambda *_a, **_k: None})())
+    monkeypatch.setattr(
+        "stream_kernel.app.runtime.SyncRunner",
+        lambda **_k: type("R", (), {"run": lambda *_a, **_k: None})(),
+    )
 
     with pytest.raises(ValueError):
         run(["--config", "cfg.yml"])
@@ -526,7 +529,10 @@ def test_run_requires_input_source_adapter(monkeypatch: pytest.MonkeyPatch) -> N
             },
         )(),
     )
-    monkeypatch.setattr("stream_kernel.app.runtime.Runner", lambda **_k: type("R", (), {"run": lambda *_a, **_k: None})())
+    monkeypatch.setattr(
+        "stream_kernel.app.runtime.SyncRunner",
+        lambda **_k: type("R", (), {"run": lambda *_a, **_k: None})(),
+    )
 
     with pytest.raises(ValueError):
         run(["--config", "cfg.yml"])

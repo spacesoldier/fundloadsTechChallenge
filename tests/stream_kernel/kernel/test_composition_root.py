@@ -6,6 +6,7 @@ import pytest
 
 # Composition root wiring is documented in docs/implementation/kernel/Composition Root Spec.md.
 from stream_kernel.kernel.composition_root import build_runtime
+from stream_kernel.execution.runner_port import RunnerPort
 
 
 def test_composition_root_builds_runtime(tmp_path: Path) -> None:
@@ -19,6 +20,9 @@ def test_composition_root_builds_runtime(tmp_path: Path) -> None:
     # Minimal wiring for ports; concrete adapters are not required for this smoke test.
     runtime = build_runtime(config=config, wiring={"steps": {"noop": lambda cfg, w: lambda msg, ctx: [msg]}})
     assert runtime.runner is not None
+    # Composition root should not return legacy kernel.runner.Runner anymore.
+    assert runtime.runner.__class__.__module__ != "stream_kernel.kernel.runner"
+    assert isinstance(runtime.runner, RunnerPort)
     assert runtime.scenario is not None
     assert runtime.scenario.scenario_id == "baseline"
 
