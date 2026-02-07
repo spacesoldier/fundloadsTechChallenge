@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # Prime checker semantics and suggested cases are documented in
 # docs/implementation/ports/PrimeChecker.md.
-from fund_load.adapters.prime_checker import SievePrimeChecker, _is_prime_trial_division
+from fund_load.adapters.services.prime_checker import SievePrimeChecker, _is_prime_trial_division
 
 
 def test_prime_checker_basic_values() -> None:

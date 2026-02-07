@@ -11,6 +11,7 @@ from fund_load.usecases.messages import (
     EnrichedAttempt,
     IdempotencyClassifiedAttempt,
     OutputLine,
+    WindowedDecision,
 )
 from fund_load.usecases.steps.compute_features import ComputeFeatures
 from fund_load.usecases.steps.compute_time_keys import ComputeTimeKeys
@@ -65,16 +66,16 @@ def test_evaluate_policies_node_contract() -> None:
 
 
 def test_update_windows_node_contract() -> None:
-    # Step 06 consumes Decision and emits Decision (docs/implementation/steps/06 UpdateWindows.md).
+    # Step 06 consumes Decision and emits WindowedDecision (stage-specific token split).
     meta = _meta(UpdateWindows)
     assert meta.consumes == [UsecaseDecision]
-    assert meta.emits == [UsecaseDecision]
+    assert meta.emits == [WindowedDecision]
 
 
 def test_format_output_node_contract() -> None:
-    # Step 07 consumes Decision and emits OutputLine (docs/implementation/steps/07 FormatOutput.md).
+    # Step 07 consumes WindowedDecision and emits OutputLine (docs/implementation/steps/07 FormatOutput.md).
     meta = _meta(FormatOutput)
-    assert meta.consumes == [UsecaseDecision]
+    assert meta.consumes == [WindowedDecision]
     assert meta.emits == [OutputLine]
 
 

@@ -95,6 +95,20 @@ When **multiple sources** emit the same model type:
 If deterministic ordering is required, use a **single source** or enforce
 ordering in a dedicated aggregation node.
 
+### 5.1 Corner case: node consumes and emits the same model token
+
+If a node consumes `T` and also emits `T`, naive type fan-out may feed its
+own output back into itself forever.
+
+Runtime policy in current implementation:
+
+- default fan-out excludes the current source node (`source` self-loop guard)
+- if source exclusion removes all consumers:
+  - strict mode: error (`explicit target required`)
+  - non-strict mode: drop
+- explicit `Envelope.target=<same node>` is still allowed (intentional loop)
+- cycle control (`max_hops` / retry budget) remains a separate policy layer
+
 ---
 
 ## 6) Test cases (TDD)
@@ -204,3 +218,25 @@ ordering in a dedicated aggregation node.
 **Expected:**
 - Router treats it as two messages.
 - If a single message is intended → must return `Batch([x1, x2])`.
+
+### 6.11 Explicit self-target is allowed
+
+**Setup:**
+1. Router consumer map: `X -> [B, C]`.
+2. Source node is `B`.
+3. Output: `Envelope(payload=X("x"), target="B")`.
+
+**Expected:**
+- Delivery to `B` happens (explicit target wins).
+- Self-loop protection applies only to default fan-out.
+
+### 6.12 Default self-loop requires explicit target in strict mode
+
+**Setup:**
+1. Router consumer map: `X -> [B]`.
+2. Source node is `B`.
+3. Output: bare `X("x")` (no target).
+
+**Expected:**
+- Strict mode: routing error (`explicit target required`).
+- Non-strict mode: message is dropped.

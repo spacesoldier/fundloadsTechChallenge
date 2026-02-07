@@ -16,11 +16,11 @@ class RoutingPort:
     _cache_version: int | None = None
     _cache_map: dict[type, list[str]] = field(default_factory=dict)
 
-    def route(self, outputs: Iterable[object]) -> list[tuple[str, object]]:
+    def route(self, outputs: Iterable[object], *, source: str | None = None) -> list[tuple[str, object]]:
         # Build a fresh consumer map per call to reflect dynamic registry state.
         consumer_map = self._build_consumer_map()
         router = Router(consumers=consumer_map, strict=self.strict)
-        return router.route(outputs)
+        return router.route(outputs, source=source)
 
     def _build_consumer_map(self) -> dict[type, list[str]]:
         # Cache consumer map based on registry version for O(1) reuse on hot paths.

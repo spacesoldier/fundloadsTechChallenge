@@ -40,7 +40,7 @@ class SyncRunner:
             outputs = list(node(envelope.payload, ctx))
 
             # Route outputs and enqueue downstream work.
-            deliveries = self.routing_port.route(outputs)
+            deliveries = self.routing_port.route(outputs, source=node_name)
             for target_name, payload in deliveries:
                 self.work_queue.push(
                     Envelope(payload=payload, target=target_name, trace_id=envelope.trace_id)

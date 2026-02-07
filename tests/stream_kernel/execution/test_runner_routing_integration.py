@@ -175,3 +175,62 @@ def test_runner_drops_unknown_target_in_non_strict_mode() -> None:
     runner.run()
 
     assert seen == []
+
+
+def test_runner_avoids_default_self_loop_on_same_token() -> None:
+    # Default fan-out should not re-deliver to the same node that emitted the payload.
+    counts = {"A": 0}
+    seen: list[str] = []
+
+    def node_a(payload: object, ctx: dict[str, object]) -> list[object]:
+        counts["A"] += 1
+        if counts["A"] == 1:
+            return [X("x")]
+        return []
+
+    def node_b(payload: object, ctx: dict[str, object]) -> list[object]:
+        seen.append("B")
+        return []
+
+    registry = InMemoryConsumerRegistry()
+    registry.register(X, ["A", "B"])
+    routing = RoutingPort(registry=registry, strict=True)
+
+    work_queue = InMemoryWorkQueue()
+    context_store = InMemoryContextStore()
+    work_queue.push(Envelope(payload="seed", target="A", trace_id="t1"))
+
+    runner = SyncRunner(
+        nodes={"A": node_a, "B": node_b},
+        work_queue=work_queue,
+        context_store=context_store,
+        routing_port=routing,
+    )
+    runner.run()
+
+    assert counts["A"] == 1
+    assert seen == ["B"]
+
+
+def test_runner_requires_explicit_target_for_single_self_consumer_in_strict_mode() -> None:
+    # If emitted token is consumed only by the same node, strict mode requires explicit target.
+    def node_a(payload: object, ctx: dict[str, object]) -> list[object]:
+        return [X("x")]
+
+    registry = InMemoryConsumerRegistry()
+    registry.register(X, ["A"])
+    routing = RoutingPort(registry=registry, strict=True)
+
+    work_queue = InMemoryWorkQueue()
+    context_store = InMemoryContextStore()
+    work_queue.push(Envelope(payload="seed", target="A", trace_id="t1"))
+
+    runner = SyncRunner(
+        nodes={"A": node_a},
+        work_queue=work_queue,
+        context_store=context_store,
+        routing_port=routing,
+    )
+
+    with pytest.raises(ValueError):
+        runner.run()

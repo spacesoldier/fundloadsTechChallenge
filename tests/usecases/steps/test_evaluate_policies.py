@@ -4,7 +4,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 
 # EvaluatePolicies behavior is specified in docs/implementation/steps/05 EvaluatePolicies.md.
-from fund_load.adapters.window_store import InMemoryWindowStore
+from fund_load.adapters.state.window_store import InMemoryWindowStore
 from fund_load.domain.messages import IdemStatus, LoadAttempt
 from fund_load.domain.money import Money
 from fund_load.domain.reasons import ReasonCode

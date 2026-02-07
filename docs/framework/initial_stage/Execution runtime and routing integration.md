@@ -154,16 +154,36 @@ context is always available.
 
 ---
 
+## 4.4 Adapter config contract (runtime-facing)
+
+Runtime resolves adapters from discovery/registry by adapter name (`adapters.<name>`).
+Config must not contain per-adapter factory paths.
+
+Config fields:
+
+- `settings` — adapter settings payload
+- `binds` — required port types (`stream`, `kv_stream`, `kv`, `request`, `response`)
+
+Forbidden in config:
+
+- model/type class paths
+- routing contracts as free-form strings
+- dynamic factory code references
+
+Type/model mapping belongs to code metadata (`@adapter` + helper mapping).
+
+---
+
 ## 5) Adapter variants
 
-### 4.1 In‑memory (default)
+### 5.1 In-memory (default)
 
 - `WorkQueue` backed by `collections.deque`
 - `ConsumerRegistry` backed by in‑memory dict(s)
 - `ContextStore` backed by an in‑memory dict
 - Best for tests, local runs, and deterministic CI
 
-### 4.2 External (Redis, etc.)
+### 5.2 External (Redis, etc.)
 
 - `WorkQueue` backed by Redis lists/streams
 - `ConsumerRegistry` backed by Redis / external registry
@@ -176,25 +196,25 @@ Adapters live in the **framework**, but are wired by config.
 
 ## 6) Runner variants
 
-### 5.1 SyncRunner (baseline)
+### 6.1 SyncRunner (baseline)
 
 - single‑threaded, processes queue until empty
 - deterministic ordering
 - ideal for baseline reference outputs
 
-### 5.2 AsyncRunner
+### 6.2 AsyncRunner
 
 - `asyncio` based
 - awaits IO‑bound nodes (HTTP, DB, MCP)
 - same router contract
 
-### 5.3 DistributedRunner
+### 6.3 DistributedRunner
 
 - integrates with Celery/worker pools
 - work items serialized through queue adapter
 - context store required
 
-### 5.4 Runner interface (contract)
+### 6.4 Runner interface (contract)
 
 All runners implement a shared interface (`RunnerPort`):
 
@@ -338,12 +358,79 @@ All **execution policy** lives in the Runner.
 
 ### 8.7 ContextStore external adapter (Redis stub)
 
+### 8.8 Adapter config/no-factory path
+
+1. **No factory reference in config**
+   - config contains adapter `factory` key
+   - runtime validator rejects config
+2. **Name-based resolution**
+   - config contains known adapter key under `adapters`
+   - runtime resolves adapter from discovery registry
+3. **Unknown adapter name**
+   - config contains adapter key not discovered in modules
+   - startup fails with explicit error
+
+### 8.9 Stable port-type binding
+
+1. **Accepted bind values**
+   - each of `stream`, `kv_stream`, `kv`, `request`, `response` is accepted
+2. **Unknown bind value**
+   - `binds` contains unknown port type
+   - startup fails with explicit error
+
 1. **Put/Get round‑trip**
    - put ctx by key
    - get returns same ctx
 2. **Overwrite**
    - put ctx1, then ctx2
    - get returns ctx2
+
+---
+
+## 10) Preflight self-test before run
+
+Before runtime starts message processing, the framework runs a **preflight** step.
+
+Preflight goals:
+
+- fail fast on invalid graph contracts
+- fail fast on ambiguous self-loop contracts
+- provide actionable diagnostics before processing any real payload
+
+Current preflight checks:
+
+1. DAG validation (`consumes/emits` providers + cycle checks)
+2. Contract safety check:
+   - if node has overlapping tokens in `consumes` and `emits`
+   - strict mode: fail with guidance
+   - non-strict mode: allow for migration
+
+### 10.1 Why this matters
+
+Without preflight, the app can start and only fail at runtime after partial
+processing. Preflight moves these failures to startup and keeps runs deterministic.
+
+### 10.2 Preflight test cases (TDD)
+
+1. **Valid graph passes**
+   - source emits `RawToken`
+   - transform consumes `RawToken`, emits `MidToken`
+   - preflight succeeds
+
+2. **Consumes/emits overlap fails in strict mode**
+   - node consumes `X`, emits `X`
+   - preflight raises error with migration hint
+
+3. **Consumes/emits overlap allowed in non-strict mode**
+   - same node contract as above
+   - preflight returns without raising
+
+4. **Runtime calls preflight before scenario build**
+   - assert preflight hook is called once during `run_with_config`
+
+5. **Deprecated runtime.pipeline is rejected**
+   - config includes `runtime.pipeline`
+   - runtime fails fast and asks to rely on contract-driven routing
 
 ---
 
@@ -354,3 +441,13 @@ All **execution policy** lives in the Runner.
 - `stream_kernel.integration.work_queue` (deque adapter)
 - `stream_kernel.integration.context_store` (in‑memory store)
 - `stream_kernel.execution` (runners, planned)
+
+---
+
+## 10) Runtime entrypoints
+
+- `run(argv)` is the primary framework-first entrypoint.
+- `run_with_config(config, ...)` is also framework-first by default and can
+  resolve discovery/adapters from config without external wiring.
+- `run_with_registry(...)` is a transitional wrapper kept for controlled
+  override/testing paths; it must stay a thin delegate to `run_with_config`.

@@ -3,13 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 
 # OutputSink adapter behavior is specified in docs/implementation/ports/OutputSink.md.
-from fund_load.adapters.output_sink import FileOutputSink
+from fund_load.adapters.factories.io import file_output_sink
 
 
 def test_output_sink_writes_ndjson_lines(tmp_path: Path) -> None:
     # Adapter writes one JSON object per line, preserving order.
     path = tmp_path / "out.txt"
-    sink = FileOutputSink(path)
+    sink = file_output_sink({"path": str(path)})
     sink.write_line('{"id":"1"}')
     sink.write_line('{"id":"2"}')
     sink.close()
@@ -19,7 +19,7 @@ def test_output_sink_writes_ndjson_lines(tmp_path: Path) -> None:
 def test_output_sink_atomic_replace(tmp_path: Path) -> None:
     # Atomic replace writes to temp and then renames to final path (OutputSink spec).
     path = tmp_path / "out.txt"
-    sink = FileOutputSink(path, atomic_replace=True)
+    sink = file_output_sink({"path": str(path), "atomic_replace": True})
     sink.write_line('{"id":"1"}')
     sink.close()
     assert path.exists()
@@ -28,7 +28,7 @@ def test_output_sink_atomic_replace(tmp_path: Path) -> None:
 def test_output_sink_close_is_idempotent(tmp_path: Path) -> None:
     # Closing twice should not raise and should not corrupt output.
     path = tmp_path / "out.txt"
-    sink = FileOutputSink(path)
+    sink = file_output_sink({"path": str(path)})
     sink.write_line('{"id":"1"}')
     sink.close()
     sink.close()

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from fund_load.ports.window_store import WindowWritePort
-from fund_load.usecases.messages import Decision
+from fund_load.usecases.messages import Decision, WindowedDecision
 from stream_kernel.application_context.config_inject import config
 from stream_kernel.application_context.inject import inject
 from stream_kernel.kernel.node import node
@@ -11,7 +11,7 @@ from stream_kernel.kernel.node import node
 
 # Discovery: register step name for pipeline assembly (docs/implementation/steps/06 UpdateWindows.md).
 # consumes/emits are used for DAG construction (docs/framework/initial_stage/DAG construction.md).
-@node(name="update_windows", consumes=[Decision], emits=[Decision])
+@node(name="update_windows", consumes=[Decision], emits=[WindowedDecision])
 @dataclass(frozen=True, slots=True)
 class UpdateWindows:
     # Step 06 mutates window state based on Decision (docs/implementation/steps/06 UpdateWindows.md).
@@ -21,10 +21,10 @@ class UpdateWindows:
     # Config-driven toggle comes from nodes.update_windows.daily_prime_gate.enabled (newgen config).
     prime_gate_enabled: bool = config.value("daily_prime_gate.enabled", default=False)
 
-    def __call__(self, msg: Decision, ctx: object | None) -> list[Decision]:
+    def __call__(self, msg: Decision, ctx: object | None) -> list[WindowedDecision]:
         # Non-canonical attempts must not mutate any windows (Step 06 invariant).
         if not msg.is_canonical:
-            return [msg]
+            return [self._to_windowed(msg)]
 
         # Attempts are incremented for every canonical decision (accepted or declined).
         self.window_store.inc_daily_attempts(
@@ -49,4 +49,14 @@ class UpdateWindows:
             if self.prime_gate_enabled and msg.is_prime_id:
                 self.window_store.inc_daily_prime_gate(day_key=msg.day_key)
 
-        return [msg]
+        return [self._to_windowed(msg)]
+
+    @staticmethod
+    def _to_windowed(msg: Decision) -> WindowedDecision:
+        # Step 06 narrows payload to output-facing fields and breaks self-loop token overlap.
+        return WindowedDecision(
+            line_no=msg.line_no,
+            id=msg.id,
+            customer_id=msg.customer_id,
+            accepted=msg.accepted,
+        )

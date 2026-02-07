@@ -86,8 +86,19 @@ This yields a **directed graph** `G = (V, E)` over nodes.
    If a token is consumed but never emitted by any node, fail fast.
 
 3) **Cycles**  
-   Cycles are detected and reported. Cycles do **not** imply runtime failure
-   by themselves, but they must be visible to operators.
+Cycles are detected and reported. Cycles do **not** imply runtime failure
+by themselves, but they must be visible to operators.
+
+3.1) **Same token on input and output of one node (`consumes=[T], emits=[T]`)**  
+This creates a **self-loop** in the analytic DAG and is treated as a cycle.
+In practice this is a common corner case for transitional flows
+(e.g. an update step that receives and returns the same model).
+
+Resolution options:
+
+- introduce stage-specific model tokens (`DecisionIn` -> `DecisionOut`)
+- keep one model token, but use explicit `Envelope.target` contracts
+- keep a temporary runtime compatibility shim (migration-only, not final design)
 
 4) **Determinism**  
    When iterating nodes or edges, we use **discovery order** for stability.
@@ -142,6 +153,8 @@ router policies (max‑hops / retry limits).
 
 - A emits `X`, consumes `X`
 - Expect cycle reported (self-loop)
+- Note: runtime may still avoid accidental infinite loops via router self-loop protection
+  on **default fan-out**; explicit self-target is still possible by design.
 
 ### 6.4.2 Cycle: figure‑eight / overlapping cycles
 

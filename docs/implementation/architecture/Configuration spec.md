@@ -63,19 +63,11 @@ scenario:
 
 runtime:
   strict: true
-  tracing:
-    enabled: false
-  pipeline:
-    - parse_load_attempt
-    - compute_time_keys
-    - idempotency_gate
-    - compute_features
-    - evaluate_policies
-    - update_windows
-    - format_output
-    - write_output
   discovery_modules:
     - fund_load.usecases.steps
+    - fund_load.adapters.factories
+  tracing:
+    enabled: false
 
 nodes:
   compute_time_keys:
@@ -104,35 +96,21 @@ nodes:
 
 adapters:
   input_source:
-    factory: fund_load.adapters.factory:file_input_source
     settings:
       path: input.txt
-    binds:
-      - port_type: stream
-        type: fund_load.ports.input_source:InputSource
+    binds: [stream]
   output_sink:
-    factory: fund_load.adapters.factory:file_output_sink
     settings:
       path: output.txt
-    binds:
-      - port_type: stream
-        type: fund_load.ports.output_sink:OutputSink
+    binds: [stream]
   window_store:
-    factory: fund_load.adapters.factory:window_store_memory
     settings: {}
-    binds:
-      - port_type: kv
-        type: fund_load.ports.window_store:WindowReadPort
-      - port_type: kv
-        type: fund_load.ports.window_store:WindowWritePort
+    binds: [kv]
   prime_checker:
-    factory: fund_load.adapters.factory:prime_checker_stub
     settings:
       strategy: sieve
       max_id: 50000
-    binds:
-      - port_type: kv
-        type: fund_load.ports.prime_checker:PrimeChecker
+    binds: [kv]
 ```
 
 ## 3. Step registry and step configuration
@@ -157,22 +135,21 @@ Config references steps by name only. If a name is unknown — startup fails.
 Step configuration is expressed as:
 
 ```yaml
-pipeline:
-  steps:
-    - name: compute_features
-      params:
-        monday_multiplier: true
-        prime_gate: true
-
+nodes:
+  compute_features:
+    monday_multiplier:
+      enabled: true
+      multiplier: 2
 ```
 
 Semantics:
 
-- `params` are step-level knobs, but must map to explicit, documented parameters in the Step Spec.
-- If a step receives unknown `params`, startup fails.
+- node config entries must map to explicit, documented parameters in the Step Spec.
+- if a node receives unknown parameters, startup fails.
 
-Recommended: keep most parameters under dedicated sections (`features`, `policies`, `windows`)  
-and use `params` only for enabling/disabling sub-behavior inside a step.
+Recommended: keep parameters grouped inside each node config (e.g.
+`nodes.compute_features.*`, `nodes.evaluate_policies.*`) and avoid parallel
+top-level feature/policy blocks.
 
 ---
 

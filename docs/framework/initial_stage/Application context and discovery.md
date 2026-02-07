@@ -60,14 +60,14 @@ This becomes the replacement for `wiring.py`.
 Discovery will scan these project areas:
 
 - `usecases` (steps and services)
-- `adapters` (thin adapters tagged by flow/type)
+- `adapters` (thin adapters tagged by framework adapter metadata)
 
 The scan list is **explicit** (module paths from config) to avoid hidden
 imports. Example:
 
 ```yaml
-discovery:
-  modules:
+runtime:
+  discovery_modules:
     - example_app.usecases.steps
     - example_app.adapters
 ```
@@ -89,17 +89,25 @@ Marks a class/function as a pipeline node:
 
 Marks an adapter with:
 
-- `type`: file/kafka/redis/etc
-- `flow`: stream_source / stream_sink / kv_stream_source / kv_stream_sink / kv_store
+- `name`: stable adapter name used by discovery and config key matching
+- optional `kind`: internal classifier (not part of YAML contract)
+- `consumes/emits`: model contracts used by DAG/routing
+- optional helper mapping hook in code (raw transport payload -> emitted model)
 
 Adapters stay thin: validate/map, then delegate to framework infrastructure.
+
+Important config rule:
+
+- adapter YAML does **not** declare model/type strings;
+- adapter is selected by YAML key name (`adapters.<name>`);
+- YAML declares only `settings` and bound port types (`binds`).
 
 ---
 
 ## 5) Outcome: how wiring changes
 
 - `wiring.py` becomes a thin call to `ApplicationContext.discover(...)`.
-- Registry population is automatic based on decorators.
+- Registry population is automatic based on decorators (`@node`, `@adapter`).
 - Dependencies are resolved by name (e.g., `feature_checker`,
   `window_store`, `output_sink`).
 - Configuration is applied by the context, not by hand-coded lambdas.
@@ -135,11 +143,17 @@ Implementation tests: [tests/stream_kernel/application_context/test_application_
 
 2) **Context assembly**
    - data contracts are validated (`consumes/emits` are coherent).
-   - registry is built from discovered nodes.
+   - node registry is built from discovered nodes.
+   - adapter registry is built from discovered adapters (no factory path in YAML).
 
 3) **Scenario build**
    - step order matches config list (until DAG mode is introduced).
    - missing step in config produces a clear error.
+
+4) **Adapter discovery/config contract**
+   - unknown adapter name fails startup.
+   - supported adapter name resolves without explicit factory reference.
+   - adapter config contains no model/type class strings.
 
 ---
 

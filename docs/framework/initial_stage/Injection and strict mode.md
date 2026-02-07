@@ -31,12 +31,27 @@ Dependencies are resolved by **port type + data type**:
 class OrderEvent: ...
 class UserState: ...
 
-stream = inject.stream(OrderEvent)   # stream_source<OrderEvent>
-store = inject.kv(UserState)         # kv_store<UserState>
+stream = inject.stream(OrderEvent)   # stream<OrderEvent>
+store = inject.kv(UserState)         # kv<UserState>
 ```
 
 This allows the framework to keep ports generic while providing
 type-safe resolution. Resolution uses `(port_type, data_type)` as a key.
+
+Port types in the framework taxonomy:
+
+- `stream`
+- `kv_stream`
+- `kv`
+- `request`
+- `response`
+
+Current injection helpers in code expose:
+
+- `inject.stream(...)`
+- `inject.kv(...)`
+
+`request/response` helpers are planned for the next stage.
 
 Strict mode applies if no match is found.
 

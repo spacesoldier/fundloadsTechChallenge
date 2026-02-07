@@ -3,7 +3,7 @@ from __future__ import annotations
 # PrimeChecker port contract is documented in docs/implementation/ports/PrimeChecker.md.
 import pytest
 
-from fund_load.adapters.prime_checker import SievePrimeChecker
+from fund_load.adapters.services.prime_checker import SievePrimeChecker
 from fund_load.ports.prime_checker import PrimeChecker
 
 

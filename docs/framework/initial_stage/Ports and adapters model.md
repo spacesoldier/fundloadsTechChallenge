@@ -19,21 +19,25 @@ A port is a **pure abstraction** for data flow:
 - it does **not** depend on concrete transport
 - it exposes one of a few **minimal shapes**
 
-### 1.1 Stream ports (object flow)
+### 1.1 Stable port types
 
-Ports that move **models** (domain objects):
+The framework supports a stable minimal set of port types:
 
-- `stream_source` → yields models
-- `stream_sink` → accepts models
+- `stream` — ordered flow of models (object messages)
+- `kv_stream` — ordered flow of `(key, value)` pairs
+- `kv` — point state operations (`get/set/update`) for key/value state
+- `request` — request-side call boundary
+- `response` — response-side call boundary
 
-### 1.2 KV stream ports (key/value flow)
+`source`/`sink` are not port types; they are runtime roles inferred from adapter
+contracts (`consumes/emits`) and graph placement.
 
-Ports that move **key/value tuples**:
+### 1.2 Why this split
 
-- `kv_stream_source` → yields `(key, value)`
-- `kv_stream_sink` → accepts `(key, value)`
-
-This keeps port contracts simple and uniform.
+- `stream`/`kv_stream` are transport-flow contracts.
+- `kv` is state access, not event flow.
+- `request`/`response` prepare framework-level integration for REST/MCP/queue RPC
+  without leaking protocol details into nodes.
 
 ---
 
@@ -46,13 +50,50 @@ Adapters implement ports by talking to concrete systems:
 - Kafka
 - HTTP / MCP
 
-Adapters are **payload‑only**:
+Adapters are **payload-only**:
 
 - they do not know about `Envelope`
 - they do not do routing
 - they do not interpret business rules
 
 The framework wraps/unwraps payloads into `Envelope` at execution boundaries.
+
+### 2.1 Adapter identities come from framework discovery
+
+Adapter instances are selected by YAML key name (`adapters.<name>`) and resolved
+through framework discovery (`@adapter(name=...)`).
+Project-specific factory paths are not part of the public config contract.
+
+Initial file-oriented kinds:
+
+- `file.line_reader` — streaming line-by-line reader (large-file friendly)
+- `file.line_writer` — line-oriented writer
+
+Rationale:
+
+- "line" reflects Python's natural iterator-based file processing.
+- Large files are processed incrementally; no full-file buffering is required by default.
+
+### 2.2 No model/type strings in adapter config
+
+Adapter YAML config must not declare model types/tokens as strings.
+Type/model declarations stay in code (`@adapter`, mapping helpers), where
+refactoring is safer and static tooling can help.
+
+Config should describe only:
+
+- adapter `settings`
+- required `binds` by **port type** (not by model class name)
+
+Example:
+
+```yaml
+adapters:
+  input_source:
+    settings:
+      path: input.txt
+    binds: [stream]
+```
 
 ---
 
@@ -145,7 +186,7 @@ If multiple sources emit the same model:
 - merge via a scheduler (round‑robin, priority, or “as available”),
 - document the ordering policy (no implicit guarantees).
 
-### 5.5 Ack semantics (avoid node‑level ack)
+### 5.5 Ack semantics (avoid node-level ack)
 
 Ack should be handled by the **runtime/adapter boundary**, not by nodes:
 
@@ -157,35 +198,48 @@ Ack should be handled by the **runtime/adapter boundary**, not by nodes:
 
 ## 6) Test cases (TDD)
 
-### 6.1 Port shape enforcement
+### 6.1 Port taxonomy enforcement
 
-- stream ports accept model objects only
-- kv ports accept `(key, value)` tuples only
+- accepted port types are exactly: `stream`, `kv_stream`, `kv`, `request`, `response`
+- unknown port type in config fails fast
+- `kv_stream` payload contract validates tuple form `(key, value)`
+- `kv` contract validates point operations (no implicit iteration contract)
 
-### 6.2 Adapters are payload‑only
+### 6.2 Adapters are payload-only
 
 - adapter reads/writes models without Envelope
 - runner is responsible for wrapping into Envelope
 
-### 6.3 Routing to sink nodes
+### 6.3 Framework-only adapter identity validation
+
+- config with unsupported adapter name fails preflight
+- config with supported adapter name passes and instantiates adapter
+- discovery index resolves adapter by name without `factory` path
+
+### 6.4 No model strings in config
+
+- config containing model/class string for adapter contract is rejected
+- contract/type mapping is taken from code metadata (`@adapter` + helper mapping)
+
+### 6.5 Routing to sink nodes
 
 - model `M` emitted
 - sink node consumes `M` and writes to port
 - adapter never sees Envelope
 
-### 6.4 Async adapter facade
+### 6.6 Async adapter facade
 
 - node calls adapter synchronously
 - adapter executes async internally
 - node code stays sync
 
-### 6.5 Open‑end validation (missing adapters)
+### 6.7 Open-end validation (missing adapters)
 
 - graph has a consumed token with no provider
 - no source adapter emits it
 - expect build‑time error: “missing provider / missing adapter”
 
-### 6.6 Multiple sources scheduler policy
+### 6.8 Multiple sources scheduler policy
 
 - two source adapters emit the same model
 - scheduler is round‑robin/priority/as‑available
@@ -193,8 +247,9 @@ Ack should be handled by the **runtime/adapter boundary**, not by nodes:
 
 ---
 
-## 7) Implementation references (to be added)
+## 7) Implementation references
 
-- `stream_kernel.integration` (ports + adapters)
+- `stream_kernel.adapters` (adapter metadata/registry, platform file adapters)
+- `stream_kernel.integration` (work queue, context store, routing port)
 - `stream_kernel.routing` (Envelope + Router)
 - `stream_kernel.execution` (runner + planning)

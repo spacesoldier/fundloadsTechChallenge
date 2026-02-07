@@ -10,6 +10,7 @@ runtime:
     enabled: false
   discovery_modules:
     - fund_load.usecases.steps
+    - fund_load.adapters.factories
 
 nodes:
   compute_time_keys:
@@ -47,32 +48,22 @@ nodes:
 
 adapters:
   input_source:
-    factory: fund_load.adapters.factory:file_input_source
     settings:
       path: input.txt
     binds:
-      - port_type: stream
-        type: fund_load.ports.input_source:InputSource
+      - stream
   output_sink:
-    factory: fund_load.adapters.factory:file_output_sink
     settings:
       path: output_exp_mp.txt
     binds:
-      - port_type: stream
-        type: fund_load.ports.output_sink:OutputSink
+      - stream
   window_store:
-    factory: fund_load.adapters.factory:window_store_memory
     settings: {}
     binds:
-      - port_type: kv
-        type: fund_load.ports.window_store:WindowReadPort
-      - port_type: kv
-        type: fund_load.ports.window_store:WindowWritePort
+      - kv
   prime_checker:
-    factory: fund_load.adapters.factory:prime_checker_stub
     settings:
       strategy: sieve
       max_id: 50000
     binds:
-      - port_type: kv
-        type: fund_load.ports.prime_checker:PrimeChecker
+      - kv

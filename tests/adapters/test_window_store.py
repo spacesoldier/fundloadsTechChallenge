@@ -4,7 +4,7 @@ from datetime import date
 from decimal import Decimal
 
 # WindowStore behavior is specified in docs/implementation/ports/WindowStore.md.
-from fund_load.adapters.window_store import InMemoryWindowStore
+from fund_load.adapters.state.window_store import InMemoryWindowStore
 from fund_load.domain.money import Money
 
 

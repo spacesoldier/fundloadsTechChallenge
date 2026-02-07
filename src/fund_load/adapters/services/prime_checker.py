@@ -67,3 +67,4 @@ def _is_prime_trial_division(n: int) -> bool:
         if n % d == 0:
             return False
     return True
+

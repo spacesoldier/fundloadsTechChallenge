@@ -28,9 +28,8 @@ def test_validate_newgen_config_happy_path() -> None:
         },
         "adapters": {
             "output_sink": {
-                "factory": "example.adapters:output_sink",
                 "settings": {"path": "output.txt"},
-                "binds": [{"port_type": "stream", "type": "example.ports:OutputSink"}],
+                "binds": ["stream"],
             }
         },
     }
@@ -67,19 +66,32 @@ def test_validate_newgen_config_requires_discovery_modules_list() -> None:
         "scenario": {"name": "baseline"},
         "runtime": {"discovery_modules": "not-a-list"},
         "nodes": {},
-        "adapters": {"output_sink": {"factory": "x", "binds": []}},
+        "adapters": {"output_sink": {"binds": []}},
     }
     with pytest.raises(ConfigError):
         validate_newgen_config(raw)
 
 
-def test_validate_newgen_config_requires_adapter_factory() -> None:
+def test_validate_newgen_config_rejects_output_sink_kind_field() -> None:
     raw = {
         "version": 1,
         "scenario": {"name": "baseline"},
         "runtime": {"discovery_modules": ["example.steps"]},
         "nodes": {},
-        "adapters": {"output_sink": {"binds": []}},
+        "adapters": {"output_sink": {"kind": "file.line_writer", "binds": []}},
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_adapter_factory_field() -> None:
+    # Factory paths are removed from config contract; adapters are resolved by kind via discovery/registry.
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {"discovery_modules": ["example.steps"]},
+        "nodes": {},
+        "adapters": {"output_sink": {"factory": "x", "binds": []}},
     }
     with pytest.raises(ConfigError):
         validate_newgen_config(raw)
@@ -91,7 +103,7 @@ def test_validate_newgen_config_requires_adapter_binds_list() -> None:
         "scenario": {"name": "baseline"},
         "runtime": {"discovery_modules": ["example.steps"]},
         "nodes": {},
-        "adapters": {"output_sink": {"factory": "x", "binds": "nope"}},
+        "adapters": {"output_sink": {"binds": "nope"}},
     }
     with pytest.raises(ConfigError):
         validate_newgen_config(raw)
@@ -104,7 +116,7 @@ def test_validate_newgen_config_requires_runtime_mapping() -> None:
         "scenario": {"name": "baseline"},
         "runtime": "nope",
         "nodes": {},
-        "adapters": {"output_sink": {"factory": "x", "binds": []}},
+        "adapters": {"output_sink": {"binds": []}},
     }
     with pytest.raises(ConfigError):
         validate_newgen_config(raw)
@@ -116,7 +128,7 @@ def test_validate_newgen_config_requires_nodes_mapping() -> None:
         "version": 1,
         "scenario": {"name": "baseline"},
         "nodes": "nope",
-        "adapters": {"output_sink": {"factory": "x", "binds": []}},
+        "adapters": {"output_sink": {"binds": []}},
     }
     with pytest.raises(ConfigError):
         validate_newgen_config(raw)
@@ -138,7 +150,7 @@ def test_validate_newgen_config_requires_output_sink_settings_mapping() -> None:
     raw = {
         "version": 1,
         "scenario": {"name": "baseline"},
-        "adapters": {"output_sink": {"factory": "x", "binds": [], "settings": "nope"}},
+        "adapters": {"output_sink": {"binds": [], "settings": "nope"}},
     }
     with pytest.raises(ConfigError):
         validate_newgen_config(raw)
@@ -149,7 +161,7 @@ def test_validate_newgen_config_defensive_output_sink_type_check(monkeypatch: py
     raw = {
         "version": 1,
         "scenario": {"name": "baseline"},
-        "adapters": {"output_sink": {"factory": "x", "binds": []}},
+        "adapters": {"output_sink": {"binds": []}},
     }
 
     def _require_mapping(root: dict[str, object], key: str) -> dict[str, object]:
@@ -159,5 +171,42 @@ def test_validate_newgen_config_defensive_output_sink_type_check(monkeypatch: py
 
     monkeypatch.setattr("stream_kernel.config.validator._require_mapping", _require_mapping)
 
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_non_string_bind_entry() -> None:
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {"discovery_modules": ["example.steps"]},
+        "nodes": {},
+        "adapters": {"output_sink": {"binds": [{"port_type": "stream"}]}},
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+@pytest.mark.parametrize("port_type", ["stream", "kv_stream", "kv", "request", "response"])
+def test_validate_newgen_config_accepts_stable_bind_port_types(port_type: str) -> None:
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {"discovery_modules": ["example.steps"]},
+        "nodes": {},
+        "adapters": {"output_sink": {"binds": [port_type]}},
+    }
+    validated = validate_newgen_config(raw)
+    assert validated["adapters"]["output_sink"]["binds"] == [port_type]
+
+
+def test_validate_newgen_config_rejects_unknown_bind_port_type() -> None:
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {"discovery_modules": ["example.steps"]},
+        "nodes": {},
+        "adapters": {"output_sink": {"binds": ["custom_port"]}},
+    }
     with pytest.raises(ConfigError):
         validate_newgen_config(raw)

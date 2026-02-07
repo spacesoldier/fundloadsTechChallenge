@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 # Config injection is described in docs/framework/initial_stage/Injection and strict mode.md.
-from fund_load.adapters.window_store import InMemoryWindowStore
+from fund_load.adapters.state.window_store import InMemoryWindowStore
 from fund_load.ports.prime_checker import PrimeChecker
 from fund_load.ports.window_store import WindowReadPort, WindowWritePort
 from fund_load.usecases.steps.compute_features import ComputeFeatures

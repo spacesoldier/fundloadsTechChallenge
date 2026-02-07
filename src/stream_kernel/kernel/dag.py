@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 
@@ -34,12 +34,10 @@ class Dag:
     edges: list[tuple[str, str]]
 
 
-def build_dag(contracts: Sequence[NodeContract], *, external_tokens: Iterable[type] | None = None) -> Dag:
+def build_dag(contracts: Sequence[NodeContract]) -> Dag:
     # Build a DAG from consumes/emits contracts (docs/framework/initial_stage/DAG construction.md).
     if not contracts:
         return Dag(nodes=[], edges=[])
-
-    external = set(external_tokens or [])
 
     # Enforce non-empty consumes for non-source nodes.
     for contract in contracts:
@@ -58,9 +56,9 @@ def build_dag(contracts: Sequence[NodeContract], *, external_tokens: Iterable[ty
         for token in contract.consumes:
             consumers.setdefault(token, []).append(contract.name)
 
-    # Verify every consumed token has at least one provider (unless external).
+    # Verify every consumed token has at least one provider.
     for token, consumer_names in consumers.items():
-        if token not in providers and token not in external:
+        if token not in providers:
             raise MissingProviderError(f"Token '{token.__name__}' has no providers for consumers {consumer_names}")
 
     # Build edges in deterministic order (discovery order).

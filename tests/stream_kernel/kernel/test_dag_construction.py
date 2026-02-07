@@ -28,42 +28,38 @@ class W:
     pass
 
 
-class Input:
-    pass
-
-
 def test_dag_fanout_edges_are_created() -> None:
     # Fan-out: one provider to many consumers (DAG construction §6.1).
     nodes = [
-        NodeContract(name="Source", consumes=[Input], emits=[Y]),
+        NodeContract(name="Source", consumes=[], emits=[Y]),
         NodeContract(name="A", consumes=[Y], emits=[X]),
         NodeContract(name="B", consumes=[X], emits=[]),
         NodeContract(name="C", consumes=[X], emits=[]),
     ]
-    dag = build_dag(nodes, external_tokens=[Input])
+    dag = build_dag(nodes)
     assert dag.edges == [("Source", "A"), ("A", "B"), ("A", "C")]
 
 
 def test_dag_fanin_edges_are_created() -> None:
     # Fan-in: many providers to one consumer (DAG construction §6.2).
     nodes = [
-        NodeContract(name="Source", consumes=[Input], emits=[Y]),
+        NodeContract(name="Source", consumes=[], emits=[Y]),
         NodeContract(name="A", consumes=[Y], emits=[X]),
         NodeContract(name="B", consumes=[Y], emits=[X]),
         NodeContract(name="C", consumes=[X], emits=[]),
     ]
-    dag = build_dag(nodes, external_tokens=[Input])
+    dag = build_dag(nodes)
     assert dag.edges == [("Source", "A"), ("Source", "B"), ("A", "C"), ("B", "C")]
 
 
 def test_dag_multiple_consumes_collapses_duplicate_edges() -> None:
     # Multiple consumes on the same node should not duplicate edges (DAG construction §6.2.1).
     nodes = [
-        NodeContract(name="Source", consumes=[Input], emits=[Z]),
+        NodeContract(name="Source", consumes=[], emits=[Z]),
         NodeContract(name="A", consumes=[Z], emits=[X, Y]),
         NodeContract(name="B", consumes=[X, Y], emits=[]),
     ]
-    dag = build_dag(nodes, external_tokens=[Input])
+    dag = build_dag(nodes)
     assert dag.edges == [("Source", "A"), ("A", "B")]
 
 

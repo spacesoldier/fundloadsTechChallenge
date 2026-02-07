@@ -4,33 +4,36 @@ import importlib
 import warnings
 from datetime import UTC, datetime
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Any
 
 from fund_load.adapters.trace_sinks import JsonlTraceSink, StdoutTraceSink
 from fund_load.ports.trace_sink import TraceSink
+from stream_kernel.adapters.discovery import discover_adapters
 from stream_kernel.adapters.registry import AdapterRegistry
 from stream_kernel.app.cli import apply_cli_overrides, parse_args
 from stream_kernel.application_context import ApplicationContext
 from stream_kernel.application_context.injection_registry import InjectionRegistry
 from stream_kernel.config.loader import load_yaml_config
 from stream_kernel.config.validator import validate_newgen_config
+from stream_kernel.execution.planning import build_execution_plan
 from stream_kernel.execution.runner import SyncRunner
 from stream_kernel.integration.context_store import InMemoryContextStore
 from stream_kernel.integration.routing_port import RoutingPort
 from stream_kernel.integration.work_queue import InMemoryWorkQueue
 from stream_kernel.kernel.context import Context, ContextFactory
-from stream_kernel.kernel.trace import ErrorInfo, MessageSignature, TraceRecord, TraceRecorder
+from stream_kernel.kernel.dag import NodeContract
 from stream_kernel.kernel.scenario import StepSpec
+from stream_kernel.kernel.trace import ErrorInfo, MessageSignature, TraceRecord, TraceRecorder
 from stream_kernel.routing.envelope import Envelope
 
 
 def run_with_config(
     config: dict[str, object],
     *,
-    adapter_registry: AdapterRegistry,
-    adapter_bindings: dict[str, object],
-    discovery_modules: list[str],
+    adapter_registry: AdapterRegistry | None = None,
+    adapter_bindings: dict[str, object] | None = None,
+    discovery_modules: list[str] | None = None,
     argv_overrides: dict[str, str] | None = None,
     run_id: str = "run",
 ) -> int:
@@ -47,13 +50,30 @@ def run_with_config(
     runtime = config.get("runtime", {})
     if not isinstance(runtime, dict):
         raise ValueError("runtime must be a mapping")
-    pipeline = runtime.get("pipeline")
-    if not isinstance(pipeline, list) or not all(isinstance(name, str) for name in pipeline):
-        raise ValueError("runtime.pipeline must be a list of step names")
+    _reject_runtime_pipeline(runtime)
+    if discovery_modules is None:
+        discovered_modules = runtime.get("discovery_modules", [])
+        if not isinstance(discovered_modules, list) or not all(
+            isinstance(item, str) for item in discovered_modules
+        ):
+            raise ValueError("runtime.discovery_modules must be a list of strings")
+        discovery_modules = discovered_modules
 
     adapters = config.get("adapters", {})
     if not isinstance(adapters, dict):
         raise ValueError("adapters must be a mapping")
+
+    if adapter_registry is None and adapter_bindings is not None:
+        raise ValueError("adapter_bindings override requires adapter_registry override")
+    if adapter_registry is None:
+        adapter_registry, resolved_bindings = _resolve_runtime_adapters(
+            adapters=adapters,
+            discovery_modules=discovery_modules,
+        )
+        if adapter_bindings is None:
+            adapter_bindings = resolved_bindings
+    if adapter_bindings is None:
+        adapter_bindings = _build_adapter_bindings(adapters, adapter_registry)
 
     adapter_instances = _build_adapter_instances_from_registry(adapters, adapter_registry)
     # Build injection registry from provided bindings using shared adapter instances.
@@ -62,12 +82,18 @@ def run_with_config(
     ctx = ApplicationContext()
     modules = [importlib.import_module(name) for name in discovery_modules]
     ctx.discover(modules)
+    adapter_contracts = _build_adapter_contracts(adapters, adapter_registry=adapter_registry)
+    dag = ctx.preflight(
+        strict=bool(runtime.get("strict", True)),
+        extra_contracts=adapter_contracts,
+    )
     consumer_registry = ctx.build_consumer_registry()
+    step_names = _resolve_step_names(dag)
 
     scenario_name = _scenario_name(config)
     scenario = ctx.build_scenario(
         scenario_id=scenario_name,
-        step_names=pipeline,
+        step_names=step_names,
         wiring={
             "injection_registry": injection_registry,
             "consumer_registry": consumer_registry,
@@ -76,17 +102,15 @@ def run_with_config(
         },
     )
 
-    # Input is provided by adapter role "input_source".
-    input_source = adapter_instances.get("input_source")
-    if input_source is None:
-        raise ValueError("adapters.input_source must be configured")
-    inputs = input_source.read()
+    # Source bootstrap: any read-capable adapter can provide input payloads.
+    inputs = _read_inputs_from_sources(adapter_instances)
 
     trace_recorder, trace_sink = _build_tracing(runtime)
     _emit_implicit_sink_diagnostics(
         config,
         scenario.steps,
         adapter_instances=adapter_instances,
+        adapter_registry=adapter_registry,
         trace_recorder=trace_recorder,
         trace_sink=trace_sink,
         run_id=run_id,
@@ -127,73 +151,70 @@ def run_with_registry(
 
 
 def run(argv: list[str] | None) -> int:
-    # Generic framework entrypoint using adapter factories declared in config.
+    # Generic framework entrypoint using discovered adapter kinds from config.
     args = parse_args(argv or [])
     config = validate_newgen_config(load_yaml_config(Path(args.config)))
     apply_cli_overrides(config, args)
+    return run_with_config(config, argv_overrides=None, run_id="run")
 
-    runtime = config.get("runtime", {})
-    if not isinstance(runtime, dict):
-        raise ValueError("runtime must be a mapping")
-    discovery = runtime.get("discovery_modules", [])
-    if not isinstance(discovery, list) or not all(isinstance(item, str) for item in discovery):
-        raise ValueError("runtime.discovery_modules must be a list of strings")
 
-    adapters = config.get("adapters", {})
-    if not isinstance(adapters, dict):
-        raise ValueError("adapters must be a mapping")
+def _resolve_runtime_adapters(
+    *,
+    adapters: dict[str, object],
+    discovery_modules: list[str],
+) -> tuple[AdapterRegistry, dict[str, object]]:
+    # Discover adapters by name and bind them to equally named YAML roles.
+    modules = [importlib.import_module(name) for name in discovery_modules]
+    discovered = discover_adapters(modules)
 
-    instances = _build_adapter_instances(adapters)
-    injection_registry = _build_injection_registry(adapters, instances)
+    registry = AdapterRegistry()
+    for role, cfg in adapters.items():
+        if not isinstance(cfg, dict):
+            raise ValueError(f"adapters.{role} must be a mapping")
+        if "kind" in cfg:
+            raise ValueError(
+                f"adapters.{role}.kind is not supported; adapter name is defined by adapters.{role}"
+            )
+        factory = discovered.get(role)
+        if factory is None:
+            raise ValueError(f"Unknown adapter name: {role}")
+        # Reuse role as registry key-kind to keep AdapterRegistry API unchanged.
+        registry.register(role, role, factory)
 
-    ctx = ApplicationContext()
-    modules = [importlib.import_module(name) for name in discovery]
-    ctx.discover(modules)
-    consumer_registry = ctx.build_consumer_registry()
+    bindings = _build_adapter_bindings(adapters, registry)
+    return registry, bindings
 
-    scenario_name = _scenario_name(config)
-    pipeline = runtime.get("pipeline")
-    if not isinstance(pipeline, list) or not all(isinstance(name, str) for name in pipeline):
-        raise ValueError("runtime.pipeline must be a list of step names")
 
-    scenario = ctx.build_scenario(
-        scenario_id=scenario_name,
-        step_names=pipeline,
-        wiring={
-            "injection_registry": injection_registry,
-            "consumer_registry": consumer_registry,
-            "config": config,
-            "strict": bool(runtime.get("strict", True)),
-        },
-    )
+def _build_adapter_bindings(
+    adapters: dict[str, object],
+    registry: AdapterRegistry,
+) -> dict[str, object]:
+    # Convert config binds (stable port names) into typed injection bindings from adapter metadata.
+    bindings: dict[str, object] = {}
+    for role, cfg in adapters.items():
+        if not isinstance(cfg, dict):
+            continue
+        meta = registry.get_meta(role, role)
+        if meta is None:
+            continue
 
-    input_source = instances.get("input_source")
-    if input_source is None:
-        raise ValueError("adapters.input_source must be configured")
+        requested = cfg.get("binds", [])
+        if not isinstance(requested, list):
+            raise ValueError(f"adapters.{role}.binds must be a list")
+        if not all(isinstance(item, str) for item in requested):
+            raise ValueError(f"adapters.{role}.binds entries must be strings")
 
-    trace_recorder, trace_sink = _build_tracing(runtime)
-    _emit_implicit_sink_diagnostics(
-        config,
-        scenario.steps,
-        adapter_instances=instances,
-        trace_recorder=trace_recorder,
-        trace_sink=trace_sink,
-        run_id="run",
-        scenario_id=scenario_name,
-    )
-    strict = bool(runtime.get("strict", True))
-    inputs = input_source.read()
-    _run_with_sync_runner(
-        scenario=scenario,
-        inputs=inputs,
-        consumer_registry=consumer_registry,
-        strict=strict,
-        run_id="run",
-        scenario_id=scenario_name,
-        trace_recorder=trace_recorder,
-        trace_sink=trace_sink,
-    )
-    return 0
+        resolved: list[tuple[str, type[Any]]] = []
+        for port_type in requested:
+            matches = [(ptype, dtype) for (ptype, dtype) in meta.binds if ptype == port_type]
+            if not matches:
+                raise ValueError(
+                    f"adapters.{role}.binds includes unsupported port_type '{port_type}' for adapter '{role}'"
+                )
+            resolved.extend(matches)
+        if resolved:
+            bindings[role] = resolved
+    return bindings
 
 
 def _run_with_sync_runner(
@@ -227,20 +248,35 @@ def _run_with_sync_runner(
         context_store=context_store,
         routing_port=routing_port,
     )
-    first_step = scenario.steps[0].name if scenario.steps else None
-    if first_step is None:
-        return
 
-    # Preserve legacy semantics: each input message is processed end-to-end before next input.
+    # Preserve deterministic semantics: each input message is processed end-to-end before next input.
     for index, payload in enumerate(inputs, start=1):
         trace_id = _trace_id(run_id, payload, index)
         context_store.put(trace_id, _initial_context(payload, trace_id))
-        work_queue.push(Envelope(payload=payload, target=first_step, trace_id=trace_id))
+        deliveries = routing_port.route([payload])
+        for target_name, routed_payload in deliveries:
+            work_queue.push(Envelope(payload=routed_payload, target=target_name, trace_id=trace_id))
         runner.run()
     if trace_sink is not None:
         # Mirror legacy runner behavior: flush/close trace sink at end of run.
         trace_sink.flush()
         trace_sink.close()
+
+
+def _read_inputs_from_sources(adapter_instances: dict[str, object]) -> list[object]:
+    # Build deterministic startup payload list from read-capable adapters.
+    payloads: list[object] = []
+    source_roles: list[str] = []
+    for role in sorted(adapter_instances.keys()):
+        adapter = adapter_instances[role]
+        read = getattr(adapter, "read", None)
+        if not callable(read):
+            continue
+        source_roles.append(role)
+        payloads.extend(read())
+    if not source_roles:
+        raise ValueError("at least one source adapter with read() must be configured")
+    return payloads
 
 
 def _build_targeted_nodes(
@@ -252,12 +288,11 @@ def _build_targeted_nodes(
     trace_sink: TraceSink | None,
     trace_contexts: dict[str, Context],
 ) -> dict[str, object]:
-    # Preserve configured pipeline order by auto-targeting each step to the next step.
+    # Wrap scenario steps for tracing while preserving native routing semantics.
+    # Actual fan-out/target resolution is handled by Router via consumes/emits contracts.
     nodes: dict[str, object] = {}
     for idx, spec in enumerate(step_specs):
-        next_name = step_specs[idx + 1].name if idx + 1 < len(step_specs) else None
-
-        def _make_step(step: object, step_name: str, step_index: int, downstream: str | None):
+        def _make_step(step: object, step_name: str, step_index: int):
             def _wrapped(msg: object, ctx: object | None) -> list[object]:
                 raw_ctx = ctx if isinstance(ctx, dict) else {}
                 node_ctx = _node_ctx(raw_ctx)
@@ -315,31 +350,65 @@ def _build_targeted_nodes(
                     )
                     if trace_sink is not None:
                         trace_sink.emit(record)
-
-                if downstream is None:
-                    return outputs
-                routed: list[object] = []
-                for item in outputs:
-                    if isinstance(item, Envelope):
-                        if item.target is None:
-                            routed.append(
-                                Envelope(
-                                    payload=item.payload,
-                                    trace_id=item.trace_id,
-                                    target=downstream,
-                                    topic=item.topic,
-                                )
-                            )
-                        else:
-                            routed.append(item)
-                        continue
-                    routed.append(Envelope(payload=item, target=downstream))
-                return routed
+                return outputs
 
             return _wrapped
 
-        nodes[spec.name] = _make_step(spec.step, spec.name, idx, next_name)
+        nodes[spec.name] = _make_step(spec.step, spec.name, idx)
     return nodes
+
+
+def _resolve_step_names(dag: object | None) -> list[str]:
+    # Runtime order is execution-plan driven and derived from DAG contracts.
+    if dag is None:
+        return []
+    if not hasattr(dag, "nodes") or not hasattr(dag, "edges"):
+        raise ValueError("preflight must return a Dag-like object with nodes and edges")
+    # Adapter contracts participate in DAG validation but are not executable scenario steps.
+    return [name for name in build_execution_plan(dag) if not name.startswith("adapter:")]
+
+
+def _build_adapter_contracts(
+    adapters: dict[str, object],
+    *,
+    adapter_registry: AdapterRegistry | None,
+) -> list[NodeContract]:
+    # Adapter contracts model source/sink edges in preflight DAG.
+    # Contracts are sourced from @adapter metadata on factory callables.
+    contracts: list[NodeContract] = []
+    for role, cfg in adapters.items():
+        if not isinstance(cfg, dict):
+            continue
+        meta = _resolve_adapter_meta(role, cfg, adapter_registry=adapter_registry)
+        if meta is None:
+            continue
+        consumes = list(meta.consumes)
+        emits = list(meta.emits)
+        if not consumes and not emits:
+            continue
+        contracts.append(NodeContract(name=f"adapter:{role}", consumes=consumes, emits=emits))
+    return contracts
+
+
+def _resolve_adapter_meta(
+    role: str,
+    cfg: dict[str, object],
+    *,
+    adapter_registry: AdapterRegistry | None,
+):
+    # Resolve adapter metadata from AdapterRegistry role/kind registrations.
+    if adapter_registry is not None:
+        meta = adapter_registry.get_meta(role, role)
+        if meta is not None:
+            return meta
+    return None
+
+
+def _reject_runtime_pipeline(runtime: dict[str, object]) -> None:
+    if "pipeline" in runtime:
+        raise ValueError(
+            "runtime.pipeline is no longer supported; rely on consumes/emits routing contracts"
+        )
 
 
 def _trace_id(run_id: str, payload: object, index: int) -> str:
@@ -377,36 +446,6 @@ def _node_ctx(ctx: dict[str, object]) -> dict[str, object]:
     return {key: value for key, value in ctx.items() if not key.startswith("__")}
 
 
-def _resolve_symbol(path: str) -> object:
-    # Resolve "module:attr" or "module.attr" to a Python object.
-    if ":" in path:
-        module_name, attr = path.split(":", 1)
-    else:
-        module_name, _, attr = path.rpartition(".")
-    if not module_name or not attr:
-        raise ValueError(f"Invalid symbol path: {path}")
-    module: ModuleType = importlib.import_module(module_name)
-    return getattr(module, attr)
-
-
-def _build_adapter_instances(adapters: dict[str, object]) -> dict[str, object]:
-    instances: dict[str, object] = {}
-    for role, cfg in adapters.items():
-        if not isinstance(cfg, dict):
-            raise ValueError(f"adapters.{role} must be a mapping")
-        factory_path = cfg.get("factory")
-        if not isinstance(factory_path, str):
-            raise ValueError(f"adapters.{role}.factory must be a string")
-        settings = cfg.get("settings", {})
-        if not isinstance(settings, dict):
-            raise ValueError(f"adapters.{role}.settings must be a mapping")
-        factory = _resolve_symbol(factory_path)
-        if not callable(factory):
-            raise ValueError(f"adapters.{role}.factory must be callable")
-        instances[role] = factory(settings)
-    return instances
-
-
 def _build_adapter_instances_from_registry(
     adapters: dict[str, object],
     registry: AdapterRegistry,
@@ -416,7 +455,10 @@ def _build_adapter_instances_from_registry(
     for role, cfg in adapters.items():
         if not isinstance(cfg, dict):
             raise ValueError(f"adapters.{role} must be a mapping")
-        instances[role] = registry.build(role, cfg)
+        # New contract: adapter is selected by YAML role name; bridge to registry API via implicit kind=role.
+        effective_cfg = dict(cfg)
+        effective_cfg.setdefault("kind", role)
+        instances[role] = registry.build(role, effective_cfg)
     return instances
 
 
@@ -439,34 +481,12 @@ def _build_injection_registry_from_bindings(
     return injection
 
 
-def _build_injection_registry(
-    adapters: dict[str, object],
-    instances: dict[str, object],
-) -> InjectionRegistry:
-    injection = InjectionRegistry()
-    for role, cfg in adapters.items():
-        if not isinstance(cfg, dict):
-            continue
-        binds = cfg.get("binds", [])
-        if not isinstance(binds, list):
-            raise ValueError(f"adapters.{role}.binds must be a list")
-        adapter = instances.get(role)
-        for bind in binds:
-            if not isinstance(bind, dict):
-                raise ValueError(f"adapters.{role}.binds entries must be mappings")
-            port_type = bind.get("port_type")
-            type_path = bind.get("type")
-            if not isinstance(port_type, str) or not isinstance(type_path, str):
-                raise ValueError(f"adapters.{role}.binds entries must define port_type and type")
-            port_cls = _resolve_symbol(type_path)
-            injection.register_factory(port_type, port_cls, lambda _a=adapter: _a)
-    return injection
-
-
 def _detect_implicit_sinks(
     adapters: dict[str, object],
     adapter_instances: dict[str, object],
     steps: list[StepSpec],
+    *,
+    adapter_registry: AdapterRegistry | None,
 ) -> list[tuple[str, list[type[object]]]]:
     # Identify adapters that consume models but are not injected into any node.
     implicit: list[tuple[str, list[type[object]]]] = []
@@ -475,7 +495,10 @@ def _detect_implicit_sinks(
     for role, cfg in adapters.items():
         if not isinstance(cfg, dict):
             continue
-        consumes = _resolve_consumes(cfg.get("consumes"))
+        meta = _resolve_adapter_meta(role, cfg, adapter_registry=adapter_registry)
+        if meta is None:
+            continue
+        consumes = list(meta.consumes)
         if not consumes:
             continue
         adapter = adapter_instances.get(role)
@@ -493,6 +516,7 @@ def _emit_implicit_sink_diagnostics(
     steps: list[StepSpec],
     *,
     adapter_instances: dict[str, object],
+    adapter_registry: AdapterRegistry | None,
     trace_recorder: TraceRecorder | None,
     trace_sink: TraceSink | None,
     run_id: str,
@@ -502,7 +526,12 @@ def _emit_implicit_sink_diagnostics(
     adapters = config.get("adapters", {})
     if not isinstance(adapters, dict):
         return
-    implicit = _detect_implicit_sinks(adapters, adapter_instances, steps)
+    implicit = _detect_implicit_sinks(
+        adapters,
+        adapter_instances,
+        steps,
+        adapter_registry=adapter_registry,
+    )
     if not implicit:
         return
 
@@ -514,22 +543,6 @@ def _emit_implicit_sink_diagnostics(
             continue
         trace_sink.emit(_diagnostic_record(note, run_id=run_id, scenario_id=scenario_id))
 
-
-def _resolve_consumes(raw: object) -> list[type[object]]:
-    # Resolve adapter consumes list (string paths or types).
-    if raw is None:
-        return []
-    if not isinstance(raw, list):
-        raise ValueError("adapter consumes must be a list")
-    tokens: list[type[object]] = []
-    for item in raw:
-        if isinstance(item, type):
-            tokens.append(item)
-        elif isinstance(item, str):
-            tokens.append(_resolve_symbol(item))
-        else:
-            raise ValueError("adapter consumes entries must be types or import paths")
-    return tokens
 
 
 def _collect_used_adapters(steps: list[StepSpec]) -> set[int]:

@@ -60,3 +60,4 @@ def _money_from_cents(cents: int) -> Money:
     # Convert back to Money for snapshot consumers.
     value = (Decimal(cents) / Decimal(100)).quantize(Decimal("0.01"))
     return Money(currency="USD", amount=value)
+

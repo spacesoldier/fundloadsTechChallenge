@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 # WriteOutput behavior is specified in docs/implementation/steps/08 WriteOutput.md.
-from fund_load.adapters.output_sink import FileOutputSink
+from stream_kernel.adapters.file_io import FileOutputSink
 from fund_load.usecases.messages import OutputLine
 from fund_load.usecases.steps.write_output import WriteOutput
 

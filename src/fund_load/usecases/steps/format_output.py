@@ -3,16 +3,16 @@ from __future__ import annotations
 import json
 from collections import OrderedDict
 
-from fund_load.usecases.messages import Decision, OutputLine
+from fund_load.usecases.messages import OutputLine, WindowedDecision
 from stream_kernel.kernel.node import node
 
 
 # Discovery: register step name for pipeline assembly (docs/implementation/steps/07 FormatOutput.md).
 # consumes/emits are used for DAG construction (docs/framework/initial_stage/DAG construction.md).
-@node(name="format_output", consumes=[Decision], emits=[OutputLine])
+@node(name="format_output", consumes=[WindowedDecision], emits=[OutputLine])
 class FormatOutput:
     # Step 07 formats Decision into JSON with deterministic key order (docs/implementation/steps/07 FormatOutput.md).
-    def __call__(self, msg: Decision, ctx: object | None) -> list[OutputLine]:
+    def __call__(self, msg: WindowedDecision, ctx: object | None) -> list[OutputLine]:
         # Only id, customer_id, accepted are emitted; internal fields are ignored.
         # We preserve the reference output order (id, customer_id, accepted) explicitly.
         payload = OrderedDict(

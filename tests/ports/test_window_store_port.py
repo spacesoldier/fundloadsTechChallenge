@@ -6,7 +6,7 @@ from decimal import Decimal
 import pytest
 
 # WindowStore port contract is documented in docs/implementation/ports/WindowStore.md.
-from fund_load.adapters.window_store import InMemoryWindowStore
+from fund_load.adapters.state.window_store import InMemoryWindowStore
 from fund_load.domain.money import Money
 from fund_load.ports.window_store import WindowReadPort, WindowWritePort
 

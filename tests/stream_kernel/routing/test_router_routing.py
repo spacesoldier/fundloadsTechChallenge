@@ -68,3 +68,33 @@ def test_router_raises_on_unknown_target_in_strict_mode() -> None:
     payload = X("x")
     with pytest.raises(ValueError):
         router.route([Envelope(payload=payload, target="Missing")])
+
+
+def test_router_excludes_source_from_default_fanout() -> None:
+    # To avoid accidental self-loops, source node is excluded from default fan-out.
+    router = _router()
+    payload = X("x")
+    deliveries = router.route([payload], source="B")
+    assert deliveries == [("C", payload)]
+
+
+def test_router_allows_explicit_self_target_even_with_source_filter() -> None:
+    # Explicit target must still allow self-delivery; source filter is default-fanout only.
+    router = _router()
+    payload = X("x")
+    deliveries = router.route([Envelope(payload=payload, target="B")], source="B")
+    assert deliveries == [("B", payload)]
+
+
+def test_router_requires_explicit_target_for_self_loop_in_strict_mode() -> None:
+    # If source-filter removes the only consumer, strict mode should fail and require explicit target.
+    router = Router(consumers={X: ["B"]}, strict=True)
+    with pytest.raises(ValueError):
+        router.route([X("x")], source="B")
+
+
+def test_router_drops_self_loop_without_target_in_non_strict_mode() -> None:
+    # Non-strict mode may drop ambiguous self-loop candidates when no other consumers remain.
+    router = Router(consumers={X: ["B"]}, strict=False)
+    deliveries = router.route([X("x")], source="B")
+    assert deliveries == []

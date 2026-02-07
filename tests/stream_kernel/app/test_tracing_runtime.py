@@ -22,17 +22,9 @@ scenario:
   name: baseline
 runtime:
   strict: true
-  pipeline:
-    - parse_load_attempt
-    - compute_time_keys
-    - idempotency_gate
-    - compute_features
-    - evaluate_policies
-    - update_windows
-    - format_output
-    - write_output
   discovery_modules:
     - fund_load.usecases.steps
+    - fund_load.adapters.factories
   tracing:
     enabled: true
     signature:
@@ -72,34 +64,24 @@ nodes:
       enabled: false
 adapters:
   input_source:
-    factory: fund_load.adapters.factory:file_input_source
     settings:
       path: input.ndjson
     binds:
-      - port_type: stream
-        type: fund_load.ports.input_source:InputSource
+      - stream
   output_sink:
-    factory: fund_load.adapters.factory:file_output_sink
     settings:
       path: output.txt
     binds:
-      - port_type: stream
-        type: fund_load.ports.output_sink:OutputSink
+      - stream
   window_store:
-    factory: fund_load.adapters.factory:window_store_memory
     settings: {}
     binds:
-      - port_type: kv
-        type: fund_load.ports.window_store:WindowReadPort
-      - port_type: kv
-        type: fund_load.ports.window_store:WindowWritePort
+      - kv
   prime_checker:
-    factory: fund_load.adapters.factory:prime_checker_stub
     settings:
       max_id: 100
     binds:
-      - port_type: kv
-        type: fund_load.ports.prime_checker:PrimeChecker
+      - kv
 """,
     )
 
@@ -140,17 +122,9 @@ scenario:
   name: baseline
 runtime:
   strict: true
-  pipeline:
-    - parse_load_attempt
-    - compute_time_keys
-    - idempotency_gate
-    - compute_features
-    - evaluate_policies
-    - update_windows
-    - format_output
-    - write_output
   discovery_modules:
     - fund_load.usecases.steps
+    - fund_load.adapters.factories
   tracing:
     enabled: false
 nodes:
@@ -179,34 +153,24 @@ nodes:
       enabled: false
 adapters:
   input_source:
-    factory: fund_load.adapters.factory:file_input_source
     settings:
       path: input.ndjson
     binds:
-      - port_type: stream
-        type: fund_load.ports.input_source:InputSource
+      - stream
   output_sink:
-    factory: fund_load.adapters.factory:file_output_sink
     settings:
       path: output.txt
     binds:
-      - port_type: stream
-        type: fund_load.ports.output_sink:OutputSink
+      - stream
   window_store:
-    factory: fund_load.adapters.factory:window_store_memory
     settings: {}
     binds:
-      - port_type: kv
-        type: fund_load.ports.window_store:WindowReadPort
-      - port_type: kv
-        type: fund_load.ports.window_store:WindowWritePort
+      - kv
   prime_checker:
-    factory: fund_load.adapters.factory:prime_checker_stub
     settings:
       max_id: 100
     binds:
-      - port_type: kv
-        type: fund_load.ports.prime_checker:PrimeChecker
+      - kv
 """,
     )
 

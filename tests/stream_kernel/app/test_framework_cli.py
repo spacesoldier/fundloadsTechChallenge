@@ -14,8 +14,8 @@ def _config() -> dict[str, object]:
         "runtime": {"strict": True, "tracing": {"enabled": False}},
         "nodes": {},
         "adapters": {
-            "input_source": {"kind": "file", "path": "input.txt"},
-            "output_sink": {"kind": "file", "path": "output.txt"},
+            "input_source": {"path": "input.txt"},
+            "output_sink": {"path": "output.txt"},
         },
     }
 

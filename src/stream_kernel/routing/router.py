@@ -20,7 +20,7 @@ class Router:
             names.update(node_list)
         object.__setattr__(self, "_known_nodes", frozenset(names))
 
-    def route(self, outputs: Iterable[object]) -> list[tuple[str, object]]:
+    def route(self, outputs: Iterable[object], *, source: str | None = None) -> list[tuple[str, object]]:
         # Convert outputs into (target, payload) deliveries (Routing semantics §5).
         deliveries: list[tuple[str, object]] = []
         for output in outputs:
@@ -52,6 +52,17 @@ class Router:
                 if self.strict:
                     raise ValueError(f"No consumers registered for '{payload_type.__name__}'")
                 continue
+
+            if source is not None:
+                # Default routing cannot silently self-loop when source is the only consumer.
+                filtered = [target for target in consumers if target != source]
+                if not filtered:
+                    if self.strict:
+                        raise ValueError(
+                            f"Self-loop for '{payload_type.__name__}' requires explicit target"
+                        )
+                    continue
+                consumers = filtered
 
             # Default fan‑out by type (Routing semantics §5.1).
             for target in consumers:

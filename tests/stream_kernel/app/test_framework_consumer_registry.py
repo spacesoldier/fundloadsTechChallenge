@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from fund_load.domain.messages import RawLine
+from stream_kernel.kernel.scenario import StepSpec
 from stream_kernel.adapters.registry import AdapterRegistry
-from stream_kernel.app.runtime import run_with_config
+from stream_kernel.app.runtime import _run_with_sync_runner, run_with_config
 import stream_kernel.app.runtime as runtime_module
 from stream_kernel.application_context import ApplicationContext
 from stream_kernel.application_context.injection_registry import InjectionRegistry
@@ -50,10 +52,9 @@ def test_run_with_config_builds_consumer_registry(monkeypatch) -> None:
     config = {
         "scenario": {"name": "baseline"},
         "runtime": {
-            "pipeline": ["a"],
             "discovery_modules": [],
         },
-        "adapters": {"input_source": {"kind": "stub"}},
+        "adapters": {"input_source": {}},
     }
 
     registry = AdapterRegistry()
@@ -108,8 +109,8 @@ def test_run_with_config_uses_sync_runner_when_tracing_disabled(monkeypatch) -> 
 
     config = {
         "scenario": {"name": "baseline"},
-        "runtime": {"pipeline": ["a"], "discovery_modules": []},
-        "adapters": {"input_source": {"kind": "stub"}},
+        "runtime": {"discovery_modules": []},
+        "adapters": {"input_source": {}},
     }
 
     exit_code = run_with_config(
@@ -171,8 +172,8 @@ def test_run_with_config_uses_sync_runner_when_tracing_enabled(monkeypatch) -> N
 
     config = {
         "scenario": {"name": "baseline"},
-        "runtime": {"pipeline": ["a"], "discovery_modules": [], "tracing": {"enabled": True}},
-        "adapters": {"input_source": {"kind": "stub"}},
+        "runtime": {"discovery_modules": [], "tracing": {"enabled": True}},
+        "adapters": {"input_source": {}},
     }
 
     exit_code = run_with_config(
@@ -183,3 +184,37 @@ def test_run_with_config_uses_sync_runner_when_tracing_enabled(monkeypatch) -> N
     )
     assert exit_code == 0
     assert captured["sync_used"] is True
+
+
+def test_runtime_bootstrap_routes_input_by_token_not_first_step() -> None:
+    # Initial payloads should be routed by ConsumerRegistry token mapping, not first scenario step.
+    seen: dict[str, bool] = {"parse": False}
+
+    def sink(msg: object, ctx: dict[str, object]) -> list[object]:
+        raise AssertionError("sink must not receive RawLine bootstrap input")
+
+    def parse(msg: object, ctx: dict[str, object]) -> list[object]:
+        assert isinstance(msg, RawLine)
+        seen["parse"] = True
+        return []
+
+    scenario = SimpleNamespace(
+        steps=[
+            StepSpec(name="sink", step=sink),
+            StepSpec(name="parse", step=parse),
+        ]
+    )
+    registry = InMemoryConsumerRegistry()
+    registry.register(RawLine, ["parse"])
+
+    _run_with_sync_runner(
+        scenario=scenario,
+        inputs=[RawLine(line_no=1, raw_text='{"id":"1"}')],
+        consumer_registry=registry,
+        strict=True,
+        run_id="run",
+        scenario_id="scenario",
+        trace_recorder=None,
+        trace_sink=None,
+    )
+    assert seen["parse"] is True

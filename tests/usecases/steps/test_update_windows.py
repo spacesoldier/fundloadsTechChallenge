@@ -4,10 +4,10 @@ from datetime import date
 from decimal import Decimal
 
 # UpdateWindows behavior is specified in docs/implementation/steps/06 UpdateWindows.md.
-from fund_load.adapters.window_store import InMemoryWindowStore
+from fund_load.adapters.state.window_store import InMemoryWindowStore
 from fund_load.domain.messages import IdemStatus
 from fund_load.domain.money import Money
-from fund_load.usecases.messages import Decision
+from fund_load.usecases.messages import Decision, WindowedDecision
 from fund_load.usecases.steps.update_windows import UpdateWindows
 
 
@@ -44,7 +44,10 @@ def test_windows_update_canonical_approved_updates_all() -> None:
     decision = _decision(accepted=True, is_canonical=True)
     out = list(step(decision, ctx=None))[0]
     snapshot = store.read_snapshot(customer_id="2", day_key=decision.day_key, week_key=decision.week_key)
-    assert out == decision
+    assert isinstance(out, WindowedDecision)
+    assert out.id == decision.id
+    assert out.customer_id == decision.customer_id
+    assert out.accepted is decision.accepted
     assert snapshot.day_attempts_before == 1
     assert snapshot.day_accepted_amount_before.amount == Decimal("10.00")
     assert snapshot.week_accepted_amount_before.amount == Decimal("10.00")

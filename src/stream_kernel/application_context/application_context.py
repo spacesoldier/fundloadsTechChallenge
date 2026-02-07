@@ -13,7 +13,7 @@ from stream_kernel.application_context.injection_registry import (
     InjectionRegistryError,
 )
 from stream_kernel.integration.consumer_registry import InMemoryConsumerRegistry
-from stream_kernel.kernel.dag import Dag, NodeContract, build_dag
+from stream_kernel.kernel.dag import Dag, DagError, NodeContract, build_dag
 from stream_kernel.kernel.discovery import discover_nodes
 from stream_kernel.kernel.node import NodeDef
 from stream_kernel.kernel.scenario import Scenario
@@ -70,12 +70,10 @@ class ApplicationContext:
         self,
         *,
         strict: bool = False,
-        external_tokens: list[type[object]] | None = None,
     ) -> None:
-        # Optional validation: ensure consumed tokens are provided by some node unless external.
+        # Optional validation: ensure every consumed token is produced by some node.
         if not strict:
             return
-        external = set(external_tokens or [])
         providers: set[type[object]] = set()
         for node in self.nodes:
             providers.update(node.meta.emits)
@@ -83,7 +81,7 @@ class ApplicationContext:
         missing: set[str] = set()
         for node in self.nodes:
             for token in node.meta.consumes:
-                if token in providers or token in external:
+                if token in providers:
                     continue
                 missing.add(_token_label(token))
         if missing:
@@ -130,7 +128,7 @@ class ApplicationContext:
                 mapping.setdefault(token, []).append(node_def.meta.name)
         return InMemoryConsumerRegistry(mapping)
 
-    def build_dag(self, *, external_tokens: list[type[object]] | None = None) -> Dag:
+    def build_dag(self) -> Dag:
         # Build analytic DAG from consumes/emits contracts (DAG construction §3–§4).
         contracts = [
             NodeContract(
@@ -140,7 +138,47 @@ class ApplicationContext:
             )
             for node_def in self.nodes
         ]
-        return build_dag(contracts, external_tokens=external_tokens)
+        return build_dag(contracts)
+
+    def preflight(
+        self,
+        *,
+        strict: bool = True,
+        extra_contracts: list[NodeContract] | None = None,
+    ) -> Dag | None:
+        # Startup self-test: validate graph contracts before any payload is processed.
+        overlap_errors: list[str] = []
+        for node_def in self.nodes:
+            overlap = set(node_def.meta.consumes).intersection(node_def.meta.emits)
+            if not overlap:
+                continue
+            labels = ", ".join(sorted(_token_label(token) for token in overlap))
+            overlap_errors.append(
+                f"node '{node_def.meta.name}' consumes and emits the same token(s): {labels}"
+            )
+
+        if overlap_errors and strict:
+            joined = "; ".join(overlap_errors)
+            raise ContextBuildError(
+                f"Preflight failed: {joined}. Use stage-specific tokens or explicit target contracts."
+            )
+
+        try:
+            contracts = [
+                NodeContract(
+                    name=node_def.meta.name,
+                    consumes=list(node_def.meta.consumes),
+                    emits=list(node_def.meta.emits),
+                )
+                for node_def in self.nodes
+            ]
+            if extra_contracts:
+                contracts.extend(extra_contracts)
+            return build_dag(contracts)
+        except DagError as exc:
+            if strict:
+                raise ContextBuildError(f"Preflight failed: {exc}") from exc
+            return None
 
     def build_scenario(
         self,

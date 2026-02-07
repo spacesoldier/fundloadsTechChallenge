@@ -12,7 +12,7 @@ class _RoutingPortStub:
     def __init__(self, routes: list[tuple[str, object]]) -> None:
         self._routes = routes
 
-    def route(self, outputs: list[object]) -> list[tuple[str, object]]:
+    def route(self, outputs: list[object], *, source: str | None = None) -> list[tuple[str, object]]:
         # Only emit routes when there is actual output to route.
         if not outputs:
             return []

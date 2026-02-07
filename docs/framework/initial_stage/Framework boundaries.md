@@ -46,11 +46,11 @@ experience. If adopted, these changes will supersede the earlier guidance.
 
 These ports are **protocol-level** contracts, not domain-specific:
 
-- `stream_source`
-- `stream_sink`
-- `kv_stream_source`
-- `kv_stream_sink`
-- `kv_store`
+- `stream`
+- `kv_stream`
+- `kv`
+- `request`
+- `response`
 - `trace_sink`
 
 The framework provides the abstract contracts and base utilities for these.
@@ -59,10 +59,10 @@ The framework provides the abstract contracts and base utilities for these.
 
 Adapters that connect to infrastructure (not domain-specific):
 
-- `file` (stream source/sink)
+- `file.line_source` / `file.line_sink`
 - `kafka` (stream / kv_stream)
-- `redis` (kv_store or kv_stream)
-- `ignite` (kv_store)
+- `redis` (kv or kv_stream)
+- `ignite` (kv)
 - `stdout` / `jsonl` (sinks)
 
 At this stage only **file/jsonl/stdout** exist in the project; others are
@@ -72,16 +72,21 @@ planned framework adapters.
 
 ### 2.4 Adapter registry (initial stage)
 
-The framework owns a **registry** that maps adapter roles to concrete kinds.
+The framework owns a discovery-backed adapter registry that maps adapter names
+to concrete implementations.
 
 Initial scope:
 
-- **stream input**: `file` → stream source
-- **stream output**: `file` → stream sink
+- `input_source` for line-by-line source reads
+- `output_sink` for line-oriented sink writes
 
-Adapters are declared under `adapters.*` with `kind` and `settings`.
-At runtime, the registry uses these settings to construct concrete adapters
-and bind them into the InjectionRegistry.
+Adapters are declared under `adapters.*` with:
+
+- `settings`
+- `binds` (port type list)
+
+Runtime resolves adapters by discovered/registered adapter name (YAML key under `adapters`).
+Config must not carry factory paths.
 
 ---
 
@@ -89,9 +94,11 @@ and bind them into the InjectionRegistry.
 
 Tests should validate:
 
-1) Adapter registry resolves known kinds (file input/output).
-2) Adapter registry rejects unknown kinds with clear errors.
+1) Adapter registry resolves known adapter names (file input/output).
+2) Adapter registry rejects unknown adapter names with clear errors.
 3) Settings are passed to adapters (e.g., file path).
+4) Unknown adapter name fails fast.
+5) Config containing factory path is rejected.
 
 ---
 
@@ -102,10 +109,10 @@ Tests should validate:
 - Scenario composition (config + wiring)
 - `main` that calls framework bootstrap (e.g., `app.run(...)`)
 - **Thin adapters** that declare *how* they connect:
-  - `@adapter(type=file, flow=stream_source)`
-  - `@adapter(type=memory, flow=kv_store)`
+  - `@adapter(name="input_source", emits=[...])`
+  - `@adapter(name="...", consumes=[...], emits=[...])`
 - Domain-level services that use framework ports (e.g., `WindowStore` logic
-  built on top of `kv_store`)
+  built on top of `kv`)
 
 Project adapters **do not own IO**; they perform minimal validation and mapping,
 then delegate to the framework adapter selected by config.
@@ -116,7 +123,7 @@ then delegate to the framework adapter selected by config.
 
 `WindowStore` is **domain-specific behavior**, not a framework port.
 
-The framework provides `kv_store` (generic key/value access).
+The framework provides `kv` (generic key/value access).
 The project implements window semantics on top of that.
 
 ---
@@ -125,7 +132,8 @@ The project implements window semantics on top of that.
 
 We plan to add decorators as **registration sugar** only:
 
-- `@adapter(type=..., flow=...)`
+- `@adapter(kind=..., consumes=..., emits=...)`
+- `@adapter(name=..., consumes=..., emits=...)`
 - `@node(name=...)`
 
 Decorators must not hide wiring or introduce side effects at import time.

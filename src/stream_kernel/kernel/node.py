@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from typing import TypeVar
-
-T = TypeVar("T")
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,22 +30,5 @@ class NodeDef:
     container_attr: str | None = None
 
 
-
-
-def node(
-    *,
-    name: str,
-    stage: str = "",
-    consumes: Iterable[type[object]] | None = None,
-    emits: Iterable[type[object]] | None = None,
-) -> Callable[[T], T]:
-    # Decorator attaches NodeMeta to a callable/class for discovery.
-    consume_list = list(consumes or [])
-    emit_list = list(emits or [])
-    meta = NodeMeta(name=name, stage=stage, consumes=consume_list, emits=emit_list)
-
-    def _decorate(target: T) -> T:
-        setattr(target, "__node_meta__", meta)
-        return target
-
-    return _decorate
+# Re-export decorator for backward compatibility; implementation lives in node_annotation.py.
+from stream_kernel.kernel.node_annotation import node

@@ -3,7 +3,8 @@ from __future__ import annotations
 # Execution planning rules are described in docs/framework/initial_stage/Execution planning model.md.
 from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.injection_registry import InjectionRegistry
-from stream_kernel.execution.planning import plan_pools
+from stream_kernel.execution.planning import build_execution_plan, plan_pools
+from stream_kernel.kernel.dag import Dag
 
 
 class EventA:
@@ -53,3 +54,28 @@ def test_plan_pools_prefers_async_for_mixed_dependencies() -> None:
     reg.register_factory("stream", EventB, lambda: object(), is_async=True)
     pools = plan_pools({"mixed_node": _NodeMixed()}, reg)
     assert pools["mixed_node"] == "async"
+
+
+def test_build_execution_plan_topological_order() -> None:
+    # Execution order must follow DAG dependencies, not declaration/discovery order.
+    dag = Dag(
+        nodes=["sink", "transform", "source"],
+        edges=[("source", "transform"), ("transform", "sink")],
+    )
+    assert build_execution_plan(dag) == ["source", "transform", "sink"]
+
+
+def test_build_execution_plan_preserves_node_order_for_independent_roots() -> None:
+    # For nodes without dependencies between them, plan keeps DAG.nodes tie-break order.
+    dag = Dag(nodes=["a", "b", "c"], edges=[])
+    assert build_execution_plan(dag) == ["a", "b", "c"]
+
+
+def test_build_execution_plan_rejects_cycle_input() -> None:
+    # Guardrail for invalid DAG inputs created outside the validated builder.
+    dag = Dag(nodes=["a", "b"], edges=[("a", "b"), ("b", "a")])
+    try:
+        build_execution_plan(dag)
+    except ValueError:
+        return
+    raise AssertionError("Expected ValueError for cyclic DAG")

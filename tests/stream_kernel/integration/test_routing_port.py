@@ -42,6 +42,15 @@ def test_routing_port_reflects_registry_updates() -> None:
     assert port.route([payload]) == [("C", payload)]
 
 
+def test_routing_port_forwards_source_for_self_loop_protection() -> None:
+    # RoutingPort should pass source to Router to support self-loop filtering.
+    registry = InMemoryConsumerRegistry({X: ["A", "B"]})
+    port = RoutingPort(registry=registry, strict=True)
+    payload = X("x")
+    deliveries = port.route([payload], source="A")
+    assert deliveries == [("B", payload)]
+
+
 def test_routing_port_uses_cached_consumer_map_until_version_changes() -> None:
     # RoutingPort should rebuild the consumer map only when registry version changes.
     class CountingRegistry(ConsumerRegistry):

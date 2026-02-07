@@ -6,14 +6,15 @@ from decimal import Decimal
 from typing import Iterable
 
 # Experimental scenario validates Monday multiplier + prime gate (docs/implementation/steps/04-06).
-from fund_load.adapters.prime_checker import SievePrimeChecker
-from fund_load.adapters.window_store import InMemoryWindowStore
+from fund_load.adapters.services.prime_checker import SievePrimeChecker
+from fund_load.adapters.state.window_store import InMemoryWindowStore
 from fund_load.domain.messages import RawLine
 from fund_load.domain.reasons import ReasonCode
 from fund_load.ports.output_sink import OutputSink
 from fund_load.ports.prime_checker import PrimeChecker
 from fund_load.ports.window_store import WindowReadPort, WindowWritePort
-from fund_load.usecases.messages import Decision
+from fund_load.usecases.messages import Decision, OutputLine
+from stream_kernel.adapters.contracts import adapter
 from stream_kernel.adapters.registry import AdapterRegistry
 from stream_kernel.app.runtime import run_with_config
 from stream_kernel.config.validator import validate_newgen_config
@@ -23,11 +24,11 @@ from stream_kernel.kernel.node import node
 DECISIONS: list[Decision] = []
 
 
-@node(name="record_decisions", consumes=[Decision], emits=[Decision])
+@node(name="record_decisions", consumes=[Decision], emits=[])
 def record_decisions(msg: Decision, ctx: object | None) -> list[Decision]:
-    # Test-only node to inspect Decisions (Step 05 output).
+    # Test-only sink node to inspect decisions without token self-loop.
     DECISIONS.append(msg)
-    return [msg]
+    return []
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,17 +60,6 @@ def _config(lines: list[RawLine]) -> dict[str, object]:
         "scenario": {"name": "exp_mp"},
         "runtime": {
             "strict": True,
-            "pipeline": [
-                "parse_load_attempt",
-                "compute_time_keys",
-                "idempotency_gate",
-                "compute_features",
-                "evaluate_policies",
-                "record_decisions",
-                "update_windows",
-                "format_output",
-                "write_output",
-            ],
             "discovery_modules": ["fund_load.usecases.steps", __name__],
         },
         "nodes": {
@@ -93,15 +83,15 @@ def _config(lines: list[RawLine]) -> dict[str, object]:
             "update_windows": {"daily_prime_gate": {"enabled": True}},
         },
         "adapters": {
-            "input_source": {"kind": "memory", "settings": {"lines": lines}},
-            "output_sink": {
-                "kind": "memory",
-                "settings": {},
-                "factory": "tests.integration.test_end_to_end_experiment_features:noop",
-                "binds": [{"port_type": "stream", "type": "fund_load.ports.output_sink:OutputSink"}],
+            "input_source": {
+                "settings": {"lines": lines},
             },
-            "window_store": {"kind": "memory", "settings": {}},
-            "prime_checker": {"kind": "stub", "settings": {"max_id": 20000}},
+            "output_sink": {
+                "settings": {},
+                "binds": ["stream"],
+            },
+            "window_store": {"settings": {}},
+            "prime_checker": {"settings": {"max_id": 20000}},
         },
     }
 
@@ -134,12 +124,23 @@ def test_experiment_end_to_end_prime_and_monday() -> None:
 
     output_sink = _CollectingOutputSink([])
     registry = AdapterRegistry()
-    registry.register("input_source", "memory", lambda settings: _InMemoryInputSource(settings["lines"]))
-    registry.register("output_sink", "memory", lambda settings, _sink=output_sink: _sink)
-    registry.register("window_store", "memory", lambda settings: InMemoryWindowStore())
+
+    @adapter(consumes=[], emits=[RawLine])
+    def _input_source_factory(settings: dict[str, object]) -> _InMemoryInputSource:
+        # Source adapter contract emits RawLine into DAG.
+        return _InMemoryInputSource(settings["lines"])  # type: ignore[index]
+
+    @adapter(consumes=[OutputLine], emits=[])
+    def _output_sink_factory(settings: dict[str, object], _sink=output_sink) -> _CollectingOutputSink:
+        # Sink adapter contract consumes OutputLine from DAG.
+        return _sink
+
+    registry.register("input_source", "input_source", _input_source_factory)
+    registry.register("output_sink", "output_sink", _output_sink_factory)
+    registry.register("window_store", "window_store", lambda settings: InMemoryWindowStore())
     registry.register(
         "prime_checker",
-        "stub",
+        "prime_checker",
         lambda settings: SievePrimeChecker.from_max(int(settings["max_id"])),
     )
 

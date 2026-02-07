@@ -20,6 +20,10 @@ This plan tracks the move from fixed `runtime.pipeline` ordering to
 - Use **consumes/emits** terminology in docs and code.
 - `consumes` must be **non-empty** for every non‑source node.
 - Routing is **dynamic**; DAG is **analytic** (not a strict execution plan).
+- Adapter config does not use per-project factory paths.
+- Adapter config does not declare model/type class strings.
+- Adapter selection in YAML is name-based (`adapters.<name>`), not `kind`-based.
+- Stable port types: `stream`, `kv_stream`, `kv`, `request`, `response`.
 
 ---
 
@@ -33,36 +37,37 @@ This plan tracks the move from fixed `runtime.pipeline` ordering to
 ## Phase 2 — DAG analysis (static)
 
 ### Tests
-- [ ] Detect cycles in the consumes/emits graph.
-- [ ] Allow multiple providers/consumers per type.
-- [ ] Missing provider for a consumed type → error.
-- [ ] Deterministic ordering for unrelated nodes (discovery order).
+- [x] Detect cycles in the consumes/emits graph.
+- [x] Allow multiple providers/consumers per type.
+- [x] Missing provider for a consumed type → error.
+- [x] Deterministic ordering for unrelated nodes (discovery order).
 
 ### Implementation
-- [ ] Build a graph from emits → consumes edges.
-- [ ] Add cycle detection utility.
-- [ ] Expose graph summary (nodes/edges, fan-in/out).
+- [x] Build a graph from emits → consumes edges.
+- [x] Add cycle detection utility.
+- [x] Expose graph summary (nodes/edges, fan-in/out).
 
 ---
 
 ## Phase 3 — Router runtime (dynamic)
 
 ### Tests
-- [ ] Route messages to all consumers of their type.
-- [ ] Preserve stable delivery order (discovery order).
-- [ ] Envelope routing: `target` overrides type-based fan-out.
-- [ ] Multi-output routing (per-output target/topic).
+- [x] Route messages to all consumers of their type.
+- [x] Preserve stable delivery order (discovery order).
+- [x] Envelope routing: `target` overrides type-based fan-out.
+- [x] Multi-output routing (per-output target/topic).
+- [x] Self-loop protection for default fan-out (`source` excluded unless explicitly targeted).
 - [ ] Enforce max-hops / retry limit for cycles.
-- [ ] Behavior when no consumers exist (error vs drop) — decide.
-- [ ] ConsumerRegistry port contract and adapter tests.
+- [x] Behavior when no consumers exist (error vs drop) — decided and tested.
+- [x] ConsumerRegistry port contract and adapter tests.
 
 ### Implementation
-- [ ] Replace step-by-step pipeline with router dispatch loop.
+- [x] Replace step-by-step pipeline with router dispatch loop.
 - [ ] Remove default output sink; require explicit sink node.
-- [ ] Ensure tracing covers routing hops and fan-out.
-- [ ] Implement `Envelope` with `target` routing (see Routing semantics).
-- [ ] Add WorkQueue + ContextStore ports (see Execution runtime and routing integration).
-- [ ] Introduce ConsumerRegistry + RoutingPort (Runner depends on RoutingPort).
+- [x] Ensure tracing covers routing hops and fan-out (sync runtime baseline).
+- [x] Implement `Envelope` with `target` routing (see Routing semantics).
+- [x] Add WorkQueue + ContextStore ports (see Execution runtime and routing integration).
+- [x] Introduce ConsumerRegistry + RoutingPort (Runner depends on RoutingPort).
 - [ ] Source/sink adapter nodes: remove hardcoded `input_source`/`output_sink` path.
 
 ---
@@ -70,29 +75,54 @@ This plan tracks the move from fixed `runtime.pipeline` ordering to
 ## Phase 4 — Context store port
 
 ### Tests
-- [ ] In-memory context store (default).
+- [x] In-memory context store (default).
 - [ ] Port shape for external store (Redis adapter later).
 
 ### Implementation
-- [ ] Port + adapter for context storage.
-- [ ] Hook into router runtime.
+- [x] Port + in-memory adapter for context storage.
+- [x] Hook into router runtime.
 
 ---
 
 ## Phase 5 — Config and migration
 
-- [ ] Make `runtime.pipeline` optional/deprecated.
-- [ ] Update newgen configs (baseline/experiment) to remove pipeline.
+- [x] Make `runtime.pipeline` optional/deprecated.
+- [x] Remove `runtime.pipeline` from runtime execution path (rejected at runtime; no legacy fallback).
+- [x] Update newgen configs (baseline/experiment) to remove pipeline.
 - [ ] Update docs + examples.
 - [ ] Add config for **source/sink adapters** as nodes (entry/exit in DAG).
+- [x] Replace runtime next-step shim; execution order now comes from DAG plan.
+- [x] Remove adapter `factory` from runtime config path (name + settings + binds only).
+- [x] Build adapter registry from discovery output (same principle as node discovery).
+- [x] Enforce framework-supported adapter names in validator/runtime.
+- [x] Remove model/type strings from adapter YAML contracts.
+
+## Phase 6 — Platform-ready validation for demo project
+
+- [ ] Add static contract rule: if a node has `consumes=[T]` and `emits=[T]`,
+      require either:
+      - stage-specific token split (`T_in` -> `T_out`), or
+      - explicit output target contract.
+- [ ] Expose this rule in dev tooling (pyright/mypy-friendly diagnostics + CI check).
+- [ ] Add a preflight validation command for graph+routing invariants before run.
+- [ ] Run full demo project on framework-only runtime without legacy sequencing hooks.
+
+### Runtime note
+
+- Runtime bootstrap starts via token routing (`RoutingPort.route([payload])`).
+- Scenario build order is derived from DAG execution plan, not discovery order.
+- Ambiguous token flows are handled by routing contracts/targets, not by next-step shims.
+- `run_with_registry` remains transitional; primary runtime path is framework-first (`run` / `run_with_config`).
 
 ---
 
 ## Open questions (to resolve)
 
-- What is the default behavior when no consumer exists?
 - What is the retry/max-hop policy for cycles?
 - Message identity for context storage: trace_id vs msg.id?
+- For nodes with `consumes=[T]` and `emits=[T]`:
+  - migrate to stage-specific tokens, or
+  - enforce explicit target contracts and loop budgets.
 
 ---
 

@@ -67,6 +67,15 @@ class Decision:
 
 
 @dataclass(frozen=True, slots=True)
+class WindowedDecision:
+    # WindowedDecision is produced after Step 06 to avoid consumes/emits self-loop on Decision token.
+    line_no: int
+    id: str
+    customer_id: str
+    accepted: bool
+
+
+@dataclass(frozen=True, slots=True)
 class OutputLine:
     # OutputLine is produced by FormatOutput (docs/implementation/steps/07 FormatOutput.md).
     line_no: int
