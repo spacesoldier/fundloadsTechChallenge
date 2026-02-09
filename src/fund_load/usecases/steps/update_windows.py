@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from fund_load.ports.window_store import WindowWritePort
+from fund_load.services.window_store import WindowStoreService
 from fund_load.usecases.messages import Decision, WindowedDecision
 from stream_kernel.application_context.config_inject import config
 from stream_kernel.application_context.inject import inject
@@ -15,9 +15,8 @@ from stream_kernel.kernel.node import node
 @dataclass(frozen=True, slots=True)
 class UpdateWindows:
     # Step 06 mutates window state based on Decision (docs/implementation/steps/06 UpdateWindows.md).
-    # Dependency injection: WindowStore write port is provided by the runtime wiring.
-    # We use the generic "kv" port_type as a service bucket in this initial stage.
-    window_store: WindowWritePort = inject.kv(WindowWritePort)
+    # Dependency injection: WindowStore service is provided by runtime adapter wiring.
+    window_store: WindowStoreService = inject.service(WindowStoreService)
     # Config-driven toggle comes from nodes.update_windows.daily_prime_gate.enabled (newgen config).
     prime_gate_enabled: bool = config.value("daily_prime_gate.enabled", default=False)
 

@@ -2,7 +2,7 @@
 
 ## Context
 We are moving from the legacy `kernel.runner` pipeline execution to the new
-routing + execution model (`RoutingPort`, `WorkQueue`, `ContextStore`, `SyncRunner`).
+routing + execution model (`RoutingPort`, `WorkQueue`, KV context storage, `SyncRunner`).
 
 ## Current gaps
 - remove remaining documentation references to `kernel.runner`
@@ -11,6 +11,7 @@ routing + execution model (`RoutingPort`, `WorkQueue`, `ContextStore`, `SyncRunn
 - prepare static checks/guidelines in editor + CI before demo-project launch
 - remove adapter factories from config/runtime and rely on discovery-based adapter registry
 - lock framework-level adapter/port taxonomy for config stability
+- migrate context storage from custom `ContextStore` to framework-native `kv` contract
 
 ## Target order of work
 
@@ -23,7 +24,7 @@ routing + execution model (`RoutingPort`, `WorkQueue`, `ContextStore`, `SyncRunn
    - Adapters remain payload‑only.
    - Runner wraps payload into Envelope with `trace_id` + `target`.
 4. **Wire runtime to SyncRunner** ✅
-   - Use WorkQueue + RoutingPort + ContextStore.
+   - Use WorkQueue + RoutingPort + KV-backed context storage.
    - Bootstrap inputs through `RoutingPort` (token-based entry) instead of hardcoded first step.
 5. **Rewrite tests** ✅
    - Legacy runner tests replaced/removed.
@@ -43,6 +44,13 @@ routing + execution model (`RoutingPort`, `WorkQueue`, `ContextStore`, `SyncRunn
    - Remove `factory` from adapter YAML and resolve adapters by discovered adapter name.
    - Keep adapter YAML model-free (no class/type strings).
    - Validate stable port types (`stream`, `kv_stream`, `kv`, `request`, `response`).
+   - Replace project-level domain ports with service layer (`inject.service(...)`) over stable framework ports. ✅
+   - WindowStore migrated to service contract (`WindowStoreService`) and wired via `service` binding. ✅
+   - PrimeChecker migrated to service contract (`PrimeCheckerService`) and wired via `service` binding. ✅
+   - Project `fund_load/ports` module removed from runtime codepath. ✅
+   - WindowStore service now persists via framework `KVStore` backend (no project-port storage shim). ✅
+   - Runner context persistence migration to `kv`-backed service facade completed (`ContextService` over `kv`).
+   - Runtime default KV backend is validator-driven (`runtime.platform.kv.backend`, default `memory`) and auto-bound to `kv<KVStore>`. ✅
 11. **Platform-ready safeguards**
    - Add contract lint: `consumes=[T]` + `emits=[T]` must be explicit by policy.
    - Policy options:
@@ -57,7 +65,7 @@ routing + execution model (`RoutingPort`, `WorkQueue`, `ContextStore`, `SyncRunn
 ## Notes
 - Routing policy stays in Router.
 - Execution policy stays in Runner.
-- ContextStore provides metadata view to nodes.
+- KV-backed context storage provides metadata view to nodes.
 - Runtime executes with DAG-based plan and routing; no next-step chaining shim remains.
 - Default fan-out must not self-loop; explicit self-target remains an intentional advanced mode.
 - Adapter config should describe runtime-facing knobs only (`settings/binds`).

@@ -1,0 +1,10 @@
+from __future__ import annotations
+
+
+def platform_discovery_modules() -> list[str]:
+    # Central framework discovery entrypoint for platform-managed modules.
+    return [
+        "stream_kernel.platform.services",
+        "stream_kernel.observability.adapters",
+        "stream_kernel.observability.observers",
+    ]

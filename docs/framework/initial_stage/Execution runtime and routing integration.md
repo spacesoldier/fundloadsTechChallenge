@@ -27,6 +27,12 @@ It complements:
 This split enables **multiple Runner implementations** (sync, async, distributed)
 while keeping **one Router contract**.
 
+Control-plane principle:
+
+- Runner and Router are runtime control-plane components by default, not regular business DAG nodes.
+- They may be represented as platform nodes only in an explicit platform control graph with dedicated queues.
+- Do not mix business DAG semantics with runtime-control semantics in one node layer.
+
 ---
 
 ## 2) Integration diagram (default)
@@ -122,30 +128,36 @@ Minimal contract:
 
 This keeps **routing data** separate from both Router and Runner.
 
-### 4.3 ContextStore
+### 4.3 Context service over `kv`
 
-ContextStore is required because **some nodes may access context** (trace,
-retries, aggregation state). The runner resolves context for each envelope and
-passes a **metadata view** to the node on invocation. Nodes are free to ignore it.
+Context handling is modeled as a **service** backed by the stable `kv` port.
 
-- `get(trace_id)`
-- `put(trace_id, ctx)`
-- `delete(trace_id)`
+- runner depends on `ContextService` (not on storage adapter lifecycle)
+- context service uses `kv.get/set/delete` internally
+- regular nodes receive metadata view; service nodes may request full context
+
+This keeps execution generic and avoids introducing a context-specific transport port.
 
 This keeps execution state portable across runtimes and ensures node-level
 context is always available.
 
-#### ContextStore behavior (logic)
+Implementation reference:
+
+- [src/stream_kernel/integration/kv_store.py](../../../../src/stream_kernel/integration/kv_store.py)
+- [src/stream_kernel/execution/runner.py](../../../../src/stream_kernel/execution/runner.py)
+
+#### Context KV behavior (logic)
 
 - Stores per‑message execution context (trace, retry metadata).
 - Keyed by `trace_id` (or `msg_id` if no trace).
-- **Idempotent** put/update expected.
+- **Idempotent** set/update expected.
 - Optional TTL for cleanup in external stores.
+- Default backend remains in-memory `dict`; planned backends include `cachetools` and Redis.
 
 #### Envelope ↔ Context aggregation
 
 - Every `Envelope` must carry a **context key** (e.g., `trace_id`).
-- Runner retrieves context from ContextStore before invoking a node.
+- Runner retrieves context from KV storage before invoking a node.
 - Node receives `payload` plus a **metadata section** (via `ctx`), not the full
   internal context object. This avoids accidental coupling to tracing internals.
 - Full-context access (including tracing internals) is **not** exposed by
@@ -180,14 +192,14 @@ Type/model mapping belongs to code metadata (`@adapter` + helper mapping).
 
 - `WorkQueue` backed by `collections.deque`
 - `ConsumerRegistry` backed by in‑memory dict(s)
-- `ContextStore` backed by an in‑memory dict
+- context KV store backed by an in‑memory dict
 - Best for tests, local runs, and deterministic CI
 
 ### 5.2 External (Redis, etc.)
 
 - `WorkQueue` backed by Redis lists/streams
 - `ConsumerRegistry` backed by Redis / external registry
-- `ContextStore` backed by Redis hashes
+- context KV store backed by Redis hashes
 - Enables multi‑process scaling and recovery
 
 Adapters live in the **framework**, but are wired by config.
@@ -249,6 +261,15 @@ Router responsibilities (pure logic):
 All **routing policy** lives in the Router.  
 All **execution policy** lives in the Runner.
 
+### 7.1 Execution-level tracing boundary
+
+Execution observers (including tracing) are called by the runner around node invocation.
+This defines a strict boundary:
+
+- runner-targeted node call => one execution span;
+- adapter attached to DAG as node => traced as its own node span;
+- adapter injected inside node code => no standalone span unless explicitly modeled.
+
 ---
 
 ## 8) Test methodology (TDD)
@@ -271,6 +292,8 @@ All **execution policy** lives in the Runner.
 - one input → expected fan‑out across nodes
 - deterministic ordering with deque
 - strict‑mode behavior for unknown targets
+- adapter-node span exists when adapter is runner-targeted
+- no extra span for injected adapter calls inside node body
 
 ### 7.3 Adapter tests
 
@@ -301,18 +324,18 @@ All **execution policy** lives in the Runner.
    - size increments on push
    - size decrements on pop
 
-### 8.2 ContextStore (in‑memory dict)
+### 8.2 Context KV store (in‑memory dict)
 
-1. **Put/Get/Delete**
-   - put `trace_id=1`
+1. **Set/Get/Delete**
+   - set `trace_id=1`
    - get returns stored ctx
    - delete removes it
 2. **Get missing**
    - get unknown id → `None`
 
 3. **Idempotent update**
-   - put ctx1
-   - put ctx2 under same key
+   - set ctx1
+   - set ctx2 under same key
    - get returns ctx2
 
 ### 8.3 Router + Runner (sync) — baseline
@@ -356,7 +379,7 @@ All **execution policy** lives in the Runner.
 2. **Persistence boundary**
    - separate runner instances can pop what another pushed
 
-### 8.7 ContextStore external adapter (Redis stub)
+### 8.7 Context KV external adapter (Redis stub)
 
 ### 8.8 Adapter config/no-factory path
 
@@ -378,8 +401,8 @@ All **execution policy** lives in the Runner.
    - `binds` contains unknown port type
    - startup fails with explicit error
 
-1. **Put/Get round‑trip**
-   - put ctx by key
+1. **Set/Get round‑trip**
+   - set ctx by key
    - get returns same ctx
 2. **Overwrite**
    - put ctx1, then ctx2
@@ -439,7 +462,8 @@ processing. Preflight moves these failures to startup and keeps runs determinist
 - `stream_kernel.routing.router` (routing logic)
 - `stream_kernel.integration.routing_port` (routing adapter)
 - `stream_kernel.integration.work_queue` (deque adapter)
-- `stream_kernel.integration.context_store` (in‑memory store)
+- `stream_kernel.integration.kv_store` (in-memory KV adapter)
+- `stream_kernel.execution.context_service` (service facade over KV)
 - `stream_kernel.execution` (runners, planned)
 
 ---

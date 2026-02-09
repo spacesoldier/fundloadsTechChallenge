@@ -14,8 +14,8 @@ But the contract is designed to allow future sources.
 
 ---
 
-**Port implementation:** [input_source.py](../../../src/fund_load/ports/input_source.py)  
-**Adapter (NDJSON file):** [input_source.py](../../../src/fund_load/adapters/input_source.py)
+**Framework adapter contract:** [file_io.py](../../../src/stream_kernel/adapters/file_io.py)  
+**Project mapping (NDJSON -> RawLine):** [io.py](../../../src/fund_load/adapters/io.py)
 
 ---
 

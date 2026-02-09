@@ -8,8 +8,11 @@ from stream_kernel.adapters.registry import AdapterRegistry
 from stream_kernel.app.runtime import _run_with_sync_runner, run_with_config
 import stream_kernel.app.runtime as runtime_module
 from stream_kernel.application_context import ApplicationContext
+from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.injection_registry import InjectionRegistry
+from stream_kernel.platform.services.context import ContextService, InMemoryKvContextService
 from stream_kernel.integration.consumer_registry import InMemoryConsumerRegistry
+from stream_kernel.integration.kv_store import InMemoryKvStore
 
 
 def test_run_with_config_builds_consumer_registry(monkeypatch) -> None:
@@ -42,12 +45,11 @@ def test_run_with_config_builds_consumer_registry(monkeypatch) -> None:
         "stream_kernel.app.runtime._build_injection_registry_from_bindings",
         lambda _instances, _bindings: InjectionRegistry(),
     )
-    monkeypatch.setattr("stream_kernel.app.runtime._build_tracing", lambda _runtime: (None, None))
+    monkeypatch.setattr("stream_kernel.app.runtime.build_execution_observers", lambda *_a, **_k: [])
     monkeypatch.setattr(
         "stream_kernel.app.runtime.SyncRunner",
-        lambda **_kw: SimpleNamespace(run=lambda *_a, **_k: None),
+        lambda **_kw: SimpleNamespace(run=lambda *_a, **_k: None, run_inputs=lambda *_a, **_k: None),
     )
-    monkeypatch.setattr("stream_kernel.app.runtime._emit_implicit_sink_diagnostics", lambda *_a, **_k: None)
 
     config = {
         "scenario": {"name": "baseline"},
@@ -97,13 +99,12 @@ def test_run_with_config_uses_sync_runner_when_tracing_disabled(monkeypatch) -> 
         "stream_kernel.app.runtime._build_injection_registry_from_bindings",
         lambda _instances, _bindings: InjectionRegistry(),
     )
-    monkeypatch.setattr("stream_kernel.app.runtime._build_tracing", lambda _runtime: (None, None))
-    monkeypatch.setattr("stream_kernel.app.runtime._emit_implicit_sink_diagnostics", lambda *_a, **_k: None)
+    monkeypatch.setattr("stream_kernel.app.runtime.build_execution_observers", lambda *_a, **_k: [])
     assert not hasattr(runtime_module, "Runner")
 
     def _sync_runner(**_kw):
         captured["sync_used"] = True
-        return SimpleNamespace(run=lambda: None)
+        return SimpleNamespace(run=lambda: None, run_inputs=lambda *_a, **_k: None)
 
     monkeypatch.setattr("stream_kernel.app.runtime.SyncRunner", _sync_runner)
 
@@ -149,26 +150,15 @@ def test_run_with_config_uses_sync_runner_when_tracing_enabled(monkeypatch) -> N
         "stream_kernel.app.runtime._build_injection_registry_from_bindings",
         lambda _instances, _bindings: InjectionRegistry(),
     )
-    monkeypatch.setattr("stream_kernel.app.runtime._emit_implicit_sink_diagnostics", lambda *_a, **_k: None)
     assert not hasattr(runtime_module, "Runner")
 
     def _sync_runner(**_kw):
         captured["sync_used"] = True
-        return SimpleNamespace(run=lambda: None)
+        return SimpleNamespace(run=lambda: None, run_inputs=lambda *_a, **_k: None)
 
     monkeypatch.setattr("stream_kernel.app.runtime.SyncRunner", _sync_runner)
 
-    class _Sink:
-        def emit(self, _record) -> None:
-            return None
-
-        def flush(self) -> None:
-            return None
-
-        def close(self) -> None:
-            return None
-
-    monkeypatch.setattr("stream_kernel.app.runtime._build_tracing", lambda _runtime: (object(), _Sink()))
+    monkeypatch.setattr("stream_kernel.app.runtime.build_execution_observers", lambda *_a, **_k: [])
 
     config = {
         "scenario": {"name": "baseline"},
@@ -206,6 +196,8 @@ def test_runtime_bootstrap_routes_input_by_token_not_first_step() -> None:
     )
     registry = InMemoryConsumerRegistry()
     registry.register(RawLine, ["parse"])
+    injection = InjectionRegistry()
+    injection.register_factory("service", ContextService, lambda: InMemoryKvContextService(InMemoryKvStore()))
 
     _run_with_sync_runner(
         scenario=scenario,
@@ -214,7 +206,79 @@ def test_runtime_bootstrap_routes_input_by_token_not_first_step() -> None:
         strict=True,
         run_id="run",
         scenario_id="scenario",
-        trace_recorder=None,
-        trace_sink=None,
+        scenario_scope=injection.instantiate_for_scenario("scenario"),
+        observers=[],
     )
     assert seen["parse"] is True
+
+
+def test_run_with_config_uses_di_context_service_and_reuses_scenario_scope(monkeypatch) -> None:
+    # Runner should resolve ContextService via DI scope created before scenario assembly.
+    captured: dict[str, object] = {}
+
+    class _CustomContextService:
+        def seed(self, *, trace_id: str, payload: object, run_id: str, scenario_id: str) -> None:
+            return None
+
+        def metadata(self, trace_id: str | None, *, full: bool) -> dict[str, object]:
+            return {}
+
+    custom_service = _CustomContextService()
+    registry = InjectionRegistry()
+    registry.register_factory("service", ContextService, lambda: custom_service)
+
+    monkeypatch.setattr(ApplicationContext, "build_consumer_registry", lambda self: InMemoryConsumerRegistry())
+
+    def _build_scenario(self: ApplicationContext, *, scenario_id, step_names, wiring):
+        captured["scenario_scope"] = wiring.get("scenario_scope")
+        return SimpleNamespace(steps=[])
+
+    monkeypatch.setattr(ApplicationContext, "build_scenario", _build_scenario)
+    monkeypatch.setattr(ApplicationContext, "discover", lambda self, modules: None)
+    monkeypatch.setattr(
+        "stream_kernel.app.runtime._build_adapter_instances_from_registry",
+        lambda _adapters, _registry: {"input_source": SimpleNamespace(read=lambda: [])},
+    )
+    monkeypatch.setattr(
+        "stream_kernel.app.runtime._build_injection_registry_from_bindings",
+        lambda _instances, _bindings: registry,
+    )
+    monkeypatch.setattr("stream_kernel.app.runtime.build_execution_observers", lambda *_a, **_k: [])
+
+    class _SyncRunner:
+        def __init__(self, **_kwargs: object) -> None:
+            self.context_service = inject.service(ContextService)
+
+        def run(self) -> None:
+            return None
+
+        def run_inputs(self, _inputs, *, run_id: str, scenario_id: str) -> None:
+            _ = (run_id, scenario_id)
+            return None
+
+    monkeypatch.setattr("stream_kernel.app.runtime.SyncRunner", _SyncRunner)
+
+    from stream_kernel.application_context import apply_injection as _apply_injection_real
+
+    def _capturing_apply_injection(obj, scope, strict: bool):
+        _apply_injection_real(obj, scope, strict)
+        if isinstance(obj, _SyncRunner):
+            captured["runner_context_service"] = obj.context_service
+
+    monkeypatch.setattr("stream_kernel.app.runtime.apply_injection", _capturing_apply_injection)
+
+    config = {
+        "scenario": {"name": "baseline"},
+        "runtime": {"discovery_modules": []},
+        "adapters": {"input_source": {}},
+    }
+
+    exit_code = run_with_config(
+        config,
+        adapter_registry=AdapterRegistry(),
+        adapter_bindings={},
+        discovery_modules=[],
+    )
+    assert exit_code == 0
+    assert captured["runner_context_service"] is custom_service
+    assert captured["scenario_scope"] is not None

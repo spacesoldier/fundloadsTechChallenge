@@ -8,9 +8,20 @@ import pytest
 from stream_kernel.adapters.registry import AdapterRegistry, AdapterRegistryError
 from stream_kernel.adapters.wiring import build_injection_registry, AdapterWiringError
 from stream_kernel.application_context.injection_registry import InjectionRegistry
+from stream_kernel.integration.kv_store import KVStore
 
 
 class _OutputPort:
+    pass
+
+
+class _WindowKVStore(KVStore):
+    # Marker contract for window state KV access.
+    pass
+
+
+class _PrimeKVStore(KVStore):
+    # Marker contract for prime-check cache KV access.
     pass
 
 
@@ -86,8 +97,8 @@ def test_build_injection_registry_supports_multiple_bindings_for_role() -> None:
     )
 
     adapters_cfg = {"window_store": {"kind": "memory", "settings": {}}}
-    bindings = {"window_store": [("kv", object), ("kv", str)]}
+    bindings = {"window_store": [("kv", _WindowKVStore), ("kv", _PrimeKVStore)]}
 
     registry = build_injection_registry(adapters_cfg, adapter_registry, bindings)
     scope = registry.instantiate_for_scenario("s1")
-    assert scope.resolve("kv", object) is scope.resolve("kv", str)
+    assert scope.resolve("kv", _WindowKVStore) is scope.resolve("kv", _PrimeKVStore)

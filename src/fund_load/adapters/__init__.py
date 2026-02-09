@@ -1,11 +1,9 @@
-from .services.prime_checker import SievePrimeChecker
-from .state.window_store import InMemoryWindowStore
-from .trace_sinks import JsonlTraceSink, StdoutTraceSink
+from .io import file_input_source, file_output_sink
+from fund_load.services.window_store import InMemoryWindowStore, window_store_memory
 
-# Public adapter exports are optional but make wiring simpler.
 __all__ = [
+    "file_input_source",
+    "file_output_sink",
+    "window_store_memory",
     "InMemoryWindowStore",
-    "SievePrimeChecker",
-    "JsonlTraceSink",
-    "StdoutTraceSink",
 ]

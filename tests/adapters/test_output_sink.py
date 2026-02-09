@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 # OutputSink adapter behavior is specified in docs/implementation/ports/OutputSink.md.
-from fund_load.adapters.factories.io import file_output_sink
+from fund_load.adapters.io import file_output_sink
 
 
 def test_output_sink_writes_ndjson_lines(tmp_path: Path) -> None:

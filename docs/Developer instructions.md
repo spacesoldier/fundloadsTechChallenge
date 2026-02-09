@@ -21,6 +21,15 @@ You are working in a local repository that already contains substantial document
 6. **Config defines composition; code defines meaning.** Configuration selects steps and parameters. Configuration must not contain business logic.
 7. **Single-threaded, per-message end-to-end execution.** The runner processes a full scenario per message, left-to-right.
 
+8. **Port taxonomy is stable.** Use framework port types (`stream`, `kv_stream`, `kv`, `request`, `response`) and avoid creating project-level domain ports.
+
+9. **If API is richer than base ports, use a service, not a new port.**  
+   Multi-method domain convenience APIs are modeled as services and injected via `inject.service(...)`.
+
+10. **Control-plane separation.**  
+    Runner/Router are runtime control-plane components by default, not business DAG nodes.
+    If modeled as nodes later, they must live in a dedicated platform control graph with explicit queues.
+
 ---
 
 ## 1) What to build (high-level)
@@ -185,4 +194,3 @@ Return progress as:
 - what tests were added
 - what code was added
 - how to run tests and generate output
-

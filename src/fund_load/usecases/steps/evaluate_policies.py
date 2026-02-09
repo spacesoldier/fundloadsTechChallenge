@@ -5,7 +5,7 @@ from decimal import Decimal
 
 from fund_load.domain.messages import IdemStatus
 from fund_load.domain.reasons import ReasonCode
-from fund_load.ports.window_store import WindowReadPort
+from fund_load.services.window_store import WindowStoreService
 from fund_load.usecases.messages import Decision, EnrichedAttempt
 from stream_kernel.application_context.config_inject import config
 from stream_kernel.application_context.inject import inject
@@ -18,9 +18,8 @@ from stream_kernel.kernel.node import node
 @dataclass(frozen=True, slots=True)
 class EvaluatePolicies:
     # Step 05 applies policy order and produces Decision (docs/implementation/steps/05 EvaluatePolicies.md).
-    # Dependency injection: WindowStore read port is provided by the runtime wiring.
-    # We use the generic "kv" port_type as a service bucket in this initial stage.
-    window_store: WindowReadPort = inject.kv(WindowReadPort)
+    # Dependency injection: WindowStore service is provided by runtime adapter wiring.
+    window_store: WindowStoreService = inject.service(WindowStoreService)
     # Config-driven limits come from nodes.evaluate_policies.* (newgen config).
     daily_attempt_limit: int = config.value("limits.daily_attempts", default=0)
     daily_amount_limit: Decimal = config.value("limits.daily_amount", default=Decimal("0"))

@@ -6,13 +6,11 @@ from decimal import Decimal
 from typing import Iterable
 
 # Experimental scenario validates Monday multiplier + prime gate (docs/implementation/steps/04-06).
-from fund_load.adapters.services.prime_checker import SievePrimeChecker
-from fund_load.adapters.state.window_store import InMemoryWindowStore
+from fund_load.services.window_store import InMemoryWindowStore
 from fund_load.domain.messages import RawLine
 from fund_load.domain.reasons import ReasonCode
-from fund_load.ports.output_sink import OutputSink
-from fund_load.ports.prime_checker import PrimeChecker
-from fund_load.ports.window_store import WindowReadPort, WindowWritePort
+from stream_kernel.adapters.file_io import FileOutputSink
+from fund_load.services.window_store import WindowStoreService
 from fund_load.usecases.messages import Decision, OutputLine
 from stream_kernel.adapters.contracts import adapter
 from stream_kernel.adapters.registry import AdapterRegistry
@@ -41,7 +39,7 @@ class _InMemoryInputSource:
 
 
 @dataclass(frozen=True, slots=True)
-class _CollectingOutputSink(OutputSink):
+class _CollectingOutputSink:
     # OutputSink stub to assert output rows and order.
     lines: list[str]
 
@@ -91,7 +89,6 @@ def _config(lines: list[RawLine]) -> dict[str, object]:
                 "binds": ["stream"],
             },
             "window_store": {"settings": {}},
-            "prime_checker": {"settings": {"max_id": 20000}},
         },
     }
 
@@ -138,23 +135,17 @@ def test_experiment_end_to_end_prime_and_monday() -> None:
     registry.register("input_source", "input_source", _input_source_factory)
     registry.register("output_sink", "output_sink", _output_sink_factory)
     registry.register("window_store", "window_store", lambda settings: InMemoryWindowStore())
-    registry.register(
-        "prime_checker",
-        "prime_checker",
-        lambda settings: SievePrimeChecker.from_max(int(settings["max_id"])),
-    )
 
     bindings = {
-        "output_sink": [("stream", OutputSink)],
-        "window_store": [("kv", WindowReadPort), ("kv", WindowWritePort)],
-        "prime_checker": [("kv", PrimeChecker)],
+        "output_sink": [("stream", FileOutputSink)],
+        "window_store": [("service", WindowStoreService)],
     }
 
     exit_code = run_with_config(
         cfg,
         adapter_registry=registry,
         adapter_bindings=bindings,
-        discovery_modules=["fund_load.usecases.steps", __name__],
+        discovery_modules=["fund_load.usecases.steps", "fund_load.services.prime_checker", __name__],
     )
     assert exit_code == 0
 

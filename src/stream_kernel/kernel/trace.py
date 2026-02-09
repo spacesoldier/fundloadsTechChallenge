@@ -35,7 +35,6 @@ class TraceRecord:
     # TraceRecord captures one step invocation for one message (Trace spec §3.1).
     trace_id: str
     scenario: str
-    line_no: int | None
     step_index: int
     step_name: str
     work_index: int
@@ -116,7 +115,6 @@ class TraceRecorder:
         record = TraceRecord(
             trace_id=ctx.trace_id,
             scenario=ctx.scenario_id,
-            line_no=ctx.line_no,
             step_index=span.step_index,
             step_name=span.step_name,
             work_index=span.work_index,

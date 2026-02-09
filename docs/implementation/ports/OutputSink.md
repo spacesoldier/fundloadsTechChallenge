@@ -12,8 +12,8 @@ For the challenge, the required sink is:
 
 ---
 
-**Port implementation:** [output_sink.py](../../../src/fund_load/ports/output_sink.py)  
-**Adapter (file):** [output_sink.py](../../../src/fund_load/adapters/output_sink.py)
+**Framework adapter contract:** [file_io.py](../../../src/stream_kernel/adapters/file_io.py)  
+**Project adapter mapping:** [io.py](../../../src/fund_load/adapters/io.py)
 
 ---
 

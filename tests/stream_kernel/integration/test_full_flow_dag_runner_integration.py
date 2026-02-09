@@ -7,8 +7,9 @@ from dataclasses import dataclass, field
 # docs/framework/initial_stage/DAG construction.md
 # docs/framework/initial_stage/Execution runtime and routing integration.md
 from stream_kernel.application_context import ApplicationContext
+from stream_kernel.platform.services.context import InMemoryKvContextService
 from stream_kernel.execution.runner import SyncRunner
-from stream_kernel.integration.context_store import InMemoryContextStore
+from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.integration.routing_port import RoutingPort
 from stream_kernel.integration.work_queue import InMemoryWorkQueue
 from stream_kernel.kernel.node import node
@@ -86,14 +87,15 @@ def test_full_flow_runner_routing_with_dag_builder() -> None:
     nodes = {spec.name: spec.step for spec in scenario.steps}
 
     work_queue = InMemoryWorkQueue()
-    context_store = InMemoryContextStore()
-    context_store.put("t1", {"trace": "ok"})
+    store = InMemoryKvStore()
+    store.set("t1", {"trace": "ok"})
+    context_service = InMemoryKvContextService(store)
 
     work_queue.push(Envelope(payload="seed", target="source", trace_id="t1"))
     runner = SyncRunner(
         nodes=nodes,
         work_queue=work_queue,
-        context_store=context_store,
+        context_service=context_service,
         routing_port=routing,
     )
     runner.run()

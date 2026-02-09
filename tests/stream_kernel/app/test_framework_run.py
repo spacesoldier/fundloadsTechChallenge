@@ -13,13 +13,11 @@ import stream_kernel.app.runtime as runtime_module
 from stream_kernel.application_context.injection_registry import InjectionRegistry
 from stream_kernel.config.loader import load_yaml_config
 from stream_kernel.config.validator import validate_newgen_config
-from fund_load.adapters.factories.io import file_input_source, file_output_sink
-from fund_load.adapters.factories.services import prime_checker_stub
-from fund_load.adapters.factories.state import window_store_memory
-from fund_load.ports.input_source import InputSource
-from fund_load.ports.output_sink import OutputSink
-from fund_load.ports.window_store import WindowReadPort, WindowWritePort
-from fund_load.ports.prime_checker import PrimeChecker
+from fund_load.adapters.io import file_input_source, file_output_sink
+from fund_load.services.window_store import window_store_memory
+from stream_kernel.adapters.file_io import FileLineInputSource
+from stream_kernel.adapters.file_io import FileOutputSink
+from fund_load.services.window_store import WindowStoreService
 
 
 @adapter(emits=[])
@@ -36,7 +34,7 @@ def _write(tmp_path: Path, text: str) -> Path:
 
 def test_build_adapter_contracts_from_factory_metadata() -> None:
     # Adapter contracts are sourced from AdapterRegistry metadata (kind -> @adapter contract).
-    from fund_load.adapters.factories.io import file_input_source, file_output_sink
+    from fund_load.adapters.io import file_input_source, file_output_sink
 
     registry = AdapterRegistry()
     registry.register("input_source", "input_source", file_input_source)
@@ -120,13 +118,7 @@ adapters:
   window_store:
     settings: {}
     binds:
-      - kv
-  prime_checker:
-    settings:
-      strategy: sieve
-      max_id: 100
-    binds:
-      - kv
+      - service
 """,
     )
 
@@ -142,20 +134,16 @@ adapters:
     registry.register("input_source", "input_source", file_input_source)
     registry.register("output_sink", "output_sink", file_output_sink)
     registry.register("window_store", "window_store", window_store_memory)
-    registry.register("prime_checker", "prime_checker", prime_checker_stub)
-
     bindings = {
-        "input_source": [("stream", InputSource)],
-        "output_sink": [("stream", OutputSink)],
-        "window_store": [("kv", WindowReadPort), ("kv", WindowWritePort)],
-        "prime_checker": [("kv", PrimeChecker)],
-    }
+        "input_source": [("stream", FileLineInputSource)],
+        "output_sink": [("stream", FileOutputSink)],
+        "window_store": [("service", WindowStoreService)],    }
 
     exit_code = run_with_config(
         cfg,
         adapter_registry=registry,
         adapter_bindings=bindings,
-        discovery_modules=["fund_load.usecases.steps"],
+        discovery_modules=["fund_load.usecases.steps", "fund_load.services.prime_checker"],
         argv_overrides={
             "input": str(input_path),
             "output": str(output_path),
@@ -177,8 +165,7 @@ scenario:
 runtime:
   strict: true
   discovery_modules:
-    - fund_load.usecases.steps
-    - fund_load.adapters.factories
+    - fund_load
 nodes:
   compute_time_keys:
     week_start: MON
@@ -217,12 +204,7 @@ adapters:
   window_store:
     settings: {}
     binds:
-      - kv
-  prime_checker:
-    settings:
-      max_id: 100
-    binds:
-      - kv
+      - service
 """,
     )
 
@@ -295,13 +277,7 @@ adapters:
   window_store:
     settings: {}
     binds:
-      - kv
-  prime_checker:
-    settings:
-      strategy: sieve
-      max_id: 100
-    binds:
-      - kv
+      - service
 """,
     )
 
@@ -316,14 +292,10 @@ adapters:
     registry.register("input_source", "input_source", file_input_source)
     registry.register("output_sink", "output_sink", file_output_sink)
     registry.register("window_store", "window_store", window_store_memory)
-    registry.register("prime_checker", "prime_checker", prime_checker_stub)
-
     bindings = {
-        "input_source": [("stream", InputSource)],
-        "output_sink": [("stream", OutputSink)],
-        "window_store": [("kv", WindowReadPort), ("kv", WindowWritePort)],
-        "prime_checker": [("kv", PrimeChecker)],
-    }
+        "input_source": [("stream", FileLineInputSource)],
+        "output_sink": [("stream", FileOutputSink)],
+        "window_store": [("service", WindowStoreService)],    }
 
     exit_code = run_with_registry(
         [
@@ -336,7 +308,7 @@ adapters:
         ],
         adapter_registry=registry,
         adapter_bindings=bindings,
-        discovery_modules=["fund_load.usecases.steps"],
+        discovery_modules=["fund_load.usecases.steps", "fund_load.services.prime_checker"],
     )
 
     assert exit_code == 0
@@ -401,7 +373,9 @@ runtime:
   strict: true
   discovery_modules:
     - fund_load.usecases.steps
-    - fund_load.adapters.factories
+    - fund_load.adapters.io
+    - fund_load.services.prime_checker
+    - fund_load.services.window_store
 nodes:
   compute_time_keys:
     week_start: MON
@@ -440,12 +414,7 @@ adapters:
   window_store:
     settings: {}
     binds:
-      - kv
-  prime_checker:
-    settings:
-      max_id: 100
-    binds:
-      - kv
+      - service
 """,
     )
 
@@ -510,10 +479,9 @@ def test_run_with_config_uses_discovery_order_when_pipeline_missing(monkeypatch:
     )
     monkeypatch.setattr(
         "stream_kernel.app.runtime._build_injection_registry_from_bindings",
-        lambda _instances, _bindings: object(),
+        lambda _instances, _bindings: InjectionRegistry(),
     )
-    monkeypatch.setattr("stream_kernel.app.runtime._build_tracing", lambda _runtime: (None, None))
-    monkeypatch.setattr("stream_kernel.app.runtime._emit_implicit_sink_diagnostics", lambda *_a, **_k: None)
+    monkeypatch.setattr("stream_kernel.app.runtime.build_execution_observers", lambda *_a, **_k: [])
     monkeypatch.setattr(
         "stream_kernel.app.runtime._run_with_sync_runner",
         lambda **_kw: None,
@@ -576,10 +544,9 @@ def test_run_with_config_invokes_preflight(monkeypatch: pytest.MonkeyPatch) -> N
     )
     monkeypatch.setattr(
         "stream_kernel.app.runtime._build_injection_registry_from_bindings",
-        lambda _instances, _bindings: object(),
+        lambda _instances, _bindings: InjectionRegistry(),
     )
-    monkeypatch.setattr("stream_kernel.app.runtime._build_tracing", lambda _runtime: (None, None))
-    monkeypatch.setattr("stream_kernel.app.runtime._emit_implicit_sink_diagnostics", lambda *_a, **_k: None)
+    monkeypatch.setattr("stream_kernel.app.runtime.build_execution_observers", lambda *_a, **_k: [])
     monkeypatch.setattr("stream_kernel.app.runtime._run_with_sync_runner", lambda **_kw: None)
 
     cfg = {
@@ -718,7 +685,7 @@ def test_run_rejects_runtime_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setattr(
         "stream_kernel.app.runtime.SyncRunner",
-        lambda **_k: type("R", (), {"run": lambda *_a, **_k: None})(),
+        lambda **_k: type("R", (), {"run": lambda *_a, **_k: None, "run_inputs": lambda *_a, **_k: None})(),
     )
 
     with pytest.raises(ValueError):
@@ -781,8 +748,7 @@ def test_run_uses_discovery_order_when_pipeline_missing(monkeypatch: pytest.Monk
         "stream_kernel.app.runtime._build_injection_registry_from_bindings",
         lambda _instances, _bindings: InjectionRegistry(),
     )
-    monkeypatch.setattr("stream_kernel.app.runtime._build_tracing", lambda _runtime: (None, None))
-    monkeypatch.setattr("stream_kernel.app.runtime._emit_implicit_sink_diagnostics", lambda *_a, **_k: None)
+    monkeypatch.setattr("stream_kernel.app.runtime.build_execution_observers", lambda *_a, **_k: [])
     monkeypatch.setattr("stream_kernel.app.runtime._run_with_sync_runner", lambda **_kw: None)
 
     exit_code = run(["--config", "cfg.yml"])
@@ -831,7 +797,7 @@ def test_run_requires_source_adapter_with_read(monkeypatch: pytest.MonkeyPatch) 
     )
     monkeypatch.setattr(
         "stream_kernel.app.runtime.SyncRunner",
-        lambda **_k: type("R", (), {"run": lambda *_a, **_k: None})(),
+        lambda **_k: type("R", (), {"run": lambda *_a, **_k: None, "run_inputs": lambda *_a, **_k: None})(),
     )
 
     with pytest.raises(ValueError):
@@ -894,8 +860,7 @@ def test_run_accepts_non_default_source_role_with_read(monkeypatch: pytest.Monke
         "stream_kernel.app.runtime._build_injection_registry_from_bindings",
         lambda _instances, _bindings: InjectionRegistry(),
     )
-    monkeypatch.setattr("stream_kernel.app.runtime._build_tracing", lambda _runtime: (None, None))
-    monkeypatch.setattr("stream_kernel.app.runtime._emit_implicit_sink_diagnostics", lambda *_a, **_k: None)
+    monkeypatch.setattr("stream_kernel.app.runtime.build_execution_observers", lambda *_a, **_k: [])
     monkeypatch.setattr("stream_kernel.app.runtime._run_with_sync_runner", lambda **_kw: None)
 
     exit_code = run(["--config", "cfg.yml"])

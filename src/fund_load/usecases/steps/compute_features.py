@@ -5,7 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from fund_load.domain.money import Money
-from fund_load.ports.prime_checker import PrimeChecker
+from fund_load.services.prime_checker import PrimeCheckerService
 from fund_load.usecases.messages import EnrichedAttempt, Features, IdempotencyClassifiedAttempt
 from stream_kernel.application_context.config_inject import config
 from stream_kernel.application_context.inject import inject
@@ -23,9 +23,8 @@ class ComputeFeatures:
     monday_multiplier: Decimal = config.value("monday_multiplier.multiplier", default=Decimal("1"))
     apply_to: str = config.value("monday_multiplier.apply_to", default="amount")
     prime_enabled: bool = config.value("prime_gate.enabled", default=False)
-    # Dependency is injected by type: PrimeChecker is bound in the injection registry.
-    # We use the generic "kv" port_type as a service bucket in this initial stage.
-    prime_checker: PrimeChecker = inject.kv(PrimeChecker)
+    # Dependency is injected by type: PrimeCheckerService is bound in the injection registry.
+    prime_checker: PrimeCheckerService = inject.service(PrimeCheckerService)
 
     def __call__(self, msg: IdempotencyClassifiedAttempt, ctx: object | None) -> list[EnrichedAttempt]:
         # Monday detection uses UTC timestamp per Time and Money Semantics doc.

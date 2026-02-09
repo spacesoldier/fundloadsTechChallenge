@@ -8,8 +8,8 @@ The prime logic is treated as a **feature provider**:
 
 ---
 
-**Port implementation:** [prime_checker.py](../../../src/fund_load/ports/prime_checker.py)  
-**Adapter (sieve):** [prime_checker.py](../../../src/fund_load/adapters/prime_checker.py)
+**Service contract:** [prime_checker.py](../../../src/fund_load/services/prime_checker.py)  
+**Service implementation (sieve):** [prime_checker.py](../../../src/fund_load/adapters/services/prime_checker.py)
 
 ---
 

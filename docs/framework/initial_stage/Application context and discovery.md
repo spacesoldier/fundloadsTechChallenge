@@ -61,6 +61,7 @@ Discovery will scan these project areas:
 
 - `usecases` (steps and services)
 - `adapters` (thin adapters tagged by framework adapter metadata)
+- framework extension providers (e.g. observability adapters/observers)
 
 The scan list is **explicit** (module paths from config) to avoid hidden
 imports. Example:
@@ -71,6 +72,9 @@ runtime:
     - example_app.usecases.steps
     - example_app.adapters
 ```
+
+Framework modules are appended via extension providers (`discovery_modules()`),
+so runtime does not hardcode concrete observability module names.
 
 ---
 
@@ -102,14 +106,30 @@ Important config rule:
 - adapter is selected by YAML key name (`adapters.<name>`);
 - YAML declares only `settings` and bound port types (`binds`).
 
+### 4.3 `@service` (planned explicit marker)
+
+Service components provide domain APIs over standard framework ports/adapters.
+They are framework-managed and scenario-scoped by default.
+
+Current practical path (already supported):
+
+- declare service class/component
+- inject it with `inject.service(ServiceImpl)`
+
+Planned addition:
+
+- explicit `@service(...)` decorator for clearer discovery/lint diagnostics
+
+See: [Service model](./Service%20model.md)
+
 ---
 
 ## 5) Outcome: how wiring changes
 
 - `wiring.py` becomes a thin call to `ApplicationContext.discover(...)`.
 - Registry population is automatic based on decorators (`@node`, `@adapter`).
-- Dependencies are resolved by name (e.g., `feature_checker`,
-  `window_store`, `output_sink`).
+- Dependencies are resolved by injection contract (`port_type + data_type`),
+  including service injections via `inject.service(...)`.
 - Configuration is applied by the context, not by hand-coded lambdas.
 
 ---

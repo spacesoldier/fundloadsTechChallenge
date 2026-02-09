@@ -33,10 +33,15 @@ class UserState: ...
 
 stream = inject.stream(OrderEvent)   # stream<OrderEvent>
 store = inject.kv(UserState)         # kv<UserState>
+window_store = inject.kv(UserState, qualifier="window_state")
 ```
 
 This allows the framework to keep ports generic while providing
-type-safe resolution. Resolution uses `(port_type, data_type)` as a key.
+type-safe resolution. Resolution uses `(port_type, data_type, qualifier?)` as a key.
+
+Use `qualifier` when multiple bindings share the same port and contract.
+This is especially useful for isolated KV scopes (for example `context`,
+`window_state`, `prime_cache`).
 
 Port types in the framework taxonomy:
 
@@ -49,9 +54,14 @@ Port types in the framework taxonomy:
 Current injection helpers in code expose:
 
 - `inject.stream(...)`
+- `inject.kv_stream(...)`
 - `inject.kv(...)`
+- `inject.request(...)`
+- `inject.response(...)`
+- `inject.service(...)`
 
-`request/response` helpers are planned for the next stage.
+Service semantics are defined in:
+- [Service model](Service%20model.md)
 
 Strict mode applies if no match is found.
 

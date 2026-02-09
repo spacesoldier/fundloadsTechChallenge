@@ -3,19 +3,20 @@ from __future__ import annotations
 from decimal import Decimal
 
 # Config injection is described in docs/framework/initial_stage/Injection and strict mode.md.
-from fund_load.adapters.state.window_store import InMemoryWindowStore
-from fund_load.ports.prime_checker import PrimeChecker
-from fund_load.ports.window_store import WindowReadPort, WindowWritePort
+from fund_load.services.window_store import InMemoryWindowStore
+from fund_load.services.prime_checker import PrimeCheckerService
+from fund_load.services.window_store import WindowStoreService
 from fund_load.usecases.steps.compute_features import ComputeFeatures
 from fund_load.usecases.steps.compute_time_keys import ComputeTimeKeys
 from fund_load.usecases.steps.evaluate_policies import EvaluatePolicies
 from fund_load.usecases.steps.update_windows import UpdateWindows
 from stream_kernel.application_context import ApplicationContext
 from stream_kernel.application_context.injection_registry import InjectionRegistry
+from stream_kernel.integration.kv_store import InMemoryKvStore
 
 
 class _FakePrimeChecker:
-    # Minimal fake for PrimeChecker port (docs/implementation/ports/PrimeChecker.md).
+    # Minimal fake for PrimeChecker service contract.
     def is_prime(self, id_num: int) -> bool:
         return id_num in {2, 3, 5, 7, 11}
 
@@ -23,10 +24,9 @@ class _FakePrimeChecker:
 def _registry() -> InjectionRegistry:
     # Provide ports needed by steps so ApplicationContext can inject dependencies.
     registry = InjectionRegistry()
-    registry.register_factory("kv", PrimeChecker, lambda: _FakePrimeChecker())
-    store = InMemoryWindowStore()
-    registry.register_factory("kv", WindowReadPort, lambda _s=store: _s)
-    registry.register_factory("kv", WindowWritePort, lambda _s=store: _s)
+    registry.register_factory("service", PrimeCheckerService, lambda: _FakePrimeChecker())
+    store = InMemoryWindowStore(store=InMemoryKvStore())
+    registry.register_factory("service", WindowStoreService, lambda _s=store: _s)
     return registry
 
 

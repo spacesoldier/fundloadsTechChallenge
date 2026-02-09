@@ -7,9 +7,10 @@ import pytest
 # Runner+router integration rules are defined in:
 # docs/framework/initial_stage/Execution runtime and routing integration.md
 # docs/framework/initial_stage/Routing semantics.md
+from stream_kernel.platform.services.context import InMemoryKvContextService
 from stream_kernel.execution.runner import SyncRunner
 from stream_kernel.integration.consumer_registry import InMemoryConsumerRegistry
-from stream_kernel.integration.context_store import InMemoryContextStore
+from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.integration.routing_port import RoutingPort
 from stream_kernel.integration.work_queue import InMemoryWorkQueue
 from stream_kernel.routing.envelope import Envelope
@@ -45,13 +46,13 @@ def test_runner_routes_outputs_via_routing_port() -> None:
     routing = RoutingPort(registry=registry, strict=True)
 
     work_queue = InMemoryWorkQueue()
-    context_store = InMemoryContextStore()
+    context_service = InMemoryKvContextService(InMemoryKvStore())
     work_queue.push(Envelope(payload="seed", target="A", trace_id="t1"))
 
     runner = SyncRunner(
         nodes={"A": node_a, "B": node_b, "C": node_c},
         work_queue=work_queue,
-        context_store=context_store,
+        context_service=context_service,
         routing_port=routing,
     )
     runner.run()
@@ -79,13 +80,13 @@ def test_runner_respects_targeted_envelope_outputs() -> None:
     routing = RoutingPort(registry=registry, strict=True)
 
     work_queue = InMemoryWorkQueue()
-    context_store = InMemoryContextStore()
+    context_service = InMemoryKvContextService(InMemoryKvStore())
     work_queue.push(Envelope(payload="seed", target="A", trace_id="t1"))
 
     runner = SyncRunner(
         nodes={"A": node_a, "B": node_b, "C": node_c},
         work_queue=work_queue,
-        context_store=context_store,
+        context_service=context_service,
         routing_port=routing,
     )
     runner.run()
@@ -103,13 +104,13 @@ def test_runner_raises_on_no_consumer_in_strict_mode() -> None:
     routing = RoutingPort(registry=registry, strict=True)
 
     work_queue = InMemoryWorkQueue()
-    context_store = InMemoryContextStore()
+    context_service = InMemoryKvContextService(InMemoryKvStore())
     work_queue.push(Envelope(payload="seed", target="A", trace_id="t1"))
 
     runner = SyncRunner(
         nodes={"A": node_a},
         work_queue=work_queue,
-        context_store=context_store,
+        context_service=context_service,
         routing_port=routing,
     )
 
@@ -133,13 +134,13 @@ def test_runner_drops_no_consumer_in_non_strict_mode() -> None:
     routing = RoutingPort(registry=registry, strict=False)
 
     work_queue = InMemoryWorkQueue()
-    context_store = InMemoryContextStore()
+    context_service = InMemoryKvContextService(InMemoryKvStore())
     work_queue.push(Envelope(payload="seed", target="A", trace_id="t1"))
 
     runner = SyncRunner(
         nodes={"A": node_a, "B": node_b},
         work_queue=work_queue,
-        context_store=context_store,
+        context_service=context_service,
         routing_port=routing,
     )
     runner.run()
@@ -163,13 +164,13 @@ def test_runner_drops_unknown_target_in_non_strict_mode() -> None:
     routing = RoutingPort(registry=registry, strict=False)
 
     work_queue = InMemoryWorkQueue()
-    context_store = InMemoryContextStore()
+    context_service = InMemoryKvContextService(InMemoryKvStore())
     work_queue.push(Envelope(payload="seed", target="A", trace_id="t1"))
 
     runner = SyncRunner(
         nodes={"A": node_a, "B": node_b},
         work_queue=work_queue,
-        context_store=context_store,
+        context_service=context_service,
         routing_port=routing,
     )
     runner.run()
@@ -197,13 +198,13 @@ def test_runner_avoids_default_self_loop_on_same_token() -> None:
     routing = RoutingPort(registry=registry, strict=True)
 
     work_queue = InMemoryWorkQueue()
-    context_store = InMemoryContextStore()
+    context_service = InMemoryKvContextService(InMemoryKvStore())
     work_queue.push(Envelope(payload="seed", target="A", trace_id="t1"))
 
     runner = SyncRunner(
         nodes={"A": node_a, "B": node_b},
         work_queue=work_queue,
-        context_store=context_store,
+        context_service=context_service,
         routing_port=routing,
     )
     runner.run()
@@ -222,13 +223,13 @@ def test_runner_requires_explicit_target_for_single_self_consumer_in_strict_mode
     routing = RoutingPort(registry=registry, strict=True)
 
     work_queue = InMemoryWorkQueue()
-    context_store = InMemoryContextStore()
+    context_service = InMemoryKvContextService(InMemoryKvStore())
     work_queue.push(Envelope(payload="seed", target="A", trace_id="t1"))
 
     runner = SyncRunner(
         nodes={"A": node_a},
         work_queue=work_queue,
-        context_store=context_store,
+        context_service=context_service,
         routing_port=routing,
     )
 

@@ -4,11 +4,12 @@ from datetime import date
 from decimal import Decimal
 
 # UpdateWindows behavior is specified in docs/implementation/steps/06 UpdateWindows.md.
-from fund_load.adapters.state.window_store import InMemoryWindowStore
+from fund_load.services.window_store import InMemoryWindowStore
 from fund_load.domain.messages import IdemStatus
 from fund_load.domain.money import Money
 from fund_load.usecases.messages import Decision, WindowedDecision
 from fund_load.usecases.steps.update_windows import UpdateWindows
+from stream_kernel.integration.kv_store import InMemoryKvStore
 
 
 def _decision(
@@ -39,7 +40,7 @@ def _decision(
 
 def test_windows_update_canonical_approved_updates_all() -> None:
     # Canonical + approved updates attempts and accepted sums (Step 06).
-    store = InMemoryWindowStore()
+    store = InMemoryWindowStore(store=InMemoryKvStore())
     step = UpdateWindows(window_store=store, prime_gate_enabled=True)
     decision = _decision(accepted=True, is_canonical=True)
     out = list(step(decision, ctx=None))[0]
@@ -55,7 +56,7 @@ def test_windows_update_canonical_approved_updates_all() -> None:
 
 def test_windows_update_canonical_declined_updates_attempts_only() -> None:
     # Canonical + declined still increments attempts, but not accepted sums.
-    store = InMemoryWindowStore()
+    store = InMemoryWindowStore(store=InMemoryKvStore())
     step = UpdateWindows(window_store=store, prime_gate_enabled=True)
     decision = _decision(accepted=False, is_canonical=True)
     list(step(decision, ctx=None))
@@ -67,7 +68,7 @@ def test_windows_update_canonical_declined_updates_attempts_only() -> None:
 
 def test_windows_update_noncanonical_no_updates() -> None:
     # Non-canonical decisions must not mutate state (Step 06 invariant).
-    store = InMemoryWindowStore()
+    store = InMemoryWindowStore(store=InMemoryKvStore())
     step = UpdateWindows(window_store=store, prime_gate_enabled=True)
     decision = _decision(accepted=False, is_canonical=False, idem_status=IdemStatus.DUP_REPLAY)
     list(step(decision, ctx=None))
@@ -79,7 +80,7 @@ def test_windows_update_noncanonical_no_updates() -> None:
 
 def test_windows_update_prime_gate_only_for_prime_approved() -> None:
     # Prime gate counter increments only for approved prime canonicals.
-    store = InMemoryWindowStore()
+    store = InMemoryWindowStore(store=InMemoryKvStore())
     step = UpdateWindows(window_store=store, prime_gate_enabled=True)
     decision = _decision(accepted=True, is_canonical=True, is_prime=True)
     list(step(decision, ctx=None))
@@ -89,7 +90,7 @@ def test_windows_update_prime_gate_only_for_prime_approved() -> None:
 
 def test_windows_update_prime_gate_disabled_no_update() -> None:
     # If prime gate is disabled in config, counter should remain unchanged.
-    store = InMemoryWindowStore()
+    store = InMemoryWindowStore(store=InMemoryKvStore())
     step = UpdateWindows(window_store=store, prime_gate_enabled=False)
     decision = _decision(accepted=True, is_canonical=True, is_prime=True)
     list(step(decision, ctx=None))

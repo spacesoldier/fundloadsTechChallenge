@@ -59,6 +59,9 @@ def build_dag(contracts: Sequence[NodeContract]) -> Dag:
     # Verify every consumed token has at least one provider.
     for token, consumer_names in consumers.items():
         if token not in providers:
+            # Implicit sink adapters are allowed to consume externally-produced streams.
+            if all(_is_adapter_sink(name) for name in consumer_names):
+                continue
             raise MissingProviderError(f"Token '{token.__name__}' has no providers for consumers {consumer_names}")
 
     # Build edges in deterministic order (discovery order).
@@ -106,3 +109,8 @@ def _assert_acyclic(nodes: Iterable[str], edges: Iterable[tuple[str, str]]) -> N
     for node in list(adjacency.keys()):
         if node not in visited:
             _visit(node)
+
+
+def _is_adapter_sink(name: str) -> bool:
+    # Adapter contracts are injected by runtime as synthetic nodes prefixed with "adapter:".
+    return name.startswith("adapter:")

@@ -57,7 +57,8 @@ def test_apply_cli_overrides_updates_paths_and_tracing() -> None:
     assert adapters["input_source"]["settings"]["path"] == "override_input.ndjson"
     assert adapters["output_sink"]["settings"]["path"] == "override_output.txt"
     assert cfg["runtime"]["tracing"]["enabled"] is True
-    assert cfg["runtime"]["tracing"]["sink"]["jsonl"]["path"] == "override_trace.jsonl"
+    assert cfg["runtime"]["tracing"]["sink"]["name"] == "trace_jsonl"
+    assert cfg["runtime"]["tracing"]["sink"]["settings"]["path"] == "override_trace.jsonl"
 
 
 def test_build_parser_declares_known_flags() -> None:
@@ -101,9 +102,9 @@ def test_apply_cli_overrides_requires_tracing_sink_mapping() -> None:
 
 
 def test_apply_cli_overrides_requires_jsonl_mapping() -> None:
-    # Trace jsonl config must be a mapping when sink.kind=jsonl (Trace runtime spec).
+    # Trace sink settings must be a mapping in the canonical tracing sink shape.
     args = SimpleNamespace(input=None, output=None, tracing=None, trace_path="trace.jsonl")
-    cfg = {"adapters": {}, "runtime": {"tracing": {"sink": {"kind": "jsonl", "jsonl": "nope"}}}}
+    cfg = {"adapters": {}, "runtime": {"tracing": {"sink": {"name": "trace_jsonl", "settings": "nope"}}}}
     with pytest.raises(ValueError):
         apply_cli_overrides(cfg, args)
 

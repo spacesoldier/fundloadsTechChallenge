@@ -8,6 +8,7 @@ It complements:
 - [Execution runtime and routing integration](Execution%20runtime%20and%20routing%20integration.md)
 - [Execution planning model](Execution%20planning%20model.md)
 - [Routing semantics](Routing%20semantics.md)
+- [Service model](Service%20model.md)
 
 ---
 
@@ -19,6 +20,12 @@ A port is a **pure abstraction** for data flow:
 - it does **not** depend on concrete transport
 - it exposes one of a few **minimal shapes**
 
+Port-introduction policy:
+
+- do not add project-specific ports for domain convenience;
+- add a new port only when introducing a genuinely new transport primitive;
+- model richer domain APIs as services over stable ports.
+
 ### 1.1 Stable port types
 
 The framework supports a stable minimal set of port types:
@@ -29,8 +36,25 @@ The framework supports a stable minimal set of port types:
 - `request` — request-side call boundary
 - `response` — response-side call boundary
 
+Context persistence is treated as a `kv` use case (keyed metadata state),
+not as a separate special transport type.
+
 `source`/`sink` are not port types; they are runtime roles inferred from adapter
 contracts (`consumes/emits`) and graph placement.
+
+### 1.3 KV marker contracts
+
+`kv` injections may use:
+
+- `KVStore` base contract
+- marker subclasses of `KVStore` (semantic role labels like `ContextKVStore`, `StateKVStore`)
+
+Constraint:
+
+- marker subclasses must not add new public methods beyond `KVStore` API (`get/set/delete`).
+- if richer behavior is needed, it must be modeled as a `@service`, not by extending port API.
+
+This rule is enforced at DI registration and `inject.kv(...)` call sites.
 
 ### 1.2 Why this split
 
@@ -49,6 +73,7 @@ Adapters implement ports by talking to concrete systems:
 - Redis
 - Kafka
 - HTTP / MCP
+- observability backends (stdout/jsonl/OTLP/Kafka/log stacks)
 
 Adapters are **payload-only**:
 
@@ -57,6 +82,19 @@ Adapters are **payload-only**:
 - they do not interpret business rules
 
 The framework wraps/unwraps payloads into `Envelope` at execution boundaries.
+
+### 2.3 Observability adapters are platform-owned
+
+Tracing/telemetry/monitoring sinks are infrastructure concerns and must be
+declared/implemented in the framework layer (`stream_kernel`), not in project
+domain ports. Project code should only emit business models; runtime and
+platform adapters handle observability transport.
+
+Framework observability model contracts are defined in:
+- `src/stream_kernel/observability/domain/`
+
+Default platform observability adapters are defined in:
+- `src/stream_kernel/observability/adapters/`
 
 ### 2.1 Adapter identities come from framework discovery
 
@@ -106,6 +144,23 @@ Instead of manually “writing to a port”, the preferred flow is:
 3. The sink node receives the model and calls its adapter
 
 This keeps routing centralized and avoids leaking infrastructure concerns into nodes.
+
+---
+
+## 3.1 Services over standard ports (no project-level domain ports)
+
+Domain-specific "fat interfaces" should be modeled as **services**, not as a
+parallel project-level port taxonomy.
+
+Recommended layering:
+
+- framework ports: transport contracts (`stream`, `kv_stream`, `kv`, `request`, `response`)
+- adapters: concrete transport implementations
+- services: domain API composed over those adapters
+- nodes: business flow using services/injected dependencies
+
+This avoids compatibility layers where the same behavior is declared twice
+(framework port + project custom port).
 
 ---
 

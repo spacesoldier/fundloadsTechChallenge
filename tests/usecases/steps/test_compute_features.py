@@ -13,7 +13,7 @@ from fund_load.usecases.steps.compute_features import ComputeFeatures
 
 
 class _FakePrimeChecker:
-    # Minimal fake for the PrimeChecker port (docs/implementation/ports/PrimeChecker.md).
+    # Minimal fake for the PrimeChecker service contract.
     def __init__(self, primes: set[int]) -> None:
         self._primes = primes
 

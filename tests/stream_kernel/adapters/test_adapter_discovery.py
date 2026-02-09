@@ -38,6 +38,20 @@ def test_discover_adapters_rejects_duplicate_name() -> None:
     module_a = ModuleType("fake.adapters.a")
     module_b = ModuleType("fake.adapters.b")
     module_a.reader = _reader
-    module_b.reader = _reader
+    @adapter(name="reader", kind="file.reader2", binds=[("stream", _PortType)])
+    def _reader2(settings: dict[str, object]) -> object:
+        return object()
+    module_b.reader = _reader2
     with pytest.raises(AdapterDiscoveryError):
         discover_adapters([module_a, module_b])
+
+
+def test_discover_adapters_allows_reexport_of_same_factory() -> None:
+    # Re-exporting the same factory from multiple modules should not be treated as a conflict.
+    module_a = ModuleType("fake.adapters.a")
+    module_b = ModuleType("fake.adapters.b")
+    module_a.reader = _reader
+    module_b.reader_alias = _reader
+    discovered = discover_adapters([module_a, module_b])
+    assert set(discovered.keys()) == {"reader"}
+    assert discovered["reader"] is _reader

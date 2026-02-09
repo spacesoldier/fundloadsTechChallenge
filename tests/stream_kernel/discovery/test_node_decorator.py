@@ -63,6 +63,18 @@ def test_node_decorator_uses_defaults_when_optional_fields_missing() -> None:
     assert meta.stage == ""
     assert meta.consumes == []
     assert meta.emits == []
+    assert meta.service is False
+
+
+def test_node_decorator_supports_service_nodes() -> None:
+    # Service nodes are marked explicitly to receive full runtime context.
+    @node(name="trace_observer", service=True)
+    def trace_observer(msg: object, ctx: object | None) -> list[object]:
+        return [msg]
+
+    meta = getattr(trace_observer, "__node_meta__", None)
+    assert isinstance(meta, NodeMeta)
+    assert meta.service is True
 
 
 def test_node_decorator_rejects_empty_name() -> None:

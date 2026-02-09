@@ -6,7 +6,8 @@ class ConfigError(ValueError):
     pass
 
 
-_STABLE_PORT_TYPES = {"stream", "kv_stream", "kv", "request", "response"}
+_STABLE_PORT_TYPES = {"stream", "kv_stream", "kv", "request", "response", "service"}
+_SUPPORTED_KV_BACKENDS = {"memory"}
 
 
 def validate_newgen_config(raw: object) -> dict[str, object]:
@@ -20,6 +21,7 @@ def validate_newgen_config(raw: object) -> dict[str, object]:
         raise ConfigError("scenario.name must be a non-empty string")
 
     runtime = _optional_mapping(raw, "runtime")
+    _normalize_runtime_platform(runtime)
     nodes = _optional_mapping(raw, "nodes")
     adapters = _optional_mapping(raw, "adapters")
 
@@ -70,3 +72,25 @@ def _optional_mapping(root: dict[str, object], key: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ConfigError(f"{key} must be a mapping when provided")
     return value
+
+
+def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
+    # Runtime platform defaults are centralized in validator to keep bootstrap deterministic.
+    platform = runtime.get("platform", {})
+    if not isinstance(platform, dict):
+        raise ConfigError("runtime.platform must be a mapping when provided")
+    runtime["platform"] = platform
+
+    kv = platform.get("kv", {})
+    if not isinstance(kv, dict):
+        raise ConfigError("runtime.platform.kv must be a mapping when provided")
+    platform["kv"] = kv
+
+    backend = kv.get("backend", "memory")
+    if not isinstance(backend, str) or not backend:
+        raise ConfigError("runtime.platform.kv.backend must be a non-empty string when provided")
+    if backend not in _SUPPORTED_KV_BACKENDS:
+        raise ConfigError(
+            f"runtime.platform.kv.backend must be one of: {sorted(_SUPPORTED_KV_BACKENDS)}"
+        )
+    kv["backend"] = backend

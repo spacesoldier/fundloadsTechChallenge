@@ -187,7 +187,7 @@ def test_validate_newgen_config_rejects_non_string_bind_entry() -> None:
         validate_newgen_config(raw)
 
 
-@pytest.mark.parametrize("port_type", ["stream", "kv_stream", "kv", "request", "response"])
+@pytest.mark.parametrize("port_type", ["stream", "kv_stream", "kv", "request", "response", "service"])
 def test_validate_newgen_config_accepts_stable_bind_port_types(port_type: str) -> None:
     raw = {
         "version": 1,
@@ -207,6 +207,41 @@ def test_validate_newgen_config_rejects_unknown_bind_port_type() -> None:
         "runtime": {"discovery_modules": ["example.steps"]},
         "nodes": {},
         "adapters": {"output_sink": {"binds": ["custom_port"]}},
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_defaults_runtime_platform_kv_backend_to_memory() -> None:
+    # Missing runtime.platform.kv.backend must be normalized to memory.
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {"discovery_modules": ["example.steps"]},
+        "nodes": {},
+        "adapters": {"output_sink": {"binds": []}},
+    }
+    validated = validate_newgen_config(raw)
+    runtime = validated["runtime"]
+    assert isinstance(runtime, dict)
+    platform = runtime.get("platform")
+    assert isinstance(platform, dict)
+    kv = platform.get("kv")
+    assert isinstance(kv, dict)
+    assert kv.get("backend") == "memory"
+
+
+def test_validate_newgen_config_rejects_unknown_runtime_platform_kv_backend() -> None:
+    # Backend value must be from the supported set.
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {
+            "discovery_modules": ["example.steps"],
+            "platform": {"kv": {"backend": "redis-cluster"}},
+        },
+        "nodes": {},
+        "adapters": {"output_sink": {"binds": []}},
     }
     with pytest.raises(ConfigError):
         validate_newgen_config(raw)

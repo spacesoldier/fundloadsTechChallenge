@@ -24,7 +24,9 @@ runtime:
   strict: true
   discovery_modules:
     - fund_load.usecases.steps
-    - fund_load.adapters.factories
+    - fund_load.adapters.io
+    - fund_load.services.prime_checker
+    - fund_load.services.window_store
   tracing:
     enabled: true
     signature:
@@ -32,12 +34,12 @@ runtime:
     context_diff:
       mode: whitelist
       whitelist:
-        - line_no
+        - run_id
     sink:
-      kind: jsonl
-      jsonl:
+      name: trace_jsonl
+      settings:
         path: trace.jsonl
-        write_mode: overwrite
+        write_mode: line
 nodes:
   compute_time_keys:
     week_start: MON
@@ -76,12 +78,7 @@ adapters:
   window_store:
     settings: {}
     binds:
-      - kv
-  prime_checker:
-    settings:
-      max_id: 100
-    binds:
-      - kv
+      - service
 """,
     )
 
@@ -110,7 +107,7 @@ adapters:
     assert len(lines) == 8
     first = json.loads(lines[0])
     assert first["step_name"] == "parse_load_attempt"
-    assert first["ctx_before"] == {"line_no": 1}
+    assert first["ctx_before"] == {"run_id": "run"}
 
 
 def test_runtime_tracing_disabled_no_sink(tmp_path: Path) -> None:
@@ -124,7 +121,9 @@ runtime:
   strict: true
   discovery_modules:
     - fund_load.usecases.steps
-    - fund_load.adapters.factories
+    - fund_load.adapters.io
+    - fund_load.services.prime_checker
+    - fund_load.services.window_store
   tracing:
     enabled: false
 nodes:
@@ -165,12 +164,7 @@ adapters:
   window_store:
     settings: {}
     binds:
-      - kv
-  prime_checker:
-    settings:
-      max_id: 100
-    binds:
-      - kv
+      - service
 """,
     )
 

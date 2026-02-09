@@ -11,6 +11,7 @@ from stream_kernel.application_context.inject import Injected
 from stream_kernel.application_context.injection_registry import (
     InjectionRegistry,
     InjectionRegistryError,
+    ScenarioScope,
 )
 from stream_kernel.integration.consumer_registry import InMemoryConsumerRegistry
 from stream_kernel.kernel.dag import Dag, DagError, NodeContract, build_dag
@@ -202,7 +203,7 @@ class ApplicationContext:
         cfg = _resolve_config(wiring)
         if scope is not None:
             for step in scenario.steps:
-                _apply_injection(step.step, scope, strict)
+                apply_injection(step.step, scope, strict)
         if cfg is not None:
             self.validate_config_requirements(cfg, strict=strict)
             for step in scenario.steps:
@@ -255,6 +256,14 @@ def _as_wiring_dict(wiring: object) -> dict[str, object]:
 
 def _resolve_scope(wiring: object, scenario_id: str):
     # Resolve a scenario-scoped registry if present.
+    scoped = None
+    if isinstance(wiring, dict):
+        scoped = wiring.get("scenario_scope")
+    else:
+        scoped = getattr(wiring, "scenario_scope", None)
+    if isinstance(scoped, ScenarioScope):
+        return scoped
+
     registry = None
     if isinstance(wiring, dict):
         registry = wiring.get("injection_registry")
@@ -391,7 +400,7 @@ def _collect_config_from_object(obj: object) -> list[ConfigValue]:
     return collected
 
 
-def _apply_injection(obj: object, scope, strict: bool) -> None:
+def apply_injection(obj: object, scope, strict: bool) -> None:
     for name, injected in _iter_injected_fields(obj):
         try:
             resolved = injected.resolve(scope)
@@ -413,6 +422,10 @@ def _apply_injection(obj: object, scope, strict: bool) -> None:
                     raise ContextBuildError(str(exc)) from exc
                 resolved = None
             object.__setattr__(container, name, resolved)
+
+
+# Backward-compatible alias for tests/importers still using the old private name.
+_apply_injection = apply_injection
 
 
 def _apply_config(obj: object, cfg: ConfigScope, strict: bool) -> None:

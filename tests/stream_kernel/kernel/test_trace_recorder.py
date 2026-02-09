@@ -21,7 +21,6 @@ def _context() -> Context:
         trace_id="trace-1",
         run_id="run-1",
         scenario_id="scenario-1",
-        line_no=1,
         received_at=datetime(2025, 1, 1, 0, 0, 0, tzinfo=UTC),
     )
 

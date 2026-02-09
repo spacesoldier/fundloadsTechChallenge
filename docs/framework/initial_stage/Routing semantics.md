@@ -16,7 +16,7 @@ It complements:
 **Envelope:** all runtime messages are wrapped in an `Envelope`:
 
 - `payload` — the actual object
-- `trace_id` — context key used by ContextStore (optional but recommended)
+- `trace_id` — context key used by KV-backed context storage (optional but recommended)
 - `target` — optional explicit destination (node name or list of node names)
 - `topic` / `channel` — optional, future extension
 - `trace` / metadata — optional

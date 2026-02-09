@@ -66,7 +66,7 @@ This plan tracks the move from fixed `runtime.pipeline` ordering to
 - [ ] Remove default output sink; require explicit sink node.
 - [x] Ensure tracing covers routing hops and fan-out (sync runtime baseline).
 - [x] Implement `Envelope` with `target` routing (see Routing semantics).
-- [x] Add WorkQueue + ContextStore ports (see Execution runtime and routing integration).
+- [x] Add WorkQueue + KV context storage (see Execution runtime and routing integration).
 - [x] Introduce ConsumerRegistry + RoutingPort (Runner depends on RoutingPort).
 - [ ] Source/sink adapter nodes: remove hardcoded `input_source`/`output_sink` path.
 
@@ -76,11 +76,14 @@ This plan tracks the move from fixed `runtime.pipeline` ordering to
 
 ### Tests
 - [x] In-memory context store (default).
-- [ ] Port shape for external store (Redis adapter later).
+- [x] Context persistence migration to framework-native `kv` port contract.
+- [ ] Adapter conformance tests for context backends (`dict`, `cachetools`, `redis`).
 
 ### Implementation
 - [x] Port + in-memory adapter for context storage.
 - [x] Hook into router runtime.
+- [x] Replace custom `ContextStore` dependency in runner with framework-native `kv` storage.
+- [ ] Keep runtime behavior identical during migration (trace_id keying + metadata view rules).
 
 ---
 
@@ -96,6 +99,8 @@ This plan tracks the move from fixed `runtime.pipeline` ordering to
 - [x] Build adapter registry from discovery output (same principle as node discovery).
 - [x] Enforce framework-supported adapter names in validator/runtime.
 - [x] Remove model/type strings from adapter YAML contracts.
+- [x] Introduce service-layer migration (`inject.service(...)`) to retire project-level domain ports.
+- [x] Add explicit `@service` discovery marker and lifecycle checks.
 
 ## Phase 6 — Platform-ready validation for demo project
 
@@ -132,7 +137,7 @@ This plan tracks the move from fixed `runtime.pipeline` ordering to
 
 - Deprecate `stream_kernel.kernel.runner` and move execution to
   `stream_kernel.execution.SyncRunner`.
-- Route via `RoutingPort` + `WorkQueue` + `ContextStore` instead of
+- Route via `RoutingPort` + `WorkQueue` + KV context storage instead of
   direct step‑by‑step pipeline calls.
 
 ### Steps
@@ -144,7 +149,7 @@ This plan tracks the move from fixed `runtime.pipeline` ordering to
    - `RunnerPort` interface (done).
    - `SyncRunner` implementation (done).
 3. **Bridge execution to routing**
-   - Use `WorkQueue`, `RoutingPort`, `ContextStore`.
+   - Use `WorkQueue`, `RoutingPort`, and KV-backed context storage.
    - Adapters remain **payload-only**; runner wraps outputs into `Envelope`.
 4. **Migrate runtime wiring** ✅
    - Legacy runner usage in `app/runtime.py` replaced by execution runtime path.

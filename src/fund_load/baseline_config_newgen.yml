@@ -9,8 +9,7 @@ runtime:
   tracing:
     enabled: false
   discovery_modules:
-    - fund_load.usecases.steps
-    - fund_load.adapters.factories
+    - fund_load
 
 nodes:
   compute_time_keys:
@@ -57,13 +56,3 @@ adapters:
       path: output.txt
     binds:
       - stream
-  window_store:
-    settings: {}
-    binds:
-      - kv
-  prime_checker:
-    settings:
-      strategy: sieve
-      max_id: 50000
-    binds:
-      - kv

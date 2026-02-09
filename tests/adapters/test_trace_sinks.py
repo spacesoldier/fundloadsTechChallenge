@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
-# Trace sinks are specified in docs/implementation/kernel/Trace and Context Change Log Spec.md.
-import fund_load.adapters.trace_sinks as trace_sinks
-from fund_load.adapters.trace_sinks import JsonlTraceSink, StdoutTraceSink
+# Trace sinks are framework infrastructure adapters (framework tracing runtime docs).
+import stream_kernel.adapters.trace_sinks as trace_sinks
+from stream_kernel.adapters.trace_sinks import JsonlTraceSink, StdoutTraceSink
 from stream_kernel.kernel.trace import MessageSignature, TraceRecord
 
 
@@ -18,7 +18,6 @@ def _record(step_name: str, step_index: int) -> TraceRecord:
     return TraceRecord(
         trace_id="t1",
         scenario="baseline",
-        line_no=1,
         step_index=step_index,
         step_name=step_name,
         work_index=0,
@@ -50,6 +49,7 @@ def test_jsonl_trace_sink_emits_one_json_per_line(tmp_path: Path) -> None:
     second = json.loads(lines[1])
     assert first["step_name"] == "step-a"
     assert second["step_name"] == "step-b"
+    assert "line_no" not in first
 
 
 def test_jsonl_trace_sink_flush_every_n(tmp_path: Path) -> None:
@@ -107,7 +107,7 @@ def test_jsonl_trace_sink_fsync_every_n(tmp_path: Path, monkeypatch: pytest.Monk
     def _fake_fsync(fd: int) -> None:
         calls.append(fd)
 
-    monkeypatch.setattr("fund_load.adapters.trace_sinks.os.fsync", _fake_fsync)
+    monkeypatch.setattr("stream_kernel.adapters.trace_sinks.os.fsync", _fake_fsync)
     path = tmp_path / "trace.jsonl"
     sink = JsonlTraceSink(path=path, write_mode="line", flush_every_n=1, fsync_every_n=1)
     sink.emit(_record("step-a", 0))

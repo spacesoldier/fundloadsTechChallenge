@@ -9,6 +9,7 @@ from stream_kernel.application_context import ApplicationContext, ContextBuildEr
 from stream_kernel.application_context.config_inject import ConfigScope, config
 from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.injection_registry import InjectionRegistry
+from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
 from stream_kernel.kernel.node import node
 
 # Internal helpers are exercised to raise coverage for application context wiring semantics.
@@ -19,6 +20,11 @@ from stream_kernel.application_context.application_context import (
     _collect_config_from_object,
     _resolve_config,
 )
+
+
+class _InternalKVStore(KVStore):
+    # Marker KV contract used for injection tests.
+    pass
 
 
 def test_resolve_config_accepts_dict_method() -> None:
@@ -73,20 +79,21 @@ def test_collect_config_from_object_reads_instance_and_class() -> None:
 def test_apply_injection_populates_instance_and_class_fields() -> None:
     # @inject should populate both instance and class-level markers (Injection registry spec).
     registry = InjectionRegistry()
-    registry.register_factory("kv", str, lambda: "ok")
+    store = InMemoryKvStore()
+    registry.register_factory("kv", _InternalKVStore, lambda _s=store: _s)
     scope = registry.instantiate_for_scenario("s1")
 
     class _Obj:
-        dep_class = inject.kv(str)
+        dep_class = inject.kv(_InternalKVStore)
 
         def __init__(self) -> None:
-            self.dep_inst = inject.kv(str)
+            self.dep_inst = inject.kv(_InternalKVStore)
 
     obj = _Obj()
     _apply_injection(obj, scope, strict=True)
 
-    assert obj.dep_class == "ok"
-    assert obj.dep_inst == "ok"
+    assert obj.dep_class is store
+    assert obj.dep_inst is store
 
 
 def test_apply_injection_bound_method_strict_raises_on_missing_dep() -> None:
@@ -95,7 +102,7 @@ def test_apply_injection_bound_method_strict_raises_on_missing_dep() -> None:
     scope = registry.instantiate_for_scenario("s1")
 
     class _Container:
-        dep = inject.kv(str)
+        dep = inject.kv(_InternalKVStore)
 
         def work(self, msg: object, ctx: object | None) -> list[object]:
             return [msg]
@@ -111,7 +118,7 @@ def test_apply_injection_bound_method_non_strict_sets_none() -> None:
     scope = registry.instantiate_for_scenario("s1")
 
     class _Container:
-        dep = inject.kv(str)
+        dep = inject.kv(_InternalKVStore)
 
         def work(self, msg: object, ctx: object | None) -> list[object]:
             return [msg]

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from types import ModuleType
 
 import pytest
@@ -10,14 +12,21 @@ from stream_kernel.app.runtime import (
     _build_adapter_bindings,
     _build_adapter_instances_from_registry,
     _build_injection_registry_from_bindings,
-    _build_tracing,
-    _detect_implicit_sinks,
-    _emit_implicit_sink_diagnostics,
+    _ensure_platform_discovery_modules,
+    _load_discovery_modules,
+    _initial_context,
+    _register_discovered_services,
     _resolve_runtime_adapters,
     _scenario_name,
+    _ensure_runtime_kv_binding,
+    _trace_id,
 )
-from stream_kernel.kernel.scenario import StepSpec
-from stream_kernel.kernel.trace import TraceRecord, TraceRecorder
+from stream_kernel.application_context.service import service
+from stream_kernel.platform.services.context import ContextService
+from stream_kernel.application_context.injection_registry import InjectionRegistry
+from stream_kernel.execution.observer_builder import build_execution_observers_from_factories
+from stream_kernel.execution.observer import ExecutionObserver, ObserverFactoryContext
+from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
 
 
 class _Token:
@@ -36,24 +45,13 @@ class _KvPort:
     pass
 
 
+def _write_file(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
 @adapter(name="source", kind="test.source", consumes=[], emits=[_Token], binds=[("stream", _StreamPort)])
 def _source_factory(settings: dict[str, object]) -> object:
-    return object()
-
-
-@adapter(name="sink", kind="test.sink", consumes=[_Token], emits=[], binds=[("stream", _StreamPort)])
-def _sink_factory(settings: dict[str, object]) -> object:
-    return object()
-
-
-@adapter(
-    name="other_sink",
-    kind="test.other_sink",
-    consumes=[_OtherToken],
-    emits=[],
-    binds=[("kv", _KvPort)],
-)
-def _other_sink_factory(settings: dict[str, object]) -> object:
     return object()
 
 
@@ -106,102 +104,222 @@ def test_build_injection_registry_from_bindings_requires_instance() -> None:
         _build_injection_registry_from_bindings({}, {"source": [("stream", _StreamPort)]})
 
 
-def test_build_tracing_rejects_invalid_jsonl_mapping() -> None:
-    runtime = {"tracing": {"enabled": True, "sink": {"kind": "jsonl", "jsonl": "nope"}}}
+def test_ensure_platform_discovery_modules_appends_framework_modules() -> None:
+    modules = ["fund_load.usecases.steps"]
+    _ensure_platform_discovery_modules(modules)
+    assert "stream_kernel.observability.adapters" in modules
+    assert "stream_kernel.observability.observers" in modules
+
+
+def test_ensure_platform_discovery_modules_does_not_duplicate_entries() -> None:
+    modules = [
+        "fund_load.usecases.steps",
+        "stream_kernel.observability.adapters",
+        "stream_kernel.observability.observers",
+    ]
+    _ensure_platform_discovery_modules(modules)
+    assert modules.count("stream_kernel.observability.adapters") == 1
+    assert modules.count("stream_kernel.observability.observers") == 1
+
+
+def test_load_discovery_modules_expands_package_root_recursively(
+    tmp_path: Path,
+) -> None:
+    # Root package names should expand to all importable submodules recursively.
+    pkg = tmp_path / "fake_root"
+    _write_file(pkg / "__init__.py", "")
+    _write_file(pkg / "mod_a.py", "x = 1\n")
+    _write_file(pkg / "nested" / "__init__.py", "")
+    _write_file(pkg / "nested" / "mod_b.py", "y = 2\n")
+
+    sys.path.insert(0, str(tmp_path))
+    try:
+        modules = _load_discovery_modules(["fake_root"])
+    finally:
+        sys.path.remove(str(tmp_path))
+
+    names = [m.__name__ for m in modules]
+    assert "fake_root" not in names
+    assert "fake_root.mod_a" in names
+    assert "fake_root.nested" in names
+    assert "fake_root.nested.mod_b" in names
+
+
+def test_load_discovery_modules_deduplicates_root_and_explicit_submodule(
+    tmp_path: Path,
+) -> None:
+    # If both root and submodule are declared, each module should still appear once.
+    pkg = tmp_path / "fake_root_dupe"
+    _write_file(pkg / "__init__.py", "")
+    _write_file(pkg / "mod_a.py", "x = 1\n")
+
+    sys.path.insert(0, str(tmp_path))
+    try:
+        modules = _load_discovery_modules(["fake_root_dupe", "fake_root_dupe.mod_a"])
+    finally:
+        sys.path.remove(str(tmp_path))
+
+    names = [m.__name__ for m in modules]
+    assert names.count("fake_root_dupe") == 0
+    assert names.count("fake_root_dupe.mod_a") == 1
+
+
+class _Observer:
+    def before_node(self, **kwargs: object) -> object | None:
+        return None
+
+    def after_node(self, **kwargs: object) -> None:
+        return None
+
+    def on_node_error(self, **kwargs: object) -> None:
+        return None
+
+    def on_run_end(self) -> None:
+        return None
+
+
+def test_build_execution_observers_collects_from_factories() -> None:
+    def _factory(_ctx: ObserverFactoryContext) -> ExecutionObserver:
+        return _Observer()
+
+    observers = build_execution_observers_from_factories(
+        factories={"x": _factory},
+        runtime={},
+        adapter_instances={},
+        run_id="r1",
+        scenario_id="s1",
+        step_specs=[],
+    )
+    assert len(observers) == 1
+
+
+def test_build_execution_observers_flattens_list_result() -> None:
+    def _factory(_ctx: ObserverFactoryContext) -> list[ExecutionObserver]:
+        return [_Observer(), _Observer()]
+
+    observers = build_execution_observers_from_factories(
+        factories={"x": _factory},
+        runtime={},
+        adapter_instances={},
+        run_id="r1",
+        scenario_id="s1",
+        step_specs=[],
+    )
+    assert len(observers) == 2
+
+
+def test_build_execution_observers_rejects_non_observer_result() -> None:
+    def _factory(_ctx: ObserverFactoryContext) -> object:
+        return object()
+
     with pytest.raises(ValueError):
-        _build_tracing(runtime)
-
-
-def test_build_tracing_rejects_invalid_jsonl_path() -> None:
-    runtime = {"tracing": {"enabled": True, "sink": {"kind": "jsonl", "jsonl": {"path": 123}}}}
-    with pytest.raises(ValueError):
-        _build_tracing(runtime)
-
-
-def test_build_tracing_supports_stdout_sink() -> None:
-    runtime = {"tracing": {"enabled": True, "sink": {"kind": "stdout"}}}
-    recorder, sink = _build_tracing(runtime)
-    assert recorder is not None
-    assert sink is not None
-
-
-def test_build_tracing_returns_recorder_without_sink_config() -> None:
-    runtime = {"tracing": {"enabled": True, "sink": "nope"}}
-    recorder, sink = _build_tracing(runtime)
-    assert recorder is not None
-    assert sink is None
-
-
-def test_build_tracing_unknown_sink_kind_returns_none_sink() -> None:
-    runtime = {"tracing": {"enabled": True, "sink": {"kind": "unknown"}}}
-    recorder, sink = _build_tracing(runtime)
-    assert recorder is not None
-    assert sink is None
+        build_execution_observers_from_factories(
+            factories={"x": _factory},
+            runtime={},
+            adapter_instances={},
+            run_id="r1",
+            scenario_id="s1",
+            step_specs=[],
+        )
 
 
 def test_scenario_name_falls_back_when_missing() -> None:
     assert _scenario_name({"scenario": "nope"}) == "scenario"
 
 
-def test_detect_implicit_sink_when_adapter_not_injected() -> None:
-    registry = AdapterRegistry()
-    registry.register("sink", "sink", _sink_factory)
-    adapters = {"sink": {"settings": {}}}
-    instances = {"sink": object()}
-    steps = [StepSpec(name="noop", step=lambda msg, ctx: [])]
-    implicit = _detect_implicit_sinks(adapters, instances, steps, adapter_registry=registry)
-    assert implicit == [("sink", [_Token])]
+def test_trace_id_is_index_based_even_for_payload_with_line_no() -> None:
+    class _Payload:
+        line_no = 42
+
+    # Runtime trace identity must be framework-generic and not depend on project fields.
+    assert _trace_id("run", _Payload(), 7) == "run:7"
 
 
-def test_detect_implicit_sink_ignores_injected_adapter() -> None:
-    adapter_instance = object()
+def test_initial_context_does_not_include_payload_line_no() -> None:
+    class _Payload:
+        line_no = 42
 
-    class _Step:
-        def __init__(self, sink: object) -> None:
-            self.sink = sink
-
-        def __call__(self, msg: object, ctx: object | None) -> list[object]:
-            return []
-
-    registry = AdapterRegistry()
-    registry.register("sink", "sink", _sink_factory)
-    adapters = {"sink": {"settings": {}}}
-    instances = {"sink": adapter_instance}
-    steps = [StepSpec(name="uses_adapter", step=_Step(adapter_instance))]
-    implicit = _detect_implicit_sinks(adapters, instances, steps, adapter_registry=registry)
-    assert implicit == []
+    ctx = _initial_context(_Payload(), "run:7", run_id="run", scenario_id="s")
+    assert ctx == {
+        "__trace_id": "run:7",
+        "__run_id": "run",
+        "__scenario_id": "s",
+    }
 
 
-def test_emit_implicit_sink_diagnostic_to_trace_sink() -> None:
-    class _Sink:
-        def __init__(self) -> None:
-            self.records: list[TraceRecord] = []
+def test_register_discovered_services_registers_service_contracts() -> None:
+    # Runtime should register services discovered via @service markers.
+    module = ModuleType("fake.services")
 
-        def emit(self, record: TraceRecord) -> None:
-            self.records.append(record)
-
-        def flush(self) -> None:
+    @service(name="ctx")
+    class _CustomContextService(ContextService):
+        def seed(self, *, trace_id: str, payload: object, run_id: str, scenario_id: str) -> None:
             return None
 
-        def close(self) -> None:
+        def metadata(self, trace_id: str | None, *, full: bool) -> dict[str, object]:
+            return {}
+
+    module._CustomContextService = _CustomContextService
+
+    registry = InjectionRegistry()
+    _register_discovered_services(registry, [module])
+    scope = registry.instantiate_for_scenario("s1")
+    resolved = scope.resolve("service", ContextService)
+    assert isinstance(resolved, _CustomContextService)
+
+
+def test_register_discovered_services_keeps_existing_binding() -> None:
+    # User/platform override must not be replaced by auto-discovered defaults.
+    class _CustomContextService:
+        def seed(self, *, trace_id: str, payload: object, run_id: str, scenario_id: str) -> None:
             return None
 
-    registry = AdapterRegistry()
-    registry.register("sink", "sink", _other_sink_factory)
-    adapters = {"sink": {"settings": {}}}
-    instances = {"sink": object()}
-    steps = [StepSpec(name="noop", step=lambda msg, ctx: [])]
-    sink = _Sink()
-    _emit_implicit_sink_diagnostics(
-        {"adapters": adapters},
-        steps,
-        adapter_instances=instances,
-        adapter_registry=registry,
-        trace_recorder=TraceRecorder(),
-        trace_sink=sink,
-        run_id="run",
-        scenario_id="scenario",
-    )
-    assert len(sink.records) == 1
-    assert sink.records[0].error is not None
-    assert "Implicit sink adapter" in sink.records[0].error.message
+        def metadata(self, trace_id: str | None, *, full: bool) -> dict[str, object]:
+            return {}
+
+    module = ModuleType("fake.services")
+
+    @service(name="ctx")
+    class _DiscoveredContextService(ContextService):
+        def seed(self, *, trace_id: str, payload: object, run_id: str, scenario_id: str) -> None:
+            return None
+
+        def metadata(self, trace_id: str | None, *, full: bool) -> dict[str, object]:
+            return {}
+
+    module._DiscoveredContextService = _DiscoveredContextService
+
+    registry = InjectionRegistry()
+    custom = _CustomContextService()
+    registry.register_factory("service", ContextService, lambda: custom)
+    _register_discovered_services(registry, [module])
+    scope = registry.instantiate_for_scenario("s1")
+    assert scope.resolve("service", ContextService) is custom
+
+
+def test_ensure_runtime_kv_binding_registers_memory_backend_when_missing() -> None:
+    # Runtime must provision default KV binding so services can inject KVStore without extra YAML boilerplate.
+    registry = InjectionRegistry()
+    _ensure_runtime_kv_binding(registry, {"platform": {"kv": {"backend": "memory"}}})
+
+    scope = registry.instantiate_for_scenario("s1")
+    resolved = scope.resolve("kv", KVStore)
+    assert isinstance(resolved, InMemoryKvStore)
+
+
+def test_ensure_runtime_kv_binding_keeps_existing_binding() -> None:
+    # Explicit bindings win over runtime defaults.
+    registry = InjectionRegistry()
+    custom = object()
+    registry.register_factory("kv", KVStore, lambda: custom)
+
+    _ensure_runtime_kv_binding(registry, {"platform": {"kv": {"backend": "memory"}}})
+    scope = registry.instantiate_for_scenario("s1")
+    assert scope.resolve("kv", KVStore) is custom
+
+
+def test_ensure_runtime_kv_binding_rejects_unknown_backend() -> None:
+    # Unsupported backend must fail fast during runtime bootstrap.
+    registry = InjectionRegistry()
+    with pytest.raises(ValueError):
+        _ensure_runtime_kv_binding(registry, {"platform": {"kv": {"backend": "redis"}}})

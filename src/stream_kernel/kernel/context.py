@@ -21,7 +21,6 @@ class Context:
     trace_id: str
     run_id: str
     scenario_id: str
-    line_no: int | None
     received_at: datetime
     tags: dict[str, str] = field(default_factory=dict)
     metrics: dict[str, float] = field(default_factory=dict)
@@ -71,13 +70,12 @@ class ContextFactory:
     run_id: str
     scenario_id: str
 
-    def new(self, *, line_no: int | None) -> Context:
+    def new(self) -> Context:
         # Trace id is generated per event; can be swapped for deterministic generator later.
         trace_id = uuid.uuid4().hex
         return Context(
             trace_id=trace_id,
             run_id=self.run_id,
             scenario_id=self.scenario_id,
-            line_no=line_no,
             received_at=datetime.now(tz=UTC),
         )

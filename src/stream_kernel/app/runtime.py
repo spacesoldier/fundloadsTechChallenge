@@ -1,31 +1,37 @@
 from __future__ import annotations
 
 import importlib
-import warnings
-from datetime import UTC, datetime
+import pkgutil
 from pathlib import Path
 from types import SimpleNamespace
+from types import ModuleType
 from typing import Any
 
-from fund_load.adapters.trace_sinks import JsonlTraceSink, StdoutTraceSink
-from fund_load.ports.trace_sink import TraceSink
 from stream_kernel.adapters.discovery import discover_adapters
 from stream_kernel.adapters.registry import AdapterRegistry
 from stream_kernel.app.cli import apply_cli_overrides, parse_args
-from stream_kernel.application_context import ApplicationContext
-from stream_kernel.application_context.injection_registry import InjectionRegistry
+from stream_kernel.app.extensions import framework_discovery_modules
+from stream_kernel.application_context import (
+    ApplicationContext,
+    apply_injection,
+    discover_services,
+    service_contract_types,
+)
+from stream_kernel.application_context.injection_registry import (
+    InjectionRegistry,
+    InjectionRegistryError,
+    ScenarioScope,
+)
 from stream_kernel.config.loader import load_yaml_config
 from stream_kernel.config.validator import validate_newgen_config
+from stream_kernel.execution.observer import ExecutionObserver
+from stream_kernel.execution.observer_builder import build_execution_observers
 from stream_kernel.execution.planning import build_execution_plan
 from stream_kernel.execution.runner import SyncRunner
-from stream_kernel.integration.context_store import InMemoryContextStore
+from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
 from stream_kernel.integration.routing_port import RoutingPort
 from stream_kernel.integration.work_queue import InMemoryWorkQueue
-from stream_kernel.kernel.context import Context, ContextFactory
 from stream_kernel.kernel.dag import NodeContract
-from stream_kernel.kernel.scenario import StepSpec
-from stream_kernel.kernel.trace import ErrorInfo, MessageSignature, TraceRecord, TraceRecorder
-from stream_kernel.routing.envelope import Envelope
 
 
 def run_with_config(
@@ -57,11 +63,15 @@ def run_with_config(
             isinstance(item, str) for item in discovered_modules
         ):
             raise ValueError("runtime.discovery_modules must be a list of strings")
-        discovery_modules = discovered_modules
+        discovery_modules = list(discovered_modules)
+    else:
+        discovery_modules = list(discovery_modules)
+    _ensure_platform_discovery_modules(discovery_modules)
 
     adapters = config.get("adapters", {})
     if not isinstance(adapters, dict):
         raise ValueError("adapters must be a mapping")
+    adapters = dict(adapters)
 
     if adapter_registry is None and adapter_bindings is not None:
         raise ValueError("adapter_bindings override requires adapter_registry override")
@@ -78,10 +88,12 @@ def run_with_config(
     adapter_instances = _build_adapter_instances_from_registry(adapters, adapter_registry)
     # Build injection registry from provided bindings using shared adapter instances.
     injection_registry = _build_injection_registry_from_bindings(adapter_instances, adapter_bindings)
+    _ensure_runtime_kv_binding(injection_registry, runtime)
 
     ctx = ApplicationContext()
-    modules = [importlib.import_module(name) for name in discovery_modules]
+    modules = _load_discovery_modules(discovery_modules)
     ctx.discover(modules)
+    _register_discovered_services(injection_registry, modules)
     adapter_contracts = _build_adapter_contracts(adapters, adapter_registry=adapter_registry)
     dag = ctx.preflight(
         strict=bool(runtime.get("strict", True)),
@@ -91,11 +103,13 @@ def run_with_config(
     step_names = _resolve_step_names(dag)
 
     scenario_name = _scenario_name(config)
+    scenario_scope = injection_registry.instantiate_for_scenario(scenario_name)
     scenario = ctx.build_scenario(
         scenario_id=scenario_name,
         step_names=step_names,
         wiring={
             "injection_registry": injection_registry,
+            "scenario_scope": scenario_scope,
             "consumer_registry": consumer_registry,
             "config": config,
             "strict": bool(runtime.get("strict", True)),
@@ -104,17 +118,13 @@ def run_with_config(
 
     # Source bootstrap: any read-capable adapter can provide input payloads.
     inputs = _read_inputs_from_sources(adapter_instances)
-
-    trace_recorder, trace_sink = _build_tracing(runtime)
-    _emit_implicit_sink_diagnostics(
-        config,
-        scenario.steps,
+    observers = build_execution_observers(
+        modules=modules,
+        runtime=runtime,
         adapter_instances=adapter_instances,
-        adapter_registry=adapter_registry,
-        trace_recorder=trace_recorder,
-        trace_sink=trace_sink,
         run_id=run_id,
         scenario_id=scenario_name,
+        step_specs=list(scenario.steps),
     )
     strict = bool(runtime.get("strict", True))
     _run_with_sync_runner(
@@ -124,8 +134,13 @@ def run_with_config(
         strict=strict,
         run_id=run_id,
         scenario_id=scenario_name,
-        trace_recorder=trace_recorder,
-        trace_sink=trace_sink,
+        scenario_scope=scenario_scope,
+        observers=observers,
+        full_context_nodes={
+            node_def.meta.name
+            for node_def in ctx.nodes
+            if bool(getattr(node_def.meta, "service", False))
+        },
     )
     return 0
 
@@ -164,7 +179,7 @@ def _resolve_runtime_adapters(
     discovery_modules: list[str],
 ) -> tuple[AdapterRegistry, dict[str, object]]:
     # Discover adapters by name and bind them to equally named YAML roles.
-    modules = [importlib.import_module(name) for name in discovery_modules]
+    modules = _load_discovery_modules(discovery_modules)
     discovered = discover_adapters(modules)
 
     registry = AdapterRegistry()
@@ -217,6 +232,59 @@ def _build_adapter_bindings(
     return bindings
 
 
+def _ensure_platform_discovery_modules(discovery_modules: list[str]) -> None:
+    # Framework platform modules are resolved from extension providers.
+    for module_name in framework_discovery_modules():
+        if module_name not in discovery_modules:
+            discovery_modules.append(module_name)
+
+
+def _load_discovery_modules(discovery_modules: list[str]) -> list[ModuleType]:
+    # Resolve discovery module names into concrete modules.
+    # Package roots are expanded recursively, so users can pass a short root like "fund_load".
+    modules: list[ModuleType] = []
+    seen: set[str] = set()
+
+    def _append(module: ModuleType) -> None:
+        if module.__name__ in seen:
+            return
+        seen.add(module.__name__)
+        modules.append(module)
+
+    for module_name in discovery_modules:
+        root_module = importlib.import_module(module_name)
+        module_path = getattr(root_module, "__path__", None)
+        if module_path is None:
+            _append(root_module)
+            continue
+        expanded_any = False
+        for module_info in pkgutil.walk_packages(module_path, prefix=f"{root_module.__name__}."):
+            expanded_any = True
+            _append(importlib.import_module(module_info.name))
+        if not expanded_any:
+            # Keep package roots that have no importable children.
+            _append(root_module)
+
+    return modules
+
+
+def _finalize_execution_observers(observers: list[ExecutionObserver]) -> None:
+    # Finalize observer lifecycle once execution queue is drained.
+    for observer in observers:
+        observer.on_run_end()
+
+
+def _register_discovered_services(registry: InjectionRegistry, modules: list[object]) -> None:
+    # Register services discovered in framework/user modules into DI unless overridden.
+    for service_cls in discover_services(modules):  # type: ignore[arg-type]
+        for contract in service_contract_types(service_cls):
+            try:
+                registry.register_factory("service", contract, lambda _cls=service_cls: _cls())
+            except InjectionRegistryError:
+                # Explicit bindings win over auto-discovered defaults.
+                continue
+
+
 def _run_with_sync_runner(
     *,
     scenario,
@@ -225,42 +293,25 @@ def _run_with_sync_runner(
     strict: bool,
     run_id: str,
     scenario_id: str,
-    trace_recorder: TraceRecorder | None,
-    trace_sink: TraceSink | None,
+    scenario_scope: ScenarioScope,
+    observers: list[ExecutionObserver] | None = None,
+    full_context_nodes: set[str] | None = None,
 ) -> None:
     # Build execution components (Execution runtime and routing integration §6).
     work_queue = InMemoryWorkQueue()
-    context_store = InMemoryContextStore()
     routing_port = RoutingPort(registry=consumer_registry, strict=strict)
 
-    trace_contexts: dict[str, Context] = {}
-    nodes = _build_targeted_nodes(
-        scenario.steps,
-        run_id=run_id,
-        scenario_id=scenario_id,
-        trace_recorder=trace_recorder,
-        trace_sink=trace_sink,
-        trace_contexts=trace_contexts,
-    )
+    nodes = {spec.name: spec.step for spec in scenario.steps}
     runner = SyncRunner(
         nodes=nodes,
         work_queue=work_queue,
-        context_store=context_store,
         routing_port=routing_port,
+        observers=list(observers or ()),
+        full_context_nodes=set(full_context_nodes or ()),
     )
-
-    # Preserve deterministic semantics: each input message is processed end-to-end before next input.
-    for index, payload in enumerate(inputs, start=1):
-        trace_id = _trace_id(run_id, payload, index)
-        context_store.put(trace_id, _initial_context(payload, trace_id))
-        deliveries = routing_port.route([payload])
-        for target_name, routed_payload in deliveries:
-            work_queue.push(Envelope(payload=routed_payload, target=target_name, trace_id=trace_id))
-        runner.run()
-    if trace_sink is not None:
-        # Mirror legacy runner behavior: flush/close trace sink at end of run.
-        trace_sink.flush()
-        trace_sink.close()
+    apply_injection(runner, scenario_scope, strict)
+    runner.run_inputs(inputs, run_id=run_id, scenario_id=scenario_id)
+    _finalize_execution_observers(list(observers or ()))
 
 
 def _read_inputs_from_sources(adapter_instances: dict[str, object]) -> list[object]:
@@ -277,85 +328,6 @@ def _read_inputs_from_sources(adapter_instances: dict[str, object]) -> list[obje
     if not source_roles:
         raise ValueError("at least one source adapter with read() must be configured")
     return payloads
-
-
-def _build_targeted_nodes(
-    step_specs: list[StepSpec],
-    *,
-    run_id: str,
-    scenario_id: str,
-    trace_recorder: TraceRecorder | None,
-    trace_sink: TraceSink | None,
-    trace_contexts: dict[str, Context],
-) -> dict[str, object]:
-    # Wrap scenario steps for tracing while preserving native routing semantics.
-    # Actual fan-out/target resolution is handled by Router via consumes/emits contracts.
-    nodes: dict[str, object] = {}
-    for idx, spec in enumerate(step_specs):
-        def _make_step(step: object, step_name: str, step_index: int):
-            def _wrapped(msg: object, ctx: object | None) -> list[object]:
-                raw_ctx = ctx if isinstance(ctx, dict) else {}
-                node_ctx = _node_ctx(raw_ctx)
-                trace_ctx: Context | None = None
-                span = None
-                if trace_recorder is not None:
-                    trace_id = _extract_trace_id(raw_ctx)
-                    if trace_id is not None:
-                        line_no = _extract_line_no(raw_ctx)
-                        trace_ctx = trace_contexts.setdefault(
-                            trace_id,
-                            Context(
-                                trace_id=trace_id,
-                                run_id=run_id,
-                                scenario_id=scenario_id,
-                                line_no=line_no,
-                                received_at=datetime.now(tz=UTC),
-                            ),
-                        )
-                        span = trace_recorder.begin(
-                            ctx=trace_ctx,
-                            step_name=step_name,
-                            step_index=step_index,
-                            work_index=0,
-                            msg_in=msg,
-                        )
-
-                try:
-                    outputs = list(step(msg, node_ctx))
-                except Exception as exc:
-                    if trace_recorder is not None and span is not None and trace_ctx is not None:
-                        record = trace_recorder.finish(
-                            ctx=trace_ctx,
-                            span=span,
-                            msg_out=[],
-                            status="error",
-                            error=ErrorInfo(
-                                type=type(exc).__name__,
-                                message=str(exc),
-                                where=step_name,
-                                stack=None,
-                            ),
-                        )
-                        if trace_sink is not None:
-                            trace_sink.emit(record)
-                    raise
-
-                if trace_recorder is not None and span is not None and trace_ctx is not None:
-                    record = trace_recorder.finish(
-                        ctx=trace_ctx,
-                        span=span,
-                        msg_out=outputs,
-                        status="ok",
-                        error=None,
-                    )
-                    if trace_sink is not None:
-                        trace_sink.emit(record)
-                return outputs
-
-            return _wrapped
-
-        nodes[spec.name] = _make_step(spec.step, spec.name, idx)
-    return nodes
 
 
 def _resolve_step_names(dag: object | None) -> list[str]:
@@ -411,39 +383,26 @@ def _reject_runtime_pipeline(runtime: dict[str, object]) -> None:
         )
 
 
-def _trace_id(run_id: str, payload: object, index: int) -> str:
-    # Keep per-message trace ids deterministic for context lookups.
-    line_no = getattr(payload, "line_no", None)
-    if isinstance(line_no, int):
-        return f"{run_id}:{line_no}"
+def _trace_id(run_id: str, _payload: object, index: int) -> str:
+    # Keep per-message trace ids deterministic without relying on project payload fields.
     return f"{run_id}:{index}"
 
 
-def _initial_context(payload: object, trace_id: str) -> dict[str, object]:
-    # Minimal metadata view exposed to nodes via ContextStore.
-    line_no = getattr(payload, "line_no", None)
-    if isinstance(line_no, int):
-        return {"line_no": line_no, "__trace_id": trace_id}
-    return {"__trace_id": trace_id}
-
-
-def _extract_trace_id(ctx: dict[str, object]) -> str | None:
-    trace_id = ctx.get("__trace_id")
-    if isinstance(trace_id, str) and trace_id:
-        return trace_id
-    return None
-
-
-def _extract_line_no(ctx: dict[str, object]) -> int | None:
-    line_no = ctx.get("line_no")
-    if isinstance(line_no, int):
-        return line_no
-    return None
-
-
-def _node_ctx(ctx: dict[str, object]) -> dict[str, object]:
-    # Hide framework-internal metadata from user nodes.
-    return {key: value for key, value in ctx.items() if not key.startswith("__")}
+def _initial_context(
+    _payload: object,
+    trace_id: str,
+    *,
+    run_id: str,
+    scenario_id: str,
+) -> dict[str, object]:
+    # Minimal metadata view exposed to nodes via KV-backed context persistence.
+    # Reserved keys are available to service nodes and observers.
+    ctx: dict[str, object] = {
+        "__trace_id": trace_id,
+        "__run_id": run_id,
+        "__scenario_id": scenario_id,
+    }
+    return ctx
 
 
 def _build_adapter_instances_from_registry(
@@ -481,179 +440,33 @@ def _build_injection_registry_from_bindings(
     return injection
 
 
-def _detect_implicit_sinks(
-    adapters: dict[str, object],
-    adapter_instances: dict[str, object],
-    steps: list[StepSpec],
-    *,
-    adapter_registry: AdapterRegistry | None,
-) -> list[tuple[str, list[type[object]]]]:
-    # Identify adapters that consume models but are not injected into any node.
-    implicit: list[tuple[str, list[type[object]]]] = []
-    used_instances = _collect_used_adapters(steps)
-
-    for role, cfg in adapters.items():
-        if not isinstance(cfg, dict):
-            continue
-        meta = _resolve_adapter_meta(role, cfg, adapter_registry=adapter_registry)
-        if meta is None:
-            continue
-        consumes = list(meta.consumes)
-        if not consumes:
-            continue
-        adapter = adapter_instances.get(role)
-        if adapter is None:
-            continue
-        # Compare by identity to avoid unhashable adapters (e.g., dict-based stubs).
-        if id(adapter) in used_instances:
-            continue
-        implicit.append((role, consumes))
-    return implicit
-
-
-def _emit_implicit_sink_diagnostics(
-    config: dict[str, object],
-    steps: list[StepSpec],
-    *,
-    adapter_instances: dict[str, object],
-    adapter_registry: AdapterRegistry | None,
-    trace_recorder: TraceRecorder | None,
-    trace_sink: TraceSink | None,
-    run_id: str,
-    scenario_id: str,
+def _ensure_runtime_kv_binding(
+    injection_registry: InjectionRegistry,
+    runtime: dict[str, object],
 ) -> None:
-    # Emit diagnostics for implicit sinks (Ports and adapters model §5.2).
-    adapters = config.get("adapters", {})
-    if not isinstance(adapters, dict):
-        return
-    implicit = _detect_implicit_sinks(
-        adapters,
-        adapter_instances,
-        steps,
-        adapter_registry=adapter_registry,
-    )
-    if not implicit:
+    # Runtime-level default: provide KVStore binding unless explicitly bound by config/adapters.
+    backend = _runtime_kv_backend(runtime)
+    if backend != "memory":
+        raise ValueError(f"Unsupported runtime.platform.kv.backend: {backend}")
+    try:
+        injection_registry.register_factory("kv", KVStore, lambda: InMemoryKvStore())
+    except InjectionRegistryError:
+        # Explicit binding already exists and must win over default provisioning.
         return
 
-    for role, consumes in implicit:
-        consume_names = ", ".join(_token_label(token) for token in consumes)
-        note = f"Implicit sink adapter '{role}' attached for consumes: {consume_names}"
-        warnings.warn(note)
-        if trace_recorder is None or trace_sink is None:
-            continue
-        trace_sink.emit(_diagnostic_record(note, run_id=run_id, scenario_id=scenario_id))
 
-
-
-def _collect_used_adapters(steps: list[StepSpec]) -> set[int]:
-    # Collect adapter instance ids referenced by step objects (identity match).
-    used: set[int] = set()
-    for spec in steps:
-        used.update(_iter_adapter_holders(spec.step))
-    return used
-
-
-def _iter_adapter_holders(step: object) -> set[int]:
-    # Inspect step instance or bound method owner for injected adapters.
-    holders: list[object] = []
-    if hasattr(step, "__self__") and getattr(step, "__self__") is not None:
-        holders.append(getattr(step, "__self__"))
-    else:
-        holders.append(step)
-
-    found: set[int] = set()
-    for holder in holders:
-        for value in _iter_attr_values(holder):
-            found.add(id(value))
-    return found
-
-
-def _iter_attr_values(obj: object) -> list[object]:
-    # Extract values from dataclass fields or __dict__ for identity checks.
-    values: list[object] = []
-    if hasattr(obj, "__dataclass_fields__"):
-        for name in obj.__dataclass_fields__:  # type: ignore[attr-defined]
-            values.append(getattr(obj, name))
-    else:
-        values.extend(list(getattr(obj, "__dict__", {}).values()))
-    return values
-
-
-def _diagnostic_record(note: str, *, run_id: str, scenario_id: str) -> TraceRecord:
-    # Build a TraceRecord for runtime diagnostics (Trace runtime spec).
-    now = datetime.now(tz=UTC)
-    msg_in = MessageSignature(type_name="RuntimeDiagnostic", identity=note, hash=None)
-    return TraceRecord(
-        trace_id=run_id,
-        scenario=scenario_id,
-        line_no=None,
-        step_index=-1,
-        step_name="runtime_diagnostic",
-        work_index=0,
-        t_enter=now,
-        t_exit=now,
-        duration_ms=0.0,
-        msg_in=msg_in,
-        msg_out=(),
-        msg_out_count=0,
-        ctx_before=None,
-        ctx_after=None,
-        ctx_diff=None,
-        status="error",
-        error=ErrorInfo(type="runtime_diagnostic", message=note, where="runtime"),
-    )
-
-
-def _token_label(token: type[object]) -> str:
-    return getattr(token, "__name__", repr(token))
-
-
-def _build_tracing(runtime: dict[str, object]) -> tuple[TraceRecorder | None, TraceSink | None]:
-    # Build trace recorder/sink from runtime.tracing config (Trace spec).
-    tracing = runtime.get("tracing")
-    if not isinstance(tracing, dict) or not tracing.get("enabled"):
-        return None, None
-
-    signature = tracing.get("signature", {})
-    context_diff = tracing.get("context_diff", {})
-    if not isinstance(signature, dict):
-        signature = {}
-    if not isinstance(context_diff, dict):
-        context_diff = {}
-
-    recorder = TraceRecorder(
-        signature_mode=str(signature.get("mode", "type_only")),
-        context_diff_mode=str(context_diff.get("mode", "none")),
-        context_diff_whitelist=list(context_diff.get("whitelist", []))
-        if isinstance(context_diff.get("whitelist", []), list)
-        else None,
-    )
-
-    sink_cfg = tracing.get("sink")
-    if not isinstance(sink_cfg, dict):
-        return recorder, None
-
-    kind = sink_cfg.get("kind")
-    if kind == "stdout":
-        return recorder, StdoutTraceSink()
-    if kind == "jsonl":
-        jsonl = sink_cfg.get("jsonl", {})
-        if not isinstance(jsonl, dict):
-            raise ValueError("runtime.tracing.sink.jsonl must be a mapping")
-        path = jsonl.get("path")
-        if not isinstance(path, str):
-            raise ValueError("runtime.tracing.sink.jsonl.path must be a string")
-        return (
-            recorder,
-            JsonlTraceSink(
-                path=Path(path),
-                write_mode=str(jsonl.get("write_mode", "line")),
-                flush_every_n=int(jsonl.get("flush_every_n", 1)),
-                flush_every_ms=jsonl.get("flush_every_ms"),
-                fsync_every_n=jsonl.get("fsync_every_n"),
-            ),
-        )
-    return recorder, None
+def _runtime_kv_backend(runtime: dict[str, object]) -> str:
+    # Read normalized backend path from runtime mapping (validator fills defaults).
+    platform = runtime.get("platform", {})
+    if not isinstance(platform, dict):
+        raise ValueError("runtime.platform must be a mapping")
+    kv = platform.get("kv", {})
+    if not isinstance(kv, dict):
+        raise ValueError("runtime.platform.kv must be a mapping")
+    backend = kv.get("backend", "memory")
+    if not isinstance(backend, str) or not backend:
+        raise ValueError("runtime.platform.kv.backend must be a non-empty string")
+    return backend
 
 
 def _scenario_name(config: dict[str, object]) -> str:

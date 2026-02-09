@@ -41,14 +41,24 @@ def apply_cli_overrides(config: dict[str, object], args: argparse.Namespace) -> 
         elif "enabled" not in tracing:
             tracing["enabled"] = True
         if args.trace_path:
-            sink = tracing.setdefault("sink", {"kind": "jsonl"})
+            sink = tracing.setdefault("sink", {"name": "trace_jsonl", "settings": {}})
             if not isinstance(sink, dict):
                 raise ValueError("runtime.tracing.sink must be a mapping")
-            sink.setdefault("kind", "jsonl")
-            jsonl = sink.setdefault("jsonl", {})
-            if not isinstance(jsonl, dict):
-                raise ValueError("runtime.tracing.sink.jsonl must be a mapping")
-            jsonl["path"] = args.trace_path
+            # CLI trace path always selects the JSONL tracing sink explicitly.
+            sink["name"] = "trace_jsonl"
+            settings = sink.setdefault("settings", {})
+            if not isinstance(settings, dict):
+                raise ValueError("runtime.tracing.sink.settings must be a mapping")
+            settings["path"] = args.trace_path
+            # Keep adapter selection discovery-driven: ensure sink adapter role exists in adapters config.
+            trace_adapter = adapters.setdefault("trace_jsonl", {})
+            if not isinstance(trace_adapter, dict):
+                raise ValueError("adapters.trace_jsonl must be a mapping")
+            trace_settings = trace_adapter.setdefault("settings", {})
+            if not isinstance(trace_settings, dict):
+                raise ValueError("adapters.trace_jsonl.settings must be a mapping")
+            trace_settings["path"] = args.trace_path
+            trace_adapter.setdefault("binds", [])
 
 
 def _set_adapter_path(adapters: dict[str, object], name: str, path: str) -> None:

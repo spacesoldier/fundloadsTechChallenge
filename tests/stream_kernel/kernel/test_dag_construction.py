@@ -72,6 +72,16 @@ def test_dag_missing_provider_fails() -> None:
         build_dag(nodes)
 
 
+def test_dag_allows_missing_provider_for_adapter_sink_contract() -> None:
+    # Adapter sink endpoints may be attached implicitly even when no in-graph producer exists.
+    nodes = [
+        NodeContract(name="adapter:trace_jsonl", consumes=[X], emits=[]),
+    ]
+    dag = build_dag(nodes)
+    assert dag.nodes == ["adapter:trace_jsonl"]
+    assert dag.edges == []
+
+
 def test_dag_self_cycle_fails() -> None:
     # Self-loop is a cycle (DAG construction §6.4.1).
     nodes = [

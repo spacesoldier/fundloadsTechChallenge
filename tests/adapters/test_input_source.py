@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 # InputSource adapter behavior is specified in docs/implementation/ports/InputSource.md.
-from fund_load.adapters.factories.io import file_input_source
+from fund_load.adapters.io import file_input_source
 from fund_load.domain.messages import RawLine
 
 

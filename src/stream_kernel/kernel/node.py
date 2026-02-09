@@ -10,6 +10,7 @@ class NodeMeta:
     stage: str = ""
     consumes: list[type[object]] = field(default_factory=list)
     emits: list[type[object]] = field(default_factory=list)
+    service: bool = False
 
     def __post_init__(self) -> None:
         # Guardrails to keep metadata deterministic and explicit.

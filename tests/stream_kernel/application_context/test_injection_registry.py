@@ -8,6 +8,8 @@ from stream_kernel.application_context.injection_registry import (
     InjectionRegistry,
     InjectionRegistryError,
 )
+from stream_kernel.application_context.inject import inject
+from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
 
 
 @dataclass
@@ -28,6 +30,22 @@ class EventB:
     pass
 
 
+class _StateKVStore(KVStore):
+    # Marker KV contract for state storage.
+    pass
+
+
+class _BadStateKVStore(KVStore):
+    # Invalid marker: extends KV API.
+    def keys(self) -> list[str]:
+        return []
+
+
+class _PrimeKVStore(KVStore):
+    # Marker contract for prime-check cache storage.
+    pass
+
+
 def test_registry_resolves_by_port_and_type() -> None:
     # Resolution should use (port_type, data_type) keys.
     reg = InjectionRegistry()
@@ -39,15 +57,26 @@ def test_registry_resolves_by_port_and_type() -> None:
     assert scope.resolve("stream", EventB).name == "B"
 
 
+def test_registry_resolves_by_port_type_and_qualifier() -> None:
+    # Qualifier disambiguates bindings for the same port/data contract.
+    reg = InjectionRegistry()
+    reg.register_factory("stream", EventA, lambda: _StreamPort("primary"), qualifier="primary")
+    reg.register_factory("stream", EventA, lambda: _StreamPort("default"))
+
+    scope = reg.instantiate_for_scenario("s1")
+    assert scope.resolve("stream", EventA, qualifier="primary").name == "primary"
+    assert scope.resolve("stream", EventA).name == "default"
+
+
 def test_registry_creates_new_instances_per_scenario() -> None:
     # Each scenario should receive distinct instances.
     reg = InjectionRegistry()
-    reg.register_factory("kv", EventA, lambda: _StorePort("X"))
+    reg.register_factory("kv", _StateKVStore, lambda: InMemoryKvStore())
 
     scope1 = reg.instantiate_for_scenario("s1")
     scope2 = reg.instantiate_for_scenario("s2")
 
-    assert scope1.resolve("kv", EventA) is not scope2.resolve("kv", EventA)
+    assert scope1.resolve("kv", _StateKVStore) is not scope2.resolve("kv", _StateKVStore)
 
 
 def test_registry_errors_on_missing_binding() -> None:
@@ -66,6 +95,13 @@ def test_registry_errors_on_duplicate_binding() -> None:
         reg.register_factory("stream", EventA, lambda: _StreamPort("B"))
 
 
+def test_registry_rejects_empty_qualifier() -> None:
+    # Qualifier must be a non-empty string for unambiguous keying.
+    reg = InjectionRegistry()
+    with pytest.raises(InjectionRegistryError):
+        reg.register_factory("stream", EventA, lambda: _StreamPort("A"), qualifier="")
+
+
 def test_registry_tracks_async_capability() -> None:
     # Registry should expose async capability for planning (Execution planning §8).
     reg = InjectionRegistry()
@@ -73,3 +109,57 @@ def test_registry_tracks_async_capability() -> None:
     reg.register_factory("stream", EventB, lambda: _StreamPort("B"), is_async=False)
     assert reg.is_async_binding("stream", EventA) is True
     assert reg.is_async_binding("stream", EventB) is False
+
+
+def test_registry_tracks_async_capability_with_qualifier() -> None:
+    # Async planning must consider qualifier-specific bindings.
+    reg = InjectionRegistry()
+    reg.register_factory("stream", EventA, lambda: _StreamPort("primary"), is_async=True, qualifier="primary")
+    reg.register_factory("stream", EventA, lambda: _StreamPort("default"), is_async=False)
+    assert reg.is_async_binding("stream", EventA, qualifier="primary") is True
+    assert reg.is_async_binding("stream", EventA) is False
+
+
+def test_registry_rejects_extended_kv_contract() -> None:
+    # KV bindings must use base or marker contracts without extra public methods.
+    reg = InjectionRegistry()
+    with pytest.raises(InjectionRegistryError):
+        reg.register_factory("kv", _BadStateKVStore, lambda: InMemoryKvStore())
+
+
+def test_registry_autowires_kv_markers_from_base_kv_binding() -> None:
+    # If only kv<KVStore> is bound, marker contracts should still resolve with dedicated instances.
+    reg = InjectionRegistry()
+    reg.register_factory("kv", KVStore, lambda: InMemoryKvStore())
+
+    @dataclass
+    class _Service:
+        state_store: object = inject.kv(_StateKVStore)  # type: ignore[assignment]
+        prime_store: object = inject.kv(_PrimeKVStore)  # type: ignore[assignment]
+
+    reg.register_factory("service", _Service, lambda: _Service())
+    scope = reg.instantiate_for_scenario("s1")
+    service = scope.resolve("service", _Service)
+    assert isinstance(service.state_store, InMemoryKvStore)
+    assert isinstance(service.prime_store, InMemoryKvStore)
+    assert service.state_store is not service.prime_store
+
+
+def test_registry_autowires_kv_markers_with_qualifier_specific_base() -> None:
+    # Marker injections with qualifier should use matching qualified KV base binding first.
+    reg = InjectionRegistry()
+    primary = InMemoryKvStore()
+    fallback = InMemoryKvStore()
+    reg.register_factory("kv", KVStore, lambda _p=fallback: _p)
+    reg.register_factory("kv", KVStore, lambda _p=primary: _p, qualifier="state")
+
+    @dataclass
+    class _Service:
+        state_store: object = inject.kv(_StateKVStore, qualifier="state")  # type: ignore[assignment]
+        default_store: object = inject.kv(_PrimeKVStore)  # type: ignore[assignment]
+
+    reg.register_factory("service", _Service, lambda: _Service())
+    scope = reg.instantiate_for_scenario("s1")
+    service = scope.resolve("service", _Service)
+    assert service.state_store is primary
+    assert service.default_store is fallback

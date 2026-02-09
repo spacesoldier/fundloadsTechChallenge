@@ -65,3 +65,33 @@ def test_discover_nodes_ignores_undecorated_symbols() -> None:
 
     nodes = discover_nodes([mod])
     assert nodes == []
+
+
+def test_discover_nodes_allows_reexport_of_same_node_target() -> None:
+    # Re-export of the same node object from another module should not be treated as duplicate declaration.
+    mod_a = types.ModuleType("mod_a")
+    mod_b = types.ModuleType("mod_b")
+
+    @node(name="same")
+    def same(msg: object, ctx: object | None) -> list[object]:
+        return [msg]
+
+    mod_a.same = same
+    mod_b.same_alias = same
+
+    nodes = discover_nodes([mod_a, mod_b])
+    assert [n.meta.name for n in nodes] == ["same"]
+
+
+def test_discover_nodes_marks_framework_observer_nodes_as_service() -> None:
+    # Framework observability observer modules are auto-marked as service nodes.
+    mod = types.ModuleType("stream_kernel.observability.observers.fake")
+
+    @node(name="trace_observer")
+    def trace_observer(msg: object, ctx: object | None) -> list[object]:
+        return [msg]
+
+    mod.trace_observer = trace_observer
+    nodes = discover_nodes([mod])
+    assert len(nodes) == 1
+    assert nodes[0].meta.service is True

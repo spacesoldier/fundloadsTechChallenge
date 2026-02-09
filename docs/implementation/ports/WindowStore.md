@@ -15,8 +15,8 @@ The core rule:
 
 ---
 
-**Port implementation:** [window_store.py](../../../src/fund_load/ports/window_store.py)  
-**Adapter (in-memory):** [window_store.py](../../../src/fund_load/adapters/window_store.py)
+**Service contract:** [window_store.py](../../../src/fund_load/services/window_store.py)  
+**Service implementation (in-memory):** [window_store.py](../../../src/fund_load/state/window_store.py)
 
 ---
 
