@@ -115,6 +115,19 @@ Minimal port contract:
 - **Backpressure hooks** (optional): enqueue limits or reject policy.
 - **Partitioning** (future): queues per node or per pool.
 
+### 4.1.1 Transport adapters behind queue port
+
+`QueuePort` is intentionally transport-agnostic.
+Default implementation is `InMemoryQueue` (deque), but the same contract can be
+backed by:
+
+- Redis stream/list,
+- Kafka topic bridge,
+- broker-native queue,
+- in-process async queue.
+
+Runner never depends on concrete transport details; queue backend is selected by runtime wiring.
+
 ### 4.2 ConsumerRegistry (routing registry)
 
 The consumer registry is a **service port** that owns the dynamic mapping
@@ -127,6 +140,15 @@ Minimal contract:
 - `list_tokens() -> list[type]`
 
 This keeps **routing data** separate from both Router and Runner.
+
+Runtime wiring rule:
+
+- runtime/bootstrap binds `service<ApplicationContext>` once per scenario scope;
+- `DiscoveryConsumerRegistry` (platform service) resolves consumer mapping from
+  discovered node contracts;
+- `RoutingPort` resolves registry via `inject.service(ConsumerRegistry)`;
+- `SyncRunner` resolves only `service<RoutingPort>` (it does not receive
+  consumer registry directly).
 
 ### 4.3 Context service over `kv`
 
@@ -220,11 +242,31 @@ Adapters live in the **framework**, but are wired by config.
 - awaits IO‑bound nodes (HTTP, DB, MCP)
 - same router contract
 
+### 6.2.1 Network-bound workloads
+
+Network interfaces (HTTP/WebSocket/GraphQL) should be modeled as adapters:
+
+- ingress adapters convert protocol payload -> domain model and enqueue via queue port;
+- business nodes stay protocol-agnostic;
+- egress adapters convert domain model -> protocol response/stream.
+
+This keeps FastAPI/WS/GraphQL integration in adapter layer and avoids runtime-specific branches.
+
 ### 6.3 DistributedRunner
 
 - integrates with Celery/worker pools
 - work items serialized through queue adapter
 - context store required
+
+### 6.3.1 Queue/topic duality
+
+Point-to-point queue and pub/sub topic are distinct runtime semantics:
+
+- queue: one consumer gets message;
+- topic: multiple subscribers can consume same message.
+
+If both are needed, use separate transport adapters under port contracts rather
+than overloading one concrete queue implementation.
 
 ### 6.4 Runner interface (contract)
 
@@ -246,6 +288,14 @@ Runner responsibilities:
 3. Normalize outputs into `Envelope` list
 4. Ask **RoutingPort** for destinations
 5. Push new envelopes into queue
+
+Runner dependencies are injected through framework DI:
+
+- `work_queue` via `inject.queue(Envelope, qualifier=\"execution.cpu\")`
+- `routing_port` via `inject.service(RoutingPort)`
+- `context_service` via `inject.service(ContextService)`
+
+No manual object lifecycle must be hardcoded in runner construction.
 
 RoutingPort responsibilities:
 
@@ -457,7 +507,7 @@ processing. Preflight moves these failures to startup and keeps runs determinist
 
 ---
 
-## 9) Implementation references (to be added)
+## 9) Implementation references
 
 - `stream_kernel.routing.router` (routing logic)
 - `stream_kernel.integration.routing_port` (routing adapter)
@@ -473,5 +523,5 @@ processing. Preflight moves these failures to startup and keeps runs determinist
 - `run(argv)` is the primary framework-first entrypoint.
 - `run_with_config(config, ...)` is also framework-first by default and can
   resolve discovery/adapters from config without external wiring.
-- `run_with_registry(...)` is a transitional wrapper kept for controlled
-  override/testing paths; it must stay a thin delegate to `run_with_config`.
+- Runtime bootstrap is expected to use execution builder APIs for artifact
+  assembly (`stream_kernel.execution.builder`) and then execute via runner APIs.

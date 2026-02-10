@@ -25,6 +25,9 @@ class NodeContract:
     name: str
     consumes: list[type] = field(default_factory=list)
     emits: list[type] = field(default_factory=list)
+    # External contracts represent platform endpoints (adapters/services) that
+    # participate in validation but are not executed as regular scenario nodes.
+    external: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,12 +35,13 @@ class Dag:
     # DAG representation for analysis: nodes + directed edges.
     nodes: list[str]
     edges: list[tuple[str, str]]
+    external_nodes: set[str] = field(default_factory=set)
 
 
 def build_dag(contracts: Sequence[NodeContract]) -> Dag:
     # Build a DAG from consumes/emits contracts (docs/framework/initial_stage/DAG construction.md).
     if not contracts:
-        return Dag(nodes=[], edges=[])
+        return Dag(nodes=[], edges=[], external_nodes=set())
 
     # Enforce non-empty consumes for non-source nodes.
     for contract in contracts:
@@ -49,8 +53,10 @@ def build_dag(contracts: Sequence[NodeContract]) -> Dag:
     # Providers and consumers indexed by token (type).
     providers: dict[type, list[str]] = {}
     consumers: dict[type, list[str]] = {}
+    by_name: dict[str, NodeContract] = {}
 
     for contract in contracts:
+        by_name[contract.name] = contract
         for token in contract.emits:
             providers.setdefault(token, []).append(contract.name)
         for token in contract.consumes:
@@ -59,8 +65,8 @@ def build_dag(contracts: Sequence[NodeContract]) -> Dag:
     # Verify every consumed token has at least one provider.
     for token, consumer_names in consumers.items():
         if token not in providers:
-            # Implicit sink adapters are allowed to consume externally-produced streams.
-            if all(_is_adapter_sink(name) for name in consumer_names):
+            # External sink endpoints are allowed to consume externally-produced streams.
+            if all(_is_external_sink(by_name.get(name)) for name in consumer_names):
                 continue
             raise MissingProviderError(f"Token '{token.__name__}' has no providers for consumers {consumer_names}")
 
@@ -82,7 +88,11 @@ def build_dag(contracts: Sequence[NodeContract]) -> Dag:
         raise CycleError("Self-loop detected in DAG")
 
     _assert_acyclic([c.name for c in contracts], edges)
-    return Dag(nodes=[c.name for c in contracts], edges=edges)
+    return Dag(
+        nodes=[c.name for c in contracts],
+        edges=edges,
+        external_nodes={c.name for c in contracts if c.external},
+    )
 
 
 def _assert_acyclic(nodes: Iterable[str], edges: Iterable[tuple[str, str]]) -> None:
@@ -111,6 +121,8 @@ def _assert_acyclic(nodes: Iterable[str], edges: Iterable[tuple[str, str]]) -> N
             _visit(node)
 
 
-def _is_adapter_sink(name: str) -> bool:
-    # Adapter contracts are injected by runtime as synthetic nodes prefixed with "adapter:".
-    return name.startswith("adapter:")
+def _is_external_sink(contract: NodeContract | None) -> bool:
+    # External sink endpoints can stay "open" on provider side during DAG validation.
+    if contract is None:
+        return False
+    return contract.external and bool(contract.consumes) and not contract.emits

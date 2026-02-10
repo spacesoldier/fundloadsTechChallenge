@@ -91,5 +91,5 @@ def test_preflight_accepts_missing_provider_when_adapter_contract_emits_token() 
     ctx.discover([mod])
     ctx.preflight(
         strict=True,
-        extra_contracts=[NodeContract(name="adapter:input_source", consumes=[], emits=[RawToken])],
+        extra_contracts=[NodeContract(name="input_source", consumes=[], emits=[RawToken], external=True)],
     )

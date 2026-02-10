@@ -104,10 +104,13 @@ adapters:
     assert exit_code == 0
     trace_path = tmp_path / "trace.jsonl"
     lines = trace_path.read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 8
+    # Source adapters now execute as graph-native bootstrap nodes and are traced as regular steps.
+    assert len(lines) == 9
     first = json.loads(lines[0])
-    assert first["step_name"] == "parse_load_attempt"
+    assert first["step_name"] == "source:input_source"
     assert first["ctx_before"] == {"run_id": "run"}
+    second = json.loads(lines[1])
+    assert second["step_name"] == "parse_load_attempt"
 
 
 def test_runtime_tracing_disabled_no_sink(tmp_path: Path) -> None:

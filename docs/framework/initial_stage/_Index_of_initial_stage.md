@@ -40,6 +40,8 @@ Obsidian plugin, but the narrative below is the human-friendly entry point.
   See: [[docs/framework/initial_stage/Routing semantics|Routing semantics]]
 - **DAG construction** → analytic graph rules and test cases.  
   See: [[docs/framework/initial_stage/DAG construction|DAG construction]]
+- **Work plans (incremental)** → short-lived execution/migration plans.  
+  See: [[docs/framework/initial_stage/_work/_Index_of__work|_work index]]
 
 tags: [MOC]
 ---

@@ -58,18 +58,16 @@ Current injection helper supports this directly.
 
 ### 3.2 Discovery marker (`@service`)
 
-Planned explicit marker:
+`@service` is now part of framework runtime:
 
 - `@service(name="window_store_service")`
 
-Rationale:
+Current behavior:
 
-- separate semantic intent from regular `@node`
-- simplify discovery diagnostics and editor linting
-- enforce service-specific lifecycle checks
-
-Until the dedicated decorator is introduced, services can be represented as
-regular framework-managed components and injected with `inject.service(...)`.
+- service classes are discovered with node/adapters during module scan;
+- duplicate service names fail fast;
+- contracts are registered by concrete type plus base classes
+  (`service_contract_types(...)`), so injection can target either.
 
 ---
 
@@ -141,8 +139,6 @@ Service contract should stay unchanged across these backend swaps.
 2. Two scenarios get different service instances.
 3. Service wraps `kv` adapter operations without leaking transport details.
 4. Replacing adapter factory (`dict` -> fake redis adapter) does not require node changes.
-5. Missing service binding:
-   - strict mode -> fail fast
-   - non-strict mode (if enabled for this path) -> explicit warning path.
+5. Missing service binding fails fast with explicit DI error.
 6. Service state does not leak between scenarios.
 7. Service discovery diagnostics identify service components distinctly from nodes.

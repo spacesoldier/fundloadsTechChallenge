@@ -158,7 +158,7 @@ def build_tracing_observer(ctx: ObserverFactoryContext) -> ExecutionObserver | N
         if isinstance(context_diff.get("whitelist", []), list)
         else None,
     )
-    step_indices = {spec.name: idx for idx, spec in enumerate(ctx.step_specs)}
+    step_indices = {name: idx for idx, name in enumerate(ctx.node_order)}
     return TracingObserver(
         recorder=recorder,
         sink=sink,

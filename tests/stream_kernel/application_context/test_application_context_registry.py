@@ -6,7 +6,6 @@ from dataclasses import dataclass
 import pytest
 
 from stream_kernel.application_context import ApplicationContext, ContextBuildError
-from stream_kernel.kernel.step_registry import StepRegistry
 from stream_kernel.kernel.node import node
 
 
@@ -47,18 +46,21 @@ def _make_module() -> types.ModuleType:
     return mod
 
 
-def test_context_build_registry_registers_nodes() -> None:
-    # build_registry should register all discovered nodes by name.
+def test_context_build_scenario_registers_nodes() -> None:
+    # build_scenario should resolve discovered nodes by name without StepRegistry.
     ctx = ApplicationContext()
     ctx.discover([_make_module()])
 
-    registry = ctx.build_registry(strict=True)
-    assert isinstance(registry, StepRegistry)
-    assert set(registry.names()) == {"source", "a", "b"}
+    scenario = ctx.build_scenario(
+        scenario_id="s1",
+        step_names=["source", "a", "b"],
+        wiring={"strict": True},
+    )
+    assert [step.name for step in scenario.steps] == ["source", "a", "b"]
 
 
-def test_context_build_registry_fails_on_missing_dependency() -> None:
-    # build_registry should fail fast when consumed tokens have no providers.
+def test_context_validate_dependencies_fails_on_missing_dependency() -> None:
+    # Strict dependency validation should fail fast when consumed tokens have no providers.
     ctx = ApplicationContext()
 
     class MissingToken:
@@ -73,4 +75,4 @@ def test_context_build_registry_fails_on_missing_dependency() -> None:
 
     ctx.discover([mod])
     with pytest.raises(ContextBuildError):
-        ctx.build_registry(strict=True)
+        ctx.validate_dependencies(strict=True)

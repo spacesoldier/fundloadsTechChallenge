@@ -29,28 +29,30 @@ def validate_newgen_config(raw: object) -> dict[str, object]:
     if not isinstance(discovery_modules, list) or not all(isinstance(item, str) for item in discovery_modules):
         raise ConfigError("runtime.discovery_modules must be a list of strings")
 
-    output_sink = _require_mapping(adapters, "output_sink")
-    if not isinstance(output_sink, dict):
-        raise ConfigError("adapters.output_sink must be a mapping when provided")
-    kind = output_sink.get("kind")
-    factory = output_sink.get("factory")
-    if kind is not None:
-        raise ConfigError("adapters.output_sink.kind is not supported; use adapter name as YAML key")
-    if factory is not None:
-        raise ConfigError("adapters.output_sink.factory is not supported")
-    binds = output_sink.get("binds", [])
-    if not isinstance(binds, list):
-        raise ConfigError("adapters.output_sink.binds must be a list")
-    if not all(isinstance(item, str) for item in binds):
-        raise ConfigError("adapters.output_sink.binds entries must be strings")
-    unknown = [item for item in binds if item not in _STABLE_PORT_TYPES]
-    if unknown:
-        raise ConfigError(
-            f"adapters.output_sink.binds entries must be one of: {sorted(_STABLE_PORT_TYPES)}"
-        )
-    settings = output_sink.get("settings", {})
-    if not isinstance(settings, dict):
-        raise ConfigError("adapters.output_sink.settings must be a mapping when provided")
+    for role, entry in adapters.items():
+        if not isinstance(entry, dict):
+            raise ConfigError(f"adapters.{role} must be a mapping when provided")
+        kind = entry.get("kind")
+        factory = entry.get("factory")
+        if kind is not None:
+            raise ConfigError(
+                f"adapters.{role}.kind is not supported; use adapter name as YAML key"
+            )
+        if factory is not None:
+            raise ConfigError(f"adapters.{role}.factory is not supported")
+        binds = entry.get("binds", [])
+        if not isinstance(binds, list):
+            raise ConfigError(f"adapters.{role}.binds must be a list")
+        if not all(isinstance(item, str) for item in binds):
+            raise ConfigError(f"adapters.{role}.binds entries must be strings")
+        unknown = [item for item in binds if item not in _STABLE_PORT_TYPES]
+        if unknown:
+            raise ConfigError(
+                f"adapters.{role}.binds entries must be one of: {sorted(_STABLE_PORT_TYPES)}"
+            )
+        settings = entry.get("settings", {})
+        if not isinstance(settings, dict):
+            raise ConfigError(f"adapters.{role}.settings must be a mapping when provided")
 
     # Normalize missing sections to keep downstream code simple.
     validated: dict[str, object] = dict(raw)

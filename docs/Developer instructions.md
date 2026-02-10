@@ -125,12 +125,11 @@ For each step:
 
 Implement kernel components as specified:
 - `Context` (mutable metadata, trace tape)
-- `Step` contract `(msg, ctx) -> Iterable[msg]`
-- `Scenario` (immutable list of bound steps)
-- `Runner` (single-threaded, per-message end-to-end, worklist semantics)
-- `StepRegistry` (composition-time only)
-- `ScenarioBuilder` (builds Scenario from config using StepRegistry)
-- `CompositionRoot` (wires ports/adapters + config + scenario)
+- Node contract (`@node`) with `consumes/emits` metadata
+- `Scenario` (immutable list of bound executable nodes)
+- execution `Runner` (single-threaded baseline, work-queue semantics)
+- `ApplicationContext` (discovery + config/injection application + scenario build)
+- execution builder/bootstrap (`stream_kernel.execution.builder`)
 
 Add kernel-level tests:
 - deterministic order

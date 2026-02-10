@@ -112,12 +112,23 @@ This plan tracks the move from fixed `runtime.pipeline` ordering to
 - [ ] Add a preflight validation command for graph+routing invariants before run.
 - [ ] Run full demo project on framework-only runtime without legacy sequencing hooks.
 
+## Phase 7 — Network interface track (HTTP/WebSocket/GraphQL)
+
+- [ ] Add config-level declarations for network interfaces in runtime section.
+- [ ] Keep protocol adapters platform-owned and discovery-driven (no runtime hardcode).
+- [ ] Map transport semantics to stable ports:
+      - HTTP req/res -> `request`/`response`
+      - WS and server stream -> `stream`
+      - keyed protocol streams -> `kv_stream`
+- [ ] Integrate ingress/egress boundaries into tracing/telemetry/monitoring.
+- [ ] Add adapter conformance tests for initial network stack (FastAPI HTTP, WS, GraphQL baseline).
+
 ### Runtime note
 
 - Runtime bootstrap starts via token routing (`RoutingPort.route([payload])`).
 - Scenario build order is derived from DAG execution plan, not discovery order.
 - Ambiguous token flows are handled by routing contracts/targets, not by next-step shims.
-- `run_with_registry` remains transitional; primary runtime path is framework-first (`run` / `run_with_config`).
+- Runtime entrypoint is framework-first (`run` / `run_with_config`) with artifact assembly through execution builder APIs.
 
 ---
 

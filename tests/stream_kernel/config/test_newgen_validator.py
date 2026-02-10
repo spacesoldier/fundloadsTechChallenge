@@ -54,8 +54,8 @@ def test_validate_newgen_config_requires_scenario_name() -> None:
         validate_newgen_config(raw)
 
 
-def test_validate_newgen_config_requires_output_sink_mapping() -> None:
-    raw = {"version": 1, "scenario": {"name": "baseline"}, "nodes": {}, "adapters": {"output_sink": "x"}}
+def test_validate_newgen_config_requires_adapter_entry_mapping() -> None:
+    raw = {"version": 1, "scenario": {"name": "baseline"}, "nodes": {}, "adapters": {"some_adapter": "x"}}
     with pytest.raises(ConfigError):
         validate_newgen_config(raw)
 
@@ -152,25 +152,6 @@ def test_validate_newgen_config_requires_output_sink_settings_mapping() -> None:
         "scenario": {"name": "baseline"},
         "adapters": {"output_sink": {"binds": [], "settings": "nope"}},
     }
-    with pytest.raises(ConfigError):
-        validate_newgen_config(raw)
-
-
-def test_validate_newgen_config_defensive_output_sink_type_check(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Defensive check: output_sink must remain a mapping after helper (validator internal guard).
-    raw = {
-        "version": 1,
-        "scenario": {"name": "baseline"},
-        "adapters": {"output_sink": {"binds": []}},
-    }
-
-    def _require_mapping(root: dict[str, object], key: str) -> dict[str, object]:
-        if key == "scenario":
-            return {"name": "baseline"}
-        return "nope"  # type: ignore[return-value]
-
-    monkeypatch.setattr("stream_kernel.config.validator._require_mapping", _require_mapping)
-
     with pytest.raises(ConfigError):
         validate_newgen_config(raw)
 

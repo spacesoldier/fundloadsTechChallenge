@@ -8,7 +8,6 @@ from stream_kernel.execution.observer import (
     ObserverFactoryContext,
 )
 from stream_kernel.execution.observer_discovery import discover_execution_observer_factories
-from stream_kernel.kernel.scenario import StepSpec
 
 
 def build_execution_observers(
@@ -18,7 +17,7 @@ def build_execution_observers(
     adapter_instances: dict[str, object],
     run_id: str,
     scenario_id: str,
-    step_specs: list[StepSpec],
+    node_order: list[str],
 ) -> list[ExecutionObserver]:
     # Public execution-level API: discover and build observers from modules.
     factories = discover_execution_observer_factories(modules)
@@ -28,7 +27,7 @@ def build_execution_observers(
         adapter_instances=adapter_instances,
         run_id=run_id,
         scenario_id=scenario_id,
-        step_specs=step_specs,
+        node_order=node_order,
     )
 
 
@@ -39,7 +38,7 @@ def build_execution_observers_from_factories(
     adapter_instances: dict[str, object],
     run_id: str,
     scenario_id: str,
-    step_specs: list[StepSpec],
+    node_order: list[str],
 ) -> list[ExecutionObserver]:
     # Build execution observers from discovered observer factories.
     context = ObserverFactoryContext(
@@ -47,7 +46,7 @@ def build_execution_observers_from_factories(
         adapter_instances=adapter_instances,
         run_id=run_id,
         scenario_id=scenario_id,
-        step_specs=step_specs,
+        node_order=node_order,
     )
     observers: list[ExecutionObserver] = []
     for _name, factory in factories.items():
@@ -64,4 +63,3 @@ def build_execution_observers_from_factories(
                 raise ValueError("Observer factory must return ExecutionObserver instances")
             observers.append(candidate)
     return observers
-

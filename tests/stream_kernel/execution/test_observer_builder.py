@@ -41,7 +41,7 @@ def test_build_execution_observers_discovers_and_builds_from_modules() -> None:
         adapter_instances={},
         run_id="run",
         scenario_id="scenario",
-        step_specs=[],
+        node_order=[],
     )
     assert len(observers) == 1
 
@@ -55,6 +55,5 @@ def test_build_execution_observers_from_factories_rejects_invalid_result() -> No
             adapter_instances={},
             run_id="run",
             scenario_id="scenario",
-            step_specs=[],
+            node_order=[],
         )
-

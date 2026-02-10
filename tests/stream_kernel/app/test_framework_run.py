@@ -10,6 +10,7 @@ from stream_kernel.adapters.registry import AdapterRegistry
 from stream_kernel.app import run, run_with_registry
 from stream_kernel.app.runtime import run_with_config
 import stream_kernel.app.runtime as runtime_module
+from stream_kernel.execution.builder import build_adapter_contracts
 from stream_kernel.application_context.injection_registry import InjectionRegistry
 from stream_kernel.config.loader import load_yaml_config
 from stream_kernel.config.validator import validate_newgen_config
@@ -43,7 +44,7 @@ def test_build_adapter_contracts_from_factory_metadata() -> None:
         "input_source": {"settings": {}},
         "output_sink": {"settings": {}},
     }
-    contracts = runtime_module._build_adapter_contracts(adapters, adapter_registry=registry)
+    contracts = build_adapter_contracts(adapters, adapter_registry=registry)
     by_name = {contract.name: contract for contract in contracts}
     assert set(by_name.keys()) == {"adapter:input_source", "adapter:output_sink"}
     assert [token.__name__ for token in by_name["adapter:input_source"].emits] == ["RawLine"]
@@ -62,7 +63,7 @@ def test_build_adapter_contracts_from_registry_metadata() -> None:
 
     registry.register("input_source", "input_source", _source_factory)
     adapters = {"input_source": {"settings": {}}}
-    contracts = runtime_module._build_adapter_contracts(adapters, adapter_registry=registry)
+    contracts = build_adapter_contracts(adapters, adapter_registry=registry)
     assert len(contracts) == 1
     assert contracts[0].name == "adapter:input_source"
     assert contracts[0].consumes == []
@@ -143,7 +144,11 @@ adapters:
         cfg,
         adapter_registry=registry,
         adapter_bindings=bindings,
-        discovery_modules=["fund_load.usecases.steps", "fund_load.services.prime_checker"],
+        discovery_modules=[
+            "fund_load.usecases.steps",
+            "fund_load.services.prime_checker",
+            "fund_load.adapters.io",
+        ],
         argv_overrides={
             "input": str(input_path),
             "output": str(output_path),
@@ -218,6 +223,101 @@ adapters:
 
     exit_code = run_with_config(
         cfg,
+        argv_overrides={
+            "input": str(input_path),
+            "output": str(output_path),
+        },
+    )
+
+    assert exit_code == 0
+    assert output_path.read_text(encoding="utf-8").strip() == '{"id":"1","customer_id":"10","accepted":true}'
+
+
+def test_run_with_config_works_without_write_output_step_when_sink_adapter_present(tmp_path: Path) -> None:
+    # Output persistence should work via graph-native sink adapter even if project write_output step is not discovered.
+    cfg_path = _write(
+        tmp_path,
+        """
+version: 1
+scenario:
+  name: baseline
+runtime:
+  strict: true
+nodes:
+  compute_time_keys:
+    week_start: MON
+  compute_features:
+    monday_multiplier:
+      enabled: false
+      multiplier: 2
+      apply_to: amount
+    prime_gate:
+      enabled: false
+      global_per_day: 1
+      amount_cap: 9999
+  evaluate_policies:
+    limits:
+      daily_amount: 5000
+      weekly_amount: 20000
+      daily_attempts: 3
+    prime_gate:
+      enabled: false
+      global_per_day: 1
+      amount_cap: 9999
+  update_windows:
+    daily_prime_gate:
+      enabled: false
+adapters:
+  input_source:
+    settings:
+      path: placeholder.ndjson
+    binds:
+      - stream
+  output_sink:
+    settings:
+      path: placeholder.txt
+    binds:
+      - stream
+  window_store:
+    settings: {}
+    binds:
+      - service
+""",
+    )
+    cfg = validate_newgen_config(load_yaml_config(cfg_path))
+    input_path = tmp_path / "input.ndjson"
+    input_path.write_text(
+        '{"id":"1","customer_id":"10","load_amount":"$1.00","time":"2025-01-01T00:00:00Z"}\n',
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "output.txt"
+
+    registry = AdapterRegistry()
+    registry.register("input_source", "input_source", file_input_source)
+    registry.register("output_sink", "output_sink", file_output_sink)
+    registry.register("window_store", "window_store", window_store_memory)
+    bindings = {
+        "input_source": [("stream", FileLineInputSource)],
+        "output_sink": [("stream", FileOutputSink)],
+        "window_store": [("service", WindowStoreService)],
+    }
+
+    exit_code = run_with_config(
+        cfg,
+        adapter_registry=registry,
+        adapter_bindings=bindings,
+        discovery_modules=[
+            "fund_load.usecases.steps.parse_load_attempt",
+            "fund_load.usecases.steps.compute_time_keys",
+            "fund_load.usecases.steps.idempotency_gate",
+            "fund_load.usecases.steps.compute_features",
+            "fund_load.usecases.steps.evaluate_policies",
+            "fund_load.usecases.steps.update_windows",
+            "fund_load.usecases.steps.format_output",
+            "fund_load.services.prime_checker",
+            "fund_load.services.window_store",
+            "fund_load.adapters.io",
+        ],
         argv_overrides={
             "input": str(input_path),
             "output": str(output_path),
@@ -308,7 +408,11 @@ adapters:
         ],
         adapter_registry=registry,
         adapter_bindings=bindings,
-        discovery_modules=["fund_load.usecases.steps", "fund_load.services.prime_checker"],
+        discovery_modules=[
+            "fund_load.usecases.steps",
+            "fund_load.services.prime_checker",
+            "fund_load.adapters.io",
+        ],
     )
 
     assert exit_code == 0
@@ -327,9 +431,15 @@ def test_run_with_registry_is_thin_wrapper(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr("stream_kernel.app.runtime.load_yaml_config", lambda _path: cfg)
     monkeypatch.setattr("stream_kernel.app.runtime.validate_newgen_config", lambda raw: raw)
 
-    def _apply_overrides(config: dict[str, object], _args: object) -> None:
+    def _apply_overrides(
+        config: dict[str, object],
+        _args: object,
+        *,
+        discovery_modules: list[str] | None = None,
+    ) -> None:
         captured["applied"] = True
         captured["config_after_apply"] = config
+        captured["overrides_discovery_modules"] = discovery_modules
 
     monkeypatch.setattr("stream_kernel.app.runtime.apply_cli_overrides", _apply_overrides)
 
@@ -353,6 +463,7 @@ def test_run_with_registry_is_thin_wrapper(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert exit_code == 77
     assert captured["applied"] is True
+    assert captured["overrides_discovery_modules"] == discovery
     assert captured["delegated_config"] == cfg
     assert captured["delegated_kwargs"] == {
         "adapter_registry": registry,
@@ -472,20 +583,17 @@ def test_run_with_config_uses_discovery_order_when_pipeline_missing(monkeypatch:
             captured["step_names"] = list(step_names)
             return type("S", (), {"steps": []})()
 
-    monkeypatch.setattr("stream_kernel.app.runtime.ApplicationContext", _Ctx)
+    monkeypatch.setattr("stream_kernel.execution.builder.ApplicationContext", _Ctx)
     monkeypatch.setattr(
-        "stream_kernel.app.runtime._build_adapter_instances_from_registry",
+        "stream_kernel.execution.builder.build_adapter_instances_from_registry",
         lambda _adapters, _registry: {"input_source": type("I", (), {"read": lambda *_a: []})()},
     )
     monkeypatch.setattr(
-        "stream_kernel.app.runtime._build_injection_registry_from_bindings",
+        "stream_kernel.execution.builder.build_injection_registry_from_bindings",
         lambda _instances, _bindings: InjectionRegistry(),
     )
-    monkeypatch.setattr("stream_kernel.app.runtime.build_execution_observers", lambda *_a, **_k: [])
-    monkeypatch.setattr(
-        "stream_kernel.app.runtime._run_with_sync_runner",
-        lambda **_kw: None,
-    )
+    monkeypatch.setattr("stream_kernel.execution.builder.build_execution_observers", lambda *_a, **_k: [])
+    monkeypatch.setattr("stream_kernel.execution.builder.run_with_sync_runner", lambda **_kw: None)
 
     cfg = {
         "version": 1,
@@ -537,17 +645,17 @@ def test_run_with_config_invokes_preflight(monkeypatch: pytest.MonkeyPatch) -> N
         def build_scenario(self, *, scenario_id, step_names, wiring):
             return type("S", (), {"steps": []})()
 
-    monkeypatch.setattr("stream_kernel.app.runtime.ApplicationContext", _Ctx)
+    monkeypatch.setattr("stream_kernel.execution.builder.ApplicationContext", _Ctx)
     monkeypatch.setattr(
-        "stream_kernel.app.runtime._build_adapter_instances_from_registry",
+        "stream_kernel.execution.builder.build_adapter_instances_from_registry",
         lambda _adapters, _registry: {"input_source": type("I", (), {"read": lambda *_a: []})()},
     )
     monkeypatch.setattr(
-        "stream_kernel.app.runtime._build_injection_registry_from_bindings",
+        "stream_kernel.execution.builder.build_injection_registry_from_bindings",
         lambda _instances, _bindings: InjectionRegistry(),
     )
-    monkeypatch.setattr("stream_kernel.app.runtime.build_execution_observers", lambda *_a, **_k: [])
-    monkeypatch.setattr("stream_kernel.app.runtime._run_with_sync_runner", lambda **_kw: None)
+    monkeypatch.setattr("stream_kernel.execution.builder.build_execution_observers", lambda *_a, **_k: [])
+    monkeypatch.setattr("stream_kernel.execution.builder.run_with_sync_runner", lambda **_kw: None)
 
     cfg = {
         "scenario": {"name": "baseline"},
@@ -671,7 +779,7 @@ def test_run_rejects_runtime_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("stream_kernel.app.runtime.validate_newgen_config", lambda raw: raw)
     monkeypatch.setattr("stream_kernel.app.runtime.apply_cli_overrides", lambda *_a, **_k: None)
     monkeypatch.setattr(
-        "stream_kernel.app.runtime.ApplicationContext",
+        "stream_kernel.execution.builder.ApplicationContext",
         lambda: type(
             "C",
             (),
@@ -684,8 +792,16 @@ def test_run_rejects_runtime_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
         )(),
     )
     monkeypatch.setattr(
-        "stream_kernel.app.runtime.SyncRunner",
-        lambda **_k: type("R", (), {"run": lambda *_a, **_k: None, "run_inputs": lambda *_a, **_k: None})(),
+        "stream_kernel.execution.builder.SyncRunner",
+        lambda **_k: type(
+            "R",
+            (),
+            {
+                "run": lambda *_a, **_k: None,
+                "run_inputs": lambda *_a, **_k: None,
+                "on_run_end": lambda *_a, **_k: None,
+            },
+        )(),
     )
 
     with pytest.raises(ValueError):
@@ -735,21 +851,21 @@ def test_run_uses_discovery_order_when_pipeline_missing(monkeypatch: pytest.Monk
     monkeypatch.setattr("stream_kernel.app.runtime.load_yaml_config", lambda _path: cfg)
     monkeypatch.setattr("stream_kernel.app.runtime.validate_newgen_config", lambda raw: raw)
     monkeypatch.setattr("stream_kernel.app.runtime.apply_cli_overrides", lambda *_a, **_k: None)
-    monkeypatch.setattr("stream_kernel.app.runtime.ApplicationContext", _Ctx)
+    monkeypatch.setattr("stream_kernel.execution.builder.ApplicationContext", _Ctx)
     monkeypatch.setattr(
-        "stream_kernel.app.runtime._resolve_runtime_adapters",
+        "stream_kernel.execution.builder.resolve_runtime_adapters",
         lambda **_kw: (AdapterRegistry(), {}),
     )
     monkeypatch.setattr(
-        "stream_kernel.app.runtime._build_adapter_instances_from_registry",
+        "stream_kernel.execution.builder.build_adapter_instances_from_registry",
         lambda _adapters, _registry: {"input_source": type("I", (), {"read": lambda *_a: []})()},
     )
     monkeypatch.setattr(
-        "stream_kernel.app.runtime._build_injection_registry_from_bindings",
+        "stream_kernel.execution.builder.build_injection_registry_from_bindings",
         lambda _instances, _bindings: InjectionRegistry(),
     )
-    monkeypatch.setattr("stream_kernel.app.runtime.build_execution_observers", lambda *_a, **_k: [])
-    monkeypatch.setattr("stream_kernel.app.runtime._run_with_sync_runner", lambda **_kw: None)
+    monkeypatch.setattr("stream_kernel.execution.builder.build_execution_observers", lambda *_a, **_k: [])
+    monkeypatch.setattr("stream_kernel.execution.builder.run_with_sync_runner", lambda **_kw: None)
 
     exit_code = run(["--config", "cfg.yml"])
     assert exit_code == 0
@@ -775,15 +891,15 @@ def test_run_requires_source_adapter_with_read(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr("stream_kernel.app.runtime.load_yaml_config", lambda _path: cfg)
     monkeypatch.setattr("stream_kernel.app.runtime.validate_newgen_config", lambda raw: raw)
     monkeypatch.setattr(
-        "stream_kernel.app.runtime._resolve_runtime_adapters",
+        "stream_kernel.execution.builder.resolve_runtime_adapters",
         lambda **_kw: (AdapterRegistry(), {}),
     )
     monkeypatch.setattr(
-        "stream_kernel.app.runtime._build_adapter_instances_from_registry",
+        "stream_kernel.execution.builder.build_adapter_instances_from_registry",
         lambda _adapters, _registry: {"output_sink": object()},
     )
     monkeypatch.setattr(
-        "stream_kernel.app.runtime.ApplicationContext",
+        "stream_kernel.execution.builder.ApplicationContext",
         lambda: type(
             "C",
             (),
@@ -796,8 +912,16 @@ def test_run_requires_source_adapter_with_read(monkeypatch: pytest.MonkeyPatch) 
         )(),
     )
     monkeypatch.setattr(
-        "stream_kernel.app.runtime.SyncRunner",
-        lambda **_k: type("R", (), {"run": lambda *_a, **_k: None, "run_inputs": lambda *_a, **_k: None})(),
+        "stream_kernel.execution.builder.SyncRunner",
+        lambda **_k: type(
+            "R",
+            (),
+            {
+                "run": lambda *_a, **_k: None,
+                "run_inputs": lambda *_a, **_k: None,
+                "on_run_end": lambda *_a, **_k: None,
+            },
+        )(),
     )
 
     with pytest.raises(ValueError):
@@ -847,21 +971,21 @@ def test_run_accepts_non_default_source_role_with_read(monkeypatch: pytest.Monke
     monkeypatch.setattr("stream_kernel.app.runtime.load_yaml_config", lambda _path: cfg)
     monkeypatch.setattr("stream_kernel.app.runtime.validate_newgen_config", lambda raw: raw)
     monkeypatch.setattr("stream_kernel.app.runtime.apply_cli_overrides", lambda *_a, **_k: None)
-    monkeypatch.setattr("stream_kernel.app.runtime.ApplicationContext", _Ctx)
+    monkeypatch.setattr("stream_kernel.execution.builder.ApplicationContext", _Ctx)
     monkeypatch.setattr(
-        "stream_kernel.app.runtime._resolve_runtime_adapters",
+        "stream_kernel.execution.builder.resolve_runtime_adapters",
         lambda **_kw: (AdapterRegistry(), {}),
     )
     monkeypatch.setattr(
-        "stream_kernel.app.runtime._build_adapter_instances_from_registry",
+        "stream_kernel.execution.builder.build_adapter_instances_from_registry",
         lambda _adapters, _registry: {"events_source": type("I", (), {"read": lambda *_a: []})()},
     )
     monkeypatch.setattr(
-        "stream_kernel.app.runtime._build_injection_registry_from_bindings",
+        "stream_kernel.execution.builder.build_injection_registry_from_bindings",
         lambda _instances, _bindings: InjectionRegistry(),
     )
-    monkeypatch.setattr("stream_kernel.app.runtime.build_execution_observers", lambda *_a, **_k: [])
-    monkeypatch.setattr("stream_kernel.app.runtime._run_with_sync_runner", lambda **_kw: None)
+    monkeypatch.setattr("stream_kernel.execution.builder.build_execution_observers", lambda *_a, **_k: [])
+    monkeypatch.setattr("stream_kernel.execution.builder.run_with_sync_runner", lambda **_kw: None)
 
     exit_code = run(["--config", "cfg.yml"])
     assert exit_code == 0

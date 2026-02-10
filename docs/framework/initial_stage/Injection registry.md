@@ -21,17 +21,19 @@ See also: [Injection and strict mode](./Injection%20and%20strict%20mode.md), [Fa
 
 The registry holds **factories**, not instances:
 
-- key: `(port_type, data_type)`
+- key: `(port_type, data_type, qualifier?)`
 - value: `factory() -> instance`
 
 At scenario build time, the registry creates a **ScenarioScope**:
 
 ```
 scope = registry.instantiate_for_scenario("baseline")
-store = scope.resolve("kv", UserState)
+store = scope.resolve("kv", UserState, qualifier="state.window")
 ```
 
 Each scenario receives a fresh set of instances.
+`ScenarioScope.close()` finalizes scoped instances via `close()`/`shutdown()`
+hooks and rejects new resolutions after close.
 
 ---
 
@@ -40,7 +42,7 @@ Each scenario receives a fresh set of instances.
 Errors are explicit:
 
 - duplicate binding → `InjectionRegistryError`
-- missing binding → `InjectionRegistryError` (or warning if strict mode is off)
+- missing binding → `InjectionRegistryError`
 
 Strict mode remains **enabled by default**.
 
@@ -64,4 +66,5 @@ Implementation tests: [tests/stream_kernel/application_context/test_injection_re
 2) Isolation across scenarios (distinct instances)
 3) Missing binding errors
 4) Duplicate binding errors
-5) Non-strict mode fallback (warning + None) when configured
+5) Qualifier-aware resolution and qualifier validation
+6) Scope lifecycle (`close()` finalizes instances, resolve-after-close fails)

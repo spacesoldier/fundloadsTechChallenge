@@ -22,7 +22,7 @@ def test_build_tracing_observer_returns_none_when_disabled() -> None:
             adapter_instances={},
             run_id="r1",
             scenario_id="s1",
-            step_specs=[],
+            node_order=[],
         )
     )
     assert observer is None
@@ -35,7 +35,7 @@ def test_build_tracing_observer_builds_when_enabled_and_sink_present() -> None:
             adapter_instances={"trace_jsonl": _Sink()},
             run_id="r1",
             scenario_id="s1",
-            step_specs=[],
+            node_order=[],
         )
     )
     assert observer is not None

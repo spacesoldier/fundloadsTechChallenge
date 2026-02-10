@@ -3,10 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from stream_kernel.application_context.inject import inject
-from stream_kernel.execution.observer import ExecutionObserver
 from stream_kernel.integration.routing_port import RoutingPort
-from stream_kernel.integration.work_queue import WorkQueue
+from stream_kernel.integration.work_queue import QueuePort
 from stream_kernel.platform.services.context import ContextService
+from stream_kernel.platform.services.observability import ObservabilityService
 from stream_kernel.routing.envelope import Envelope
 
 
@@ -14,20 +14,21 @@ from stream_kernel.routing.envelope import Envelope
 class SyncRunner:
     # Synchronous execution engine.
     # Responsibilities:
-    # - pull work items from WorkQueue;
+    # - pull work items from QueuePort;
     # - resolve context metadata by trace_id via ContextService;
     # - invoke target node;
     # - route node outputs via RoutingPort;
-    # - push downstream envelopes back to WorkQueue.
+    # - push downstream envelopes back to QueuePort.
     #
     # This runner does not own dependency lifecycle: services/ports are injected by framework DI.
     nodes: dict[str, object]
-    work_queue: WorkQueue
-    routing_port: RoutingPort
+    # Queue/routing are framework-managed dependencies and must come from DI.
+    work_queue: object = inject.queue(Envelope, qualifier="execution.cpu")
+    router: object = inject.service(RoutingPort)
     # Resolved through DI (`inject.service(ContextService)` in ApplicationContext wiring phase).
     context_service: object = inject.service(ContextService)
-    # Optional hooks for tracing/telemetry/monitoring around node execution.
-    observers: list[ExecutionObserver] = field(default_factory=list)
+    # Framework-level observability gateway (tracing/metrics/logging hooks).
+    observability: object = inject.service(ObservabilityService)
     # Service/system nodes can request full metadata, regular nodes receive filtered view.
     full_context_nodes: set[str] = field(default_factory=set)
 
@@ -35,8 +36,11 @@ class SyncRunner:
         # Drain current queue until empty.
         # Determinism: each popped envelope is fully executed and routed before next pop.
         context_service = self._context_service()
+        work_queue = self._work_queue()
+        router = self._router()
+        observability = self._observability()
         while True:
-            item = self.work_queue.pop()
+            item = work_queue.pop()
             if item is None:
                 break
             envelope = self._normalize(item)
@@ -59,49 +63,47 @@ class SyncRunner:
             # Pass a copy to the node so it cannot mutate persisted context in-place by accident.
             node_ctx = dict(raw_ctx)
             node = self.nodes[node_name]
-            # Observers can keep per-node temporary state (timers, snapshots, counters).
-            observer_states = [
-                observer.before_node(
-                    node_name=node_name,
-                    payload=envelope.payload,
-                    ctx=raw_ctx,
-                    trace_id=envelope.trace_id,
-                )
-                for observer in self.observers
-            ]
+            # Observability hooks can keep per-node temporary state (timers, snapshots, counters).
+            observer_state = observability.before_node(
+                node_name=node_name,
+                payload=envelope.payload,
+                ctx=raw_ctx,
+                trace_id=envelope.trace_id,
+            )
             try:
                 # Node contract is `(payload, ctx) -> iterable[output]`.
                 outputs = list(node(envelope.payload, node_ctx))
             except Exception as exc:
                 # Error path is explicitly observable for diagnostics and metrics.
-                for observer, state in zip(self.observers, observer_states, strict=False):
-                    observer.on_node_error(
-                        node_name=node_name,
-                        payload=envelope.payload,
-                        ctx=raw_ctx,
-                        trace_id=envelope.trace_id,
-                        error=exc,
-                        state=state,
-                    )
-                raise
-            # Success path callback after node output materialization.
-            for observer, state in zip(self.observers, observer_states, strict=False):
-                observer.after_node(
+                observability.on_node_error(
                     node_name=node_name,
                     payload=envelope.payload,
                     ctx=raw_ctx,
                     trace_id=envelope.trace_id,
-                    outputs=outputs,
-                    state=state,
+                    error=exc,
+                    state=observer_state,
                 )
+                raise
+            # Success path callback after node output materialization.
+            observability.after_node(
+                node_name=node_name,
+                payload=envelope.payload,
+                ctx=raw_ctx,
+                trace_id=envelope.trace_id,
+                outputs=outputs,
+                state=observer_state,
+            )
 
             # Router translates outputs to concrete `(target_node, payload)` deliveries.
-            deliveries = self.routing_port.route(outputs, source=node_name)
-            for target_name, payload in deliveries:
-                # Downstream keeps same trace_id to preserve end-to-end correlation.
-                self.work_queue.push(
-                    Envelope(payload=payload, target=target_name, trace_id=envelope.trace_id)
-                )
+            # Envelope trace_id emitted by node output overrides current trace_id if present.
+            for output in outputs:
+                explicit_trace_id = output.trace_id if isinstance(output, Envelope) else None
+                deliveries = router.route([output], source=node_name)
+                downstream_trace_id = explicit_trace_id or envelope.trace_id
+                for target_name, payload in deliveries:
+                    work_queue.push(
+                        Envelope(payload=payload, target=target_name, trace_id=downstream_trace_id)
+                    )
 
     def run_inputs(
         self,
@@ -119,7 +121,21 @@ class SyncRunner:
         #
         # This preserves "message-by-message" deterministic processing.
         context_service = self._context_service()
+        work_queue = self._work_queue()
+        router = self._router()
         for index, payload in enumerate(inputs, start=1):
+            if isinstance(payload, Envelope) and payload.target is not None:
+                trace_id = payload.trace_id or self._trace_id(run_id=run_id, index=index)
+                context_service.seed(
+                    trace_id=trace_id,
+                    payload=payload.payload,
+                    run_id=run_id,
+                    scenario_id=scenario_id,
+                )
+                work_queue.push(Envelope(payload=payload.payload, target=payload.target, trace_id=trace_id))
+                self.run()
+                continue
+
             trace_id = self._trace_id(run_id=run_id, index=index)
             context_service.seed(
                 trace_id=trace_id,
@@ -127,25 +143,60 @@ class SyncRunner:
                 run_id=run_id,
                 scenario_id=scenario_id,
             )
-            deliveries = self.routing_port.route([payload])
+            deliveries = router.route([payload])
             for target_name, routed_payload in deliveries:
-                self.work_queue.push(
+                work_queue.push(
                     Envelope(payload=routed_payload, target=target_name, trace_id=trace_id)
                 )
             self.run()
+
+    def on_run_end(self) -> None:
+        # Finalize observability lifecycle once run loop is completed.
+        self._observability().on_run_end()
 
     @staticmethod
     def _normalize(item: object) -> Envelope:
         # Internal queue contract: runner consumes only Envelope items.
         if isinstance(item, Envelope):
             return item
-        raise ValueError("WorkQueue must contain Envelope instances")
+        raise ValueError("QueuePort must contain Envelope instances")
 
     def _context_service(self) -> ContextService:
         # Runtime guard: DI must resolve `inject.service(ContextService)` before execution starts.
         if not isinstance(self.context_service, ContextService):
             raise ValueError("SyncRunner context_service is not resolved via DI")
         return self.context_service
+
+    def _work_queue(self) -> QueuePort:
+        # Runtime guard: DI must resolve `inject.queue(Envelope, qualifier="execution.cpu")`.
+        if isinstance(self.work_queue, QueuePort):
+            return self.work_queue
+        if callable(getattr(self.work_queue, "push", None)) and callable(
+            getattr(self.work_queue, "pop", None)
+        ):
+            return self.work_queue  # type: ignore[return-value]
+        raise ValueError("SyncRunner work_queue is not resolved via DI")
+
+    def _router(self) -> RoutingPort:
+        # Runtime guard: DI must resolve `inject.service(RoutingPort)`.
+        if isinstance(self.router, RoutingPort):
+            return self.router
+        if callable(getattr(self.router, "route", None)):
+            return self.router  # type: ignore[return-value]
+        raise ValueError("SyncRunner router is not resolved via DI")
+
+    def _observability(self) -> ObservabilityService:
+        # Runtime guard: DI must resolve `inject.service(ObservabilityService)`.
+        if isinstance(self.observability, ObservabilityService):
+            return self.observability
+        if (
+            callable(getattr(self.observability, "before_node", None))
+            and callable(getattr(self.observability, "after_node", None))
+            and callable(getattr(self.observability, "on_node_error", None))
+            and callable(getattr(self.observability, "on_run_end", None))
+        ):
+            return self.observability  # type: ignore[return-value]
+        raise ValueError("SyncRunner observability is not resolved via DI")
 
     @staticmethod
     def _trace_id(*, run_id: str, index: int) -> str:

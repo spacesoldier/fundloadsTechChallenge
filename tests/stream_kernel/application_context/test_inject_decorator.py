@@ -38,6 +38,16 @@ class _ResponsePort:
     name: str
 
 
+@dataclass
+class _QueuePort:
+    name: str
+
+
+@dataclass
+class _TopicPort:
+    name: str
+
+
 class _ContextKVStore(KVStore):
     # Marker KV contract for DI isolation by role.
     pass
@@ -93,6 +103,22 @@ def test_inject_response_descriptor_carries_port_and_type() -> None:
     dep = inject.response(EventA)
     assert isinstance(dep, Injected)
     assert dep.port_type == "response"
+    assert dep.data_type is EventA
+
+
+def test_inject_queue_descriptor_carries_port_and_type() -> None:
+    # Queue injection should carry "queue" port metadata.
+    dep = inject.queue(EventA)
+    assert isinstance(dep, Injected)
+    assert dep.port_type == "queue"
+    assert dep.data_type is EventA
+
+
+def test_inject_topic_descriptor_carries_port_and_type() -> None:
+    # Topic injection should carry "topic" port metadata.
+    dep = inject.topic(EventA)
+    assert isinstance(dep, Injected)
+    assert dep.port_type == "topic"
     assert dep.data_type is EventA
 
 
@@ -187,6 +213,30 @@ def test_inject_response_resolves_from_scope() -> None:
     resolved = dep.resolve(scope)
     assert isinstance(resolved, _ResponsePort)
     assert resolved.name == "resp"
+
+
+def test_inject_queue_resolves_from_scope() -> None:
+    # Queue injection should resolve using scenario scope lookup.
+    reg = InjectionRegistry()
+    reg.register_factory("queue", EventA, lambda: _QueuePort("queue"))
+    scope = reg.instantiate_for_scenario("s1")
+
+    dep = inject.queue(EventA)
+    resolved = dep.resolve(scope)
+    assert isinstance(resolved, _QueuePort)
+    assert resolved.name == "queue"
+
+
+def test_inject_topic_resolves_from_scope() -> None:
+    # Topic injection should resolve using scenario scope lookup.
+    reg = InjectionRegistry()
+    reg.register_factory("topic", EventA, lambda: _TopicPort("topic"))
+    scope = reg.instantiate_for_scenario("s1")
+
+    dep = inject.topic(EventA)
+    resolved = dep.resolve(scope)
+    assert isinstance(resolved, _TopicPort)
+    assert resolved.name == "topic"
 
 
 def test_inject_missing_binding_raises() -> None:

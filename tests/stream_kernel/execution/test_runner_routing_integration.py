@@ -8,11 +8,12 @@ import pytest
 # docs/framework/initial_stage/Execution runtime and routing integration.md
 # docs/framework/initial_stage/Routing semantics.md
 from stream_kernel.platform.services.context import InMemoryKvContextService
+from stream_kernel.platform.services.observability import NoOpObservabilityService
 from stream_kernel.execution.runner import SyncRunner
 from stream_kernel.integration.consumer_registry import InMemoryConsumerRegistry
 from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.integration.routing_port import RoutingPort
-from stream_kernel.integration.work_queue import InMemoryWorkQueue
+from stream_kernel.integration.work_queue import InMemoryQueue
 from stream_kernel.routing.envelope import Envelope
 
 
@@ -45,7 +46,7 @@ def test_runner_routes_outputs_via_routing_port() -> None:
     registry.register(X, ["B", "C"])
     routing = RoutingPort(registry=registry, strict=True)
 
-    work_queue = InMemoryWorkQueue()
+    work_queue = InMemoryQueue()
     context_service = InMemoryKvContextService(InMemoryKvStore())
     work_queue.push(Envelope(payload="seed", target="A", trace_id="t1"))
 
@@ -53,7 +54,8 @@ def test_runner_routes_outputs_via_routing_port() -> None:
         nodes={"A": node_a, "B": node_b, "C": node_c},
         work_queue=work_queue,
         context_service=context_service,
-        routing_port=routing,
+        router=routing,
+        observability=NoOpObservabilityService(),
     )
     runner.run()
 
@@ -79,7 +81,7 @@ def test_runner_respects_targeted_envelope_outputs() -> None:
     registry.register(X, ["B", "C"])
     routing = RoutingPort(registry=registry, strict=True)
 
-    work_queue = InMemoryWorkQueue()
+    work_queue = InMemoryQueue()
     context_service = InMemoryKvContextService(InMemoryKvStore())
     work_queue.push(Envelope(payload="seed", target="A", trace_id="t1"))
 
@@ -87,7 +89,8 @@ def test_runner_respects_targeted_envelope_outputs() -> None:
         nodes={"A": node_a, "B": node_b, "C": node_c},
         work_queue=work_queue,
         context_service=context_service,
-        routing_port=routing,
+        router=routing,
+        observability=NoOpObservabilityService(),
     )
     runner.run()
 
@@ -103,7 +106,7 @@ def test_runner_raises_on_no_consumer_in_strict_mode() -> None:
     registry.register(X, ["B"])
     routing = RoutingPort(registry=registry, strict=True)
 
-    work_queue = InMemoryWorkQueue()
+    work_queue = InMemoryQueue()
     context_service = InMemoryKvContextService(InMemoryKvStore())
     work_queue.push(Envelope(payload="seed", target="A", trace_id="t1"))
 
@@ -111,7 +114,8 @@ def test_runner_raises_on_no_consumer_in_strict_mode() -> None:
         nodes={"A": node_a},
         work_queue=work_queue,
         context_service=context_service,
-        routing_port=routing,
+        router=routing,
+        observability=NoOpObservabilityService(),
     )
 
     with pytest.raises(ValueError):
@@ -133,7 +137,7 @@ def test_runner_drops_no_consumer_in_non_strict_mode() -> None:
     registry.register(X, ["B"])
     routing = RoutingPort(registry=registry, strict=False)
 
-    work_queue = InMemoryWorkQueue()
+    work_queue = InMemoryQueue()
     context_service = InMemoryKvContextService(InMemoryKvStore())
     work_queue.push(Envelope(payload="seed", target="A", trace_id="t1"))
 
@@ -141,7 +145,8 @@ def test_runner_drops_no_consumer_in_non_strict_mode() -> None:
         nodes={"A": node_a, "B": node_b},
         work_queue=work_queue,
         context_service=context_service,
-        routing_port=routing,
+        router=routing,
+        observability=NoOpObservabilityService(),
     )
     runner.run()
 
@@ -163,7 +168,7 @@ def test_runner_drops_unknown_target_in_non_strict_mode() -> None:
     registry.register(X, ["B"])
     routing = RoutingPort(registry=registry, strict=False)
 
-    work_queue = InMemoryWorkQueue()
+    work_queue = InMemoryQueue()
     context_service = InMemoryKvContextService(InMemoryKvStore())
     work_queue.push(Envelope(payload="seed", target="A", trace_id="t1"))
 
@@ -171,7 +176,8 @@ def test_runner_drops_unknown_target_in_non_strict_mode() -> None:
         nodes={"A": node_a, "B": node_b},
         work_queue=work_queue,
         context_service=context_service,
-        routing_port=routing,
+        router=routing,
+        observability=NoOpObservabilityService(),
     )
     runner.run()
 
@@ -197,7 +203,7 @@ def test_runner_avoids_default_self_loop_on_same_token() -> None:
     registry.register(X, ["A", "B"])
     routing = RoutingPort(registry=registry, strict=True)
 
-    work_queue = InMemoryWorkQueue()
+    work_queue = InMemoryQueue()
     context_service = InMemoryKvContextService(InMemoryKvStore())
     work_queue.push(Envelope(payload="seed", target="A", trace_id="t1"))
 
@@ -205,7 +211,8 @@ def test_runner_avoids_default_self_loop_on_same_token() -> None:
         nodes={"A": node_a, "B": node_b},
         work_queue=work_queue,
         context_service=context_service,
-        routing_port=routing,
+        router=routing,
+        observability=NoOpObservabilityService(),
     )
     runner.run()
 
@@ -222,7 +229,7 @@ def test_runner_requires_explicit_target_for_single_self_consumer_in_strict_mode
     registry.register(X, ["A"])
     routing = RoutingPort(registry=registry, strict=True)
 
-    work_queue = InMemoryWorkQueue()
+    work_queue = InMemoryQueue()
     context_service = InMemoryKvContextService(InMemoryKvStore())
     work_queue.push(Envelope(payload="seed", target="A", trace_id="t1"))
 
@@ -230,7 +237,8 @@ def test_runner_requires_explicit_target_for_single_self_consumer_in_strict_mode
         nodes={"A": node_a},
         work_queue=work_queue,
         context_service=context_service,
-        routing_port=routing,
+        router=routing,
+        observability=NoOpObservabilityService(),
     )
 
     with pytest.raises(ValueError):

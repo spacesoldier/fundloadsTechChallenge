@@ -83,7 +83,7 @@ For now, this is conceptual only; execution remains within a single process.
 ## 5) Implementation references
 
 - Scenario model: [src/stream_kernel/kernel/scenario.py](../../../../src/stream_kernel/kernel/scenario.py)
-- Scenario builder: [src/stream_kernel/kernel/scenario_builder.py](../../../../src/stream_kernel/kernel/scenario_builder.py)
+- Scenario build path: [src/stream_kernel/application_context/application_context.py](../../../../src/stream_kernel/application_context/application_context.py)
 - Application context instantiation: [src/stream_kernel/application_context/application_context.py](../../../../src/stream_kernel/application_context/application_context.py)
 - Node/stage metadata: [src/stream_kernel/kernel/node.py](../../../../src/stream_kernel/kernel/node.py), [src/stream_kernel/kernel/stage.py](../../../../src/stream_kernel/kernel/stage.py)
 

@@ -53,11 +53,10 @@ def discover_services(modules: list[ModuleType]) -> list[type[object]]:
 
 
 def service_contract_types(service_cls: type[object]) -> list[type[object]]:
-    # Register service by concrete class and protocol bases for flexible injection.
+    # Register service by concrete class and public base contracts for flexible injection.
     contracts: list[type[object]] = [service_cls]
     for base in service_cls.__mro__[1:]:
         if base is object:
             continue
-        if getattr(base, "_is_protocol", False):
-            contracts.append(base)
+        contracts.append(base)
     return contracts

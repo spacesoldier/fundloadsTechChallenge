@@ -50,6 +50,8 @@ Port types in the framework taxonomy:
 - `kv`
 - `request`
 - `response`
+- `queue` (execution transport)
+- `topic` (pub/sub transport)
 
 Current injection helpers in code expose:
 
@@ -58,7 +60,16 @@ Current injection helpers in code expose:
 - `inject.kv(...)`
 - `inject.request(...)`
 - `inject.response(...)`
+- `inject.queue(...)`
+- `inject.topic(...)`
 - `inject.service(...)`
+
+Execution components use the same DI rails as business nodes:
+
+- runners receive `QueuePort` via `inject.queue(...)`
+- runners receive routing gateway via `inject.service(RoutingPort)`
+
+Runtime may provide default bindings, but explicit project bindings always win.
 
 Service semantics are defined in:
 - [Service model](Service%20model.md)

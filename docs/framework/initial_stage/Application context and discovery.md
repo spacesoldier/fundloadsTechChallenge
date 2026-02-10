@@ -17,8 +17,8 @@ See also: [Scenario vs node axes](./Scenario%20vs%20node%20axes.md), [Node and s
 
 In a manually wired project, the wiring module typically:
 
-- builds a `StepRegistry`
-- registers every step explicitly by name
+- registers every executable node explicitly by name
+- hardcodes execution order as a list
 - injects dependencies (ports/services) from a `wiring` dict
 - pulls config values from an app config model
 
@@ -106,19 +106,15 @@ Important config rule:
 - adapter is selected by YAML key name (`adapters.<name>`);
 - YAML declares only `settings` and bound port types (`binds`).
 
-### 4.3 `@service` (planned explicit marker)
+### 4.3 `@service`
 
 Service components provide domain APIs over standard framework ports/adapters.
 They are framework-managed and scenario-scoped by default.
 
-Current practical path (already supported):
+Current path:
 
-- declare service class/component
-- inject it with `inject.service(ServiceImpl)`
-
-Planned addition:
-
-- explicit `@service(...)` decorator for clearer discovery/lint diagnostics
+- declare service class with `@service(...)`
+- inject it with `inject.service(ServiceImpl)` or by base contract type
 
 See: [Service model](./Service%20model.md)
 
@@ -126,8 +122,8 @@ See: [Service model](./Service%20model.md)
 
 ## 5) Outcome: how wiring changes
 
-- `wiring.py` becomes a thin call to `ApplicationContext.discover(...)`.
-- Registry population is automatic based on decorators (`@node`, `@adapter`).
+- Runtime bootstrap delegates to `ApplicationContext` discovery/build APIs.
+- Registry population is automatic based on decorators (`@node`, `@adapter`, `@service`).
 - Dependencies are resolved by injection contract (`port_type + data_type`),
   including service injections via `inject.service(...)`.
 - Configuration is applied by the context, not by hand-coded lambdas.
@@ -146,7 +142,8 @@ to module discovery + config-driven composition.
 
 - Application context assembly: [src/stream_kernel/application_context/application_context.py](../../../../src/stream_kernel/application_context/application_context.py)
 - Discovery and metadata: [src/stream_kernel/kernel/discovery.py](../../../../src/stream_kernel/kernel/discovery.py), [src/stream_kernel/kernel/node.py](../../../../src/stream_kernel/kernel/node.py), [src/stream_kernel/kernel/stage.py](../../../../src/stream_kernel/kernel/stage.py)
-- Scenario build + registry: [src/stream_kernel/kernel/scenario_builder.py](../../../../src/stream_kernel/kernel/scenario_builder.py), [src/stream_kernel/kernel/step_registry.py](../../../../src/stream_kernel/kernel/step_registry.py)
+- Scenario build from discovered nodes: [src/stream_kernel/application_context/application_context.py](../../../../src/stream_kernel/application_context/application_context.py)
+- Runtime artifact assembly: [src/stream_kernel/execution/builder.py](../../../../src/stream_kernel/execution/builder.py)
 - Injection/config: [src/stream_kernel/application_context/inject.py](../../../../src/stream_kernel/application_context/inject.py), [src/stream_kernel/application_context/injection_registry.py](../../../../src/stream_kernel/application_context/injection_registry.py), [src/stream_kernel/application_context/config_inject.py](../../../../src/stream_kernel/application_context/config_inject.py)
 
 ---
@@ -167,8 +164,8 @@ Implementation tests: [tests/stream_kernel/application_context/test_application_
    - adapter registry is built from discovered adapters (no factory path in YAML).
 
 3) **Scenario build**
-   - step order matches config list (until DAG mode is introduced).
-   - missing step in config produces a clear error.
+   - step order is execution-plan driven from DAG (not manual config pipeline).
+   - missing/ambiguous contracts produce clear preflight errors.
 
 4) **Adapter discovery/config contract**
    - unknown adapter name fails startup.
@@ -196,7 +193,7 @@ at **build time** how to interpret them.
 
 ### 9.2 Why build-time resolution
 
-Resolution happens in ApplicationContext/ScenarioBuilder to:
+Resolution happens in ApplicationContext build phase to:
 
 - keep runtime deterministic (no per-message factory calls)
 - avoid side effects during module import

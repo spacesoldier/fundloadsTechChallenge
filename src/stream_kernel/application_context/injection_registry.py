@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import fields, is_dataclass
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any
 
 from stream_kernel.integration.kv_store import KVStore, validate_kv_contract_type
@@ -27,13 +26,29 @@ class _Binding:
 class ScenarioScope:
     # Scenario-scoped instances resolved by (port_type, data_type).
     _instances: dict[tuple[str, type[Any], str | None], object] = field(default_factory=dict)
+    _closed: bool = False
 
     def resolve(self, port_type: str, data_type: type[Any], *, qualifier: str | None = None) -> object:
+        if self._closed:
+            raise InjectionRegistryError("ScenarioScope is closed")
         normalized_qualifier = _normalize_qualifier(qualifier)
         key = (port_type, data_type, normalized_qualifier)
         if key not in self._instances:
             raise InjectionRegistryError(_missing_binding_message(port_type, data_type, normalized_qualifier))
         return self._instances[key]
+
+    def close(self) -> None:
+        # Finalize scenario-scoped instances via close()/shutdown() hooks when available.
+        if self._closed:
+            return
+        seen_ids: set[int] = set()
+        for instance in self._instances.values():
+            inst_id = id(instance)
+            if inst_id in seen_ids:
+                continue
+            seen_ids.add(inst_id)
+            _finalize_instance(instance)
+        self._closed = True
 
 
 @dataclass(slots=True)
@@ -156,6 +171,16 @@ def _resolve_kv_base_binding(
     if qualifier is not None:
         return bindings.get(("kv", KVStore, None))
     return None
+
+
+def _finalize_instance(instance: object) -> None:
+    close = getattr(instance, "close", None)
+    if callable(close):
+        close()
+        return
+    shutdown = getattr(instance, "shutdown", None)
+    if callable(shutdown):
+        shutdown()
 
 
 def _normalize_qualifier(qualifier: str | None) -> str | None:

@@ -42,6 +42,17 @@ not as a separate special transport type.
 `source`/`sink` are not port types; they are runtime roles inferred from adapter
 contracts (`consumes/emits`) and graph placement.
 
+### 1.1.1 Network protocol mapping
+
+Recommended mapping for network workloads:
+
+- HTTP request handlers -> `request`
+- HTTP response writers -> `response`
+- WebSocket and server streaming -> `stream`
+- keyed event protocols -> `kv_stream`
+
+Protocol parsing/serialization is adapter responsibility, not node responsibility.
+
 ### 1.3 KV marker contracts
 
 `kv` injections may use:
@@ -74,6 +85,13 @@ Adapters implement ports by talking to concrete systems:
 - Kafka
 - HTTP / MCP
 - observability backends (stdout/jsonl/OTLP/Kafka/log stacks)
+
+For planned network runtime support, platform adapters should include:
+
+- FastAPI HTTP ingress/egress
+- WebSocket ingress/egress
+- HTTP/2 stream adapters
+- GraphQL query/mutation adapters
 
 Adapters are **payload-only**:
 
@@ -259,6 +277,12 @@ Ack should be handled by the **runtime/adapter boundary**, not by nodes:
 - unknown port type in config fails fast
 - `kv_stream` payload contract validates tuple form `(key, value)`
 - `kv` contract validates point operations (no implicit iteration contract)
+
+### 6.1.1 Network mapping conformance
+
+- network ingress adapters bind to `request` or `stream` only
+- network egress adapters bind to `response` or `stream` only
+- GraphQL adapters are validated as `request`/`response` pairs
 
 ### 6.2 Adapters are payload-only
 

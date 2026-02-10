@@ -7,7 +7,6 @@ import pytest
 # Factory-node behavior is defined in docs/framework/initial_stage/Factory and injection model.md.
 from stream_kernel.application_context import ApplicationContext, ContextBuildError
 from stream_kernel.kernel.node import node
-from stream_kernel.kernel.scenario_builder import ScenarioBuilder, StepBuildError
 
 
 def test_function_node_factory_builds_step_once_with_config() -> None:
@@ -28,13 +27,10 @@ def test_function_node_factory_builds_step_once_with_config() -> None:
 
     ctx = ApplicationContext()
     ctx.discover([mod])
-    registry = ctx.build_registry()
-    builder = ScenarioBuilder(registry)
-
-    scenario = builder.build(
+    scenario = ctx.build_scenario(
         scenario_id="s1",
-        steps=[{"name": "factory_node", "config": {"inc": 2}}],
-        wiring={},
+        step_names=["factory_node"],
+        wiring={"config": {"nodes": {"factory_node": {"inc": 2}}}},
     )
 
     step = scenario.steps[0].step
@@ -54,14 +50,12 @@ def test_function_node_factory_must_return_callable() -> None:
 
     ctx = ApplicationContext()
     ctx.discover([mod])
-    registry = ctx.build_registry()
-    builder = ScenarioBuilder(registry)
 
-    with pytest.raises(StepBuildError):
-        builder.build(
+    with pytest.raises(ContextBuildError):
+        ctx.build_scenario(
             scenario_id="s1",
-            steps=[{"name": "bad_factory", "config": {}}],
-            wiring={},
+            step_names=["bad_factory"],
+            wiring={"config": {"nodes": {"bad_factory": {}}}},
         )
 
 
@@ -77,12 +71,9 @@ def test_class_nodes_are_not_treated_as_factories() -> None:
 
     ctx = ApplicationContext()
     ctx.discover([mod])
-    registry = ctx.build_registry()
-    builder = ScenarioBuilder(registry)
-
-    scenario = builder.build(
+    scenario = ctx.build_scenario(
         scenario_id="s1",
-        steps=[{"name": "class_node", "config": {"ignored": True}}],
+        step_names=["class_node"],
         wiring={},
     )
 
@@ -100,12 +91,9 @@ def test_function_step_is_not_called_as_factory() -> None:
 
     ctx = ApplicationContext()
     ctx.discover([mod])
-    registry = ctx.build_registry()
-    builder = ScenarioBuilder(registry)
-
-    scenario = builder.build(
+    scenario = ctx.build_scenario(
         scenario_id="s1",
-        steps=[{"name": "plain_step", "config": {}}],
+        step_names=["plain_step"],
         wiring={},
     )
 

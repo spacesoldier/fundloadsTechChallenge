@@ -138,6 +138,14 @@ These tests ensure:
 - setup: same as above with `runtime.tracing.enabled=false`;
 - expected: no sink writes and no external trace stream.
 
+`TRC-NET-01` network ingress boundary:
+- setup: network ingress adapter emits domain model into queue;
+- expected: tracing records ingress boundary event before first business node span.
+
+`TRC-NET-02` network egress boundary:
+- setup: business node emits response model consumed by network egress adapter;
+- expected: tracing records egress boundary event after producer node span.
+
 ---
 
 ## 6. Observability streams

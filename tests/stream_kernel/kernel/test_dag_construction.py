@@ -75,10 +75,10 @@ def test_dag_missing_provider_fails() -> None:
 def test_dag_allows_missing_provider_for_adapter_sink_contract() -> None:
     # Adapter sink endpoints may be attached implicitly even when no in-graph producer exists.
     nodes = [
-        NodeContract(name="adapter:trace_jsonl", consumes=[X], emits=[]),
+        NodeContract(name="trace_jsonl_sink", consumes=[X], emits=[], external=True),
     ]
     dag = build_dag(nodes)
-    assert dag.nodes == ["adapter:trace_jsonl"]
+    assert dag.nodes == ["trace_jsonl_sink"]
     assert dag.edges == []
 
 

@@ -61,6 +61,10 @@ routing + execution model (`RoutingPort`, `WorkQueue`, KV context storage, `Sync
    - Remove `runtime.pipeline` fully. ✅
    - Keep routing-only startup and DAG preflight as the single execution path.
    - Run test/demo project on framework runtime with no legacy sequencing fallback.
+13. **Network-ready execution entrypoints**
+   - Define adapter-driven ingress/egress model for HTTP/WS/GraphQL over stable ports.
+   - Keep runner transport-agnostic (`QueuePort` + transport adapters).
+   - Cover network boundaries in tracing/telemetry observer contracts.
 
 ## Notes
 - Routing policy stays in Router.
@@ -70,3 +74,10 @@ routing + execution model (`RoutingPort`, `WorkQueue`, KV context storage, `Sync
 - Default fan-out must not self-loop; explicit self-target remains an intentional advanced mode.
 - Adapter config should describe runtime-facing knobs only (`settings/binds`).
 - Adapter type/model mapping belongs to code metadata (`@adapter` + helper mapping).
+- Runtime now binds `service<ApplicationContext>` and provides
+  `ConsumerRegistry` via discovered platform service
+  (`DiscoveryConsumerRegistry`), consumed by `RoutingPort` through
+  `inject.service(ConsumerRegistry)` (no manual constructor threading in
+  SyncRunner path).
+- `run_with_sync_runner(...)` finalizes observer lifecycle and closes
+  `ScenarioScope` after every run (including failures).

@@ -17,10 +17,8 @@ from stream_kernel.integration.consumer_registry import InMemoryConsumerRegistry
 from stream_kernel.kernel.dag import Dag, DagError, NodeContract, build_dag
 from stream_kernel.kernel.discovery import discover_nodes
 from stream_kernel.kernel.node import NodeDef
-from stream_kernel.kernel.scenario import Scenario
-from stream_kernel.kernel.scenario_builder import InvalidScenarioConfigError, ScenarioBuilder
+from stream_kernel.kernel.scenario import Scenario, StepSpec
 from stream_kernel.kernel.stage import StageDef
-from stream_kernel.kernel.step_registry import StepRegistry, UnknownStepError
 
 
 class ContextBuildError(RuntimeError):
@@ -87,39 +85,6 @@ class ApplicationContext:
                 missing.add(_token_label(token))
         if missing:
             raise ContextBuildError(f"Missing token providers: {sorted(missing)}")
-
-    def build_registry(self, *, strict: bool = False) -> StepRegistry:
-        # Build a StepRegistry from discovered nodes (ApplicationContext spec).
-        self.validate_dependencies(strict=strict)
-        registry = StepRegistry()
-
-        for discovered in self.nodes:
-            target = discovered.target
-            container_cls = discovered.container_cls
-            container_attr = discovered.container_attr
-
-            def _factory(cfg: dict[str, object], wiring: dict[str, object], *, _t=target):  # type: ignore[override]
-                # Default factory: instantiate classes with no args or treat functions as factories.
-                if isinstance(_t, type):
-                    return _t()
-                # Function nodes: if callable with cfg, treat as factory; otherwise treat as step.
-                try:
-                    step = _t(cfg) # pyright: ignore[reportCallIssue]
-                except TypeError:
-                    return _t
-                if not callable(step):
-                    raise ContextBuildError("Function node factory must return a callable step")
-                return step
-
-            if container_cls is not None and container_attr is not None:
-                def _factory(cfg: dict[str, object], wiring: dict[str, object], *, _c=container_cls, _a=container_attr):  # type: ignore[override]
-                    # Method nodes: instantiate container per scenario and bind method.
-                    instance = _c()
-                    return getattr(instance, _a)
-
-            registry.register(discovered.meta.name, _factory)
-
-        return registry
 
     def build_consumer_registry(self) -> InMemoryConsumerRegistry:
         # Build ConsumerRegistry from discovery output (Execution runtime + routing integration §4.2).
@@ -188,18 +153,21 @@ class ApplicationContext:
         step_names: list[str],
         wiring: object,
     ) -> Scenario:
-        # Build a Scenario from a list of step names, preserving order.
-        registry = self.build_registry()
-        builder = ScenarioBuilder(registry=registry)
-        steps_cfg = [{"name": name, "config": {}} for name in step_names]
-        try:
-            scenario = builder.build(scenario_id=scenario_id, steps=steps_cfg, wiring=_as_wiring_dict(wiring))
-        except (UnknownStepError, InvalidScenarioConfigError) as exc:
-            raise ContextBuildError(str(exc)) from exc
+        # Build a Scenario directly from discovered node definitions.
+        strict = _resolve_strict(wiring)
+        by_name = {node.meta.name: node for node in self.nodes}
+        built_steps: list[StepSpec] = []
+        for name in step_names:
+            node_def = by_name.get(name)
+            if node_def is None:
+                raise ContextBuildError(f"Unknown step: {name}")
+            step = _build_step(node_def, wiring)
+            built_steps.append(StepSpec(name=name, step=step))
+
+        scenario = Scenario(scenario_id=scenario_id, steps=built_steps)
 
         # Resolve @inject fields using scenario-scoped registry.
         scope = _resolve_scope(wiring, scenario_id)
-        strict = _resolve_strict(wiring)
         cfg = _resolve_config(wiring)
         if scope is not None:
             for step in scenario.steps:
@@ -318,6 +286,42 @@ def _build_config_scope(cfg: dict[str, object], node_name: str) -> ConfigScope:
 def _token_label(token: type[object]) -> str:
     # Best-effort label for error reporting (type tokens are preferred).
     return getattr(token, "__name__", repr(token))
+
+
+def _node_cfg(wiring: object, node_name: str) -> dict[str, object]:
+    cfg = _resolve_config(wiring)
+    if cfg is None:
+        return {}
+    nodes = cfg.get("nodes", {})
+    if not isinstance(nodes, dict):
+        raise ContextBuildError("config.nodes must be a mapping when provided")
+    node_cfg = nodes.get(node_name, {})
+    if not isinstance(node_cfg, dict):
+        raise ContextBuildError(f"config.nodes.{node_name} must be a mapping when provided")
+    return dict(node_cfg)
+
+
+def _build_step(node_def: NodeDef, wiring: object) -> object:
+    # Build callable step instance directly from NodeDef.
+    if node_def.container_cls is not None and node_def.container_attr is not None:
+        instance = node_def.container_cls()
+        return getattr(instance, node_def.container_attr)
+
+    target = node_def.target
+    if isinstance(target, type):
+        return target()
+
+    if callable(target):
+        cfg = _node_cfg(wiring, node_def.meta.name)
+        try:
+            candidate = target(cfg)  # pyright: ignore[reportCallIssue]
+        except TypeError:
+            return target
+        if not callable(candidate):
+            raise ContextBuildError(f"Factory node '{node_def.meta.name}' must return a callable step")
+        return candidate
+
+    raise ContextBuildError(f"Node '{node_def.meta.name}' target is not callable")
 
 
 def _iter_injected_fields(obj: object):

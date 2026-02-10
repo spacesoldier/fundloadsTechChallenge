@@ -142,7 +142,7 @@ Failure behavior depends on strict mode.
 - Injection registry + scope: [src/stream_kernel/application_context/injection_registry.py](../../../../src/stream_kernel/application_context/injection_registry.py)
 - Injection descriptors: [src/stream_kernel/application_context/inject.py](../../../../src/stream_kernel/application_context/inject.py)
 - Config descriptors: [src/stream_kernel/application_context/config_inject.py](../../../../src/stream_kernel/application_context/config_inject.py)
-- Registry and scenario build: [src/stream_kernel/kernel/step_registry.py](../../../../src/stream_kernel/kernel/step_registry.py), [src/stream_kernel/kernel/scenario_builder.py](../../../../src/stream_kernel/kernel/scenario_builder.py)
+- Discovery + runtime artifact builder: [src/stream_kernel/kernel/discovery.py](../../../../src/stream_kernel/kernel/discovery.py), [src/stream_kernel/execution/builder.py](../../../../src/stream_kernel/execution/builder.py)
 
 ---
 

@@ -1,9 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Protocol, TypeVar, runtime_checkable
-
-from stream_kernel.kernel.scenario import StepSpec
+from typing import Protocol, TypeVar, runtime_checkable
 
 
 @runtime_checkable
@@ -31,6 +30,21 @@ class ExecutionObserver(Protocol):
     ) -> None:
         return None
 
+    def on_node_error(
+        self,
+        *,
+        node_name: str,
+        payload: object,
+        ctx: dict[str, object],
+        trace_id: str | None,
+        error: Exception,
+        state: object | None,
+    ) -> None:
+        return None
+
+    def on_run_end(self) -> None:
+        return None
+
 
 @dataclass(frozen=True, slots=True)
 class ObserverFactoryMeta:
@@ -45,7 +59,7 @@ class ObserverFactoryContext:
     adapter_instances: dict[str, object]
     run_id: str
     scenario_id: str
-    step_specs: list[StepSpec]
+    node_order: list[str]
 
 
 ObserverFactoryResult = ExecutionObserver | list[ExecutionObserver] | None
@@ -68,18 +82,3 @@ def get_observer_factory_meta(target: object) -> ObserverFactoryMeta | None:
     if isinstance(meta, ObserverFactoryMeta):
         return meta
     return None
-
-    def on_node_error(
-        self,
-        *,
-        node_name: str,
-        payload: object,
-        ctx: dict[str, object],
-        trace_id: str | None,
-        error: Exception,
-        state: object | None,
-    ) -> None:
-        return None
-
-    def on_run_end(self) -> None:
-        return None

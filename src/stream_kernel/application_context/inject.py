@@ -44,6 +44,12 @@ class _InjectFactory:
     def service(self, data_type: type[Any], *, qualifier: str | None = None) -> Injected:
         return Injected(port_type="service", data_type=data_type, qualifier=_normalize_qualifier(qualifier))
 
+    def queue(self, data_type: type[Any], *, qualifier: str | None = None) -> Injected:
+        return Injected(port_type="queue", data_type=data_type, qualifier=_normalize_qualifier(qualifier))
+
+    def topic(self, data_type: type[Any], *, qualifier: str | None = None) -> Injected:
+        return Injected(port_type="topic", data_type=data_type, qualifier=_normalize_qualifier(qualifier))
+
 
 def _normalize_qualifier(qualifier: str | None) -> str | None:
     if qualifier is None:

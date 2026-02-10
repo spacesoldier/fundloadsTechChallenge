@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 from stream_kernel.adapters.contracts import AdapterMeta, get_adapter_meta
 

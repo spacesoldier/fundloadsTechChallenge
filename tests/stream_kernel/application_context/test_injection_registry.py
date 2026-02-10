@@ -163,3 +163,47 @@ def test_registry_autowires_kv_markers_with_qualifier_specific_base() -> None:
     service = scope.resolve("service", _Service)
     assert service.state_store is primary
     assert service.default_store is fallback
+
+
+def test_scenario_scope_close_calls_close_once_per_instance() -> None:
+    # Scope shutdown should finalize each unique instance once via close().
+    closed: list[str] = []
+
+    class _Closable:
+        def close(self) -> None:
+            closed.append("x")
+
+    instance = _Closable()
+    reg = InjectionRegistry()
+    reg.register_factory("stream", EventA, lambda _i=instance: _i)
+    reg.register_factory("stream", EventB, lambda _i=instance: _i)
+
+    scope = reg.instantiate_for_scenario("s1")
+    scope.close()
+    scope.close()
+    assert closed == ["x"]
+
+
+def test_scenario_scope_close_falls_back_to_shutdown() -> None:
+    # If close() is absent, scope should call shutdown().
+    shutdown_calls: list[str] = []
+
+    class _ShutdownOnly:
+        def shutdown(self) -> None:
+            shutdown_calls.append("x")
+
+    reg = InjectionRegistry()
+    reg.register_factory("stream", EventA, lambda: _ShutdownOnly())
+    scope = reg.instantiate_for_scenario("s1")
+    scope.close()
+    assert shutdown_calls == ["x"]
+
+
+def test_scenario_scope_resolve_after_close_fails() -> None:
+    # Closed scopes should reject further resolution to prevent lifecycle misuse.
+    reg = InjectionRegistry()
+    reg.register_factory("stream", EventA, lambda: _StreamPort("A"))
+    scope = reg.instantiate_for_scenario("s1")
+    scope.close()
+    with pytest.raises(InjectionRegistryError, match="ScenarioScope is closed"):
+        scope.resolve("stream", EventA)

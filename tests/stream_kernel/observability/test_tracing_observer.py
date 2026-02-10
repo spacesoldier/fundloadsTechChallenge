@@ -4,10 +4,11 @@ from dataclasses import dataclass, field
 
 from stream_kernel.platform.services.context import InMemoryKvContextService
 from stream_kernel.execution.runner import SyncRunner
+from stream_kernel.execution.observability_service import ObserverBackedObservabilityService
 from stream_kernel.integration.consumer_registry import InMemoryConsumerRegistry
 from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.integration.routing_port import RoutingPort
-from stream_kernel.integration.work_queue import InMemoryWorkQueue
+from stream_kernel.integration.work_queue import InMemoryQueue
 from stream_kernel.kernel.trace import TraceRecorder
 from stream_kernel.observability.observers.tracing import TracingObserver
 from stream_kernel.routing.envelope import Envelope
@@ -142,7 +143,7 @@ def test_tracing_records_span_for_adapter_node_executed_in_graph() -> None:
     registry = InMemoryConsumerRegistry()
     registry.register(Event, ["worker"])
 
-    queue = InMemoryWorkQueue()
+    queue = InMemoryQueue()
     queue.push(Envelope(payload="seed", target="adapter_source", trace_id="t1"))
     context_store = InMemoryKvStore()
     context_store.set("t1", {"run_id": "run"})
@@ -152,8 +153,8 @@ def test_tracing_records_span_for_adapter_node_executed_in_graph() -> None:
         nodes={"adapter_source": adapter_source, "worker": worker},
         work_queue=queue,
         context_service=context_service,
-        routing_port=RoutingPort(registry=registry, strict=True),
-        observers=[observer],
+        router=RoutingPort(registry=registry, strict=True),
+        observability=ObserverBackedObservabilityService(observers=[observer]),
     )
     runner.run()
 
@@ -185,7 +186,7 @@ def test_tracing_does_not_add_extra_span_for_injected_adapter_call() -> None:
         injected.write(payload)
         return []
 
-    queue = InMemoryWorkQueue()
+    queue = InMemoryQueue()
     queue.push(Envelope(payload="seed", target="worker", trace_id="t1"))
     context_store = InMemoryKvStore()
     context_store.set("t1", {"run_id": "run"})
@@ -195,8 +196,8 @@ def test_tracing_does_not_add_extra_span_for_injected_adapter_call() -> None:
         nodes={"worker": worker},
         work_queue=queue,
         context_service=context_service,
-        routing_port=RoutingPort(registry=InMemoryConsumerRegistry(), strict=True),
-        observers=[observer],
+        router=RoutingPort(registry=InMemoryConsumerRegistry(), strict=True),
+        observability=ObserverBackedObservabilityService(observers=[observer]),
     )
     runner.run()
 
