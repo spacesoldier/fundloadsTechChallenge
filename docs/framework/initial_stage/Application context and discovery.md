@@ -31,13 +31,13 @@ In a manually wired project, the wiring module typically:
 - `evaluate_policies` → `EvaluatePolicies(...)` (uses `window_store`)
 - `update_state` → `UpdateState(...)`
 - `format_output` → `FormatOutput()`
-- `write_output` → `WriteOutput(output_sink=...)`
+- `sink:egress_file` → graph-native sink adapter node consuming `OutputLine`
 
 ### Dependencies used (generic)
 
 - `feature_checker`
 - `window_store`
-- `output_sink`
+- `egress sink adapter`
 
 ---
 

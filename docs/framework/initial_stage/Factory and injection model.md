@@ -77,7 +77,7 @@ Dependencies are resolved by name from application context wiring:
 
 - `state_store`
 - `feature_checker`
-- `output_sink`
+- `egress sink adapter`
 
 Missing dependencies are handled by **strict mode** (default: error).
 

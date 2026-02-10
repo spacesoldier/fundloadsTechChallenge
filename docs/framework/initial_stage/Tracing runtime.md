@@ -81,15 +81,18 @@ At runtime, the framework:
 3) Resolves tracing sink as a framework adapter via the same
    discovery/registry path as other adapters.
 4) Builds `TraceRecorder` from `signature` + `context_diff`.
-5) Attaches tracing as a runner-level execution observer (`TracingObserver`).
+5) Builds runtime observers from discovery and binds them via platform
+   `FanoutObservabilityService` (no execution shim layer).
 
 Implementation:
 - Runtime wiring: `src/stream_kernel/app/runtime.py`
 - Extension discovery: `src/stream_kernel/app/extensions.py`
 - Execution engine: `src/stream_kernel/execution/runner.py`
+- Runtime artifact builder + observability binding: `src/stream_kernel/execution/builder.py`
 - Tracing observer: `src/stream_kernel/observability/observers/tracing.py`
 - Trace sink adapter discovery/factories: `src/stream_kernel/observability/adapters/tracing.py`
 - Trace sink adapters: `src/stream_kernel/adapters/trace_sinks.py`
+- Platform observability service: `src/stream_kernel/platform/services/observability.py`
 - Observability domain models: `src/stream_kernel/observability/domain/`
 
 ---

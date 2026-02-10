@@ -22,22 +22,23 @@ from stream_kernel.application_context.injection_registry import (
     ScenarioScope,
 )
 from stream_kernel.execution.observer_builder import build_execution_observers
-from stream_kernel.execution.observability_service import ObserverBackedObservabilityService
 from stream_kernel.execution.planning import build_execution_plan
 from stream_kernel.execution.runner import SyncRunner
+from stream_kernel.execution.source_ingress import BootstrapControl, build_source_ingress_plan
 from stream_kernel.integration.consumer_registry import ConsumerRegistry
 from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
 from stream_kernel.integration.work_queue import InMemoryQueue, InMemoryTopic
 from stream_kernel.kernel.dag import NodeContract
 from stream_kernel.kernel.scenario import Scenario, StepSpec
-from stream_kernel.platform.services.context import ContextService
-from stream_kernel.platform.services.observability import ObservabilityService
+from stream_kernel.platform.services.observability import (
+    FanoutObservabilityService,
+    ObservabilityService,
+)
 from stream_kernel.routing.envelope import Envelope
 
 BUILD_TIME_REGISTRY_TYPES = (AdapterRegistry, InjectionRegistry)
 RUNTIME_SERVICE_REGISTRY_CONTRACTS = (ApplicationContext,)
 DEFAULT_EXECUTION_QUEUE_QUALIFIER = "execution.cpu"
-_NO_PAYLOAD = object()
 
 
 @dataclass(slots=True)
@@ -56,12 +57,6 @@ class RuntimeBuildArtifacts:
     consumer_registry: ConsumerRegistry | None = None
     modules: list[ModuleType] = field(default_factory=list)
     runtime: dict[str, object] = field(default_factory=dict)
-
-
-@dataclass(frozen=True, slots=True)
-class BootstrapControl:
-    # Framework control payload used to trigger source nodes without leaking ad-hoc marker dicts.
-    target: str
 
 
 def ensure_platform_discovery_modules(discovery_modules: list[str]) -> None:
@@ -245,7 +240,7 @@ def build_runtime_artifacts(
             "strict": strict,
         },
     )
-    source_nodes, source_consumers = build_source_bootstrap_nodes(
+    source_ingress = build_source_ingress_plan(
         adapters=adapters,
         adapter_instances=adapter_instances,
         adapter_registry=adapter_registry,
@@ -253,7 +248,7 @@ def build_runtime_artifacts(
         run_id=run_id,
         scenario_id=scenario_id,
     )
-    for token, node_names in source_consumers.items():
+    for token, node_names in source_ingress.source_consumers.items():
         get_consumers = getattr(consumer_registry, "get_consumers", None)
         register = getattr(consumer_registry, "register", None)
         if not callable(get_consumers) or not callable(register):
@@ -280,24 +275,19 @@ def build_runtime_artifacts(
         existing = list(get_consumers(token))
         register(token, [*existing, *node_names])
 
-    source_steps = [StepSpec(name=name, step=step) for name, step in source_nodes.items()]
     sink_steps = [StepSpec(name=name, step=step) for name, step in sink_nodes.items()]
     existing_steps = list(getattr(scenario, "steps", []))
     if isinstance(scenario, Scenario):
         scenario = Scenario(
             scenario_id=scenario.scenario_id,
-            steps=tuple([*source_steps, *existing_steps, *sink_steps]),
+            steps=tuple([*source_ingress.source_steps, *existing_steps, *sink_steps]),
         )
     else:
-        scenario = SimpleNamespace(steps=[*source_steps, *existing_steps, *sink_steps])
+        scenario = SimpleNamespace(steps=[*source_ingress.source_steps, *existing_steps, *sink_steps])
 
-    bootstrap_inputs = [
-        Envelope(payload=BootstrapControl(target=target), target=target)
-        for target in source_nodes.keys()
-    ]
     return RuntimeBuildArtifacts(
         scenario=scenario,
-        inputs=bootstrap_inputs,
+        inputs=source_ingress.bootstrap_inputs,
         strict=strict,
         run_id=run_id,
         scenario_id=scenario_id,
@@ -307,7 +297,7 @@ def build_runtime_artifacts(
             for node_def in ctx.nodes
             if bool(getattr(node_def.meta, "service", False))
         }
-        | set(source_nodes.keys()),
+        | set(source_ingress.source_node_names),
         adapter_registry=adapter_registry,
         injection_registry=injection_registry,
         consumer_registry=consumer_registry,
@@ -321,109 +311,9 @@ def ensure_runtime_observability_binding(
     injection_registry: InjectionRegistry,
     observers: list[object],
 ) -> None:
-    # Bind platform observability service to observer-backed implementation for this runtime.
-    service = ObserverBackedObservabilityService(observers=list(observers))
+    # Bind platform observability service to runtime fan-out implementation for this run.
+    service = FanoutObservabilityService(observers=list(observers))
     injection_registry.register_factory("service", ObservabilityService, lambda _svc=service: _svc)
-
-
-@dataclass(slots=True)
-class SourceBootstrapNode:
-    # Source adapter wrapper executed inside runner graph.
-    role: str
-    node_name: str
-    adapter: object
-    context_service: ContextService
-    run_id: str
-    scenario_id: str
-    _sequence: int = 0
-    _iterator: object | None = None
-    _next_payload: object = _NO_PAYLOAD
-    _primed: bool = False
-    exhausted: bool = False
-
-    def __call__(self, _msg: object, _ctx: object | None) -> list[Envelope]:
-        if not self._primed:
-            self._prime_next()
-            self._primed = True
-
-        if self.exhausted or self._next_payload is _NO_PAYLOAD:
-            return []
-
-        payload = self._next_payload
-        self._prime_next()
-        self._sequence += 1
-        trace_id = f"{self.run_id}:{self.role}:{self._sequence}"
-        self.context_service.seed(
-            trace_id=trace_id,
-            payload=payload,
-            run_id=self.run_id,
-            scenario_id=self.scenario_id,
-        )
-        outputs = [Envelope(payload=payload, trace_id=trace_id)]
-        if not self.exhausted:
-            # Re-schedule source polling on the same rails as regular node routing.
-            outputs.append(
-                Envelope(
-                    payload=BootstrapControl(target=self.node_name),
-                    target=self.node_name,
-                )
-            )
-        return outputs
-
-    def _prime_next(self) -> None:
-        if self.exhausted:
-            return
-        if self._iterator is None:
-            read = getattr(self.adapter, "read", None)
-            if not callable(read):
-                self.exhausted = True
-                self._next_payload = _NO_PAYLOAD
-                return
-            self._iterator = iter(read())
-        try:
-            self._next_payload = next(self._iterator)
-        except StopIteration:
-            self.exhausted = True
-            self._next_payload = _NO_PAYLOAD
-
-
-def build_source_bootstrap_nodes(
-    *,
-    adapters: dict[str, object],
-    adapter_instances: dict[str, object],
-    adapter_registry: AdapterRegistry | None,
-    scenario_scope: ScenarioScope,
-    run_id: str,
-    scenario_id: str,
-) -> tuple[dict[str, object], dict[type[Any], list[str]]]:
-    # Build executable source nodes from adapter contracts (consumes=[] and emits!=[]).
-    context_service = scenario_scope.resolve("service", ContextService)
-    source_nodes: dict[str, object] = {}
-    source_consumers: dict[type[Any], list[str]] = {}
-    for role in sorted(adapter_instances.keys()):
-        cfg = adapters.get(role)
-        if not isinstance(cfg, dict):
-            continue
-        meta = resolve_adapter_meta(role, cfg, adapter_registry=adapter_registry)
-        adapter = adapter_instances[role]
-        has_reader = callable(getattr(adapter, "read", None))
-        if not has_reader:
-            continue
-        if meta is not None and (meta.consumes or not meta.emits):
-            continue
-        node_name = f"source:{role}"
-        source_nodes[node_name] = SourceBootstrapNode(
-            role=role,
-            node_name=node_name,
-            adapter=adapter,
-            context_service=context_service,
-            run_id=run_id,
-            scenario_id=scenario_id,
-        )
-        source_consumers.setdefault(BootstrapControl, []).append(node_name)
-    if adapters and not source_nodes:
-        raise ValueError("at least one source adapter (consumes=[], emits!=[]) with read() must be configured")
-    return source_nodes, source_consumers
 
 
 @dataclass(slots=True)
@@ -505,7 +395,9 @@ def build_adapter_contracts(
             continue
         contracts.append(
             NodeContract(
-                name=f"adapter:{role}",
+                # Use configured adapter role as stable graph contract id.
+                # Avoid synthetic adapter-prefixed ids in DAG diagnostics/planning.
+                name=role,
                 consumes=consumes,
                 emits=emits,
                 external=True,

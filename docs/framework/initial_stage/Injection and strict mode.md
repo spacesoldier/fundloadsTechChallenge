@@ -21,7 +21,7 @@ Use cases:
 
 - `state_store`
 - `feature_checker`
-- `output_sink`
+- `egress sink adapter`
 
 ### 2.1 Type-aware injection (preferred)
 

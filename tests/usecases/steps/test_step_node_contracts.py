@@ -20,7 +20,6 @@ from fund_load.usecases.steps.format_output import FormatOutput
 from fund_load.usecases.steps.idempotency_gate import IdempotencyGate
 from fund_load.usecases.steps.parse_load_attempt import ParseLoadAttempt
 from fund_load.usecases.steps.update_windows import UpdateWindows
-from fund_load.usecases.steps.write_output import WriteOutput
 from stream_kernel.kernel.node import NodeMeta
 
 
@@ -77,10 +76,3 @@ def test_format_output_node_contract() -> None:
     meta = _meta(FormatOutput)
     assert meta.consumes == [WindowedDecision]
     assert meta.emits == [OutputLine]
-
-
-def test_write_output_node_contract() -> None:
-    # Step 08 consumes OutputLine and emits nothing (docs/implementation/steps/08 WriteOutput.md).
-    meta = _meta(WriteOutput)
-    assert meta.consumes == [OutputLine]
-    assert meta.emits == []

@@ -46,6 +46,10 @@ class _CollectingOutputSink:
     def write_line(self, line: str) -> None:
         self.lines.append(line)
 
+    def consume(self, payload: OutputLine) -> None:
+        # Graph-native sink contract consumes OutputLine objects.
+        self.lines.append(payload.json_text)
+
     def close(self) -> None:
         pass
 
@@ -81,10 +85,10 @@ def _config(lines: list[RawLine]) -> dict[str, object]:
             "update_windows": {"daily_prime_gate": {"enabled": True}},
         },
         "adapters": {
-            "input_source": {
+            "ingress_file": {
                 "settings": {"lines": lines},
             },
-            "output_sink": {
+            "egress_file": {
                 "settings": {},
                 "binds": ["stream"],
             },
@@ -119,7 +123,7 @@ def test_experiment_end_to_end_prime_and_monday() -> None:
 
     cfg = validate_newgen_config(_config(inputs))
 
-    output_sink = _CollectingOutputSink([])
+    egress_file = _CollectingOutputSink([])
     registry = AdapterRegistry()
 
     @adapter(consumes=[], emits=[RawLine])
@@ -128,16 +132,16 @@ def test_experiment_end_to_end_prime_and_monday() -> None:
         return _InMemoryInputSource(settings["lines"])  # type: ignore[index]
 
     @adapter(consumes=[OutputLine], emits=[])
-    def _output_sink_factory(settings: dict[str, object], _sink=output_sink) -> _CollectingOutputSink:
+    def _output_sink_factory(settings: dict[str, object], _sink=egress_file) -> _CollectingOutputSink:
         # Sink adapter contract consumes OutputLine from DAG.
         return _sink
 
-    registry.register("input_source", "input_source", _input_source_factory)
-    registry.register("output_sink", "output_sink", _output_sink_factory)
+    registry.register("ingress_file", "ingress_file", _input_source_factory)
+    registry.register("egress_file", "egress_file", _output_sink_factory)
     registry.register("window_store", "window_store", lambda settings: InMemoryWindowStore())
 
     bindings = {
-        "output_sink": [("stream", FileOutputSink)],
+        "egress_file": [("stream", FileOutputSink)],
         "window_store": [("service", WindowStoreService)],
     }
 
@@ -156,7 +160,7 @@ def test_experiment_end_to_end_prime_and_monday() -> None:
     assert decision_by_id["107"].accepted is False
     assert decision_by_id["107"].reasons == (ReasonCode.PRIME_DAILY_GLOBAL_LIMIT.value,)
 
-    output = [json.loads(line) for line in output_sink.lines]
+    output = [json.loads(line) for line in egress_file.lines]
     assert [row["id"] for row in output] == ["101", "102", "103", "107"]
     assert output[0]["accepted"] is False
     assert output[1]["accepted"] is True

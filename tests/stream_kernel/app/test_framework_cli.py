@@ -18,8 +18,8 @@ def _config() -> dict[str, object]:
         },
         "nodes": {},
         "adapters": {
-            "input_source": {"path": "input.txt"},
-            "output_sink": {"path": "output.txt"},
+            "ingress_file": {"path": "input.txt"},
+            "egress_file": {"path": "output.txt"},
         },
     }
 
@@ -58,8 +58,8 @@ def test_apply_cli_overrides_updates_paths_and_tracing() -> None:
     apply_cli_overrides(cfg, args)
 
     adapters = cfg["adapters"]
-    assert adapters["input_source"]["settings"]["path"] == "override_input.ndjson"
-    assert adapters["output_sink"]["settings"]["path"] == "override_output.txt"
+    assert adapters["ingress_file"]["settings"]["path"] == "override_input.ndjson"
+    assert adapters["egress_file"]["settings"]["path"] == "override_output.txt"
     assert cfg["runtime"]["tracing"]["enabled"] is True
     assert cfg["runtime"]["tracing"]["sink"]["name"] == "trace_jsonl"
     assert cfg["runtime"]["tracing"]["sink"]["settings"]["path"] == "override_trace.jsonl"
@@ -140,8 +140,8 @@ def test_apply_cli_overrides_requires_adapter_entry_mapping() -> None:
     # Adapter entries must be mappings for path override (Configuration spec §2.1).
     args = SimpleNamespace(input="in.txt", output=None, tracing=None, trace_path=None)
     cfg = {
-        "runtime": {"cli": {"input_adapter": "input_source"}},
-        "adapters": {"input_source": "nope"},
+        "runtime": {"cli": {"input_adapter": "ingress_file"}},
+        "adapters": {"ingress_file": "nope"},
     }
     with pytest.raises(ValueError):
         apply_cli_overrides(cfg, args)
@@ -151,8 +151,8 @@ def test_apply_cli_overrides_requires_adapter_settings_mapping() -> None:
     # Adapter settings must be a mapping for path override (Configuration spec §2.1).
     args = SimpleNamespace(input="in.txt", output=None, tracing=None, trace_path=None)
     cfg = {
-        "runtime": {"cli": {"input_adapter": "input_source"}},
-        "adapters": {"input_source": {"settings": "nope"}},
+        "runtime": {"cli": {"input_adapter": "ingress_file"}},
+        "adapters": {"ingress_file": {"settings": "nope"}},
     }
     with pytest.raises(ValueError):
         apply_cli_overrides(cfg, args)

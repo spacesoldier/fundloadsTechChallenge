@@ -26,7 +26,7 @@ class OutputLineFileSink:
 
 
 @adapter(
-    name="input_source",
+    name="ingress_file",
     kind="file.line_source",
     consumes=[],
     emits=[RawLine],
@@ -41,7 +41,7 @@ def file_input_source(settings: dict[str, Any]) -> FileLineInputSource:
 
 
 @adapter(
-    name="output_sink",
+    name="egress_file",
     kind="file.line_sink",
     consumes=[OutputLine],
     emits=[],

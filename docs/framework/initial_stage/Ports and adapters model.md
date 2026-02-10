@@ -145,7 +145,7 @@ Example:
 
 ```yaml
 adapters:
-  input_source:
+  ingress_file:
     settings:
       path: input.txt
     binds: [stream]

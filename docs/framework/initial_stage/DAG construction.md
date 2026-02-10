@@ -98,7 +98,6 @@ Resolution options:
 
 - introduce stage-specific model tokens (`DecisionIn` -> `DecisionOut`)
 - keep one model token, but use explicit `Envelope.target` contracts
-- keep a temporary runtime compatibility shim (migration-only, not final design)
 
 4) **Determinism**  
    When iterating nodes or edges, we use **discovery order** for stability.

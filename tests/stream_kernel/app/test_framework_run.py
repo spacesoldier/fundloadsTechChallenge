@@ -10,7 +10,7 @@ from stream_kernel.adapters.registry import AdapterRegistry
 from stream_kernel.app import run, run_with_registry
 from stream_kernel.app.runtime import run_with_config
 import stream_kernel.app.runtime as runtime_module
-from stream_kernel.execution.builder import build_adapter_contracts
+from stream_kernel.execution.builder import build_adapter_contracts, build_runtime_artifacts
 from stream_kernel.application_context.injection_registry import InjectionRegistry
 from stream_kernel.config.loader import load_yaml_config
 from stream_kernel.config.validator import validate_newgen_config
@@ -38,17 +38,17 @@ def test_build_adapter_contracts_from_factory_metadata() -> None:
     from fund_load.adapters.io import file_input_source, file_output_sink
 
     registry = AdapterRegistry()
-    registry.register("input_source", "input_source", file_input_source)
-    registry.register("output_sink", "output_sink", file_output_sink)
+    registry.register("ingress_file", "ingress_file", file_input_source)
+    registry.register("egress_file", "egress_file", file_output_sink)
     adapters = {
-        "input_source": {"settings": {}},
-        "output_sink": {"settings": {}},
+        "ingress_file": {"settings": {}},
+        "egress_file": {"settings": {}},
     }
     contracts = build_adapter_contracts(adapters, adapter_registry=registry)
     by_name = {contract.name: contract for contract in contracts}
-    assert set(by_name.keys()) == {"adapter:input_source", "adapter:output_sink"}
-    assert [token.__name__ for token in by_name["adapter:input_source"].emits] == ["RawLine"]
-    assert [token.__name__ for token in by_name["adapter:output_sink"].consumes] == ["OutputLine"]
+    assert set(by_name.keys()) == {"ingress_file", "egress_file"}
+    assert [token.__name__ for token in by_name["ingress_file"].emits] == ["RawLine"]
+    assert [token.__name__ for token in by_name["egress_file"].consumes] == ["OutputLine"]
 
 
 def test_build_adapter_contracts_from_registry_metadata() -> None:
@@ -61,11 +61,11 @@ def test_build_adapter_contracts_from_registry_metadata() -> None:
     def _source_factory(settings: dict[str, object]) -> object:
         return object()
 
-    registry.register("input_source", "input_source", _source_factory)
-    adapters = {"input_source": {"settings": {}}}
+    registry.register("ingress_file", "ingress_file", _source_factory)
+    adapters = {"ingress_file": {"settings": {}}}
     contracts = build_adapter_contracts(adapters, adapter_registry=registry)
     assert len(contracts) == 1
-    assert contracts[0].name == "adapter:input_source"
+    assert contracts[0].name == "ingress_file"
     assert contracts[0].consumes == []
     assert [token.__name__ for token in contracts[0].emits] == ["RawLine"]
 
@@ -80,7 +80,7 @@ scenario:
 runtime:
   strict: true
   discovery_modules:
-    - fund_load.usecases.steps
+    - fund_load
 nodes:
   compute_time_keys:
     week_start: MON
@@ -106,12 +106,12 @@ nodes:
     daily_prime_gate:
       enabled: false
 adapters:
-  input_source:
+  ingress_file:
     settings:
       path: input.ndjson
     binds:
       - stream
-  output_sink:
+  egress_file:
     settings:
       path: output.txt
     binds:
@@ -132,12 +132,12 @@ adapters:
     output_path = tmp_path / "output.txt"
 
     registry = AdapterRegistry()
-    registry.register("input_source", "input_source", file_input_source)
-    registry.register("output_sink", "output_sink", file_output_sink)
+    registry.register("ingress_file", "ingress_file", file_input_source)
+    registry.register("egress_file", "egress_file", file_output_sink)
     registry.register("window_store", "window_store", window_store_memory)
     bindings = {
-        "input_source": [("stream", FileLineInputSource)],
-        "output_sink": [("stream", FileOutputSink)],
+        "ingress_file": [("stream", FileLineInputSource)],
+        "egress_file": [("stream", FileOutputSink)],
         "window_store": [("service", WindowStoreService)],    }
 
     exit_code = run_with_config(
@@ -196,12 +196,12 @@ nodes:
     daily_prime_gate:
       enabled: false
 adapters:
-  input_source:
+  ingress_file:
     settings:
       path: placeholder.ndjson
     binds:
       - stream
-  output_sink:
+  egress_file:
     settings:
       path: placeholder.txt
     binds:
@@ -268,12 +268,12 @@ nodes:
     daily_prime_gate:
       enabled: false
 adapters:
-  input_source:
+  ingress_file:
     settings:
       path: placeholder.ndjson
     binds:
       - stream
-  output_sink:
+  egress_file:
     settings:
       path: placeholder.txt
     binds:
@@ -293,12 +293,12 @@ adapters:
     output_path = tmp_path / "output.txt"
 
     registry = AdapterRegistry()
-    registry.register("input_source", "input_source", file_input_source)
-    registry.register("output_sink", "output_sink", file_output_sink)
+    registry.register("ingress_file", "ingress_file", file_input_source)
+    registry.register("egress_file", "egress_file", file_output_sink)
     registry.register("window_store", "window_store", window_store_memory)
     bindings = {
-        "input_source": [("stream", FileLineInputSource)],
-        "output_sink": [("stream", FileOutputSink)],
+        "ingress_file": [("stream", FileLineInputSource)],
+        "egress_file": [("stream", FileOutputSink)],
         "window_store": [("service", WindowStoreService)],
     }
 
@@ -326,6 +326,84 @@ adapters:
 
     assert exit_code == 0
     assert output_path.read_text(encoding="utf-8").strip() == '{"id":"1","customer_id":"10","accepted":true}'
+
+
+def test_build_runtime_artifacts_uses_graph_native_sink_instead_of_write_output_step(
+    tmp_path: Path,
+) -> None:
+    # Stage 4 contract: project execution path should not include write_output;
+    # sink adapter should be attached as graph-native sink node.
+    cfg_path = _write(
+        tmp_path,
+        """
+version: 1
+scenario:
+  name: baseline
+runtime:
+  strict: true
+  discovery_modules:
+    - fund_load
+nodes:
+  compute_time_keys:
+    week_start: MON
+  compute_features:
+    monday_multiplier:
+      enabled: false
+      multiplier: 2
+      apply_to: amount
+    prime_gate:
+      enabled: false
+      global_per_day: 1
+      amount_cap: 9999
+  evaluate_policies:
+    limits:
+      daily_amount: 5000
+      weekly_amount: 20000
+      daily_attempts: 3
+    prime_gate:
+      enabled: false
+      global_per_day: 1
+      amount_cap: 9999
+  update_windows:
+    daily_prime_gate:
+      enabled: false
+adapters:
+  ingress_file:
+    settings:
+      path: input.ndjson
+    binds:
+      - stream
+  egress_file:
+    settings:
+      path: output.txt
+    binds:
+      - stream
+  window_store:
+    settings: {}
+    binds:
+      - service
+""",
+    )
+    cfg = validate_newgen_config(load_yaml_config(cfg_path))
+
+    registry = AdapterRegistry()
+    registry.register("ingress_file", "ingress_file", file_input_source)
+    registry.register("egress_file", "egress_file", file_output_sink)
+    registry.register("window_store", "window_store", window_store_memory)
+    bindings = {
+        "ingress_file": [("stream", FileLineInputSource)],
+        "egress_file": [("stream", FileOutputSink)],
+        "window_store": [("service", WindowStoreService)],
+    }
+
+    artifacts = build_runtime_artifacts(
+        cfg,
+        adapter_registry=registry,
+        adapter_bindings=bindings,
+    )
+    names = [spec.name for spec in artifacts.scenario.steps]
+    assert "write_output" not in names
+    assert "sink:egress_file" in names
 
 
 def test_run_reads_cli_and_overrides_paths(tmp_path: Path) -> None:
@@ -364,12 +442,12 @@ nodes:
     daily_prime_gate:
       enabled: false
 adapters:
-  input_source:
+  ingress_file:
     settings:
       path: placeholder.ndjson
     binds:
       - stream
-  output_sink:
+  egress_file:
     settings:
       path: placeholder.txt
     binds:
@@ -389,12 +467,12 @@ adapters:
     output_path = tmp_path / "output.txt"
 
     registry = AdapterRegistry()
-    registry.register("input_source", "input_source", file_input_source)
-    registry.register("output_sink", "output_sink", file_output_sink)
+    registry.register("ingress_file", "ingress_file", file_input_source)
+    registry.register("egress_file", "egress_file", file_output_sink)
     registry.register("window_store", "window_store", window_store_memory)
     bindings = {
-        "input_source": [("stream", FileLineInputSource)],
-        "output_sink": [("stream", FileOutputSink)],
+        "ingress_file": [("stream", FileLineInputSource)],
+        "egress_file": [("stream", FileOutputSink)],
         "window_store": [("service", WindowStoreService)],    }
 
     exit_code = run_with_registry(
@@ -512,12 +590,12 @@ nodes:
     daily_prime_gate:
       enabled: false
 adapters:
-  input_source:
+  ingress_file:
     settings:
       path: placeholder.ndjson
     binds:
       - stream
-  output_sink:
+  egress_file:
     settings:
       path: placeholder.txt
     binds:
@@ -586,7 +664,7 @@ def test_run_with_config_uses_discovery_order_when_pipeline_missing(monkeypatch:
     monkeypatch.setattr("stream_kernel.execution.builder.ApplicationContext", _Ctx)
     monkeypatch.setattr(
         "stream_kernel.execution.builder.build_adapter_instances_from_registry",
-        lambda _adapters, _registry: {"input_source": type("I", (), {"read": lambda *_a: []})()},
+        lambda _adapters, _registry: {"ingress_file": type("I", (), {"read": lambda *_a: []})()},
     )
     monkeypatch.setattr(
         "stream_kernel.execution.builder.build_injection_registry_from_bindings",
@@ -600,7 +678,7 @@ def test_run_with_config_uses_discovery_order_when_pipeline_missing(monkeypatch:
         "scenario": {"name": "baseline"},
         "runtime": {},
         "nodes": {},
-        "adapters": {"input_source": {}, "output_sink": {}},
+        "adapters": {"ingress_file": {}, "egress_file": {}},
     }
     exit_code = run_with_config(
         cfg,
@@ -648,7 +726,7 @@ def test_run_with_config_invokes_preflight(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr("stream_kernel.execution.builder.ApplicationContext", _Ctx)
     monkeypatch.setattr(
         "stream_kernel.execution.builder.build_adapter_instances_from_registry",
-        lambda _adapters, _registry: {"input_source": type("I", (), {"read": lambda *_a: []})()},
+        lambda _adapters, _registry: {"ingress_file": type("I", (), {"read": lambda *_a: []})()},
     )
     monkeypatch.setattr(
         "stream_kernel.execution.builder.build_injection_registry_from_bindings",
@@ -661,7 +739,7 @@ def test_run_with_config_invokes_preflight(monkeypatch: pytest.MonkeyPatch) -> N
         "scenario": {"name": "baseline"},
         "runtime": {"strict": True},
         "nodes": {},
-        "adapters": {"input_source": {}, "output_sink": {}},
+        "adapters": {"ingress_file": {}, "egress_file": {}},
     }
     exit_code = run_with_config(
         cfg,
@@ -706,7 +784,7 @@ def test_run_with_config_rejects_runtime_pipeline() -> None:
     cfg = {
         "scenario": {"name": "baseline"},
         "runtime": {"pipeline": ["a", "b"]},
-        "adapters": {"input_source": {}, "output_sink": {}},
+        "adapters": {"ingress_file": {}, "egress_file": {}},
     }
     with pytest.raises(ValueError):
         run_with_config(
@@ -842,7 +920,7 @@ def test_run_uses_discovery_order_when_pipeline_missing(monkeypatch: pytest.Monk
     cfg = {
         "scenario": {"name": "baseline"},
         "runtime": {"discovery_modules": []},
-        "adapters": {"input_source": {}, "output_sink": {}},
+        "adapters": {"ingress_file": {}, "egress_file": {}},
     }
     monkeypatch.setattr(
         "stream_kernel.app.runtime.parse_args",
@@ -858,7 +936,7 @@ def test_run_uses_discovery_order_when_pipeline_missing(monkeypatch: pytest.Monk
     )
     monkeypatch.setattr(
         "stream_kernel.execution.builder.build_adapter_instances_from_registry",
-        lambda _adapters, _registry: {"input_source": type("I", (), {"read": lambda *_a: []})()},
+        lambda _adapters, _registry: {"ingress_file": type("I", (), {"read": lambda *_a: []})()},
     )
     monkeypatch.setattr(
         "stream_kernel.execution.builder.build_injection_registry_from_bindings",
@@ -878,7 +956,7 @@ def test_run_requires_source_adapter_with_read(monkeypatch: pytest.MonkeyPatch) 
         "scenario": {"name": "baseline"},
         "runtime": {"discovery_modules": []},
         "adapters": {
-            "output_sink": {
+            "egress_file": {
                 "settings": {},
                 "binds": [],
             }
@@ -896,7 +974,7 @@ def test_run_requires_source_adapter_with_read(monkeypatch: pytest.MonkeyPatch) 
     )
     monkeypatch.setattr(
         "stream_kernel.execution.builder.build_adapter_instances_from_registry",
-        lambda _adapters, _registry: {"output_sink": object()},
+        lambda _adapters, _registry: {"egress_file": object()},
     )
     monkeypatch.setattr(
         "stream_kernel.execution.builder.ApplicationContext",

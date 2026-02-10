@@ -19,6 +19,7 @@ class _Observer:
     before: list[str] = field(default_factory=list)
     after: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    run_end_calls: int = 0
 
     def before_node(
         self,
@@ -61,7 +62,7 @@ class _Observer:
         self.errors.append(type(error).__name__)
 
     def on_run_end(self) -> None:
-        return None
+        self.run_end_calls += 1
 
 
 def _routing() -> RoutingPort:
@@ -128,3 +129,19 @@ def test_runner_noop_observability_is_valid_runtime_dependency() -> None:
         observability=NoOpObservabilityService(),
     )
     runner.run()
+
+
+def test_runner_calls_observer_on_run_end_hook() -> None:
+    # Characterization: run lifecycle completion is driven by explicit runner.on_run_end() call.
+    observer = _Observer()
+    runner = SyncRunner(
+        nodes={},
+        work_queue=InMemoryQueue(),
+        context_service=InMemoryKvContextService(InMemoryKvStore()),
+        router=_routing(),
+        observability=observer,
+    )
+
+    runner.on_run_end()
+
+    assert observer.run_end_calls == 1

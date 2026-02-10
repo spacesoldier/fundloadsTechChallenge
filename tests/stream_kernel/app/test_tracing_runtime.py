@@ -65,12 +65,12 @@ nodes:
     daily_prime_gate:
       enabled: false
 adapters:
-  input_source:
+  ingress_file:
     settings:
       path: input.ndjson
     binds:
       - stream
-  output_sink:
+  egress_file:
     settings:
       path: output.txt
     binds:
@@ -107,7 +107,7 @@ adapters:
     # Source adapters now execute as graph-native bootstrap nodes and are traced as regular steps.
     assert len(lines) == 9
     first = json.loads(lines[0])
-    assert first["step_name"] == "source:input_source"
+    assert first["step_name"] == "source:ingress_file"
     assert first["ctx_before"] == {"run_id": "run"}
     second = json.loads(lines[1])
     assert second["step_name"] == "parse_load_attempt"
@@ -154,12 +154,12 @@ nodes:
     daily_prime_gate:
       enabled: false
 adapters:
-  input_source:
+  ingress_file:
     settings:
       path: input.ndjson
     binds:
       - stream
-  output_sink:
+  egress_file:
     settings:
       path: output.txt
     binds:

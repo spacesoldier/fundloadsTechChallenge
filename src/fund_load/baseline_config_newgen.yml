@@ -46,12 +46,12 @@ nodes:
       enabled: false
 
 adapters:
-  input_source:
+  ingress_file:
     settings:
       path: input.txt
     binds:
       - stream
-  output_sink:
+  egress_file:
     settings:
       path: output.txt
     binds:

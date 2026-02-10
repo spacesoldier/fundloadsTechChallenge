@@ -63,12 +63,12 @@ This plan tracks the move from fixed `runtime.pipeline` ordering to
 
 ### Implementation
 - [x] Replace step-by-step pipeline with router dispatch loop.
-- [ ] Remove default output sink; require explicit sink node.
+- [x] Remove default output sink; require explicit sink node.
 - [x] Ensure tracing covers routing hops and fan-out (sync runtime baseline).
 - [x] Implement `Envelope` with `target` routing (see Routing semantics).
 - [x] Add WorkQueue + KV context storage (see Execution runtime and routing integration).
 - [x] Introduce ConsumerRegistry + RoutingPort (Runner depends on RoutingPort).
-- [ ] Source/sink adapter nodes: remove hardcoded `input_source`/`output_sink` path.
+- [x] Source/sink adapter nodes: remove hardcoded `input_source`/`output_sink` path.
 
 ---
 

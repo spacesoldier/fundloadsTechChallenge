@@ -13,13 +13,14 @@ from stream_kernel.execution.builder import (
     BootstrapControl,
     RUNTIME_SERVICE_REGISTRY_CONTRACTS,
     RuntimeBuildArtifacts,
+    build_adapter_contracts,
     build_adapter_bindings,
     build_adapter_instances_from_registry,
     build_sink_runtime_nodes,
     build_injection_registry_from_bindings,
-    build_source_bootstrap_nodes,
     execute_runtime_artifacts,
     ensure_platform_discovery_modules,
+    ensure_runtime_observability_binding,
     ensure_runtime_registry_bindings,
     ensure_runtime_transport_bindings,
     load_discovery_modules,
@@ -32,6 +33,7 @@ from stream_kernel.execution.builder import (
     ensure_runtime_kv_binding,
     trace_id,
 )
+from stream_kernel.execution.source_ingress import build_source_ingress_plan
 from stream_kernel.application_context.service import service
 from stream_kernel.platform.services.context import ContextService, InMemoryKvContextService
 from stream_kernel.application_context.injection_registry import InjectionRegistry, InjectionRegistryError
@@ -42,7 +44,11 @@ from stream_kernel.application_context.application_context import ApplicationCon
 from stream_kernel.integration.consumer_registry import ConsumerRegistry, InMemoryConsumerRegistry
 from stream_kernel.integration.routing_port import RoutingPort
 from stream_kernel.integration.work_queue import InMemoryQueue
-from stream_kernel.platform.services.observability import NoOpObservabilityService, ObservabilityService
+from stream_kernel.platform.services.observability import (
+    FanoutObservabilityService,
+    NoOpObservabilityService,
+    ObservabilityService,
+)
 from stream_kernel.kernel.scenario import StepSpec
 from stream_kernel.routing.envelope import Envelope
 from stream_kernel.kernel.dag import NodeContract, build_dag
@@ -110,6 +116,16 @@ def test_build_adapter_bindings_resolves_typed_ports() -> None:
         registry,
     )
     assert bindings["source"] == [("stream", _StreamPort)]
+
+
+def test_build_adapter_contracts_uses_role_name_as_contract_id() -> None:
+    # Contract ids should be stable role names from config, without synthetic adapter prefixes.
+    registry = AdapterRegistry()
+    registry.register("source", "source", _source_factory)
+    contracts = build_adapter_contracts({"source": {"settings": {}}}, adapter_registry=registry)
+    assert len(contracts) == 1
+    assert contracts[0].name == "source"
+    assert contracts[0].external is True
 
 
 def test_build_adapter_instances_from_registry_requires_mapping() -> None:
@@ -334,8 +350,8 @@ def test_register_discovered_services_keeps_existing_binding() -> None:
     assert scope.resolve("service", ContextService) is custom
 
 
-def test_build_source_bootstrap_nodes_wraps_readable_adapters() -> None:
-    # Source adapters should be converted into executable bootstrap nodes.
+def test_build_source_ingress_plan_wraps_readable_adapters() -> None:
+    # Source adapters should be converted into graph-native ingress runtime nodes.
     registry = AdapterRegistry()
     registry.register("events_source", "events_source", _source_factory)
     adapters = {"events_source": {"settings": {}}}
@@ -345,7 +361,7 @@ def test_build_source_bootstrap_nodes_wraps_readable_adapters() -> None:
     injection.register_factory("service", ContextService, lambda: InMemoryKvContextService(InMemoryKvStore()))
     scope = injection.instantiate_for_scenario("s1")
 
-    nodes, source_consumers = build_source_bootstrap_nodes(
+    ingress = build_source_ingress_plan(
         adapters=adapters,
         adapter_instances=adapter_instances,
         adapter_registry=registry,
@@ -353,11 +369,14 @@ def test_build_source_bootstrap_nodes_wraps_readable_adapters() -> None:
         run_id="run",
         scenario_id="scenario",
     )
-    assert list(nodes.keys()) == ["source:events_source"]
-    assert source_consumers == {BootstrapControl: ["source:events_source"]}
-    first = nodes["source:events_source"]({}, {})
-    second = nodes["source:events_source"]({}, {})
-    third = nodes["source:events_source"]({}, {})
+    assert [step.name for step in ingress.source_steps] == ["source:events_source"]
+    assert ingress.source_consumers == {BootstrapControl: ["source:events_source"]}
+    assert ingress.source_node_names == {"source:events_source"}
+    assert [item.target for item in ingress.bootstrap_inputs] == ["source:events_source"]
+    node = ingress.source_steps[0].step
+    first = node({}, {})
+    second = node({}, {})
+    third = node({}, {})
     assert [item.trace_id for item in first if isinstance(item.payload, int)] == ["run:events_source:1"]
     assert [item.payload for item in first if isinstance(item.payload, int)] == [1]
     assert [item.trace_id for item in second if isinstance(item.payload, int)] == ["run:events_source:2"]
@@ -527,6 +546,20 @@ def test_register_discovered_services_registers_routing_service() -> None:
     routing = scope.resolve("service", RoutingPort)
     assert isinstance(routing, RoutingPort)
     assert isinstance(routing.registry, ConsumerRegistry)
+
+
+def test_ensure_runtime_observability_binding_uses_platform_fanout_service() -> None:
+    # Runtime should bind platform observability fan-out service, not execution shim.
+    registry = InjectionRegistry()
+    observer = _Observer()
+    ensure_runtime_observability_binding(
+        injection_registry=registry,
+        observers=[observer],
+    )
+    scope = registry.instantiate_for_scenario("s1")
+    resolved = scope.resolve("service", ObservabilityService)
+    assert isinstance(resolved, FanoutObservabilityService)
+    assert len(resolved.observers) == 1
 
 
 def test_ensure_runtime_kv_binding_rejects_unknown_backend() -> None:

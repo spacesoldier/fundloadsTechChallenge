@@ -36,8 +36,8 @@ experience. If adopted, these changes will supersede the earlier guidance.
 
 - Scenario execution and orchestration
 - Context lifecycle
-- Step contract
-- Scenario builder and step registry
+- Node contract
+- DAG analysis and execution-plan assembly
 - Tracing (recorder + sink interfaces)
 - Generic CLI bootstrap (argument parsing + runtime assembly)
 - Generic config loading (YAML/JSON + schema validation)
@@ -77,8 +77,8 @@ to concrete implementations.
 
 Initial scope:
 
-- `input_source` for line-by-line source reads
-- `output_sink` for line-oriented sink writes
+- demo project uses neutral adapter roles (`ingress_file` / `egress_file`)
+- framework resolves behavior by adapter contracts (`consumes` / `emits`), not by hardcoded names
 
 Adapters are declared under `adapters.*` with:
 
@@ -109,7 +109,7 @@ Tests should validate:
 - Scenario composition (config + wiring)
 - `main` that calls framework bootstrap (e.g., `app.run(...)`)
 - **Thin adapters** that declare *how* they connect:
-  - `@adapter(name="input_source", emits=[...])`
+  - `@adapter(name="ingress_file", emits=[...])`
   - `@adapter(name="...", consumes=[...], emits=[...])`
 - Domain-level services that use framework ports (e.g., `WindowStore` logic
   built on top of `kv`)
