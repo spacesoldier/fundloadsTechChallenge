@@ -21,7 +21,7 @@ This is a staged migration plan, not a one-shot refactor.
 
 1. `src/fund_load/ports` has been removed from code.
 2. Usecases now depend on service contracts (`PrimeCheckerService`, `WindowStoreService`) or framework stream bindings.
-3. IO adapters are framework-driven (`stream_kernel.adapters.file_io`) with project mapping in `fund_load.adapters.io`.
+3. IO adapters are framework-driven (`stream_kernel.adapters.file_io`) with project-level bridge nodes in `fund_load.usecases.steps.io_bridge`.
 4. Remaining work is mostly documentation/test-structure cleanup, not runtime behavior migration.
 
 2. Not all current interfaces are true framework ports:

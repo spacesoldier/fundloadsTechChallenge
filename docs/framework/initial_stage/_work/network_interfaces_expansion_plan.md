@@ -12,6 +12,11 @@ The target model remains framework-native:
 - routing/execution use the same `Envelope` + `Router` + `Runner` mechanics;
 - no special-case runtime branches for specific protocols.
 
+Codec/backend alignment:
+
+- network adapters and file adapters must reuse the same transport codec layer;
+- see [Transport codecs and file IO options](../Transport%20codecs%20and%20file%20IO%20options.md).
+
 ## Scope
 
 In scope:
@@ -78,4 +83,3 @@ Out of scope (later stages):
 `NET-OBS-01` tracing observer records ingress and egress boundary events.
 
 `NET-ERR-01` malformed inbound payload is rejected with monitoring event and no node call.
-

@@ -46,13 +46,18 @@ nodes:
       enabled: true
 
 adapters:
-  ingress_file:
+  source:
     settings:
       path: input.txt
+      format: text/jsonl
+      encoding: utf-8
+      decode_errors: strict
     binds:
       - stream
-  egress_file:
+  sink:
     settings:
       path: output_exp_mp.txt
+      format: text/jsonl
+      encoding: utf-8
     binds:
       - stream

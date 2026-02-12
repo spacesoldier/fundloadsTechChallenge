@@ -14,7 +14,15 @@ from stream_kernel.execution.builder import build_adapter_contracts, build_runti
 from stream_kernel.application_context.injection_registry import InjectionRegistry
 from stream_kernel.config.loader import load_yaml_config
 from stream_kernel.config.validator import validate_newgen_config
-from fund_load.adapters.io import file_input_source, file_output_sink
+from stream_kernel.adapters.file_io import (
+    ByteRecord,
+    SinkLine,
+    TextRecord,
+    egress_file_sink as file_output_sink,
+    ingress_file_source as file_input_source,
+    sink_file_sink as file_sink_alias,
+    source_file_source as file_source_alias,
+)
 from fund_load.services.window_store import window_store_memory
 from stream_kernel.adapters.file_io import FileLineInputSource
 from stream_kernel.adapters.file_io import FileOutputSink
@@ -35,7 +43,7 @@ def _write(tmp_path: Path, text: str) -> Path:
 
 def test_build_adapter_contracts_from_factory_metadata() -> None:
     # Adapter contracts are sourced from AdapterRegistry metadata (kind -> @adapter contract).
-    from fund_load.adapters.io import file_input_source, file_output_sink
+    from stream_kernel.adapters.file_io import ByteRecord, SinkLine, TextRecord, egress_file_sink as file_output_sink, ingress_file_source as file_input_source
 
     registry = AdapterRegistry()
     registry.register("ingress_file", "ingress_file", file_input_source)
@@ -47,8 +55,8 @@ def test_build_adapter_contracts_from_factory_metadata() -> None:
     contracts = build_adapter_contracts(adapters, adapter_registry=registry)
     by_name = {contract.name: contract for contract in contracts}
     assert set(by_name.keys()) == {"ingress_file", "egress_file"}
-    assert [token.__name__ for token in by_name["ingress_file"].emits] == ["RawLine"]
-    assert [token.__name__ for token in by_name["egress_file"].consumes] == ["OutputLine"]
+    assert [token.__name__ for token in by_name["ingress_file"].emits] == ["ByteRecord", "TextRecord"]
+    assert [token.__name__ for token in by_name["egress_file"].consumes] == ["SinkLine"]
 
 
 def test_build_adapter_contracts_from_registry_metadata() -> None:
@@ -68,6 +76,22 @@ def test_build_adapter_contracts_from_registry_metadata() -> None:
     assert contracts[0].name == "ingress_file"
     assert contracts[0].consumes == []
     assert [token.__name__ for token in contracts[0].emits] == ["RawLine"]
+
+
+def test_build_adapter_contracts_supports_source_sink_alias_names() -> None:
+    # Generic role names source/sink resolve to the same file transport contracts.
+    registry = AdapterRegistry()
+    registry.register("source", "source", file_source_alias)
+    registry.register("sink", "sink", file_sink_alias)
+    adapters = {
+        "source": {"settings": {}},
+        "sink": {"settings": {}},
+    }
+    contracts = build_adapter_contracts(adapters, adapter_registry=registry)
+    by_name = {contract.name: contract for contract in contracts}
+    assert set(by_name.keys()) == {"source", "sink"}
+    assert [token.__name__ for token in by_name["source"].emits] == ["ByteRecord", "TextRecord"]
+    assert [token.__name__ for token in by_name["sink"].consumes] == ["SinkLine"]
 
 
 def test_run_with_config_builds_runtime_and_runs(tmp_path: Path) -> None:
@@ -147,7 +171,7 @@ adapters:
         discovery_modules=[
             "fund_load.usecases.steps",
             "fund_load.services.prime_checker",
-            "fund_load.adapters.io",
+            "stream_kernel.adapters.file_io",
         ],
         argv_overrides={
             "input": str(input_path),
@@ -314,9 +338,10 @@ adapters:
             "fund_load.usecases.steps.evaluate_policies",
             "fund_load.usecases.steps.update_windows",
             "fund_load.usecases.steps.format_output",
+            "fund_load.usecases.steps.io_bridge",
             "fund_load.services.prime_checker",
             "fund_load.services.window_store",
-            "fund_load.adapters.io",
+            "stream_kernel.adapters.file_io",
         ],
         argv_overrides={
             "input": str(input_path),
@@ -489,7 +514,7 @@ adapters:
         discovery_modules=[
             "fund_load.usecases.steps",
             "fund_load.services.prime_checker",
-            "fund_load.adapters.io",
+            "stream_kernel.adapters.file_io",
         ],
     )
 
@@ -562,7 +587,7 @@ runtime:
   strict: true
   discovery_modules:
     - fund_load.usecases.steps
-    - fund_load.adapters.io
+    - stream_kernel.adapters.file_io
     - fund_load.services.prime_checker
     - fund_load.services.window_store
 nodes:

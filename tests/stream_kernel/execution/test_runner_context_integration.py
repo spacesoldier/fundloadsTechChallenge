@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 # Context/runner behavior is specified in docs/framework/initial_stage/Execution runtime and routing integration.md.
+import pytest
+
 from stream_kernel.platform.services.context import InMemoryKvContextService
 from stream_kernel.platform.services.observability import NoOpObservabilityService
 from stream_kernel.execution.runner import SyncRunner
@@ -152,3 +154,85 @@ def test_runner_propagates_trace_id_to_downstream_nodes() -> None:
     runner.run()
     assert seen_a == [{"k": "v"}]
     assert seen_b == [{"k": "v"}]
+
+
+def test_runner_source_seq_mode_requires_seq_for_sink_nodes() -> None:
+    # Ordered sink mode must fail when sink delivery context has no transport seq.
+    seen: list[object] = []
+
+    def sink(payload: object, _ctx: dict[str, object]) -> list[object]:
+        seen.append(payload)
+        return []
+
+    work_queue = InMemoryQueue()
+    store = InMemoryKvStore()
+    store.set("t1", {"k": "v"})  # no __seq
+    context_service = InMemoryKvContextService(store)
+    work_queue.push(Envelope(payload="msg", target="sink:writer", trace_id="t1"))
+
+    runner = SyncRunner(
+        nodes={"sink:writer": sink},
+        work_queue=work_queue,
+        context_service=context_service,
+        router=_RoutingPortStub([]),
+        observability=NoOpObservabilityService(),
+        ordered_sink_mode="source_seq",
+    )
+
+    with pytest.raises(ValueError):
+        runner.run()
+    assert seen == []
+
+
+def test_runner_source_seq_mode_accepts_seq_for_sink_nodes() -> None:
+    # Ordered sink mode should allow sink processing when __seq is present.
+    seen: list[object] = []
+
+    def sink(payload: object, _ctx: dict[str, object]) -> list[object]:
+        seen.append(payload)
+        return []
+
+    work_queue = InMemoryQueue()
+    store = InMemoryKvStore()
+    store.set("t1", {"__seq": 3, "k": "v"})
+    context_service = InMemoryKvContextService(store)
+    work_queue.push(Envelope(payload="msg", target="sink:writer", trace_id="t1"))
+
+    runner = SyncRunner(
+        nodes={"sink:writer": sink},
+        work_queue=work_queue,
+        context_service=context_service,
+        router=_RoutingPortStub([]),
+        observability=NoOpObservabilityService(),
+        ordered_sink_mode="source_seq",
+    )
+    runner.run()
+    assert seen == ["msg"]
+
+
+def test_runner_completion_mode_keeps_current_queue_order_without_reorder() -> None:
+    # Characterization: without reorder engine, sink observes queue/completion order as-is.
+    observed_seq: list[int] = []
+
+    def sink(_payload: object, ctx: dict[str, object]) -> list[object]:
+        observed_seq.append(int(ctx["seq"]))
+        return []
+
+    work_queue = InMemoryQueue()
+    store = InMemoryKvStore()
+    store.set("t2", {"seq": 2})
+    store.set("t1", {"seq": 1})
+    context_service = InMemoryKvContextService(store)
+    work_queue.push(Envelope(payload="second", target="sink:writer", trace_id="t2"))
+    work_queue.push(Envelope(payload="first", target="sink:writer", trace_id="t1"))
+
+    runner = SyncRunner(
+        nodes={"sink:writer": sink},
+        work_queue=work_queue,
+        context_service=context_service,
+        router=_RoutingPortStub([]),
+        observability=NoOpObservabilityService(),
+        ordered_sink_mode="completion",
+    )
+    runner.run()
+    assert observed_seq == [2, 1]

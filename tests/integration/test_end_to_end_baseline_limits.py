@@ -9,9 +9,9 @@ from typing import Iterable
 from fund_load.services.window_store import InMemoryWindowStore
 from fund_load.domain.messages import RawLine
 from fund_load.domain.reasons import ReasonCode
-from stream_kernel.adapters.file_io import FileOutputSink
+from stream_kernel.adapters.file_io import FileOutputSink, SinkLine, TextRecord
 from fund_load.services.window_store import WindowStoreService
-from fund_load.usecases.messages import Decision, OutputLine
+from fund_load.usecases.messages import Decision
 from stream_kernel.adapters.contracts import adapter
 from stream_kernel.adapters.registry import AdapterRegistry
 from stream_kernel.app.runtime import run_with_config
@@ -31,11 +31,11 @@ def record_decisions(msg: Decision, ctx: object | None) -> list[Decision]:
 
 @dataclass(frozen=True, slots=True)
 class _InMemoryInputSource:
-    # InputSource stub returns provided RawLine stream (NDJSON order preserved).
+    # Source stub returns framework TextRecord payloads (NDJSON order preserved).
     lines: list[RawLine]
 
-    def read(self) -> Iterable[RawLine]:
-        return self.lines
+    def read(self) -> Iterable[TextRecord]:
+        return [TextRecord(text=item.raw_text, seq=item.line_no, source="ingress_file", encoding="utf-8") for item in self.lines]
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,9 +46,9 @@ class _CollectingOutputSink:
     def write_line(self, line: str) -> None:
         self.lines.append(line)
 
-    def consume(self, payload: OutputLine) -> None:
-        # Graph-native sink contract consumes OutputLine objects.
-        self.lines.append(payload.json_text)
+    def consume(self, payload: SinkLine) -> None:
+        # Graph-native sink contract consumes framework SinkLine payloads.
+        self.lines.append(payload.text)
 
     def close(self) -> None:
         pass
@@ -134,14 +134,14 @@ def test_baseline_end_to_end_limits() -> None:
     egress_file = _CollectingOutputSink([])
     registry = AdapterRegistry()
 
-    @adapter(consumes=[], emits=[RawLine])
+    @adapter(consumes=[], emits=[TextRecord])
     def _input_source_factory(settings: dict[str, object]) -> _InMemoryInputSource:
-        # Source adapter contract emits RawLine into DAG.
+        # Source adapter contract emits framework TextRecord into DAG.
         return _InMemoryInputSource(settings["lines"])  # type: ignore[index]
 
-    @adapter(consumes=[OutputLine], emits=[])
+    @adapter(consumes=[SinkLine], emits=[])
     def _output_sink_factory(settings: dict[str, object], _sink=egress_file) -> _CollectingOutputSink:
-        # Sink adapter contract consumes OutputLine from DAG.
+        # Sink adapter contract consumes framework SinkLine from DAG.
         return _sink
 
     registry.register("ingress_file", "ingress_file", _input_source_factory)

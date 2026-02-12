@@ -26,15 +26,18 @@ class InMemoryKvContextService(ContextService):
     store: KVStore = inject.kv(KVStore, qualifier="context")
 
     def seed(self, *, trace_id: str, payload: object, run_id: str, scenario_id: str) -> None:
-        # Payload is accepted for future enrichers; default context stays framework-generic.
-        _ = payload
+        # Transport sequence (if present) is persisted for ordered sink delivery modes.
+        seq = getattr(payload, "seq", None)
+        seeded: dict[str, object] = {
+            "__trace_id": trace_id,
+            "__run_id": run_id,
+            "__scenario_id": scenario_id,
+        }
+        if isinstance(seq, int):
+            seeded["__seq"] = seq
         self.store.set(
             trace_id,
-            {
-                "__trace_id": trace_id,
-                "__run_id": run_id,
-                "__scenario_id": scenario_id,
-            },
+            seeded,
         )
 
     def metadata(self, trace_id: str | None, *, full: bool) -> dict[str, object]:

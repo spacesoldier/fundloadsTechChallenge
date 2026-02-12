@@ -37,3 +37,15 @@ def test_context_service_wraps_non_mapping_values() -> None:
     store.set("t1", 123)
 
     assert service.metadata("t1", full=True) == {"value": 123}
+
+
+def test_context_service_seeds_transport_seq_when_payload_has_seq() -> None:
+    # Transport sequence is persisted in internal context for ordered sink modes.
+    class _Payload:
+        seq = 7
+
+    store = InMemoryKvStore()
+    service = InMemoryKvContextService(store)
+    service.seed(trace_id="t1", payload=_Payload(), run_id="run", scenario_id="scenario")
+
+    assert service.metadata("t1", full=True).get("__seq") == 7

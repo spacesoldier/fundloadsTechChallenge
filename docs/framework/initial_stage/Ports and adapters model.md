@@ -9,6 +9,7 @@ It complements:
 - [Execution planning model](Execution%20planning%20model.md)
 - [Routing semantics](Routing%20semantics.md)
 - [Service model](Service%20model.md)
+- [File adapters and ordering model](File%20adapters%20and%20ordering%20model.md)
 
 ---
 
@@ -125,6 +126,14 @@ Initial file-oriented kinds:
 - `file.line_reader` — streaming line-by-line reader (large-file friendly)
 - `file.line_writer` — line-oriented writer
 
+Detailed transport model for file payloads (`TextRecord`/`ByteRecord`), `seq`
+ordering and parallel reorder strategy is defined in:
+
+- [File adapters and ordering model](File%20adapters%20and%20ordering%20model.md)
+
+The same document contains the active Stage A test-case map with direct links to
+Python test files.
+
 Rationale:
 
 - "line" reflects Python's natural iterator-based file processing.
@@ -148,8 +157,25 @@ adapters:
   ingress_file:
     settings:
       path: input.txt
+      format: text/jsonl
+    binds: [stream]
+  egress_file:
+    settings:
+      path: output.txt
     binds: [stream]
 ```
+
+```yaml
+runtime:
+  ordering:
+    sink_mode: source_seq  # or completion
+```
+
+Notes:
+
+- `settings.format` defaults to `text/jsonl` when omitted.
+- `runtime.ordering.sink_mode=source_seq` enables strict sink-order guard based on transport `seq`.
+- `runtime.ordering.sink_mode=completion` keeps current completion/FIFO drain semantics.
 
 ---
 
@@ -323,6 +349,16 @@ Ack should be handled by the **runtime/adapter boundary**, not by nodes:
 - two source adapters emit the same model
 - scheduler is round‑robin/priority/as‑available
 - ordering is not guaranteed unless policy is explicit
+
+### 6.9 Test coverage pointers
+
+- `tests/stream_kernel/adapters/test_file_io.py`
+- `tests/stream_kernel/config/test_newgen_validator.py`
+- `tests/stream_kernel/execution/test_context_service.py`
+- `tests/stream_kernel/execution/test_runner_context_integration.py`
+- `tests/stream_kernel/app/test_framework_run.py`
+- `tests/integration/test_end_to_end_baseline_limits.py`
+- `tests/integration/test_end_to_end_experiment_features.py`
 
 ---
 

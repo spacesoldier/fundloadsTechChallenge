@@ -8,6 +8,7 @@ from typing import Any
 
 from stream_kernel.adapters.contracts import get_adapter_meta
 from stream_kernel.adapters.discovery import discover_adapters
+from stream_kernel.app.extensions import framework_discovery_modules
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -144,7 +145,11 @@ def _discover_io_adapter_roles(
     raw_modules = discovery_modules if discovery_modules is not None else runtime.get("discovery_modules", [])
     if not isinstance(raw_modules, list) or not all(isinstance(item, str) for item in raw_modules):
         return []
-    modules = _load_discovery_modules(raw_modules)
+    module_names = list(raw_modules)
+    for framework_module in framework_discovery_modules():
+        if framework_module not in module_names:
+            module_names.append(framework_module)
+    modules = _load_discovery_modules(module_names)
     discovered = discover_adapters(modules)
     matches: list[str] = []
     for role in adapters:

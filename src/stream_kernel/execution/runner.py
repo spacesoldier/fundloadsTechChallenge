@@ -9,6 +9,8 @@ from stream_kernel.platform.services.context import ContextService
 from stream_kernel.platform.services.observability import ObservabilityService
 from stream_kernel.routing.envelope import Envelope
 
+_ORDERED_SINK_MODES = {"completion", "source_seq"}
+
 
 @dataclass(slots=True)
 class SyncRunner:
@@ -31,6 +33,8 @@ class SyncRunner:
     observability: object = inject.service(ObservabilityService)
     # Service/system nodes can request full metadata, regular nodes receive filtered view.
     full_context_nodes: set[str] = field(default_factory=set)
+    # Sink delivery ordering mode: `completion` (default) or `source_seq`.
+    ordered_sink_mode: str = "completion"
 
     def run(self) -> None:
         # Drain current queue until empty.
@@ -55,11 +59,18 @@ class SyncRunner:
             if node_name not in self.nodes:
                 raise ValueError(f"Unknown node '{node_name}'")
 
+            is_sink_node = node_name.startswith("sink:")
+            full_ctx = context_service.metadata(envelope.trace_id, full=True)
+            if self.ordered_sink_mode == "source_seq" and is_sink_node:
+                if not isinstance(full_ctx.get("__seq"), int):
+                    raise ValueError(
+                        f"Missing __seq in context for sink node '{node_name}' "
+                        "while runtime.ordering.sink_mode=source_seq"
+                    )
             # Context is loaded by trace_id. `full` grants internal keys for service/system nodes.
-            raw_ctx = context_service.metadata(
-                envelope.trace_id,
-                full=(node_name in self.full_context_nodes),
-            )
+            raw_ctx = full_ctx if (node_name in self.full_context_nodes) else {
+                key: value for key, value in full_ctx.items() if not key.startswith("__")
+            }
             # Pass a copy to the node so it cannot mutate persisted context in-place by accident.
             node_ctx = dict(raw_ctx)
             node = self.nodes[node_name]
@@ -202,3 +213,10 @@ class SyncRunner:
     def _trace_id(*, run_id: str, index: int) -> str:
         # Stable trace id format for reproducible runs.
         return f"{run_id}:{index}"
+
+    def __post_init__(self) -> None:
+        if self.ordered_sink_mode not in _ORDERED_SINK_MODES:
+            raise ValueError(
+                "SyncRunner ordered_sink_mode must be one of: "
+                f"{sorted(_ORDERED_SINK_MODES)}"
+            )

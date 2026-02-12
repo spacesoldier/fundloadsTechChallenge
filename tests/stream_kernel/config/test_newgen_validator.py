@@ -226,3 +226,188 @@ def test_validate_newgen_config_rejects_unknown_runtime_platform_kv_backend() ->
     }
     with pytest.raises(ConfigError):
         validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_defaults_runtime_ordering_sink_mode_to_completion() -> None:
+    # Ordering mode defaults to completion-order when omitted.
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {"discovery_modules": ["example.steps"]},
+        "nodes": {},
+        "adapters": {"output_sink": {"binds": []}},
+    }
+    validated = validate_newgen_config(raw)
+    runtime = validated["runtime"]
+    assert isinstance(runtime, dict)
+    ordering = runtime.get("ordering")
+    assert isinstance(ordering, dict)
+    assert ordering.get("sink_mode") == "completion"
+
+
+@pytest.mark.parametrize("mode", ["completion", "source_seq"])
+def test_validate_newgen_config_accepts_runtime_ordering_sink_mode(mode: str) -> None:
+    # Runtime ordering mode is validated against framework-supported values.
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {
+            "discovery_modules": ["example.steps"],
+            "ordering": {"sink_mode": mode},
+        },
+        "nodes": {},
+        "adapters": {"output_sink": {"binds": []}},
+    }
+    validated = validate_newgen_config(raw)
+    runtime = validated["runtime"]
+    assert isinstance(runtime, dict)
+    ordering = runtime.get("ordering")
+    assert isinstance(ordering, dict)
+    assert ordering.get("sink_mode") == mode
+
+
+def test_validate_newgen_config_rejects_unknown_runtime_ordering_sink_mode() -> None:
+    # Unknown ordering mode must fail fast.
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {
+            "discovery_modules": ["example.steps"],
+            "ordering": {"sink_mode": "stable_sort"},
+        },
+        "nodes": {},
+        "adapters": {"output_sink": {"binds": []}},
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+@pytest.mark.parametrize(
+    "fmt",
+    ["text/jsonl", "text/plain", "application/octet-stream"],
+)
+def test_validate_newgen_config_accepts_supported_adapter_format_values(fmt: str) -> None:
+    # Adapter format hint is validated against the framework-supported transport set.
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {"discovery_modules": ["example.steps"]},
+        "nodes": {},
+        "adapters": {
+            "ingress_file": {
+                "binds": ["stream"],
+                "settings": {"path": "input.txt", "format": fmt},
+            }
+        },
+    }
+    validated = validate_newgen_config(raw)
+    adapters = validated["adapters"]
+    assert isinstance(adapters, dict)
+    ingress = adapters["ingress_file"]
+    assert isinstance(ingress, dict)
+    settings = ingress["settings"]
+    assert isinstance(settings, dict)
+    assert settings["format"] == fmt
+
+
+@pytest.mark.parametrize("mode", ["strict", "replace"])
+def test_validate_newgen_config_accepts_adapter_decode_errors_policy(mode: str) -> None:
+    # Decode policy is adapter-level transport setting for text formats.
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {"discovery_modules": ["example.steps"]},
+        "nodes": {},
+        "adapters": {
+            "ingress_file": {
+                "binds": ["stream"],
+                "settings": {"path": "input.txt", "format": "text/plain", "decode_errors": mode},
+            }
+        },
+    }
+    validated = validate_newgen_config(raw)
+    adapters = validated["adapters"]
+    assert isinstance(adapters, dict)
+    ingress = adapters["ingress_file"]
+    assert isinstance(ingress, dict)
+    settings = ingress["settings"]
+    assert isinstance(settings, dict)
+    assert settings["decode_errors"] == mode
+
+
+def test_validate_newgen_config_rejects_unknown_adapter_decode_errors_policy() -> None:
+    # Unknown decode policy must fail fast.
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {"discovery_modules": ["example.steps"]},
+        "nodes": {},
+        "adapters": {
+            "ingress_file": {
+                "binds": ["stream"],
+                "settings": {"path": "input.txt", "format": "text/plain", "decode_errors": "skip"},
+            }
+        },
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_accepts_adapter_encoding_setting() -> None:
+    # Text encoding is adapter-level transport setting and should be preserved.
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {"discovery_modules": ["example.steps"]},
+        "nodes": {},
+        "adapters": {
+            "source": {
+                "binds": ["stream"],
+                "settings": {"path": "input.txt", "format": "text/plain", "encoding": "utf-16-le"},
+            }
+        },
+    }
+    validated = validate_newgen_config(raw)
+    adapters = validated["adapters"]
+    assert isinstance(adapters, dict)
+    source = adapters["source"]
+    assert isinstance(source, dict)
+    settings = source["settings"]
+    assert isinstance(settings, dict)
+    assert settings["encoding"] == "utf-16-le"
+
+
+def test_validate_newgen_config_rejects_non_string_adapter_encoding() -> None:
+    # Invalid encoding type must fail fast.
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {"discovery_modules": ["example.steps"]},
+        "nodes": {},
+        "adapters": {
+            "source": {
+                "binds": ["stream"],
+                "settings": {"path": "input.txt", "format": "text/plain", "encoding": 123},
+            }
+        },
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_unknown_adapter_format_value() -> None:
+    # Unknown format must fail fast during validation.
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {"discovery_modules": ["example.steps"]},
+        "nodes": {},
+        "adapters": {
+            "ingress_file": {
+                "binds": ["stream"],
+                "settings": {"path": "input.txt", "format": "text/csv"},
+            }
+        },
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)

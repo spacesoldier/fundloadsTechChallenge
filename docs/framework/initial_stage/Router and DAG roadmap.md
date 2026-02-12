@@ -123,6 +123,18 @@ This plan tracks the move from fixed `runtime.pipeline` ordering to
 - [ ] Integrate ingress/egress boundaries into tracing/telemetry/monitoring.
 - [ ] Add adapter conformance tests for initial network stack (FastAPI HTTP, WS, GraphQL baseline).
 
+## Phase 8 — Serializer/Deserializer layer (transport codecs)
+
+- [ ] Add framework-level serializer/deserializer contracts for ingress/egress boundaries.
+- [ ] Keep business nodes codec-agnostic: codecs stay in adapters/boundary bridges only.
+- [ ] Add config-driven codec selection (`json`, `msgpack`, `avro`, `protobuf`, custom).
+- [ ] Add sync + async codec adapters for stream/request/response flows.
+- [ ] Add file-IO backend matrix support (`local`, compressed files, remote `fsspec`) under the same contract.
+- [ ] Add compatibility tests for schema/version evolution and backward-compatible decode.
+- [ ] Add deterministic error policy for decode/encode failures (strict/drop/dlq/retry hooks).
+
+Reference: [Transport codecs and file IO options](Transport%20codecs%20and%20file%20IO%20options.md)
+
 ### Runtime note
 
 - Runtime bootstrap starts via token routing (`RoutingPort.route([payload])`).

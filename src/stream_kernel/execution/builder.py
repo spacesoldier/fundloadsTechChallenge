@@ -115,12 +115,14 @@ def run_with_sync_runner(
     scenario_id: str,
     scenario_scope: ScenarioScope,
     full_context_nodes: set[str] | None = None,
+    ordered_sink_mode: str = "completion",
 ) -> None:
     # Build execution components (Execution runtime and routing integration §6).
     nodes = {spec.name: spec.step for spec in scenario.steps}
     runner = SyncRunner(
         nodes=nodes,
         full_context_nodes=set(full_context_nodes or ()),
+        ordered_sink_mode=ordered_sink_mode,
     )
     apply_injection(runner, scenario_scope, strict)
     try:
@@ -132,6 +134,7 @@ def run_with_sync_runner(
 
 def execute_runtime_artifacts(artifacts: RuntimeBuildArtifacts) -> None:
     # Single execution entrypoint for runtime-prepared artifacts.
+    ordered_sink_mode = runtime_ordering_sink_mode(artifacts.runtime)
     run_with_sync_runner(
         scenario=artifacts.scenario,
         inputs=artifacts.inputs,
@@ -140,6 +143,7 @@ def execute_runtime_artifacts(artifacts: RuntimeBuildArtifacts) -> None:
         scenario_id=artifacts.scenario_id,
         scenario_scope=artifacts.scenario_scope,
         full_context_nodes=artifacts.full_context_nodes,
+        ordered_sink_mode=ordered_sink_mode,
     )
 
 
@@ -511,6 +515,17 @@ def runtime_kv_backend(runtime: dict[str, object]) -> str:
     if not isinstance(backend, str) or not backend:
         raise ValueError("runtime.platform.kv.backend must be a non-empty string")
     return backend
+
+
+def runtime_ordering_sink_mode(runtime: dict[str, object]) -> str:
+    # Read normalized sink ordering mode from runtime mapping.
+    ordering = runtime.get("ordering", {})
+    if not isinstance(ordering, dict):
+        raise ValueError("runtime.ordering must be a mapping")
+    sink_mode = ordering.get("sink_mode", "completion")
+    if not isinstance(sink_mode, str) or not sink_mode:
+        raise ValueError("runtime.ordering.sink_mode must be a non-empty string")
+    return sink_mode
 
 
 def scenario_name(config: dict[str, object]) -> str:

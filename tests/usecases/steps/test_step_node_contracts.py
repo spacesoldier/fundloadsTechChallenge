@@ -18,9 +18,11 @@ from fund_load.usecases.steps.compute_time_keys import ComputeTimeKeys
 from fund_load.usecases.steps.evaluate_policies import EvaluatePolicies
 from fund_load.usecases.steps.format_output import FormatOutput
 from fund_load.usecases.steps.idempotency_gate import IdempotencyGate
+from fund_load.usecases.steps.io_bridge import EgressLineBridge, IngressLineBridge
 from fund_load.usecases.steps.parse_load_attempt import ParseLoadAttempt
 from fund_load.usecases.steps.update_windows import UpdateWindows
 from stream_kernel.kernel.node import NodeMeta
+from stream_kernel.adapters.file_io import SinkLine, TextRecord
 
 
 def _meta(obj: object) -> NodeMeta:
@@ -34,6 +36,13 @@ def test_parse_load_attempt_node_contract() -> None:
     meta = _meta(ParseLoadAttempt)
     assert meta.consumes == [RawLine]
     assert meta.emits == [LoadAttempt, DomainDecision]
+
+
+def test_ingress_line_bridge_node_contract() -> None:
+    # Graph-native file source emits text transport records for text formats; bridge converts to domain RawLine.
+    meta = _meta(IngressLineBridge)
+    assert meta.consumes == [TextRecord]
+    assert meta.emits == [RawLine]
 
 
 def test_compute_time_keys_node_contract() -> None:
@@ -76,3 +85,10 @@ def test_format_output_node_contract() -> None:
     meta = _meta(FormatOutput)
     assert meta.consumes == [WindowedDecision]
     assert meta.emits == [OutputLine]
+
+
+def test_egress_line_bridge_node_contract() -> None:
+    # Graph-native file sink consumes SinkLine; bridge converts from OutputLine.
+    meta = _meta(EgressLineBridge)
+    assert meta.consumes == [OutputLine]
+    assert meta.emits == [SinkLine]

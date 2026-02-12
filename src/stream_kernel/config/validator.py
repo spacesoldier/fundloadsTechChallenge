@@ -8,6 +8,9 @@ class ConfigError(ValueError):
 
 _STABLE_PORT_TYPES = {"stream", "kv_stream", "kv", "request", "response", "service"}
 _SUPPORTED_KV_BACKENDS = {"memory"}
+_SUPPORTED_FILE_FORMATS = {"text/jsonl", "text/plain", "application/octet-stream"}
+_SUPPORTED_DECODE_ERROR_POLICIES = {"strict", "replace"}
+_SUPPORTED_ORDERING_SINK_MODES = {"completion", "source_seq"}
 
 
 def validate_newgen_config(raw: object) -> dict[str, object]:
@@ -22,6 +25,7 @@ def validate_newgen_config(raw: object) -> dict[str, object]:
 
     runtime = _optional_mapping(raw, "runtime")
     _normalize_runtime_platform(runtime)
+    _normalize_runtime_ordering(runtime)
     nodes = _optional_mapping(raw, "nodes")
     adapters = _optional_mapping(raw, "adapters")
 
@@ -53,6 +57,31 @@ def validate_newgen_config(raw: object) -> dict[str, object]:
         settings = entry.get("settings", {})
         if not isinstance(settings, dict):
             raise ConfigError(f"adapters.{role}.settings must be a mapping when provided")
+        fmt = settings.get("format")
+        if fmt is not None:
+            if not isinstance(fmt, str) or not fmt:
+                raise ConfigError(f"adapters.{role}.settings.format must be a non-empty string when provided")
+            if fmt not in _SUPPORTED_FILE_FORMATS:
+                raise ConfigError(
+                    f"adapters.{role}.settings.format must be one of: {sorted(_SUPPORTED_FILE_FORMATS)}"
+                )
+        decode_errors = settings.get("decode_errors")
+        if decode_errors is not None:
+            if not isinstance(decode_errors, str) or not decode_errors:
+                raise ConfigError(
+                    f"adapters.{role}.settings.decode_errors must be a non-empty string when provided"
+                )
+            if decode_errors not in _SUPPORTED_DECODE_ERROR_POLICIES:
+                raise ConfigError(
+                    "adapters."
+                    f"{role}.settings.decode_errors must be one of: {sorted(_SUPPORTED_DECODE_ERROR_POLICIES)}"
+                )
+        encoding = settings.get("encoding")
+        if encoding is not None:
+            if not isinstance(encoding, str) or not encoding:
+                raise ConfigError(
+                    f"adapters.{role}.settings.encoding must be a non-empty string when provided"
+                )
 
     # Normalize missing sections to keep downstream code simple.
     validated: dict[str, object] = dict(raw)
@@ -96,3 +125,21 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
             f"runtime.platform.kv.backend must be one of: {sorted(_SUPPORTED_KV_BACKENDS)}"
         )
     kv["backend"] = backend
+
+
+def _normalize_runtime_ordering(runtime: dict[str, object]) -> None:
+    # Runtime ordering defaults are centralized in validator for deterministic runner behavior.
+    ordering = runtime.get("ordering", {})
+    if not isinstance(ordering, dict):
+        raise ConfigError("runtime.ordering must be a mapping when provided")
+    runtime["ordering"] = ordering
+
+    sink_mode = ordering.get("sink_mode", "completion")
+    if not isinstance(sink_mode, str) or not sink_mode:
+        raise ConfigError("runtime.ordering.sink_mode must be a non-empty string when provided")
+    if sink_mode not in _SUPPORTED_ORDERING_SINK_MODES:
+        raise ConfigError(
+            "runtime.ordering.sink_mode must be one of: "
+            f"{sorted(_SUPPORTED_ORDERING_SINK_MODES)}"
+        )
+    ordering["sink_mode"] = sink_mode

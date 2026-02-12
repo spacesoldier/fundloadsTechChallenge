@@ -24,7 +24,7 @@ runtime:
   strict: true
   discovery_modules:
     - fund_load.usecases.steps
-    - fund_load.adapters.io
+    - stream_kernel.adapters.file_io
     - fund_load.services.prime_checker
     - fund_load.services.window_store
   tracing:
@@ -104,13 +104,24 @@ adapters:
     assert exit_code == 0
     trace_path = tmp_path / "trace.jsonl"
     lines = trace_path.read_text(encoding="utf-8").splitlines()
-    # Source adapters now execute as graph-native bootstrap nodes and are traced as regular steps.
-    assert len(lines) == 9
+    # Source/sink adapters and IO bridge nodes are traced as regular graph-native steps.
+    assert len(lines) == 11
+    step_names = [json.loads(line)["step_name"] for line in lines]
+    assert step_names == [
+        "source:ingress_file",
+        "ingress_line_bridge",
+        "parse_load_attempt",
+        "compute_time_keys",
+        "idempotency_gate",
+        "compute_features",
+        "evaluate_policies",
+        "update_windows",
+        "format_output",
+        "egress_line_bridge",
+        "sink:egress_file",
+    ]
     first = json.loads(lines[0])
-    assert first["step_name"] == "source:ingress_file"
     assert first["ctx_before"] == {"run_id": "run"}
-    second = json.loads(lines[1])
-    assert second["step_name"] == "parse_load_attempt"
 
 
 def test_runtime_tracing_disabled_no_sink(tmp_path: Path) -> None:
@@ -124,7 +135,7 @@ runtime:
   strict: true
   discovery_modules:
     - fund_load.usecases.steps
-    - fund_load.adapters.io
+    - stream_kernel.adapters.file_io
     - fund_load.services.prime_checker
     - fund_load.services.window_store
   tracing:
