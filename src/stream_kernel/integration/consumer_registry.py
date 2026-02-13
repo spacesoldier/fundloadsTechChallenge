@@ -46,7 +46,7 @@ class InMemoryConsumerRegistry(ConsumerRegistry):
         return list(self._map.keys())
 
     def version(self) -> int:
-        # Monotonic version used for RoutingPort cache invalidation.
+        # Monotonic version used for RoutingService cache invalidation.
         return self._version
 
     def register(self, token: type, consumers: Iterable[str]) -> None:

@@ -114,6 +114,10 @@ This plan tracks the move from fixed `runtime.pipeline` ordering to
 
 ## Phase 7 — Network interface track (HTTP/WebSocket/GraphQL)
 
+- [x] Start web track docs under `initial_stage/web` (FastAPI interface architecture + correlation routing model).
+- [x] Start process-isolated web/execution migration planning (`multiprocessing + Redis` backbone).
+- [x] Add detailed process-isolation implementation roadmap:
+      [`_work/web_multiprocessing_secure_tcp_fastapi_plan`](./_work/web_multiprocessing_secure_tcp_fastapi_plan.md)
 - [ ] Add config-level declarations for network interfaces in runtime section.
 - [ ] Keep protocol adapters platform-owned and discovery-driven (no runtime hardcode).
 - [ ] Map transport semantics to stable ports:

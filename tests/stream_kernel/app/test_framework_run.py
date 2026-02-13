@@ -10,10 +10,10 @@ from stream_kernel.adapters.registry import AdapterRegistry
 from stream_kernel.app import run, run_with_registry
 from stream_kernel.app.runtime import run_with_config
 import stream_kernel.app.runtime as runtime_module
-from stream_kernel.execution.builder import build_adapter_contracts, build_runtime_artifacts
+from stream_kernel.execution.orchestration.builder import build_adapter_contracts, build_runtime_artifacts
 from stream_kernel.application_context.injection_registry import InjectionRegistry
 from stream_kernel.config.loader import load_yaml_config
-from stream_kernel.config.validator import validate_newgen_config
+from stream_kernel.config.validator import ConfigError, validate_newgen_config
 from stream_kernel.adapters.file_io import (
     ByteRecord,
     SinkLine,
@@ -39,6 +39,137 @@ def _write(tmp_path: Path, text: str) -> Path:
     path = tmp_path / "cfg.yml"
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def test_runtime_contract_summary_defaults_to_memory_profile() -> None:
+    config = {
+        "scenario": {"name": "baseline"},
+        "runtime": {},
+        "nodes": {},
+        "adapters": {},
+    }
+    summary = runtime_module.runtime_contract_summary(config)
+    assert summary["execution_ipc"]["enabled"] is False
+    assert summary["execution_ipc"]["transport"] is None
+    assert summary["process_groups"]["count"] == 0
+    assert summary["web"]["interface_count"] == 0
+    assert summary["kv_backend"] == "memory"
+    assert summary["ordering_sink_mode"] == "completion"
+    assert summary["bootstrap_mode"] == "inline"
+    assert summary["execution_ipc"]["secret_mode"] is None
+    assert summary["execution_ipc"]["kdf"] is None
+
+
+def test_runtime_contract_summary_reports_phase0_sections() -> None:
+    config = {
+        "scenario": {"name": "baseline"},
+        "runtime": {
+            "platform": {
+                "kv": {"backend": "memory"},
+                "execution_ipc": {
+                    "transport": "tcp_local",
+                    "bind_host": "127.0.0.1",
+                    "bind_port": 0,
+                    "auth": {
+                        "mode": "hmac",
+                        "secret_mode": "generated",
+                        "kdf": "hkdf_sha256",
+                        "ttl_seconds": 30,
+                    },
+                    "max_payload_bytes": 1024,
+                },
+                "bootstrap": {"mode": "process_supervisor"},
+                "process_groups": [{"name": "web"}, {"name": "cpu_sync"}],
+            },
+            "web": {
+                "interfaces": [
+                    {"kind": "http", "binds": ["request", "response"]},
+                    {"kind": "websocket", "binds": ["stream"]},
+                ]
+            },
+            "ordering": {"sink_mode": "source_seq"},
+        },
+        "nodes": {},
+        "adapters": {},
+    }
+    summary = runtime_module.runtime_contract_summary(config)
+    assert summary["execution_ipc"]["enabled"] is True
+    assert summary["execution_ipc"]["transport"] == "tcp_local"
+    assert summary["execution_ipc"]["auth_mode"] == "hmac"
+    assert summary["execution_ipc"]["secret_mode"] == "generated"
+    assert summary["execution_ipc"]["kdf"] == "hkdf_sha256"
+    assert summary["execution_ipc"]["ttl_seconds"] == 30
+    assert summary["bootstrap_mode"] == "process_supervisor"
+    assert summary["process_groups"]["names"] == ["web", "cpu_sync"]
+    assert summary["web"]["kinds"] == ["http", "websocket"]
+    assert summary["ordering_sink_mode"] == "source_seq"
+
+
+def test_runtime_contract_summary_reports_execution_transport_profile() -> None:
+    # IPC-INT-03: runtime summary should expose resolved execution transport profile.
+    memory_summary = runtime_module.runtime_contract_summary(
+        {
+            "scenario": {"name": "baseline"},
+            "runtime": {},
+            "nodes": {},
+            "adapters": {},
+        }
+    )
+    assert memory_summary["execution_transport_profile"] == "memory"
+
+    tcp_summary = runtime_module.runtime_contract_summary(
+        {
+            "scenario": {"name": "baseline"},
+            "runtime": {
+                "platform": {
+                    "execution_ipc": {
+                        "transport": "tcp_local",
+                        "bind_host": "127.0.0.1",
+                        "bind_port": 0,
+                        "auth": {"mode": "hmac", "ttl_seconds": 30, "nonce_cache_size": 1000},
+                        "max_payload_bytes": 1048576,
+                    }
+                }
+            },
+            "nodes": {},
+            "adapters": {},
+        }
+    )
+    assert tcp_summary["execution_transport_profile"] == "tcp_local"
+
+
+def test_run_with_config_builds_runtime_contract_summary_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_summary(config: dict[str, object]) -> dict[str, object]:
+        captured["summary_called"] = True
+        captured["config"] = config
+        return {"ok": True}
+
+    monkeypatch.setattr(runtime_module, "runtime_contract_summary", _fake_summary)
+    monkeypatch.setattr(
+        runtime_module.execution_builder,
+        "build_runtime_artifacts",
+        lambda *_a, **_k: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        runtime_module.execution_builder,
+        "execute_runtime_artifacts",
+        lambda *_a, **_k: None,
+    )
+
+    cfg = {
+        "scenario": {"name": "baseline"},
+        "runtime": {},
+        "nodes": {},
+        "adapters": {},
+    }
+    exit_code = run_with_config(cfg)
+    assert exit_code == 0
+    assert captured["summary_called"] is True
+    assert captured["config"] is cfg
 
 
 def test_build_adapter_contracts_from_factory_metadata() -> None:
@@ -686,17 +817,17 @@ def test_run_with_config_uses_discovery_order_when_pipeline_missing(monkeypatch:
             captured["step_names"] = list(step_names)
             return type("S", (), {"steps": []})()
 
-    monkeypatch.setattr("stream_kernel.execution.builder.ApplicationContext", _Ctx)
+    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.ApplicationContext", _Ctx)
     monkeypatch.setattr(
-        "stream_kernel.execution.builder.build_adapter_instances_from_registry",
+        "stream_kernel.execution.orchestration.builder.build_adapter_instances_from_registry",
         lambda _adapters, _registry: {"ingress_file": type("I", (), {"read": lambda *_a: []})()},
     )
     monkeypatch.setattr(
-        "stream_kernel.execution.builder.build_injection_registry_from_bindings",
+        "stream_kernel.execution.orchestration.builder.build_injection_registry_from_bindings",
         lambda _instances, _bindings: InjectionRegistry(),
     )
-    monkeypatch.setattr("stream_kernel.execution.builder.build_execution_observers", lambda *_a, **_k: [])
-    monkeypatch.setattr("stream_kernel.execution.builder.run_with_sync_runner", lambda **_kw: None)
+    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.build_execution_observers", lambda *_a, **_k: [])
+    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_sync_runner", lambda **_kw: None)
 
     cfg = {
         "version": 1,
@@ -748,17 +879,17 @@ def test_run_with_config_invokes_preflight(monkeypatch: pytest.MonkeyPatch) -> N
         def build_scenario(self, *, scenario_id, step_names, wiring):
             return type("S", (), {"steps": []})()
 
-    monkeypatch.setattr("stream_kernel.execution.builder.ApplicationContext", _Ctx)
+    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.ApplicationContext", _Ctx)
     monkeypatch.setattr(
-        "stream_kernel.execution.builder.build_adapter_instances_from_registry",
+        "stream_kernel.execution.orchestration.builder.build_adapter_instances_from_registry",
         lambda _adapters, _registry: {"ingress_file": type("I", (), {"read": lambda *_a: []})()},
     )
     monkeypatch.setattr(
-        "stream_kernel.execution.builder.build_injection_registry_from_bindings",
+        "stream_kernel.execution.orchestration.builder.build_injection_registry_from_bindings",
         lambda _instances, _bindings: InjectionRegistry(),
     )
-    monkeypatch.setattr("stream_kernel.execution.builder.build_execution_observers", lambda *_a, **_k: [])
-    monkeypatch.setattr("stream_kernel.execution.builder.run_with_sync_runner", lambda **_kw: None)
+    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.build_execution_observers", lambda *_a, **_k: [])
+    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_sync_runner", lambda **_kw: None)
 
     cfg = {
         "scenario": {"name": "baseline"},
@@ -804,20 +935,64 @@ def test_run_with_config_rejects_adapters_mapping() -> None:
         )
 
 
-def test_run_with_config_rejects_runtime_pipeline() -> None:
-    # runtime.pipeline is removed; runtime must build flow from discovered contracts.
+def test_run_with_config_ignores_runtime_pipeline_without_special_case(monkeypatch: pytest.MonkeyPatch) -> None:
+    # run_with_config should not carry dedicated legacy pipeline rejection logic.
+    captured: dict[str, object] = {}
+
+    class _Meta:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class _NodeDef:
+        def __init__(self, name: str) -> None:
+            self.meta = _Meta(name)
+
+    class _Ctx:
+        def __init__(self) -> None:
+            self.nodes = [_NodeDef("b"), _NodeDef("a")]
+
+        def discover(self, _modules) -> None:
+            return None
+
+        def build_consumer_registry(self):
+            return type("R", (), {"list_tokens": lambda *_a: []})()
+
+        def preflight(self, *, strict: bool = True, extra_contracts=None):
+            from stream_kernel.kernel.dag import Dag
+
+            return Dag(nodes=["b", "a"], edges=[("a", "b")])
+
+        def build_scenario(self, *, scenario_id, step_names, wiring):
+            captured["step_names"] = list(step_names)
+            return type("S", (), {"steps": []})()
+
+    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.ApplicationContext", _Ctx)
+    monkeypatch.setattr(
+        "stream_kernel.execution.orchestration.builder.build_adapter_instances_from_registry",
+        lambda _adapters, _registry: {"ingress_file": type("I", (), {"read": lambda *_a: []})()},
+    )
+    monkeypatch.setattr(
+        "stream_kernel.execution.orchestration.builder.build_injection_registry_from_bindings",
+        lambda _instances, _bindings: InjectionRegistry(),
+    )
+    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.build_execution_observers", lambda *_a, **_k: [])
+    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_sync_runner", lambda **_kw: None)
+
     cfg = {
+        "version": 1,
         "scenario": {"name": "baseline"},
-        "runtime": {"pipeline": ["a", "b"]},
+        "runtime": {"pipeline": ["b", "a"]},
+        "nodes": {},
         "adapters": {"ingress_file": {}, "egress_file": {}},
     }
-    with pytest.raises(ValueError):
-        run_with_config(
-            cfg,
-            adapter_registry=AdapterRegistry(),
-            adapter_bindings={},
-            discovery_modules=[],
-        )
+    exit_code = run_with_config(
+        cfg,
+        adapter_registry=AdapterRegistry(),
+        adapter_bindings={},
+        discovery_modules=[],
+    )
+    assert exit_code == 0
+    assert captured["step_names"] == ["a", "b"]
 
 
 def test_run_rejects_invalid_runtime_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -867,47 +1042,22 @@ def test_run_rejects_non_mapping_adapters(monkeypatch: pytest.MonkeyPatch) -> No
         run(["--config", "cfg.yml"])
 
 
-def test_run_rejects_runtime_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
-    # runtime.pipeline is deprecated and unsupported; routing must derive flow from contracts.
+def test_run_rejects_runtime_pipeline_via_runtime_allow_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Runtime key allow-list rejects legacy runtime.pipeline during validation.
     cfg = {
+        "version": 1,
         "scenario": {"name": "baseline"},
-        "runtime": {"discovery_modules": [], "pipeline": ["a", "b"]},
-        "adapters": {},
+        "runtime": {"pipeline": ["a", "b"]},
+        "nodes": {},
+        "adapters": {"ingress_file": {"binds": []}},
     }
     monkeypatch.setattr(
         "stream_kernel.app.runtime.parse_args",
         lambda _argv: SimpleNamespace(config="x", input=None, output=None, tracing=None, trace_path=None),
     )
     monkeypatch.setattr("stream_kernel.app.runtime.load_yaml_config", lambda _path: cfg)
-    monkeypatch.setattr("stream_kernel.app.runtime.validate_newgen_config", lambda raw: raw)
-    monkeypatch.setattr("stream_kernel.app.runtime.apply_cli_overrides", lambda *_a, **_k: None)
-    monkeypatch.setattr(
-        "stream_kernel.execution.builder.ApplicationContext",
-        lambda: type(
-            "C",
-            (),
-            {
-                "discover": lambda *_a, **_k: None,
-                "preflight": lambda *_a, **_k: None,
-                "build_scenario": lambda *_a, **_k: type("S", (), {"steps": []})(),
-                "build_consumer_registry": lambda *_a, **_k: type("R", (), {"list_tokens": lambda *_a: []})(),
-            },
-        )(),
-    )
-    monkeypatch.setattr(
-        "stream_kernel.execution.builder.SyncRunner",
-        lambda **_k: type(
-            "R",
-            (),
-            {
-                "run": lambda *_a, **_k: None,
-                "run_inputs": lambda *_a, **_k: None,
-                "on_run_end": lambda *_a, **_k: None,
-            },
-        )(),
-    )
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError):
         run(["--config", "cfg.yml"])
 
 
@@ -954,21 +1104,21 @@ def test_run_uses_discovery_order_when_pipeline_missing(monkeypatch: pytest.Monk
     monkeypatch.setattr("stream_kernel.app.runtime.load_yaml_config", lambda _path: cfg)
     monkeypatch.setattr("stream_kernel.app.runtime.validate_newgen_config", lambda raw: raw)
     monkeypatch.setattr("stream_kernel.app.runtime.apply_cli_overrides", lambda *_a, **_k: None)
-    monkeypatch.setattr("stream_kernel.execution.builder.ApplicationContext", _Ctx)
+    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.ApplicationContext", _Ctx)
     monkeypatch.setattr(
-        "stream_kernel.execution.builder.resolve_runtime_adapters",
+        "stream_kernel.execution.orchestration.builder.resolve_runtime_adapters",
         lambda **_kw: (AdapterRegistry(), {}),
     )
     monkeypatch.setattr(
-        "stream_kernel.execution.builder.build_adapter_instances_from_registry",
+        "stream_kernel.execution.orchestration.builder.build_adapter_instances_from_registry",
         lambda _adapters, _registry: {"ingress_file": type("I", (), {"read": lambda *_a: []})()},
     )
     monkeypatch.setattr(
-        "stream_kernel.execution.builder.build_injection_registry_from_bindings",
+        "stream_kernel.execution.orchestration.builder.build_injection_registry_from_bindings",
         lambda _instances, _bindings: InjectionRegistry(),
     )
-    monkeypatch.setattr("stream_kernel.execution.builder.build_execution_observers", lambda *_a, **_k: [])
-    monkeypatch.setattr("stream_kernel.execution.builder.run_with_sync_runner", lambda **_kw: None)
+    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.build_execution_observers", lambda *_a, **_k: [])
+    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_sync_runner", lambda **_kw: None)
 
     exit_code = run(["--config", "cfg.yml"])
     assert exit_code == 0
@@ -994,15 +1144,15 @@ def test_run_requires_source_adapter_with_read(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr("stream_kernel.app.runtime.load_yaml_config", lambda _path: cfg)
     monkeypatch.setattr("stream_kernel.app.runtime.validate_newgen_config", lambda raw: raw)
     monkeypatch.setattr(
-        "stream_kernel.execution.builder.resolve_runtime_adapters",
+        "stream_kernel.execution.orchestration.builder.resolve_runtime_adapters",
         lambda **_kw: (AdapterRegistry(), {}),
     )
     monkeypatch.setattr(
-        "stream_kernel.execution.builder.build_adapter_instances_from_registry",
+        "stream_kernel.execution.orchestration.builder.build_adapter_instances_from_registry",
         lambda _adapters, _registry: {"egress_file": object()},
     )
     monkeypatch.setattr(
-        "stream_kernel.execution.builder.ApplicationContext",
+        "stream_kernel.execution.orchestration.builder.ApplicationContext",
         lambda: type(
             "C",
             (),
@@ -1015,7 +1165,7 @@ def test_run_requires_source_adapter_with_read(monkeypatch: pytest.MonkeyPatch) 
         )(),
     )
     monkeypatch.setattr(
-        "stream_kernel.execution.builder.SyncRunner",
+        "stream_kernel.execution.orchestration.builder.SyncRunner",
         lambda **_k: type(
             "R",
             (),
@@ -1074,21 +1224,21 @@ def test_run_accepts_non_default_source_role_with_read(monkeypatch: pytest.Monke
     monkeypatch.setattr("stream_kernel.app.runtime.load_yaml_config", lambda _path: cfg)
     monkeypatch.setattr("stream_kernel.app.runtime.validate_newgen_config", lambda raw: raw)
     monkeypatch.setattr("stream_kernel.app.runtime.apply_cli_overrides", lambda *_a, **_k: None)
-    monkeypatch.setattr("stream_kernel.execution.builder.ApplicationContext", _Ctx)
+    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.ApplicationContext", _Ctx)
     monkeypatch.setattr(
-        "stream_kernel.execution.builder.resolve_runtime_adapters",
+        "stream_kernel.execution.orchestration.builder.resolve_runtime_adapters",
         lambda **_kw: (AdapterRegistry(), {}),
     )
     monkeypatch.setattr(
-        "stream_kernel.execution.builder.build_adapter_instances_from_registry",
+        "stream_kernel.execution.orchestration.builder.build_adapter_instances_from_registry",
         lambda _adapters, _registry: {"events_source": type("I", (), {"read": lambda *_a: []})()},
     )
     monkeypatch.setattr(
-        "stream_kernel.execution.builder.build_injection_registry_from_bindings",
+        "stream_kernel.execution.orchestration.builder.build_injection_registry_from_bindings",
         lambda _instances, _bindings: InjectionRegistry(),
     )
-    monkeypatch.setattr("stream_kernel.execution.builder.build_execution_observers", lambda *_a, **_k: [])
-    monkeypatch.setattr("stream_kernel.execution.builder.run_with_sync_runner", lambda **_kw: None)
+    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.build_execution_observers", lambda *_a, **_k: [])
+    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_sync_runner", lambda **_kw: None)
 
     exit_code = run(["--config", "cfg.yml"])
     assert exit_code == 0

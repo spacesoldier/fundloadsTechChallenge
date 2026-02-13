@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
-from stream_kernel.execution.observer import (
+from stream_kernel.execution.observers.observer import (
     ExecutionObserver,
     ObserverFactoryContext,
     observer_factory,

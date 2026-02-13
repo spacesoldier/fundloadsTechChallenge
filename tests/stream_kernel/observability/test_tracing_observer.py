@@ -3,10 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from stream_kernel.platform.services.context import InMemoryKvContextService
-from stream_kernel.execution.runner import SyncRunner
+from stream_kernel.execution.runtime.runner import SyncRunner
 from stream_kernel.integration.consumer_registry import InMemoryConsumerRegistry
 from stream_kernel.integration.kv_store import InMemoryKvStore
-from stream_kernel.integration.routing_port import RoutingPort
+from stream_kernel.routing.routing_service import RoutingService
 from stream_kernel.integration.work_queue import InMemoryQueue
 from stream_kernel.kernel.trace import TraceRecorder
 from stream_kernel.observability.observers.tracing import TracingObserver
@@ -153,7 +153,7 @@ def test_tracing_records_span_for_adapter_node_executed_in_graph() -> None:
         nodes={"adapter_source": adapter_source, "worker": worker},
         work_queue=queue,
         context_service=context_service,
-        router=RoutingPort(registry=registry, strict=True),
+        router=RoutingService(registry=registry, strict=True),
         observability=FanoutObservabilityService(observers=[observer]),
     )
     runner.run()
@@ -196,7 +196,7 @@ def test_tracing_does_not_add_extra_span_for_injected_adapter_call() -> None:
         nodes={"worker": worker},
         work_queue=queue,
         context_service=context_service,
-        router=RoutingPort(registry=InMemoryConsumerRegistry(), strict=True),
+        router=RoutingService(registry=InMemoryConsumerRegistry(), strict=True),
         observability=FanoutObservabilityService(observers=[observer]),
     )
     runner.run()

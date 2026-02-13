@@ -2,7 +2,11 @@
 
 ## Context
 We are moving from the legacy `kernel.runner` pipeline execution to the new
-routing + execution model (`RoutingPort`, `WorkQueue`, KV context storage, `SyncRunner`).
+routing + execution model (`RoutingService`/`RoutingPort`, `WorkQueue`, KV context storage, `SyncRunner`).
+
+Active cleanup continuation:
+
+- [engine_runtime_contract_cleanup_tdd_plan](engine_runtime_contract_cleanup_tdd_plan.md)
 
 ## Current gaps
 - remove remaining documentation references to `kernel.runner`
@@ -65,6 +69,13 @@ routing + execution model (`RoutingPort`, `WorkQueue`, KV context storage, `Sync
    - Define adapter-driven ingress/egress model for HTTP/WS/GraphQL over stable ports.
    - Keep runner transport-agnostic (`QueuePort` + transport adapters).
    - Cover network boundaries in tracing/telemetry observer contracts.
+14. **Engine cleanup continuation (active)**
+   - Strict runtime allow-list schema (no legacy runtime special-case logic).
+   - Rename routing facade contract to `RoutingService`.
+   - Remove reply-correlation policy from runner hot path.
+   - Remove compatibility tails in routing/runner/lifecycle.
+   - Execute via:
+     [engine_runtime_contract_cleanup_tdd_plan](engine_runtime_contract_cleanup_tdd_plan.md)
 
 ## Notes
 - Routing policy stays in Router.

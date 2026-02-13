@@ -7,7 +7,7 @@ def platform_discovery_modules() -> list[str]:
         "stream_kernel.adapters.file_io",
         "stream_kernel.platform.services",
         "stream_kernel.integration.work_queue",
-        "stream_kernel.integration.routing_port",
+        "stream_kernel.routing.routing_service",
         "stream_kernel.observability.adapters",
         "stream_kernel.observability.observers",
     ]

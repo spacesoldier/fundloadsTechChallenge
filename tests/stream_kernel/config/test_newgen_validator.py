@@ -72,6 +72,38 @@ def test_validate_newgen_config_requires_discovery_modules_list() -> None:
         validate_newgen_config(raw)
 
 
+def test_validate_newgen_config_rejects_unknown_runtime_top_level_key() -> None:
+    # Runtime contract is allow-list based; unknown top-level keys must fail fast.
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {
+            "discovery_modules": ["example.steps"],
+            "debug_profile": {"enabled": True},
+        },
+        "nodes": {},
+        "adapters": {"output_sink": {"binds": []}},
+    }
+    with pytest.raises(ConfigError, match="runtime has unsupported keys"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_runtime_pipeline_as_unknown_key() -> None:
+    # Legacy runtime.pipeline is removed and now rejected by strict runtime key allow-list.
+    raw = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {
+            "discovery_modules": ["example.steps"],
+            "pipeline": ["a", "b"],
+        },
+        "nodes": {},
+        "adapters": {"output_sink": {"binds": []}},
+    }
+    with pytest.raises(ConfigError, match="runtime has unsupported keys"):
+        validate_newgen_config(raw)
+
+
 def test_validate_newgen_config_rejects_output_sink_kind_field() -> None:
     raw = {
         "version": 1,
@@ -411,3 +443,290 @@ def test_validate_newgen_config_rejects_unknown_adapter_format_value() -> None:
     }
     with pytest.raises(ConfigError):
         validate_newgen_config(raw)
+
+
+def _phase0_base_config() -> dict[str, object]:
+    return {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {"discovery_modules": ["example.steps"]},
+        "nodes": {},
+        "adapters": {"source": {"binds": ["stream"]}},
+    }
+
+
+def test_validate_newgen_config_rejects_unknown_execution_ipc_transport() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {"execution_ipc": {"transport": "udp_local"}}
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_unknown_execution_ipc_auth_mode() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "bind_host": "127.0.0.1",
+            "auth": {"mode": "token"},
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_non_positive_execution_ipc_ttl() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "bind_host": "127.0.0.1",
+            "auth": {"mode": "hmac", "ttl_seconds": 0},
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_non_positive_execution_ipc_max_payload() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "bind_host": "127.0.0.1",
+            "auth": {"mode": "hmac"},
+            "max_payload_bytes": -1,
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_non_localhost_execution_ipc_bind_host() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "bind_host": "0.0.0.0",
+            "auth": {"mode": "hmac"},
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_accepts_valid_execution_ipc_config() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "bind_host": "127.0.0.1",
+            "bind_port": 0,
+            "auth": {"mode": "hmac", "ttl_seconds": 30, "nonce_cache_size": 1000},
+            "max_payload_bytes": 1024,
+        }
+    }
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    execution_ipc = platform.get("execution_ipc")
+    assert isinstance(execution_ipc, dict)
+    assert execution_ipc.get("transport") == "tcp_local"
+
+
+def test_validate_newgen_config_defaults_runtime_platform_bootstrap_mode_to_inline() -> None:
+    # BOOT-CFG-04: bootstrap mode defaults to inline when omitted.
+    raw = _phase0_base_config()
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    bootstrap = platform.get("bootstrap")
+    assert isinstance(bootstrap, dict)
+    assert bootstrap.get("mode") == "inline"
+
+
+def test_validate_newgen_config_rejects_unknown_bootstrap_mode() -> None:
+    # BOOT-CFG-01: unknown bootstrap mode must fail fast.
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {"bootstrap": {"mode": "detached_supervisor"}}
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_unknown_execution_ipc_secret_mode() -> None:
+    # BOOT-CFG-02: unknown execution_ipc auth secret mode must fail fast.
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "bind_host": "127.0.0.1",
+            "auth": {"mode": "hmac", "secret_mode": "vault_agent"},
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_unknown_execution_ipc_kdf() -> None:
+    # BOOT-CFG-03: unsupported KDF mode must fail fast.
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "bind_host": "127.0.0.1",
+            "auth": {"mode": "hmac", "secret_mode": "generated", "kdf": "pbkdf2"},
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_requires_tcp_local_transport_for_process_supervisor_mode() -> None:
+    # BOOT-CFG-05: process supervisor mode requires explicit tcp_local execution_ipc section.
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {"bootstrap": {"mode": "process_supervisor"}}
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_accepts_process_supervisor_mode_with_valid_execution_ipc() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "bootstrap": {"mode": "process_supervisor"},
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "bind_host": "127.0.0.1",
+            "bind_port": 0,
+            "auth": {
+                "mode": "hmac",
+                "secret_mode": "generated",
+                "kdf": "hkdf_sha256",
+                "ttl_seconds": 30,
+                "nonce_cache_size": 1000,
+            },
+            "max_payload_bytes": 1024,
+        },
+    }
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    bootstrap = platform.get("bootstrap")
+    assert isinstance(bootstrap, dict)
+    assert bootstrap.get("mode") == "process_supervisor"
+    execution_ipc = platform.get("execution_ipc")
+    assert isinstance(execution_ipc, dict)
+    auth = execution_ipc.get("auth")
+    assert isinstance(auth, dict)
+    assert auth.get("secret_mode") == "generated"
+    assert auth.get("kdf") == "hkdf_sha256"
+
+
+def test_validate_newgen_config_rejects_non_list_process_groups() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {"process_groups": "web"}
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_process_group_without_name() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {"process_groups": [{"runner": "sync"}]}
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_duplicate_process_group_names() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "process_groups": [{"name": "web"}, {"name": "web"}],
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_unknown_process_group_selector_field() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {"process_groups": [{"name": "web", "zones": ["a"]}]}
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_unknown_web_interface_kind() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["web"] = {"interfaces": [{"kind": "grpc"}]}
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_invalid_web_interface_binds() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["web"] = {"interfaces": [{"kind": "http", "binds": ["kv"]}]}
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_accepts_valid_web_interface() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["web"] = {"interfaces": [{"kind": "http", "binds": ["request", "response"]}]}
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    web = validated_runtime.get("web")
+    assert isinstance(web, dict)
+    interfaces = web.get("interfaces")
+    assert isinstance(interfaces, list)
+    assert interfaces[0]["kind"] == "http"
+
+
+def test_validate_newgen_config_keeps_memory_profile_compatible_when_new_sections_omitted() -> None:
+    raw = _phase0_base_config()
+    validated = validate_newgen_config(raw)
+    runtime = validated["runtime"]
+    assert isinstance(runtime, dict)
+    platform = runtime.get("platform")
+    assert isinstance(platform, dict)
+    kv = platform.get("kv")
+    assert isinstance(kv, dict)
+    assert kv.get("backend") == "memory"

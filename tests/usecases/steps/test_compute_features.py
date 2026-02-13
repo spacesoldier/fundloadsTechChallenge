@@ -73,6 +73,21 @@ def test_features_monday_multiplier_applied() -> None:
     assert result.features.effective_amount.amount == Decimal("20.00")
 
 
+def test_features_monday_multiplier_float_config_is_normalized_to_decimal() -> None:
+    # CLI YAML parsing yields float values; step must normalize multiplier to Decimal.
+    step = ComputeFeatures(
+        monday_multiplier_enabled=True,
+        monday_multiplier=2.0,  # type: ignore[arg-type]
+        apply_to="amount",
+        prime_checker=_FakePrimeChecker(set()),
+        prime_enabled=False,
+    )
+    msg = _classified_attempt(datetime(2000, 1, 3, 12, 0, 0, tzinfo=UTC))  # Monday
+    result = list(step(msg, ctx=None))[0]
+    assert result.features.risk_factor == Decimal("2.0")
+    assert result.features.effective_amount.amount == Decimal("20.00")
+
+
 def test_features_non_monday_multiplier_not_applied() -> None:
     # Non-Monday retains risk_factor=1 even when multiplier is enabled.
     step = ComputeFeatures(

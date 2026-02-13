@@ -7,6 +7,40 @@ from stream_kernel.routing.envelope import Envelope
 
 
 @dataclass(frozen=True, slots=True)
+class RoutingResult:
+    # Structured routing outcome used by execution engine.
+    local_deliveries: list[tuple[str, object]]
+    boundary_deliveries: list[object] = field(default_factory=list)
+    terminal_outputs: list[object] = field(default_factory=list)
+
+    def __iter__(self):
+        # Compatibility: allow legacy `for target, payload in router.route(...)`.
+        return iter(self.local_deliveries)
+
+    def __len__(self) -> int:
+        # Compatibility: allow `len(router.route(...))`.
+        return len(self.local_deliveries)
+
+    def __bool__(self) -> bool:
+        return bool(self.local_deliveries)
+
+    def __eq__(self, other: object) -> bool:
+        # Compatibility: keep existing list-based assertions stable during migration.
+        if isinstance(other, list):
+            return self.local_deliveries == other
+        if isinstance(other, RoutingResult):
+            return (
+                self.local_deliveries == other.local_deliveries
+                and self.boundary_deliveries == other.boundary_deliveries
+                and self.terminal_outputs == other.terminal_outputs
+            )
+        return NotImplemented
+
+    def as_pairs(self) -> list[tuple[str, object]]:
+        return list(self.local_deliveries)
+
+
+@dataclass(frozen=True, slots=True)
 class Router:
     # Routes outputs to consumers based on type or explicit target (Routing semantics §1–§3).
     consumers: dict[type, list[str]]
@@ -20,7 +54,7 @@ class Router:
             names.update(node_list)
         object.__setattr__(self, "_known_nodes", frozenset(names))
 
-    def route(self, outputs: Iterable[object], *, source: str | None = None) -> list[tuple[str, object]]:
+    def route(self, outputs: Iterable[object], *, source: str | None = None) -> RoutingResult:
         # Convert outputs into (target, payload) deliveries (Routing semantics §5).
         deliveries: list[tuple[str, object]] = []
         for output in outputs:
@@ -67,7 +101,7 @@ class Router:
             # Default fan‑out by type (Routing semantics §5.1).
             for target in consumers:
                 deliveries.append((target, payload))
-        return deliveries
+        return RoutingResult(local_deliveries=deliveries)
 
     @staticmethod
     def _normalize(output: object) -> Envelope:

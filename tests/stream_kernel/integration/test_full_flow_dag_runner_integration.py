@@ -9,9 +9,9 @@ from dataclasses import dataclass, field
 from stream_kernel.application_context import ApplicationContext
 from stream_kernel.platform.services.context import InMemoryKvContextService
 from stream_kernel.platform.services.observability import NoOpObservabilityService
-from stream_kernel.execution.runner import SyncRunner
+from stream_kernel.execution.runtime.runner import SyncRunner
 from stream_kernel.integration.kv_store import InMemoryKvStore
-from stream_kernel.integration.routing_port import RoutingPort
+from stream_kernel.routing.routing_service import RoutingService
 from stream_kernel.integration.work_queue import InMemoryQueue
 from stream_kernel.kernel.node import node
 from stream_kernel.routing.envelope import Envelope
@@ -78,7 +78,7 @@ def test_full_flow_runner_routing_with_dag_builder() -> None:
 
     # Build routing registry and scenario instances.
     registry = ctx.build_consumer_registry()
-    routing = RoutingPort(registry=registry, strict=True)
+    routing = RoutingService(registry=registry, strict=True)
 
     scenario = ctx.build_scenario(
         scenario_id="s1",

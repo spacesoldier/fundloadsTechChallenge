@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from stream_kernel.execution.observer import ObserverFactoryContext
+from stream_kernel.execution.observers.observer import ObserverFactoryContext
 from stream_kernel.observability.observers.tracing import build_tracing_observer
 
 

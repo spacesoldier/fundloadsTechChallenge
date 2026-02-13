@@ -12,7 +12,15 @@ from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
 @runtime_checkable
 class ContextService(Protocol):
     # Service-level contract for context lifecycle and metadata views.
-    def seed(self, *, trace_id: str, payload: object, run_id: str, scenario_id: str) -> None:
+    def seed(
+        self,
+        *,
+        trace_id: str,
+        payload: object,
+        run_id: str,
+        scenario_id: str,
+        reply_to: str | None = None,
+    ) -> None:
         raise NotImplementedError("ContextService.seed must be implemented")
 
     def metadata(self, trace_id: str | None, *, full: bool) -> dict[str, object]:
@@ -25,7 +33,15 @@ class InMemoryKvContextService(ContextService):
     # Default context service backed by standard KV storage.
     store: KVStore = inject.kv(KVStore, qualifier="context")
 
-    def seed(self, *, trace_id: str, payload: object, run_id: str, scenario_id: str) -> None:
+    def seed(
+        self,
+        *,
+        trace_id: str,
+        payload: object,
+        run_id: str,
+        scenario_id: str,
+        reply_to: str | None = None,
+    ) -> None:
         # Transport sequence (if present) is persisted for ordered sink delivery modes.
         seq = getattr(payload, "seq", None)
         seeded: dict[str, object] = {
@@ -35,6 +51,8 @@ class InMemoryKvContextService(ContextService):
         }
         if isinstance(seq, int):
             seeded["__seq"] = seq
+        if isinstance(reply_to, str) and reply_to:
+            seeded["__reply_to"] = reply_to
         self.store.set(
             trace_id,
             seeded,

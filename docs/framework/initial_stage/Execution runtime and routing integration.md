@@ -311,6 +311,34 @@ Router responsibilities (pure logic):
 All **routing policy** lives in the Router.  
 All **execution policy** lives in the Runner.
 
+### 7.2 Target model (post-Phase 4bis)
+
+The target split is stricter than current implementation:
+
+1. `Runner` executes nodes and enqueues deliveries only.
+2. `Router` produces structured routing outcomes:
+   - local deliveries
+   - boundary deliveries (grouped by process group)
+   - terminal outputs
+3. `ReplyCoordinatorService` owns correlation:
+   - ingress registration (`trace_id`, `reply_to`, timeout)
+   - terminal completion (`complete_if_waiting`)
+   - timeout/cancel lifecycle
+
+Performance rule:
+
+- request/reply checks must not be done on every hop;
+- correlation lookup happens only on ingress registration and terminal completion (O(1)).
+
+Process-boundary rule:
+
+- boundary dispatch is placement-driven (`target node -> process_group`),
+  not global batch-level group selection.
+
+Reference migration plan:
+
+- [engine runner/router target model plan](./_work/engine_runner_router_target_model_tdd_plan.md)
+
 ### 7.1 Execution-level tracing boundary
 
 Execution observers (including tracing) are called by the runner around node invocation.

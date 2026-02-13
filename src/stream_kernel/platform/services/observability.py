@@ -4,8 +4,14 @@ from dataclasses import dataclass
 from dataclasses import field
 from typing import Protocol, runtime_checkable
 
+from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.service import service
-from stream_kernel.execution.observer import ExecutionObserver
+from stream_kernel.execution.observers.observer import ExecutionObserver
+from stream_kernel.platform.services.reply_coordinator import (
+    ReplyCoordinatorService,
+    legacy_reply_coordinator,
+)
+from stream_kernel.platform.services.reply_waiter import TerminalEvent
 
 
 @runtime_checkable
@@ -163,3 +169,133 @@ class FanoutObservabilityService(ObservabilityService):
     def on_run_end(self) -> None:
         for observer in self.observers:
             observer.on_run_end()
+
+
+@dataclass(slots=True)
+class ReplyAwareObservabilityService(ObservabilityService):
+    # Decorates base observability with correlated request/reply policy hooks.
+    inner: object
+    reply_coordinator: object = inject.service(ReplyCoordinatorService)
+
+    def before_node(
+        self,
+        *,
+        node_name: str,
+        payload: object,
+        ctx: dict[str, object],
+        trace_id: str | None,
+    ) -> object | None:
+        return self._inner().before_node(
+            node_name=node_name,
+            payload=payload,
+            ctx=ctx,
+            trace_id=trace_id,
+        )
+
+    def after_node(
+        self,
+        *,
+        node_name: str,
+        payload: object,
+        ctx: dict[str, object],
+        trace_id: str | None,
+        outputs: list[object],
+        state: object | None,
+    ) -> None:
+        self._inner().after_node(
+            node_name=node_name,
+            payload=payload,
+            ctx=ctx,
+            trace_id=trace_id,
+            outputs=outputs,
+            state=state,
+        )
+
+    def on_node_error(
+        self,
+        *,
+        node_name: str,
+        payload: object,
+        ctx: dict[str, object],
+        trace_id: str | None,
+        error: Exception,
+        state: object | None,
+    ) -> None:
+        self._inner().on_node_error(
+            node_name=node_name,
+            payload=payload,
+            ctx=ctx,
+            trace_id=trace_id,
+            error=error,
+            state=state,
+        )
+
+    def on_run_end(self) -> None:
+        self._inner().on_run_end()
+
+    def on_ingress(
+        self,
+        *,
+        trace_id: str | None,
+        reply_to: str | None,
+    ) -> None:
+        on_ingress = getattr(self._inner(), "on_ingress", None)
+        if callable(on_ingress):
+            on_ingress(trace_id=trace_id, reply_to=reply_to)
+        self._reply_coordinator().register_if_requested(
+            trace_id=trace_id,
+            reply_to=reply_to,
+        )
+
+    def on_terminal_event(
+        self,
+        *,
+        trace_id: str | None,
+        terminal_event: TerminalEvent | None,
+    ) -> None:
+        on_terminal_event = getattr(self._inner(), "on_terminal_event", None)
+        if callable(on_terminal_event):
+            on_terminal_event(trace_id=trace_id, terminal_event=terminal_event)
+        self._reply_coordinator().complete_if_waiting(
+            trace_id=trace_id,
+            terminal_event=terminal_event,
+        )
+
+    def _inner(self) -> ObservabilityService:
+        if isinstance(self.inner, ObservabilityService):
+            return self.inner
+        if (
+            callable(getattr(self.inner, "before_node", None))
+            and callable(getattr(self.inner, "after_node", None))
+            and callable(getattr(self.inner, "on_node_error", None))
+            and callable(getattr(self.inner, "on_run_end", None))
+        ):
+            return self.inner  # type: ignore[return-value]
+        raise ValueError("ReplyAwareObservabilityService inner is not a valid ObservabilityService")
+
+    def _reply_coordinator(self) -> ReplyCoordinatorService:
+        if isinstance(self.reply_coordinator, ReplyCoordinatorService):
+            return self.reply_coordinator
+        if (
+            callable(getattr(self.reply_coordinator, "register_if_requested", None))
+            and callable(getattr(self.reply_coordinator, "complete_if_waiting", None))
+        ):
+            return self.reply_coordinator  # type: ignore[return-value]
+        raise ValueError(
+            "ReplyAwareObservabilityService reply_coordinator is not resolved via DI"
+        )
+
+
+def legacy_reply_aware_observability(
+    *,
+    inner: object,
+    reply_waiter: object,
+    timeout_seconds: int = 30,
+) -> ReplyAwareObservabilityService:
+    # Transitional helper for tests/callers that still pass waiter directly to runner.
+    service = ReplyAwareObservabilityService(inner=inner)
+    service.reply_coordinator = legacy_reply_coordinator(
+        reply_waiter=reply_waiter,
+        timeout_seconds=timeout_seconds,
+    )
+    return service

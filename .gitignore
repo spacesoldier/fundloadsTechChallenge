@@ -67,3 +67,12 @@ src/stream_kernel/observability/observers/__pycache__/*
 src/stream_kernel/platform/__pycache__/*
 src/stream_kernel/platform/services/__pycache__/*
 tests/stream_kernel/observability/__pycache__/*
+src/stream_kernel/execution/observers/__pycache__/*
+src/stream_kernel/execution/orchestration/__pycache__/*
+src/stream_kernel/execution/runtime/__pycache__/*
+src/stream_kernel/execution/transport/__pycache__/*
+tests/stream_kernel/execution/observers/__pycache__/*
+tests/stream_kernel/execution/orchestration/__pycache__/*
+tests/stream_kernel/execution/runtime/__pycache__/*
+tests/stream_kernel/execution/transport/__pycache__/*
+tests/stream_kernel/platform/services/__pycache__/*

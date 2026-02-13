@@ -16,6 +16,14 @@ Codec/backend alignment:
 
 - network adapters and file adapters must reuse the same transport codec layer;
 - see [Transport codecs and file IO options](../Transport%20codecs%20and%20file%20IO%20options.md).
+- process-isolated execution and secure IPC rollout details:
+  [web_multiprocessing_secure_tcp_fastapi_plan](web_multiprocessing_secure_tcp_fastapi_plan.md).
+- bootstrap-process and generated-secret rollout details (Phase 3):
+  [web_phase3_bootstrap_process_and_secret_distribution_tdd_plan](web_phase3_bootstrap_process_and_secret_distribution_tdd_plan.md).
+- Phase 3 Step A contract freeze spec:
+  [web_phase3_stepa_contract_freeze_spec](web_phase3_stepa_contract_freeze_spec.md).
+- Phase 4 reply-correlation rollout details:
+  [web_phase4_reply_correlation_tdd_plan](web_phase4_reply_correlation_tdd_plan.md).
 
 ## Scope
 

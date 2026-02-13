@@ -43,8 +43,14 @@ class ComputeFeatures:
         if not self.monday_multiplier_enabled:
             return Decimal("1")
         if ts.weekday() == 0:
-            return self.monday_multiplier
+            return self._normalized_multiplier()
         return Decimal("1")
+
+    def _normalized_multiplier(self) -> Decimal:
+        # YAML numbers may arrive as float; normalize to Decimal for Money math.
+        if isinstance(self.monday_multiplier, Decimal):
+            return self.monday_multiplier
+        return Decimal(str(self.monday_multiplier))
 
     def _effective_amount(self, amount: Money, risk_factor: Decimal) -> Money:
         # Default semantics apply multiplier to amount; "limits" mode keeps amount unchanged.
