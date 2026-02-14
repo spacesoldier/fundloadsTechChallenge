@@ -158,4 +158,5 @@ def _secure_to_envelope(secure: SecureEnvelope) -> Envelope:
         trace_id=secure.trace_id,
         target=secure.target,
         reply_to=secure.reply_to,
+        span_id=secure.span_id,
     )

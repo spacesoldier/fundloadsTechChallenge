@@ -19,12 +19,23 @@ _SUPPORTED_EXECUTION_IPC_KDFS = {"none", "hkdf_sha256"}
 _SUPPORTED_WEB_INTERFACE_KINDS = {"http", "http_stream", "websocket", "graphql"}
 _SUPPORTED_WEB_BIND_PORT_TYPES = {"request", "response", "stream", "kv_stream"}
 _PROCESS_GROUP_SELECTOR_KEYS = {"stages", "tags", "runners", "nodes"}
+_PROCESS_GROUP_RUNTIME_KEYS = {
+    "workers",
+    "runner_profile",
+    "heartbeat_seconds",
+    "start_timeout_seconds",
+    "stop_timeout_seconds",
+}
+_SUPPORTED_OBSERVABILITY_TRACE_EXPORTER_KINDS = {"jsonl", "stdout", "otel_otlp", "opentracing_bridge"}
+_SUPPORTED_OBSERVABILITY_LOG_EXPORTER_KINDS = {"stdout", "jsonl", "otel_logs_otlp"}
+_SUPPORTED_OBSERVABILITY_LOG_LEVELS = {"info", "debug"}
 _SUPPORTED_RUNTIME_KEYS = {
     "strict",
     "discovery_modules",
     "platform",
     "ordering",
     "web",
+    "observability",
     "tracing",
     "cli",
 }
@@ -45,6 +56,7 @@ def validate_newgen_config(raw: object) -> dict[str, object]:
     _normalize_runtime_platform(runtime)
     _normalize_runtime_ordering(runtime)
     _normalize_runtime_web(runtime)
+    _normalize_runtime_observability(runtime)
     _normalize_runtime_tracing(runtime)
     _normalize_runtime_cli(runtime)
     nodes = _optional_mapping(raw, "nodes")
@@ -174,91 +186,19 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
     if execution_ipc is not None:
         if not isinstance(execution_ipc, dict):
             raise ConfigError("runtime.platform.execution_ipc must be a mapping when provided")
+        _normalize_execution_ipc_mapping(
+            execution_ipc,
+            prefix="runtime.platform.execution_ipc",
+        )
 
-        transport = execution_ipc.get("transport", "tcp_local")
-        if not isinstance(transport, str) or not transport:
-            raise ConfigError("runtime.platform.execution_ipc.transport must be a non-empty string when provided")
-        if transport not in _SUPPORTED_EXECUTION_IPC_TRANSPORTS:
-            raise ConfigError(
-                "runtime.platform.execution_ipc.transport must be one of: "
-                f"{sorted(_SUPPORTED_EXECUTION_IPC_TRANSPORTS)}"
+        control = execution_ipc.get("control")
+        if control is not None:
+            if not isinstance(control, dict):
+                raise ConfigError("runtime.platform.execution_ipc.control must be a mapping when provided")
+            _normalize_execution_ipc_mapping(
+                control,
+                prefix="runtime.platform.execution_ipc.control",
             )
-        execution_ipc["transport"] = transport
-
-        bind_host = execution_ipc.get("bind_host", "127.0.0.1")
-        if not isinstance(bind_host, str) or not bind_host:
-            raise ConfigError("runtime.platform.execution_ipc.bind_host must be a non-empty string when provided")
-        if transport == "tcp_local" and bind_host != "127.0.0.1":
-            raise ConfigError("runtime.platform.execution_ipc.bind_host must be 127.0.0.1 for tcp_local transport")
-        execution_ipc["bind_host"] = bind_host
-
-        bind_port = execution_ipc.get("bind_port", 0)
-        if not isinstance(bind_port, int):
-            raise ConfigError("runtime.platform.execution_ipc.bind_port must be an integer when provided")
-        if bind_port < 0 or bind_port > 65535:
-            raise ConfigError("runtime.platform.execution_ipc.bind_port must be in range [0, 65535]")
-        execution_ipc["bind_port"] = bind_port
-
-        auth = execution_ipc.get("auth", {})
-        if not isinstance(auth, dict):
-            raise ConfigError("runtime.platform.execution_ipc.auth must be a mapping when provided")
-        execution_ipc["auth"] = auth
-
-        auth_mode = auth.get("mode", "hmac")
-        if not isinstance(auth_mode, str) or not auth_mode:
-            raise ConfigError("runtime.platform.execution_ipc.auth.mode must be a non-empty string when provided")
-        if auth_mode not in _SUPPORTED_EXECUTION_IPC_AUTH_MODES:
-            raise ConfigError(
-                "runtime.platform.execution_ipc.auth.mode must be one of: "
-                f"{sorted(_SUPPORTED_EXECUTION_IPC_AUTH_MODES)}"
-            )
-        auth["mode"] = auth_mode
-
-        secret_mode = auth.get("secret_mode", "static")
-        if not isinstance(secret_mode, str) or not secret_mode:
-            raise ConfigError(
-                "runtime.platform.execution_ipc.auth.secret_mode must be a non-empty string when provided"
-            )
-        if secret_mode not in _SUPPORTED_EXECUTION_IPC_SECRET_MODES:
-            raise ConfigError(
-                "runtime.platform.execution_ipc.auth.secret_mode must be one of: "
-                f"{sorted(_SUPPORTED_EXECUTION_IPC_SECRET_MODES)}"
-            )
-        auth["secret_mode"] = secret_mode
-
-        default_kdf = "hkdf_sha256" if secret_mode == "generated" else "none"
-        kdf = auth.get("kdf", default_kdf)
-        if not isinstance(kdf, str) or not kdf:
-            raise ConfigError("runtime.platform.execution_ipc.auth.kdf must be a non-empty string when provided")
-        if kdf not in _SUPPORTED_EXECUTION_IPC_KDFS:
-            raise ConfigError(
-                "runtime.platform.execution_ipc.auth.kdf must be one of: "
-                f"{sorted(_SUPPORTED_EXECUTION_IPC_KDFS)}"
-            )
-        auth["kdf"] = kdf
-
-        ttl_seconds = auth.get("ttl_seconds", 30)
-        if not isinstance(ttl_seconds, int):
-            raise ConfigError("runtime.platform.execution_ipc.auth.ttl_seconds must be an integer when provided")
-        if ttl_seconds <= 0:
-            raise ConfigError("runtime.platform.execution_ipc.auth.ttl_seconds must be > 0")
-        auth["ttl_seconds"] = ttl_seconds
-
-        nonce_cache_size = auth.get("nonce_cache_size", 100000)
-        if not isinstance(nonce_cache_size, int):
-            raise ConfigError(
-                "runtime.platform.execution_ipc.auth.nonce_cache_size must be an integer when provided"
-            )
-        if nonce_cache_size <= 0:
-            raise ConfigError("runtime.platform.execution_ipc.auth.nonce_cache_size must be > 0")
-        auth["nonce_cache_size"] = nonce_cache_size
-
-        max_payload_bytes = execution_ipc.get("max_payload_bytes", 1048576)
-        if not isinstance(max_payload_bytes, int):
-            raise ConfigError("runtime.platform.execution_ipc.max_payload_bytes must be an integer when provided")
-        if max_payload_bytes <= 0:
-            raise ConfigError("runtime.platform.execution_ipc.max_payload_bytes must be > 0")
-        execution_ipc["max_payload_bytes"] = max_payload_bytes
 
     if bootstrap_mode == "process_supervisor":
         if execution_ipc is None:
@@ -289,7 +229,7 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
                 raise ConfigError(f"runtime.platform.process_groups contains duplicate name: {name}")
             seen_names.add(name)
 
-            allowed = _PROCESS_GROUP_SELECTOR_KEYS | {"name"}
+            allowed = _PROCESS_GROUP_SELECTOR_KEYS | _PROCESS_GROUP_RUNTIME_KEYS | {"name"}
             unknown_keys = [key for key in group if key not in allowed]
             if unknown_keys:
                 raise ConfigError(
@@ -306,6 +246,174 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
                     raise ConfigError(
                         f"runtime.platform.process_groups[{index}].{key} entries must be non-empty strings"
                     )
+
+            workers = group.get("workers", 1)
+            if not isinstance(workers, int):
+                raise ConfigError(f"runtime.platform.process_groups[{index}].workers must be an integer when provided")
+            if workers <= 0:
+                raise ConfigError(f"runtime.platform.process_groups[{index}].workers must be > 0")
+            group["workers"] = workers
+
+            runner_profile = group.get("runner_profile", "sync")
+            if not isinstance(runner_profile, str) or not runner_profile:
+                raise ConfigError(
+                    f"runtime.platform.process_groups[{index}].runner_profile must be a non-empty string when provided"
+                )
+            group["runner_profile"] = runner_profile
+
+            heartbeat_seconds = group.get("heartbeat_seconds", 5)
+            if not isinstance(heartbeat_seconds, int):
+                raise ConfigError(
+                    f"runtime.platform.process_groups[{index}].heartbeat_seconds must be an integer when provided"
+                )
+            if heartbeat_seconds <= 0:
+                raise ConfigError(f"runtime.platform.process_groups[{index}].heartbeat_seconds must be > 0")
+            group["heartbeat_seconds"] = heartbeat_seconds
+
+            start_timeout_seconds = group.get("start_timeout_seconds", 30)
+            if not isinstance(start_timeout_seconds, int):
+                raise ConfigError(
+                    f"runtime.platform.process_groups[{index}].start_timeout_seconds must be an integer when provided"
+                )
+            if start_timeout_seconds <= 0:
+                raise ConfigError(f"runtime.platform.process_groups[{index}].start_timeout_seconds must be > 0")
+            group["start_timeout_seconds"] = start_timeout_seconds
+
+            stop_timeout_seconds = group.get("stop_timeout_seconds", 30)
+            if not isinstance(stop_timeout_seconds, int):
+                raise ConfigError(
+                    f"runtime.platform.process_groups[{index}].stop_timeout_seconds must be an integer when provided"
+                )
+            if stop_timeout_seconds <= 0:
+                raise ConfigError(f"runtime.platform.process_groups[{index}].stop_timeout_seconds must be > 0")
+            group["stop_timeout_seconds"] = stop_timeout_seconds
+
+    readiness = platform.get("readiness")
+    if readiness is not None:
+        if not isinstance(readiness, dict):
+            raise ConfigError("runtime.platform.readiness must be a mapping when provided")
+        enabled = readiness.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ConfigError("runtime.platform.readiness.enabled must be a boolean when provided")
+        readiness["enabled"] = enabled
+
+        start_work_on_all_groups_ready = readiness.get("start_work_on_all_groups_ready", True)
+        if not isinstance(start_work_on_all_groups_ready, bool):
+            raise ConfigError(
+                "runtime.platform.readiness.start_work_on_all_groups_ready must be a boolean when provided"
+            )
+        readiness["start_work_on_all_groups_ready"] = start_work_on_all_groups_ready
+
+        readiness_timeout_seconds = readiness.get("readiness_timeout_seconds", 30)
+        if not isinstance(readiness_timeout_seconds, int):
+            raise ConfigError(
+                "runtime.platform.readiness.readiness_timeout_seconds must be an integer when provided"
+            )
+        if readiness_timeout_seconds <= 0:
+            raise ConfigError("runtime.platform.readiness.readiness_timeout_seconds must be > 0")
+        readiness["readiness_timeout_seconds"] = readiness_timeout_seconds
+
+    routing_cache = platform.get("routing_cache")
+    if routing_cache is not None:
+        if not isinstance(routing_cache, dict):
+            raise ConfigError("runtime.platform.routing_cache must be a mapping when provided")
+        unknown_keys = [key for key in routing_cache if key not in {"enabled", "negative_cache", "max_entries"}]
+        if unknown_keys:
+            raise ConfigError(
+                "runtime.platform.routing_cache has unsupported keys: "
+                f"{sorted(unknown_keys)}"
+            )
+        enabled = routing_cache.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ConfigError("runtime.platform.routing_cache.enabled must be a boolean when provided")
+        routing_cache["enabled"] = enabled
+
+        negative_cache = routing_cache.get("negative_cache", True)
+        if not isinstance(negative_cache, bool):
+            raise ConfigError("runtime.platform.routing_cache.negative_cache must be a boolean when provided")
+        routing_cache["negative_cache"] = negative_cache
+
+        max_entries = routing_cache.get("max_entries", 100000)
+        if not isinstance(max_entries, int):
+            raise ConfigError("runtime.platform.routing_cache.max_entries must be an integer when provided")
+        if max_entries <= 0:
+            raise ConfigError("runtime.platform.routing_cache.max_entries must be > 0")
+        routing_cache["max_entries"] = max_entries
+
+
+def _normalize_execution_ipc_mapping(mapping: dict[str, object], *, prefix: str) -> None:
+    transport = mapping.get("transport", "tcp_local")
+    if not isinstance(transport, str) or not transport:
+        raise ConfigError(f"{prefix}.transport must be a non-empty string when provided")
+    if transport not in _SUPPORTED_EXECUTION_IPC_TRANSPORTS:
+        raise ConfigError(
+            f"{prefix}.transport must be one of: {sorted(_SUPPORTED_EXECUTION_IPC_TRANSPORTS)}"
+        )
+    mapping["transport"] = transport
+
+    bind_host = mapping.get("bind_host", "127.0.0.1")
+    if not isinstance(bind_host, str) or not bind_host:
+        raise ConfigError(f"{prefix}.bind_host must be a non-empty string when provided")
+    if transport == "tcp_local" and bind_host != "127.0.0.1":
+        raise ConfigError(f"{prefix}.bind_host must be 127.0.0.1 for tcp_local transport")
+    mapping["bind_host"] = bind_host
+
+    bind_port = mapping.get("bind_port", 0)
+    if not isinstance(bind_port, int):
+        raise ConfigError(f"{prefix}.bind_port must be an integer when provided")
+    if bind_port < 0 or bind_port > 65535:
+        raise ConfigError(f"{prefix}.bind_port must be in range [0, 65535]")
+    mapping["bind_port"] = bind_port
+
+    auth = mapping.get("auth", {})
+    if not isinstance(auth, dict):
+        raise ConfigError(f"{prefix}.auth must be a mapping when provided")
+    mapping["auth"] = auth
+
+    auth_mode = auth.get("mode", "hmac")
+    if not isinstance(auth_mode, str) or not auth_mode:
+        raise ConfigError(f"{prefix}.auth.mode must be a non-empty string when provided")
+    if auth_mode not in _SUPPORTED_EXECUTION_IPC_AUTH_MODES:
+        raise ConfigError(f"{prefix}.auth.mode must be one of: {sorted(_SUPPORTED_EXECUTION_IPC_AUTH_MODES)}")
+    auth["mode"] = auth_mode
+
+    secret_mode = auth.get("secret_mode", "static")
+    if not isinstance(secret_mode, str) or not secret_mode:
+        raise ConfigError(f"{prefix}.auth.secret_mode must be a non-empty string when provided")
+    if secret_mode not in _SUPPORTED_EXECUTION_IPC_SECRET_MODES:
+        raise ConfigError(
+            f"{prefix}.auth.secret_mode must be one of: {sorted(_SUPPORTED_EXECUTION_IPC_SECRET_MODES)}"
+        )
+    auth["secret_mode"] = secret_mode
+
+    default_kdf = "hkdf_sha256" if secret_mode == "generated" else "none"
+    kdf = auth.get("kdf", default_kdf)
+    if not isinstance(kdf, str) or not kdf:
+        raise ConfigError(f"{prefix}.auth.kdf must be a non-empty string when provided")
+    if kdf not in _SUPPORTED_EXECUTION_IPC_KDFS:
+        raise ConfigError(f"{prefix}.auth.kdf must be one of: {sorted(_SUPPORTED_EXECUTION_IPC_KDFS)}")
+    auth["kdf"] = kdf
+
+    ttl_seconds = auth.get("ttl_seconds", 30)
+    if not isinstance(ttl_seconds, int):
+        raise ConfigError(f"{prefix}.auth.ttl_seconds must be an integer when provided")
+    if ttl_seconds <= 0:
+        raise ConfigError(f"{prefix}.auth.ttl_seconds must be > 0")
+    auth["ttl_seconds"] = ttl_seconds
+
+    nonce_cache_size = auth.get("nonce_cache_size", 100000)
+    if not isinstance(nonce_cache_size, int):
+        raise ConfigError(f"{prefix}.auth.nonce_cache_size must be an integer when provided")
+    if nonce_cache_size <= 0:
+        raise ConfigError(f"{prefix}.auth.nonce_cache_size must be > 0")
+    auth["nonce_cache_size"] = nonce_cache_size
+
+    max_payload_bytes = mapping.get("max_payload_bytes", 1048576)
+    if not isinstance(max_payload_bytes, int):
+        raise ConfigError(f"{prefix}.max_payload_bytes must be an integer when provided")
+    if max_payload_bytes <= 0:
+        raise ConfigError(f"{prefix}.max_payload_bytes must be > 0")
+    mapping["max_payload_bytes"] = max_payload_bytes
 
 
 def _normalize_runtime_ordering(runtime: dict[str, object]) -> None:
@@ -364,6 +472,83 @@ def _normalize_runtime_web(runtime: dict[str, object]) -> None:
                 f"runtime.web.interfaces[{index}].binds entries must be one of: "
                 f"{sorted(_SUPPORTED_WEB_BIND_PORT_TYPES)}"
             )
+
+
+def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
+    observability = runtime.get("observability")
+    if observability is None:
+        return
+    if not isinstance(observability, dict):
+        raise ConfigError("runtime.observability must be a mapping when provided")
+    runtime["observability"] = observability
+
+    tracing = observability.get("tracing", {})
+    if not isinstance(tracing, dict):
+        raise ConfigError("runtime.observability.tracing must be a mapping when provided")
+    observability["tracing"] = tracing
+    tracing_exporters = tracing.get("exporters", [])
+    if not isinstance(tracing_exporters, list):
+        raise ConfigError("runtime.observability.tracing.exporters must be a list when provided")
+    for index, exporter in enumerate(tracing_exporters):
+        if not isinstance(exporter, dict):
+            raise ConfigError(f"runtime.observability.tracing.exporters[{index}] must be a mapping")
+        kind = exporter.get("kind")
+        if not isinstance(kind, str) or not kind:
+            raise ConfigError(f"runtime.observability.tracing.exporters[{index}].kind must be a non-empty string")
+        if kind not in _SUPPORTED_OBSERVABILITY_TRACE_EXPORTER_KINDS:
+            raise ConfigError(
+                "runtime.observability.tracing.exporters["
+                f"{index}].kind must be one of: {sorted(_SUPPORTED_OBSERVABILITY_TRACE_EXPORTER_KINDS)}"
+            )
+        settings = exporter.get("settings", {})
+        if not isinstance(settings, dict):
+            raise ConfigError(
+                f"runtime.observability.tracing.exporters[{index}].settings must be a mapping when provided"
+            )
+        exporter["settings"] = settings
+
+    logging = observability.get("logging", {})
+    if not isinstance(logging, dict):
+        raise ConfigError("runtime.observability.logging must be a mapping when provided")
+    observability["logging"] = logging
+    log_exporters = logging.get("exporters", [])
+    if not isinstance(log_exporters, list):
+        raise ConfigError("runtime.observability.logging.exporters must be a list when provided")
+    for index, exporter in enumerate(log_exporters):
+        if not isinstance(exporter, dict):
+            raise ConfigError(f"runtime.observability.logging.exporters[{index}] must be a mapping")
+        kind = exporter.get("kind")
+        if not isinstance(kind, str) or not kind:
+            raise ConfigError(f"runtime.observability.logging.exporters[{index}].kind must be a non-empty string")
+        if kind not in _SUPPORTED_OBSERVABILITY_LOG_EXPORTER_KINDS:
+            raise ConfigError(
+                "runtime.observability.logging.exporters["
+                f"{index}].kind must be one of: {sorted(_SUPPORTED_OBSERVABILITY_LOG_EXPORTER_KINDS)}"
+            )
+        settings = exporter.get("settings", {})
+        if not isinstance(settings, dict):
+            raise ConfigError(
+                f"runtime.observability.logging.exporters[{index}].settings must be a mapping when provided"
+            )
+        exporter["settings"] = settings
+
+    lifecycle_events = logging.get("lifecycle_events", {})
+    if not isinstance(lifecycle_events, dict):
+        raise ConfigError("runtime.observability.logging.lifecycle_events must be a mapping when provided")
+    logging["lifecycle_events"] = lifecycle_events
+    enabled = lifecycle_events.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ConfigError("runtime.observability.logging.lifecycle_events.enabled must be a boolean when provided")
+    lifecycle_events["enabled"] = enabled
+    level = lifecycle_events.get("level", "info")
+    if not isinstance(level, str) or not level:
+        raise ConfigError("runtime.observability.logging.lifecycle_events.level must be a non-empty string")
+    if level not in _SUPPORTED_OBSERVABILITY_LOG_LEVELS:
+        raise ConfigError(
+            "runtime.observability.logging.lifecycle_events.level must be one of: "
+            f"{sorted(_SUPPORTED_OBSERVABILITY_LOG_LEVELS)}"
+        )
+    lifecycle_events["level"] = level
 
 
 def _normalize_runtime_tracing(runtime: dict[str, object]) -> None:

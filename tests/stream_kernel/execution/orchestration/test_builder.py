@@ -1011,6 +1011,7 @@ def _runtime_artifacts_for_bootstrap_supervisor(
     runtime: dict[str, object],
     supervisor: object | None,
     reply_waiter: object | None = None,
+    adapters: dict[str, object] | None = None,
 ) -> RuntimeBuildArtifacts:
     injection = InjectionRegistry()
     if supervisor is not None:
@@ -1035,6 +1036,7 @@ def _runtime_artifacts_for_bootstrap_supervisor(
         scenario_scope=scope,
         full_context_nodes=set(),
         runtime=runtime,
+        adapters=dict(adapters or {}),
     )
 
 
@@ -1529,6 +1531,202 @@ def test_execute_runtime_artifacts_process_supervisor_passes_child_bootstrap_met
     assert getattr(bundle, "key_bundle").execution_ipc.secret_mode == "generated"
     # Metadata-only contract: no loaded module objects are passed through bundle.
     assert not hasattr(bundle, "modules")
+
+
+def test_execute_runtime_artifacts_process_supervisor_passes_adapter_config_to_child_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # CHILD-BOOT-02: child bootstrap bundle must carry adapter config for runtime source/sink wrappers.
+    captured: dict[str, object] = {}
+
+    class _Supervisor:
+        def load_child_bootstrap_bundle(self, bundle: object) -> None:
+            captured["bundle"] = bundle
+
+        def start_groups(self, group_names: list[str]) -> None:
+            _ = group_names
+            return None
+
+        def wait_ready(self, timeout_seconds: int) -> bool:
+            _ = timeout_seconds
+            return True
+
+        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
+            _ = graceful_timeout_seconds
+            _ = drain_inflight
+            return None
+
+    monkeypatch.setattr(builder_module, "run_with_sync_runner", lambda **_kwargs: None)
+    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
+        runtime={
+            "discovery_modules": ["fund_load"],
+            "platform": {
+                "execution_ipc": {
+                    "transport": "tcp_local",
+                    "auth": {"mode": "hmac", "secret_mode": "generated", "kdf": "hkdf_sha256"},
+                },
+                "bootstrap": {"mode": "process_supervisor"},
+                "process_groups": [{"name": "execution.cpu"}],
+            },
+        },
+        supervisor=_Supervisor(),
+        adapters={
+            "source": {"settings": {"path": "input.txt"}, "binds": ["stream"]},
+            "sink": {"settings": {"path": "output.txt"}, "binds": ["stream"]},
+        },
+    )
+    execute_runtime_artifacts(artifacts)
+
+    bundle = captured.get("bundle")
+    assert bundle is not None
+    adapters = getattr(bundle, "adapters")
+    assert isinstance(adapters, dict)
+    assert "source" in adapters
+    assert "sink" in adapters
+
+
+def test_execute_runtime_artifacts_process_supervisor_passes_runtime_config_to_child_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # CHILD-BOOT-03: child bootstrap bundle must carry full config for node-level config injection in worker.
+    captured: dict[str, object] = {}
+
+    class _Supervisor:
+        def load_child_bootstrap_bundle(self, bundle: object) -> None:
+            captured["bundle"] = bundle
+
+        def start_groups(self, group_names: list[str]) -> None:
+            _ = group_names
+            return None
+
+        def wait_ready(self, timeout_seconds: int) -> bool:
+            _ = timeout_seconds
+            return True
+
+        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
+            _ = graceful_timeout_seconds
+            _ = drain_inflight
+            return None
+
+    monkeypatch.setattr(builder_module, "run_with_sync_runner", lambda **_kwargs: None)
+    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
+        runtime={
+            "discovery_modules": ["fund_load"],
+            "platform": {
+                "execution_ipc": {
+                    "transport": "tcp_local",
+                    "auth": {"mode": "hmac", "secret_mode": "generated", "kdf": "hkdf_sha256"},
+                },
+                "bootstrap": {"mode": "process_supervisor"},
+                "process_groups": [{"name": "execution.cpu"}],
+            },
+        },
+        supervisor=_Supervisor(),
+    )
+    artifacts.config = {
+        "runtime": artifacts.runtime,
+        "nodes": {"compute_time_keys": {"week_start": "SUN"}},
+    }
+
+    execute_runtime_artifacts(artifacts)
+    bundle = captured.get("bundle")
+    assert bundle is not None
+    assert getattr(bundle, "config") == artifacts.config
+
+
+def test_execute_runtime_artifacts_process_supervisor_passes_routing_cache_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ROUTE-CACHE-01: process-supervisor path should pass runtime.platform.routing_cache into supervisor.
+    captured: dict[str, object] = {}
+
+    class _Supervisor:
+        def configure_routing_cache(self, settings: dict[str, object]) -> None:
+            captured["settings"] = dict(settings)
+
+        def start_groups(self, group_names: list[str]) -> None:
+            _ = group_names
+            return None
+
+        def wait_ready(self, timeout_seconds: int) -> bool:
+            _ = timeout_seconds
+            return True
+
+        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
+            _ = graceful_timeout_seconds
+            _ = drain_inflight
+            return None
+
+    monkeypatch.setattr(builder_module, "run_with_sync_runner", lambda **_kwargs: None)
+    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
+        runtime={
+            "platform": {
+                "execution_ipc": {
+                    "transport": "tcp_local",
+                    "auth": {"mode": "hmac", "secret_mode": "generated", "kdf": "hkdf_sha256"},
+                },
+                "bootstrap": {"mode": "process_supervisor"},
+                "process_groups": [{"name": "execution.cpu"}],
+                "routing_cache": {"enabled": True, "negative_cache": True, "max_entries": 4096},
+            },
+        },
+        supervisor=_Supervisor(),
+    )
+    execute_runtime_artifacts(artifacts)
+
+    settings = captured.get("settings")
+    assert settings == {"enabled": True, "negative_cache": True, "max_entries": 4096}
+
+
+def test_execute_runtime_artifacts_process_supervisor_passes_lifecycle_logging_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BOOT-LOG-01: process-supervisor path should pass runtime.observability.logging into supervisor.
+    captured: dict[str, object] = {}
+
+    class _Supervisor:
+        def configure_lifecycle_logging(self, settings: dict[str, object]) -> None:
+            captured["settings"] = dict(settings)
+
+        def start_groups(self, group_names: list[str]) -> None:
+            _ = group_names
+            return None
+
+        def wait_ready(self, timeout_seconds: int) -> bool:
+            _ = timeout_seconds
+            return True
+
+        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
+            _ = graceful_timeout_seconds
+            _ = drain_inflight
+            return None
+
+    monkeypatch.setattr(builder_module, "run_with_sync_runner", lambda **_kwargs: None)
+    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
+        runtime={
+            "platform": {
+                "execution_ipc": {
+                    "transport": "tcp_local",
+                    "auth": {"mode": "hmac", "secret_mode": "generated", "kdf": "hkdf_sha256"},
+                },
+                "bootstrap": {"mode": "process_supervisor"},
+                "process_groups": [{"name": "execution.cpu"}],
+            },
+            "observability": {
+                "logging": {
+                    "exporters": [{"kind": "stdout"}],
+                    "lifecycle_events": {"enabled": True, "level": "debug"},
+                }
+            },
+        },
+        supervisor=_Supervisor(),
+    )
+    execute_runtime_artifacts(artifacts)
+    settings = captured.get("settings")
+    assert settings == {
+        "exporters": [{"kind": "stdout"}],
+        "lifecycle_events": {"enabled": True, "level": "debug"},
+    }
 
 
 def test_execute_runtime_artifacts_process_supervisor_graceful_stop_drains_inflight(

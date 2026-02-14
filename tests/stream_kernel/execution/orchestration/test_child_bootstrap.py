@@ -2,17 +2,26 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from datetime import UTC, datetime
+from decimal import Decimal
 
 import pytest
 
+from fund_load.domain.messages import LoadAttempt
+from fund_load.domain.money import Money
+from fund_load.usecases.messages import AttemptWithKeys
 from stream_kernel.execution.transport.bootstrap_keys import build_bootstrap_key_bundle
 from stream_kernel.execution.orchestration.child_bootstrap import (
     ChildBootstrapBundle,
     ChildRuntimeBootstrapError,
     execute_child_boundary_loop_from_bundle,
+    execute_child_boundary_loop_with_runtime,
     bootstrap_child_runtime_from_bundle,
 )
+from stream_kernel.execution.orchestration.source_ingress import BootstrapControl
 from stream_kernel.execution.orchestration.lifecycle_orchestration import BoundaryDispatchInput
+from stream_kernel.integration.consumer_registry import ConsumerRegistry
+from stream_kernel.adapters.file_io import SinkLine
 from stream_kernel.platform.services.reply_waiter import TerminalEvent
 from stream_kernel.platform.services.lifecycle import RuntimeLifecycleManager
 from stream_kernel.platform.services.transport import RuntimeTransportService, TcpLocalRuntimeTransportService
@@ -257,3 +266,245 @@ def test_child_boundary_loop_unknown_target_is_deterministic_error(tmp_path: Pat
             )
     finally:
         sys.path.remove(str(tmp_path))
+
+
+def test_child_boundary_loop_executes_runtime_source_node_with_adapter_bundle(tmp_path: Path) -> None:
+    # CHILD-BOOT-04: child runtime should materialize source:* wrappers from bundle.adapters and route outputs.
+    input_path = tmp_path / "input.txt"
+    input_path.write_text('{"id":"1","customer_id":"10","load_amount":"$1.00","time":"2025-01-01T00:00:00Z"}\n')
+    output_path = tmp_path / "output.txt"
+
+    runtime = _runtime_tcp_local_generated()
+    runtime["discovery_modules"] = ["fund_load"]
+    key_bundle = build_bootstrap_key_bundle(runtime, token_bytes_fn=lambda n: b"f" * n, now_fn=lambda: 7)
+    bundle = ChildBootstrapBundle(
+        scenario_id="baseline_mp",
+        process_group="execution.ingress",
+        discovery_modules=["fund_load"],
+        runtime=runtime,
+        adapters={
+            "source": {
+                "settings": {
+                    "path": str(input_path),
+                    "format": "text/jsonl",
+                    "encoding": "utf-8",
+                    "decode_errors": "strict",
+                },
+                "binds": ["stream"],
+            },
+            "sink": {
+                "settings": {"path": str(output_path), "format": "text/jsonl", "encoding": "utf-8"},
+                "binds": ["stream"],
+            },
+        },
+        key_bundle=key_bundle,
+    )
+
+    outputs = execute_child_boundary_loop_from_bundle(
+        bundle=bundle,
+        inputs=[
+            BoundaryDispatchInput(
+                payload=BootstrapControl(target="source:source"),
+                dispatch_group="execution.ingress",
+                target="source:source",
+            )
+        ],
+    )
+
+    targets = [item.target for item in outputs if isinstance(item.target, str)]
+    assert "ingress_line_bridge" in targets
+    trace_ids = [item.trace_id for item in outputs if item.target == "ingress_line_bridge"]
+    assert trace_ids and isinstance(trace_ids[0], str)
+    assert trace_ids[0].startswith("run:source:")
+
+
+def test_bootstrap_child_runtime_binds_runtime_consumer_registry_for_sink_wiring(tmp_path: Path) -> None:
+    # CHILD-BOOT-08: runtime consumer registry bound in DI must include dynamic sink wiring.
+    input_path = tmp_path / "input.txt"
+    input_path.write_text('{"id":"1","customer_id":"10","load_amount":"$1.00","time":"2025-01-01T00:00:00Z"}\n')
+    output_path = tmp_path / "out.txt"
+
+    runtime = _runtime_tcp_local_generated()
+    runtime["discovery_modules"] = ["fund_load"]
+    key_bundle = build_bootstrap_key_bundle(runtime, token_bytes_fn=lambda n: b"j" * n, now_fn=lambda: 11)
+    bundle = ChildBootstrapBundle(
+        scenario_id="baseline_mp",
+        process_group="execution.egress",
+        discovery_modules=["fund_load"],
+        runtime=runtime,
+        adapters={
+            "source": {
+                "settings": {
+                    "path": str(input_path),
+                    "format": "text/jsonl",
+                    "encoding": "utf-8",
+                    "decode_errors": "strict",
+                },
+                "binds": ["stream"],
+            },
+            "sink": {
+                "settings": {"path": str(output_path), "format": "text/jsonl", "encoding": "utf-8"},
+                "binds": ["stream"],
+            },
+        },
+        key_bundle=key_bundle,
+    )
+
+    child = bootstrap_child_runtime_from_bundle(bundle)
+    registry = child.scenario_scope.resolve("service", ConsumerRegistry)
+    assert "sink:sink" in registry.get_consumers(SinkLine)
+
+
+def test_child_boundary_loop_applies_node_config_from_bundle() -> None:
+    # CHILD-BOOT-05: child bootstrap must apply config.nodes.* values when executing discovered nodes.
+    runtime = _runtime_tcp_local_generated()
+    runtime["discovery_modules"] = ["fund_load"]
+    key_bundle = build_bootstrap_key_bundle(runtime, token_bytes_fn=lambda n: b"g" * n, now_fn=lambda: 8)
+    bundle = ChildBootstrapBundle(
+        scenario_id="scenario_child",
+        process_group="execution.features",
+        discovery_modules=["fund_load"],
+        runtime=runtime,
+        config={"nodes": {"compute_time_keys": {"week_start": "SUN"}}},
+        key_bundle=key_bundle,
+    )
+
+    outputs = execute_child_boundary_loop_from_bundle(
+        bundle=bundle,
+        inputs=[
+            BoundaryDispatchInput(
+                payload=LoadAttempt(
+                    line_no=1,
+                    id="1",
+                    customer_id="10",
+                    amount=Money(currency="USD", amount=Decimal("1.00")),
+                    ts=datetime(2025, 1, 8, 0, 0, 0, tzinfo=UTC),
+                ),
+                dispatch_group="execution.features",
+                target="compute_time_keys",
+                trace_id="t1",
+            )
+        ],
+    )
+
+    assert len(outputs) == 1
+    payload = outputs[0].payload
+    assert isinstance(payload, AttemptWithKeys)
+    assert payload.week_key.week_start == "SUN"
+
+
+def test_child_boundary_runtime_reuse_preserves_source_state(tmp_path: Path) -> None:
+    # CHILD-BOOT-06: reused child runtime must preserve source node state across boundary batches.
+    input_path = tmp_path / "input.txt"
+    input_path.write_text('{"id":"1","customer_id":"10","load_amount":"$1.00","time":"2025-01-01T00:00:00Z"}\n')
+
+    runtime = _runtime_tcp_local_generated()
+    runtime["discovery_modules"] = ["fund_load"]
+    key_bundle = build_bootstrap_key_bundle(runtime, token_bytes_fn=lambda n: b"h" * n, now_fn=lambda: 9)
+    bundle = ChildBootstrapBundle(
+        scenario_id="baseline_mp",
+        process_group="execution.ingress",
+        discovery_modules=["fund_load"],
+        runtime=runtime,
+        adapters={
+            "source": {
+                "settings": {
+                    "path": str(input_path),
+                    "format": "text/jsonl",
+                    "encoding": "utf-8",
+                    "decode_errors": "strict",
+                },
+                "binds": ["stream"],
+            }
+        },
+        key_bundle=key_bundle,
+    )
+
+    child = bootstrap_child_runtime_from_bundle(bundle)
+    first = execute_child_boundary_loop_with_runtime(
+        child=child,
+        inputs=[
+            BoundaryDispatchInput(
+                payload=BootstrapControl(target="source:source"),
+                dispatch_group="execution.ingress",
+                target="source:source",
+            )
+        ],
+    )
+    second = execute_child_boundary_loop_with_runtime(
+        child=child,
+        inputs=[
+            BoundaryDispatchInput(
+                payload=BootstrapControl(target="source:source"),
+                dispatch_group="execution.ingress",
+                target="source:source",
+            )
+        ],
+    )
+
+    assert first
+    assert second == []
+
+
+def test_child_boundary_loop_emits_observability_traces_from_runtime_exporters(tmp_path: Path) -> None:
+    # CHILD-BOOT-07: child runtime should emit tracing spans when runtime observability exporters are configured.
+    pkg = tmp_path / "child_pkg_obs"
+    _write_file(pkg / "__init__.py", "")
+    _write_file(
+        pkg / "nodes.py",
+        "\n".join(
+            [
+                "from stream_kernel.kernel.node_annotation import node",
+                "",
+                "@node(name='child.echo', consumes=[], emits=[])",
+                "def child_echo(payload, ctx):",
+                "    _ = ctx",
+                "    return [payload]",
+                "",
+            ]
+        ),
+    )
+
+    exported: list[dict[str, object]] = []
+    runtime = _runtime_tcp_local_generated()
+    runtime["discovery_modules"] = ["child_pkg_obs"]
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "settings": {
+                        "endpoint": "http://collector:4318/v1/traces",
+                        "_export_fn": lambda span: exported.append(span),
+                    },
+                }
+            ]
+        }
+    }
+    key_bundle = build_bootstrap_key_bundle(runtime, token_bytes_fn=lambda n: b"i" * n, now_fn=lambda: 10)
+    bundle = ChildBootstrapBundle(
+        scenario_id="scenario_child",
+        process_group="execution.cpu",
+        discovery_modules=["child_pkg_obs"],
+        runtime=runtime,
+        key_bundle=key_bundle,
+    )
+
+    sys.path.insert(0, str(tmp_path))
+    try:
+        _ = execute_child_boundary_loop_from_bundle(
+            bundle=bundle,
+            inputs=[
+                BoundaryDispatchInput(
+                    payload={"v": 7},
+                    dispatch_group="execution.cpu",
+                    target="child.echo",
+                    trace_id="t1",
+                )
+            ],
+        )
+    finally:
+        sys.path.remove(str(tmp_path))
+
+    assert exported
+    assert exported[0].get("trace_id") == "t1"

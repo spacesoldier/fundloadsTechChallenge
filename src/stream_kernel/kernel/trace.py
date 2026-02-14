@@ -31,6 +31,15 @@ class ErrorInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class RouteInfo:
+    # RouteInfo captures cross-process execution path markers for observability.
+    process_group: str | None = None
+    handoff_from: str | None = None
+    route_hop: int | None = None
+    parent_span_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class TraceRecord:
     # TraceRecord captures one step invocation for one message (Trace spec §3.1).
     trace_id: str
@@ -49,6 +58,9 @@ class TraceRecord:
     ctx_diff: dict[str, object] | None
     status: Literal["ok", "error"]
     error: ErrorInfo | None
+    route: RouteInfo | None = None
+    span_id: str | None = None
+    parent_span_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +72,8 @@ class TraceSpan:
     msg_in: MessageSignature
     t_enter: datetime
     ctx_before: dict[str, object] | None
+    route: RouteInfo | None = None
+    span_id: str | None = None
 
 
 class TraceRecorder:
@@ -85,6 +99,7 @@ class TraceRecorder:
         step_index: int,
         work_index: int,
         msg_in: object,
+        route: RouteInfo | None = None,
     ) -> TraceSpan:
         # Snapshot context before the step if tracing config requests it.
         ctx_before = self._snapshot_context(ctx) if self._context_diff_mode != "none" else None
@@ -95,6 +110,13 @@ class TraceRecorder:
             msg_in=self._signature(msg_in),
             t_enter=datetime.now(tz=UTC),
             ctx_before=ctx_before,
+            route=route,
+            span_id=_span_id_for_begin(
+                trace_id=ctx.trace_id,
+                step_name=step_name,
+                step_index=step_index,
+                work_index=work_index,
+            ),
         )
 
     def finish(
@@ -129,6 +151,9 @@ class TraceRecorder:
             ctx_diff=ctx_diff,
             status=status,
             error=error,
+            route=span.route,
+            span_id=span.span_id,
+            parent_span_id=span.route.parent_span_id if span.route is not None else None,
         )
         ctx.trace.append(record)
         return record
@@ -213,3 +238,14 @@ def _truncate_snapshot(snapshot: dict[str, object], max_len: int) -> dict[str, o
         else:
             truncated[key] = value
     return truncated
+
+
+def _span_id_for_begin(
+    *,
+    trace_id: str,
+    step_name: str,
+    step_index: int,
+    work_index: int,
+) -> str:
+    material = f"{trace_id}:{step_name}:{step_index}:{work_index}".encode("utf-8")
+    return hashlib.sha256(material).digest()[:8].hex()

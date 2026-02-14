@@ -93,6 +93,7 @@ class SecureEnvelope:
     ts: int
     nonce: str
     sig: str
+    span_id: str | None = None
 
 
 class _ReplayGuard:
@@ -132,6 +133,7 @@ class SecureTcpTransport:
         payload_bytes: bytes,
         trace_id: str | None = None,
         reply_to: str | None = None,
+        span_id: str | None = None,
         target: str | list[str] | None = None,
         headers: dict[str, str] | None = None,
         ts: int | None = None,
@@ -147,6 +149,7 @@ class SecureTcpTransport:
             ts=int(self._now_fn() if ts is None else ts),
             nonce=nonce or secrets.token_hex(16),
             sig="",
+            span_id=span_id,
         )
         sig = self._sign_canonical(envelope)
         return replace_sig(envelope, sig)
@@ -245,6 +248,7 @@ class SecureTcpTransport:
         return {
             "trace_id": envelope.trace_id,
             "reply_to": envelope.reply_to,
+            "span_id": envelope.span_id,
             "kind": envelope.kind,
             "target": envelope.target,
             "payload_b64": base64.b64encode(envelope.payload_bytes).decode("ascii"),
@@ -273,6 +277,9 @@ class SecureTcpTransport:
         reply_to = wire.get("reply_to")
         if reply_to is not None and (not isinstance(reply_to, str) or not reply_to):
             raise SecureTcpTransportError("reply_to must be null or non-empty string")
+        span_id = wire.get("span_id")
+        if span_id is not None and (not isinstance(span_id, str) or not span_id):
+            raise SecureTcpTransportError("span_id must be null or non-empty string")
 
         target_raw = wire.get("target")
         if target_raw is None:
@@ -331,12 +338,14 @@ class SecureTcpTransport:
             ts=ts,
             nonce=nonce,
             sig=sig,
+            span_id=span_id,
         )
 
     def _sign_canonical(self, envelope: SecureEnvelope) -> str:
         body = {
             "trace_id": envelope.trace_id,
             "reply_to": envelope.reply_to,
+            "span_id": envelope.span_id,
             "kind": envelope.kind,
             "target": envelope.target,
             "payload_b64": base64.b64encode(envelope.payload_bytes).decode("ascii"),
@@ -359,4 +368,5 @@ def replace_sig(envelope: SecureEnvelope, sig: str) -> SecureEnvelope:
         ts=envelope.ts,
         nonce=envelope.nonce,
         sig=sig,
+        span_id=envelope.span_id,
     )

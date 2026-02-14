@@ -165,9 +165,15 @@ The framework keeps these streams separable so teams can route them to different
 backends without changing business nodes.
 
 Framework adapters currently exposed for these streams:
-- tracing: `trace_stdout`, `trace_jsonl`
+- tracing: `trace_stdout`, `trace_jsonl`, `trace_otel_otlp`, `trace_opentracing_bridge`
 - logging: `log_stdout`
 - telemetry: `telemetry_stdout`
+
+`trace_otel_otlp` settings (runtime observability exporter path):
+- `endpoint` (default: `http://127.0.0.1:4318/v1/traces`)
+- `service_name` (default: `stream-kernel`)
+- `headers` (optional string map)
+- `timeout_seconds` (default: `2.0`)
 
 ---
 

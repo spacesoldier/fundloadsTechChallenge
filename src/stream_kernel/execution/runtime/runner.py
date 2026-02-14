@@ -73,6 +73,9 @@ class SyncRunner:
             raw_ctx = full_ctx if (node_name in self.full_context_nodes) else {
                 key: value for key, value in full_ctx.items() if not key.startswith("__")
             }
+            observability_ctx = dict(raw_ctx)
+            if isinstance(envelope.span_id, str) and envelope.span_id:
+                observability_ctx["__parent_span_id"] = envelope.span_id
             # Pass a copy to the node so it cannot mutate persisted context in-place by accident.
             node_ctx = dict(raw_ctx)
             node = self.nodes[node_name]
@@ -80,7 +83,7 @@ class SyncRunner:
             observer_state = observability.before_node(
                 node_name=node_name,
                 payload=envelope.payload,
-                ctx=raw_ctx,
+                ctx=observability_ctx,
                 trace_id=envelope.trace_id,
             )
             try:
@@ -91,7 +94,7 @@ class SyncRunner:
                 observability.on_node_error(
                     node_name=node_name,
                     payload=envelope.payload,
-                    ctx=raw_ctx,
+                    ctx=observability_ctx,
                     trace_id=envelope.trace_id,
                     error=exc,
                     state=observer_state,
@@ -101,11 +104,12 @@ class SyncRunner:
             observability.after_node(
                 node_name=node_name,
                 payload=envelope.payload,
-                ctx=raw_ctx,
+                ctx=observability_ctx,
                 trace_id=envelope.trace_id,
                 outputs=outputs,
                 state=observer_state,
             )
+            produced_span_id = self._span_id_from_observer_state(observer_state)
 
             # Router translates outputs to concrete `(target_node, payload)` deliveries.
             # Envelope trace_id emitted by node output overrides current trace_id if present.
@@ -122,9 +126,11 @@ class SyncRunner:
 
                 explicit_trace_id = output.trace_id if isinstance(output, Envelope) else None
                 explicit_reply_to = output.reply_to if isinstance(output, Envelope) else None
+                explicit_span_id = output.span_id if isinstance(output, Envelope) else None
                 routing_result = router.route([output], source=node_name)
                 downstream_trace_id = explicit_trace_id or envelope.trace_id
                 downstream_reply_to = explicit_reply_to or envelope.reply_to
+                downstream_span_id = explicit_span_id or produced_span_id
                 for target_name, payload in self._local_deliveries(routing_result):
                     work_queue.push(
                         Envelope(
@@ -132,6 +138,7 @@ class SyncRunner:
                             target=target_name,
                             trace_id=downstream_trace_id,
                             reply_to=downstream_reply_to,
+                            span_id=downstream_span_id,
                         )
                     )
 
@@ -175,6 +182,7 @@ class SyncRunner:
                             target=payload.target,
                             trace_id=trace_id,
                             reply_to=payload.reply_to,
+                            span_id=payload.span_id,
                         )
                     )
                 else:
@@ -186,6 +194,7 @@ class SyncRunner:
                                 target=target_name,
                                 trace_id=trace_id,
                                 reply_to=payload.reply_to,
+                                span_id=payload.span_id,
                             )
                         )
                 self.run()
@@ -329,6 +338,19 @@ class SyncRunner:
         on_terminal_event = getattr(self._observability(), "on_terminal_event", None)
         if callable(on_terminal_event):
             on_terminal_event(trace_id=trace_id, terminal_event=terminal)
+
+    @staticmethod
+    def _span_id_from_observer_state(state: object) -> str | None:
+        states = state if isinstance(state, list) else [state]
+        for item in states:
+            span = getattr(item, "span", None)
+            span_id = getattr(span, "span_id", None)
+            if isinstance(span_id, str) and span_id:
+                return span_id
+            candidate = getattr(item, "span_id", None)
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        return None
 
     def __post_init__(self) -> None:
         if self.ordered_sink_mode not in _ORDERED_SINK_MODES:

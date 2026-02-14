@@ -13,6 +13,7 @@ It complements:
 - [analysis/Async runtime models and event loop internals](analysis/Async%20runtime%20models%20and%20event%20loop%20internals.md)
 - [analysis/Web-execution process isolation and Redis backbone](analysis/Web-execution%20process%20isolation%20and%20Redis%20backbone.md)
 - [analysis/Execution process port security profile](analysis/Execution%20process%20port%20security%20profile.md)
+- [analysis/Multiprocess bus ownership and outbound route cache](analysis/Multiprocess%20bus%20ownership%20and%20outbound%20route%20cache.md)
 
 ---
 
@@ -166,6 +167,10 @@ Full policy engine is out of scope for this stage.
   - [`_work/web_phase4bis_remote_execution_handoff_tdd_plan`](../_work/web_phase4bis_remote_execution_handoff_tdd_plan.md)
   - remaining immediate gap: full remote child-process execution handoff for
     cross-group workloads in `process_supervisor` profile.
+- New prerequisite track before Phase 5 implementation:
+  - [`_work/web_phase5pre_multiprocess_supervisor_and_observability_tdd_plan`](../_work/web_phase5pre_multiprocess_supervisor_and_observability_tdd_plan.md)
+  - objective: enable real multiprocess supervisor orchestration and Jaeger-ready
+    tracing export (OTel primary, OpenTracing bridge for legacy stacks).
 
 ---
 

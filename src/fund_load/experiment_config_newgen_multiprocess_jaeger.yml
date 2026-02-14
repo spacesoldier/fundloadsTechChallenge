@@ -1,0 +1,125 @@
+version: 1
+
+scenario:
+  name: exp_mp_multiprocess_jaeger
+  description: "Experimental profile (multiprocess + Jaeger OTLP tracing)"
+
+runtime:
+  strict: true
+  tracing:
+    enabled: false
+  observability:
+    tracing:
+      exporters:
+        - kind: otel_otlp
+          settings:
+            endpoint: http://127.0.0.1:4318/v1/traces
+            service_name: fund-load-experiment-multiprocess
+            service_namespace: stream-kernel
+            service_version: 1.0.0-dev
+            deployment_environment: local-dev
+            service_name_by_process_group: true
+            include_runtime_resource: true
+            span_kind: SPAN_KIND_INTERNAL
+            timeout_seconds: 2.0
+    logging:
+      exporters:
+        - kind: stdout
+      lifecycle_events:
+        enabled: true
+        level: debug
+  discovery_modules:
+    - fund_load
+  platform:
+    execution_ipc:
+      transport: tcp_local
+      bind_host: 127.0.0.1
+      bind_port: 0
+      auth:
+        mode: hmac
+        secret_mode: generated
+        kdf: hkdf_sha256
+        ttl_seconds: 30
+        nonce_cache_size: 100000
+      max_payload_bytes: 1048576
+    bootstrap:
+      mode: process_supervisor
+    process_groups:
+      - name: execution.ingress
+        workers: 1
+        nodes:
+          - source:source
+          - ingress_line_bridge
+          - parse_load_attempt
+      - name: execution.features
+        workers: 1
+        nodes:
+          - compute_time_keys
+          - idempotency_gate
+          - compute_features
+      - name: execution.policy
+        workers: 1
+        nodes:
+          - evaluate_policies
+          - update_windows
+      - name: execution.egress
+        workers: 1
+        nodes:
+          - format_output
+          - egress_line_bridge
+          - sink:sink
+    readiness:
+      enabled: true
+      start_work_on_all_groups_ready: true
+      readiness_timeout_seconds: 30
+
+nodes:
+  compute_time_keys:
+    week_start: MON
+
+  compute_features:
+    monday_multiplier:
+      enabled: true
+      multiplier: 2.0
+      apply_to: amount
+    prime_gate:
+      enabled: true
+      global_per_day: 1
+      amount_cap: 9999.00
+
+  evaluate_policies:
+    limits:
+      daily_amount: 5000.00
+      weekly_amount: 20000.00
+      daily_attempts: 3
+    prime_gate:
+      enabled: true
+      global_per_day: 1
+      amount_cap: 9999.00
+
+  update_windows:
+    daily_attempts:
+      enabled: true
+    daily_accepted_amount:
+      enabled: true
+    weekly_accepted_amount:
+      enabled: true
+    daily_prime_gate:
+      enabled: true
+
+adapters:
+  source:
+    settings:
+      path: input.txt
+      format: text/jsonl
+      encoding: utf-8
+      decode_errors: strict
+    binds:
+      - stream
+  sink:
+    settings:
+      path: output_exp_mp_jaeger.txt
+      format: text/jsonl
+      encoding: utf-8
+    binds:
+      - stream

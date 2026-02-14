@@ -95,6 +95,15 @@ def test_registry_errors_on_duplicate_binding() -> None:
         reg.register_factory("stream", EventA, lambda: _StreamPort("B"))
 
 
+def test_registry_can_replace_existing_binding_explicitly() -> None:
+    # Runtime wiring can intentionally override discovered defaults.
+    reg = InjectionRegistry()
+    reg.register_factory("stream", EventA, lambda: _StreamPort("A"))
+    reg.register_factory("stream", EventA, lambda: _StreamPort("B"), replace=True)
+    scope = reg.instantiate_for_scenario("s1")
+    assert scope.resolve("stream", EventA).name == "B"
+
+
 def test_registry_rejects_empty_qualifier() -> None:
     # Qualifier must be a non-empty string for unambiguous keying.
     reg = InjectionRegistry()

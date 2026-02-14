@@ -730,3 +730,223 @@ def test_validate_newgen_config_keeps_memory_profile_compatible_when_new_section
     kv = platform.get("kv")
     assert isinstance(kv, dict)
     assert kv.get("backend") == "memory"
+
+
+def test_validate_newgen_config_rejects_non_int_process_group_workers() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "process_groups": [
+            {"name": "execution.cpu", "workers": "2"},
+        ]
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_non_positive_process_group_workers() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "process_groups": [
+            {"name": "execution.cpu", "workers": 0},
+        ]
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_invalid_runtime_platform_readiness_timeout() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "readiness": {
+            "enabled": True,
+            "start_work_on_all_groups_ready": True,
+            "readiness_timeout_seconds": 0,
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_unknown_observability_tracing_exporter_kind() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {"kind": "zipkin_native", "settings": {}},
+            ]
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_unknown_observability_logging_exporter_kind() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "logging": {
+            "exporters": [
+                {"kind": "console_colorized", "settings": {}},
+            ]
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_unknown_observability_logging_lifecycle_level() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "logging": {
+            "lifecycle_events": {"enabled": True, "level": "warning"},
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_invalid_execution_ipc_control_bind_host() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "bind_host": "127.0.0.1",
+            "auth": {"mode": "hmac"},
+            "control": {
+                "transport": "tcp_local",
+                "bind_host": "0.0.0.0",
+                "auth": {"mode": "hmac"},
+            },
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_accepts_phase5pre_stepa_contract_and_defaults() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {"exporters": [{"kind": "otel_otlp", "settings": {"endpoint": "http://collector:4318"}}]},
+        "logging": {
+            "exporters": [{"kind": "stdout"}],
+            "lifecycle_events": {"enabled": True, "level": "debug"},
+        },
+    }
+    runtime["platform"] = {
+        "bootstrap": {"mode": "process_supervisor"},
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "bind_host": "127.0.0.1",
+            "auth": {"mode": "hmac"},
+            "control": {
+                "transport": "tcp_local",
+                "bind_host": "127.0.0.1",
+                "bind_port": 0,
+                "auth": {"mode": "hmac", "ttl_seconds": 15, "nonce_cache_size": 2048},
+                "max_payload_bytes": 8192,
+            },
+        },
+        "readiness": {
+            "enabled": True,
+            "start_work_on_all_groups_ready": True,
+            "readiness_timeout_seconds": 45,
+        },
+        "process_groups": [
+            {
+                "name": "execution.ingress",
+                "nodes": ["source:source", "ingress_line_bridge"],
+                "workers": 2,
+                "runner_profile": "sync",
+                "heartbeat_seconds": 3,
+                "start_timeout_seconds": 20,
+                "stop_timeout_seconds": 25,
+            }
+        ],
+    }
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    observability = validated_runtime.get("observability")
+    assert isinstance(observability, dict)
+    logging = observability.get("logging")
+    assert isinstance(logging, dict)
+    lifecycle_events = logging.get("lifecycle_events")
+    assert isinstance(lifecycle_events, dict)
+    assert lifecycle_events.get("level") == "debug"
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    readiness = platform.get("readiness")
+    assert isinstance(readiness, dict)
+    assert readiness.get("readiness_timeout_seconds") == 45
+    process_groups = platform.get("process_groups")
+    assert isinstance(process_groups, list)
+    assert process_groups[0]["workers"] == 2
+
+
+def test_validate_newgen_config_accepts_runtime_platform_routing_cache_contract() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "routing_cache": {
+            "enabled": True,
+            "negative_cache": True,
+            "max_entries": 1234,
+        }
+    }
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    routing_cache = platform.get("routing_cache")
+    assert isinstance(routing_cache, dict)
+    assert routing_cache.get("enabled") is True
+    assert routing_cache.get("negative_cache") is True
+    assert routing_cache.get("max_entries") == 1234
+
+
+def test_validate_newgen_config_rejects_runtime_platform_routing_cache_unknown_keys() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "routing_cache": {
+            "enabled": True,
+            "unknown": "x",
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_runtime_platform_routing_cache_bad_max_entries() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "routing_cache": {
+            "enabled": True,
+            "negative_cache": True,
+            "max_entries": 0,
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)

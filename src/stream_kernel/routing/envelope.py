@@ -12,6 +12,7 @@ class Envelope:
     target: str | Sequence[str] | None = None
     topic: str | None = None
     reply_to: str | None = None
+    span_id: str | None = None
 
     def __post_init__(self) -> None:
         # Invariants keep routing deterministic and explicit (Routing semantics §1–§2).
@@ -47,3 +48,9 @@ class Envelope:
                 raise ValueError("Envelope.reply_to must be a string")
             if not self.reply_to:
                 raise ValueError("Envelope.reply_to must not be empty")
+
+        if self.span_id is not None:
+            if not isinstance(self.span_id, str):
+                raise ValueError("Envelope.span_id must be a string")
+            if not self.span_id:
+                raise ValueError("Envelope.span_id must not be empty")

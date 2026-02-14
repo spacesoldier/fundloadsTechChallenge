@@ -64,6 +64,7 @@ class InjectionRegistry:
         *,
         is_async: bool = False,
         qualifier: str | None = None,
+        replace: bool = False,
     ) -> None:
         if port_type == "kv":
             try:
@@ -72,7 +73,7 @@ class InjectionRegistry:
                 raise InjectionRegistryError(str(exc)) from exc
         normalized_qualifier = _normalize_qualifier(qualifier)
         key = (port_type, data_type, normalized_qualifier)
-        if key in self._bindings:
+        if key in self._bindings and not replace:
             raise InjectionRegistryError(_duplicate_binding_message(port_type, data_type, normalized_qualifier))
         self._bindings[key] = _Binding(factory=factory, is_async=is_async)
 

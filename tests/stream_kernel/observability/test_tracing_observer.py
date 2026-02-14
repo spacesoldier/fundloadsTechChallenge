@@ -93,6 +93,42 @@ def test_tracing_observer_emits_error_record() -> None:
     assert record.error.type == "RuntimeError"
 
 
+def test_tracing_observer_captures_route_markers_from_context() -> None:
+    recorder = TraceRecorder()
+    sink = _Sink()
+    observer = TracingObserver(
+        recorder=recorder,
+        sink=sink,
+        run_id="run",
+        scenario_id="s1",
+        step_indices={"n1": 0},
+    )
+
+    ctx = {
+        "__process_group": "execution.features",
+        "__handoff_from": "execution.ingress",
+        "__route_hop": 2,
+        "__parent_span_id": "0123456789abcdef",
+    }
+    state = observer.before_node(node_name="n1", payload={"id": "1"}, ctx=ctx, trace_id="t1")
+    observer.after_node(
+        node_name="n1",
+        payload={"id": "1"},
+        ctx=ctx,
+        trace_id="t1",
+        outputs=[{"ok": True}],
+        state=state,
+    )
+
+    assert len(sink.records) == 1
+    record = sink.records[0]
+    assert record.route is not None
+    assert record.route.process_group == "execution.features"
+    assert record.route.handoff_from == "execution.ingress"
+    assert record.route.route_hop == 2
+    assert record.route.parent_span_id == "0123456789abcdef"
+
+
 def test_tracing_observer_skips_messages_without_trace_id() -> None:
     recorder = TraceRecorder()
     sink = _Sink()

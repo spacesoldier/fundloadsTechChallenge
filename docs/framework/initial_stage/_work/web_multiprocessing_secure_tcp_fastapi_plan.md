@@ -17,6 +17,8 @@ This plan extends and details:
 - [Execution process port security profile](../web/analysis/Execution%20process%20port%20security%20profile.md)
 - [engine runner/router target model plan](engine_runner_router_target_model_tdd_plan.md)
 - [engine runtime contract cleanup plan](engine_runtime_contract_cleanup_tdd_plan.md)
+- [web phase 5pre multiprocess supervisor and observability plan](web_phase5pre_multiprocess_supervisor_and_observability_tdd_plan.md)
+- [multiprocess bus ownership and outbound route cache analysis](../web/analysis/Multiprocess%20bus%20ownership%20and%20outbound%20route%20cache.md)
 
 ---
 
@@ -358,6 +360,12 @@ Activate real process-isolated execution for cross-group workloads in
 
 ## Phase 5 — FastAPI interface baseline (discovery-driven)
 
+Phase 5 prerequisite:
+
+- [web_phase5pre_multiprocess_supervisor_and_observability_tdd_plan](web_phase5pre_multiprocess_supervisor_and_observability_tdd_plan.md)
+- Phase 5 starts only after 5pre exit criteria are green (real multiprocess
+  supervisor + OTel/OpenTracing observability substrate).
+
 ### Objective
 
 Attach FastAPI HTTP/websocket endpoints as platform adapters using the same routing core.
@@ -464,13 +472,21 @@ Define minimal production-readiness gates before enabling web track by default.
 1. Phase 0 -> 1 -> 2 -> 3 (core process/transport substrate)
 2. Phase 4 (correlated reply reliability)
 3. Phase 4bis (real remote execution handoff)
-4. Phase 5 -> 6 (web capability expansion)
-5. Phase 7 -> 8 -> 9 (observability, parity, hardening)
+4. Phase 5pre (real multiprocess supervisor + OTel/OpenTracing substrate)
+5. Phase 5 -> 6 (web capability expansion)
+6. Phase 7 -> 8 -> 9 (observability, parity, hardening)
 
 ---
 
 ## Immediate next step (execution)
 
-- Start Phase 4bis Step A:
-  - freeze parent/child handoff contract and placement invariants;
-  - add RED tests for cross-group remote execution dispatch and failure mapping.
+- Start Phase 5pre Step A:
+  - freeze config/contracts for multiprocess supervisor control plane;
+  - add RED validator and supervisor contract tests;
+  - lock observability exporter contract (`otel_otlp`, `opentracing_bridge`).
+
+Follow-up track (after Phase 5pre closure):
+
+- introduce dedicated data-plane bus backend (ZeroMQ local profile);
+- keep star control plane for lifecycle only;
+- add routing-service outbound bus cache with versioned invalidation.

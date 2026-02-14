@@ -18,6 +18,10 @@ Codec/backend alignment:
 - see [Transport codecs and file IO options](../Transport%20codecs%20and%20file%20IO%20options.md).
 - process-isolated execution and secure IPC rollout details:
   [web_multiprocessing_secure_tcp_fastapi_plan](web_multiprocessing_secure_tcp_fastapi_plan.md).
+- multiprocess supervisor + observability substrate prerequisite (Phase 5pre):
+  [web_phase5pre_multiprocess_supervisor_and_observability_tdd_plan](web_phase5pre_multiprocess_supervisor_and_observability_tdd_plan.md).
+- multiprocess bus ownership and outbound routing cache target model:
+  [../web/analysis/Multiprocess bus ownership and outbound route cache](../web/analysis/Multiprocess%20bus%20ownership%20and%20outbound%20route%20cache.md).
 - bootstrap-process and generated-secret rollout details (Phase 3):
   [web_phase3_bootstrap_process_and_secret_distribution_tdd_plan](web_phase3_bootstrap_process_and_secret_distribution_tdd_plan.md).
 - Phase 3 Step A contract freeze spec:
@@ -41,6 +45,11 @@ Out of scope (later stages):
 - production-grade retry/DLQ policies for all transports.
 
 ## Phases (TDD-first)
+
+Phase ordering note:
+
+- before network interface implementation phases, complete web `Phase 5pre`
+  (real multiprocess supervisor + OTel/OpenTracing substrate).
 
 1. Contract freeze (ports and semantics)
 - [ ] Freeze contract mapping:

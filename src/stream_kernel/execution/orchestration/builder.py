@@ -70,7 +70,9 @@ class RuntimeBuildArtifacts:
     injection_registry: InjectionRegistry | None = None
     consumer_registry: ConsumerRegistry | None = None
     modules: list[ModuleType] = field(default_factory=list)
+    config: dict[str, object] = field(default_factory=dict)
     runtime: dict[str, object] = field(default_factory=dict)
+    adapters: dict[str, object] = field(default_factory=dict)
 
 
 def ensure_platform_discovery_modules(discovery_modules: list[str]) -> None:
@@ -154,11 +156,13 @@ def execute_runtime_artifacts(artifacts: RuntimeBuildArtifacts) -> None:
         return
     if runtime_bootstrap_mode(artifacts.runtime) == "process_supervisor":
         execute_with_bootstrap_supervisor(
+            config=artifacts.config,
             runtime=artifacts.runtime,
             scenario_id=artifacts.scenario_id,
             run_id=artifacts.run_id,
             inputs=list(artifacts.inputs),
             scenario_scope=artifacts.scenario_scope,
+            adapters=dict(artifacts.adapters),
             run=lambda: _execute_runner(artifacts),
         )
         return
@@ -341,7 +345,9 @@ def build_runtime_artifacts(
         injection_registry=injection_registry,
         consumer_registry=consumer_registry,
         modules=modules,
+        config=dict(config),
         runtime=runtime,
+        adapters=adapters,
     )
 
 
@@ -349,6 +355,7 @@ def ensure_runtime_observability_binding(
     *,
     injection_registry: InjectionRegistry,
     observers: list[object],
+    replace: bool = True,
 ) -> None:
     # Bind platform observability service to runtime fan-out implementation for this run.
     injection_registry.register_factory(
@@ -357,6 +364,7 @@ def ensure_runtime_observability_binding(
         lambda _observers=list(observers): ReplyAwareObservabilityService(
             inner=FanoutObservabilityService(observers=list(_observers))
         ),
+        replace=replace,
     )
 
 
@@ -597,28 +605,22 @@ def ensure_runtime_registry_bindings(
     from stream_kernel.application_context.application_context import ApplicationContext as AppContextContract
 
     for contract in {AppContextContract, type(app_context)}:
-        try:
-            injection_registry.register_factory(
-                "service",
-                contract,
-                lambda _ctx=app_context: _ctx,
-            )
-        except InjectionRegistryError:
-            # Explicit project binding wins.
-            continue
+        injection_registry.register_factory(
+            "service",
+            contract,
+            lambda _ctx=app_context: _ctx,
+            replace=True,
+        )
 
     if consumer_registry is None:
         return
     for contract in {ConsumerRegistry, type(consumer_registry)}:
-        try:
-            injection_registry.register_factory(
-                "service",
-                contract,
-                lambda _registry=consumer_registry: _registry,
-            )
-        except InjectionRegistryError:
-            # Explicit project binding wins.
-            continue
+        injection_registry.register_factory(
+            "service",
+            contract,
+            lambda _registry=consumer_registry: _registry,
+            replace=True,
+        )
 
 
 def ensure_runtime_transport_bindings(

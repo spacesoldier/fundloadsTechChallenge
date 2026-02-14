@@ -65,6 +65,9 @@ class BoundaryDispatchInput:
     target: str | None = None
     trace_id: str | None = None
     reply_to: str | None = None
+    source_group: str | None = None
+    route_hop: int | None = None
+    span_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,11 +217,13 @@ def resolve_bootstrap_supervisor(scope: ScenarioScope) -> BootstrapSupervisor:
 
 def execute_with_bootstrap_supervisor(
     *,
+    config: dict[str, object],
     runtime: dict[str, object],
     scenario_id: str,
     run_id: str,
     inputs: list[object],
     scenario_scope: ScenarioScope,
+    adapters: dict[str, object] | None = None,
     run: Callable[[], None],
 ) -> None:
     # Execute runner call under process-supervisor lifecycle semantics.
@@ -239,14 +244,42 @@ def execute_with_bootstrap_supervisor(
     )
     child_bootstrap_bundle = build_child_bootstrap_bundle(
         scenario_id=scenario_id,
+        run_id=run_id,
         process_group=None,
         discovery_modules=discovery_modules,
+        config=config,
         runtime=runtime,
+        adapters=dict(adapters or {}),
         key_bundle=key_bundle,
     )
     bundle_loader = getattr(supervisor, "load_child_bootstrap_bundle", None)
     if callable(bundle_loader):
         bundle_loader(child_bootstrap_bundle)
+    platform = runtime.get("platform", {})
+    if not isinstance(platform, dict):
+        platform = {}
+    configure_groups = getattr(supervisor, "configure_process_groups", None)
+    if callable(configure_groups):
+        process_groups = []
+        process_groups_raw = platform.get("process_groups", [])
+        if isinstance(process_groups_raw, list):
+            process_groups = [group for group in process_groups_raw if isinstance(group, dict)]
+        configure_groups(process_groups)
+    configure_routing_cache = getattr(supervisor, "configure_routing_cache", None)
+    if callable(configure_routing_cache):
+        routing_cache = platform.get("routing_cache", {})
+        if not isinstance(routing_cache, dict):
+            routing_cache = {}
+        configure_routing_cache(dict(routing_cache))
+    configure_lifecycle_logging = getattr(supervisor, "configure_lifecycle_logging", None)
+    if callable(configure_lifecycle_logging):
+        observability = runtime.get("observability", {})
+        if not isinstance(observability, dict):
+            observability = {}
+        logging_cfg = observability.get("logging", {})
+        if not isinstance(logging_cfg, dict):
+            logging_cfg = {}
+        configure_lifecycle_logging(dict(logging_cfg))
     boundary_inputs, dispatch_group, trace_aliases = _build_boundary_dispatch_inputs(
         runtime=runtime,
         inputs=inputs,
@@ -408,6 +441,9 @@ def _build_boundary_dispatch_inputs(
                     target=target_name,
                     trace_id=item.trace_id,
                     reply_to=item.reply_to,
+                    source_group="supervisor.entry",
+                    route_hop=0,
+                    span_id=item.span_id,
                 )
             )
             if isinstance(item.trace_id, str) and item.trace_id:
@@ -417,6 +453,8 @@ def _build_boundary_dispatch_inputs(
             BoundaryDispatchInput(
                 payload=item,
                 dispatch_group=default_dispatch_group,
+                source_group="supervisor.entry",
+                route_hop=0,
             )
         )
     # Transitional aggregate group marker used by existing diagnostics/messages.

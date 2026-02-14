@@ -11,7 +11,8 @@ import pytest
 # Trace sinks are framework infrastructure adapters (framework tracing runtime docs).
 import stream_kernel.adapters.trace_sinks as trace_sinks
 from stream_kernel.adapters.trace_sinks import JsonlTraceSink, StdoutTraceSink
-from stream_kernel.kernel.trace import MessageSignature, TraceRecord
+from stream_kernel.adapters.trace_sinks import OpenTracingBridgeTraceSink, OTelOtlpTraceSink
+from stream_kernel.kernel.trace import MessageSignature, RouteInfo, TraceRecord
 
 
 def _record(step_name: str, step_index: int) -> TraceRecord:
@@ -164,3 +165,173 @@ def test_trace_sink_as_dict_handles_none_and_passthrough() -> None:
     # Helper supports passthrough for non-dataclass values (Trace spec §7.2).
     assert trace_sinks._as_dict(None) is None
     assert trace_sinks._as_dict({"k": "v"}) == {"k": "v"}
+
+
+def test_otel_otlp_trace_sink_exports_span_with_trace_id() -> None:
+    # P5PRE-OBS-01: OTLP exporter sink must preserve framework trace_id in exported span payload.
+    exported: list[dict[str, object]] = []
+    sink = OTelOtlpTraceSink(
+        endpoint="http://collector:4318/v1/traces",
+        export_fn=lambda span: exported.append(span),
+    )
+    sink.emit(
+        replace(
+            _record("step-a", 0),
+            route=RouteInfo(
+                process_group="execution.features",
+                handoff_from="execution.ingress",
+                route_hop=1,
+            ),
+        )
+    )
+    sink.close()
+    assert len(exported) == 1
+    assert exported[0]["trace_id"] == "t1"
+    assert exported[0]["name"] == "step-a"
+    attrs = exported[0]["attributes"]
+    assert attrs["process_group"] == "execution.features"
+    assert attrs["handoff_from"] == "execution.ingress"
+    assert attrs["route_hop"] == 1
+
+
+def test_opentracing_bridge_sink_maps_operation_and_tags() -> None:
+    # P5PRE-OBS-02: OpenTracing bridge sink should map step identity into operation/tags payload.
+    exported: list[dict[str, object]] = []
+    sink = OpenTracingBridgeTraceSink(
+        bridge_name="legacy-tracer",
+        emit_fn=lambda span: exported.append(span),
+    )
+    sink.emit(_record("step-b", 1))
+    sink.close()
+    assert len(exported) == 1
+    span = exported[0]
+    assert span["trace_id"] == "t1"
+    assert span["operation_name"] == "step-b"
+    assert span["tags"]["step_index"] == 1
+    assert span["tags"]["scenario"] == "baseline"
+
+
+def test_otel_otlp_trace_sink_isolates_exporter_failures() -> None:
+    # P5PRE-OBS-03: exporter errors must be isolated and never propagate to execution flow.
+    sink = OTelOtlpTraceSink(
+        endpoint="http://collector:4318/v1/traces",
+        export_fn=lambda _span: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    sink.emit(_record("step-a", 0))
+    diagnostics = sink.diagnostics()
+    assert diagnostics["exported"] == 0
+    assert diagnostics["dropped"] == 1
+
+
+def test_otel_otlp_trace_sink_posts_http_json_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    # P5PRE-OTLP-01/02: default OTLP sink path should POST JSON payload and propagate configured headers.
+    captured: dict[str, object] = {}
+
+    class _Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            _ = (exc_type, exc, tb)
+            return False
+
+    def _fake_urlopen(request, timeout: float = 0.0):
+        captured["url"] = request.full_url
+        captured["headers"] = dict(request.header_items())
+        captured["body"] = request.data
+        captured["timeout"] = timeout
+        return _Response()
+
+    monkeypatch.setattr(trace_sinks.urllib_request, "urlopen", _fake_urlopen)
+    sink = OTelOtlpTraceSink(
+        endpoint="http://collector:4318/v1/traces",
+        headers={"authorization": "Bearer test-token"},
+        service_name="fund-load",
+        timeout_seconds=1.5,
+    )
+    sink.emit(_record("step-a", 0))
+    diagnostics = sink.diagnostics()
+
+    assert diagnostics["exported"] == 1
+    assert diagnostics["dropped"] == 0
+    assert captured["url"] == "http://collector:4318/v1/traces"
+    assert captured["timeout"] == 1.5
+    headers = captured["headers"]
+    assert isinstance(headers, dict)
+    assert headers["Content-type"] == "application/json"
+    assert headers["Authorization"] == "Bearer test-token"
+    body = json.loads(captured["body"].decode("utf-8"))  # type: ignore[union-attr]
+    resource_spans = body["resourceSpans"]
+    assert isinstance(resource_spans, list)
+    assert resource_spans
+    assert body["resourceSpans"][0]["resource"]["attributes"][0]["key"] == "service.name"
+    spans = body["resourceSpans"][0]["scopeSpans"][0]["spans"]
+    assert spans[0]["name"] == "step-a"
+    assert spans[0]["kind"] == "SPAN_KIND_INTERNAL"
+    assert spans[0]["attributes"]
+
+
+def test_otel_otlp_trace_sink_network_failures_increment_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
+    # P5PRE-OTLP-03: network exporter failures must be isolated from execution flow.
+    def _boom(_request, timeout: float = 0.0):
+        _ = timeout
+        raise OSError("network down")
+
+    monkeypatch.setattr(trace_sinks.urllib_request, "urlopen", _boom)
+    sink = OTelOtlpTraceSink(endpoint="http://collector:4318/v1/traces")
+    sink.emit(_record("step-a", 0))
+    diagnostics = sink.diagnostics()
+    assert diagnostics["exported"] == 0
+    assert diagnostics["dropped"] == 1
+
+
+def test_otel_otlp_trace_sink_adds_parent_span_and_process_group_service_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            _ = (exc_type, exc, tb)
+            return False
+
+    def _fake_urlopen(request, timeout: float = 0.0):
+        _ = timeout
+        captured["body"] = request.data
+        return _Response()
+
+    monkeypatch.setattr(trace_sinks.urllib_request, "urlopen", _fake_urlopen)
+    sink = OTelOtlpTraceSink(
+        endpoint="http://collector:4318/v1/traces",
+        service_name="fund-load",
+    )
+    sink.emit(
+        replace(
+            _record("step-a", 0),
+            span_id="1111111111111111",
+            parent_span_id="0123456789abcdef",
+            route=RouteInfo(process_group="execution.features", handoff_from="execution.ingress", route_hop=2),
+        )
+    )
+
+    body = json.loads(captured["body"].decode("utf-8"))  # type: ignore[union-attr]
+    resource_attrs = body["resourceSpans"][0]["resource"]["attributes"]
+    resource_keys = {item["key"] for item in resource_attrs}
+    assert "service.name" in resource_keys
+    assert "process.pid" in resource_keys
+    assert "host.name" in resource_keys
+
+    service_name = next(item["value"]["stringValue"] for item in resource_attrs if item["key"] == "service.name")
+    assert service_name == "fund-load.execution.features"
+
+    span = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+    assert span["spanId"] == "1111111111111111"
+    assert span["parentSpanId"] == "0123456789abcdef"
+    assert span["kind"] == "SPAN_KIND_INTERNAL"

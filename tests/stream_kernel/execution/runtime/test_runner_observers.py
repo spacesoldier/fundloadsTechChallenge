@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import pytest
 
@@ -145,3 +146,76 @@ def test_runner_calls_observer_on_run_end_hook() -> None:
     runner.on_run_end()
 
     assert observer.run_end_calls == 1
+
+
+def test_runner_propagates_parent_and_current_span_ids_across_messages() -> None:
+    @dataclass(frozen=True, slots=True)
+    class Event:
+        value: str
+
+    class _SpanObserver:
+        def __init__(self) -> None:
+            self._seen_parent_by_node: dict[str, str | None] = {}
+
+        def before_node(self, *, node_name: str, payload: object, ctx: dict[str, object], trace_id: str | None):
+            _ = (payload, trace_id)
+            parent = ctx.get("__parent_span_id")
+            self._seen_parent_by_node[node_name] = parent if isinstance(parent, str) else None
+            return SimpleNamespace(span=SimpleNamespace(span_id=f"span-{node_name}"))
+
+        def after_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            outputs: list[object],
+            state: object | None,
+        ) -> None:
+            _ = (node_name, payload, ctx, trace_id, outputs, state)
+
+        def on_node_error(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            error: Exception,
+            state: object | None,
+        ) -> None:
+            _ = (node_name, payload, ctx, trace_id, error, state)
+
+        def on_run_end(self) -> None:
+            return None
+
+    observer = _SpanObserver()
+    registry = InMemoryConsumerRegistry({Event: ["n2"]})
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="seed", target="n1", trace_id="t1", span_id="upstream-parent"))
+
+    seen: list[str] = []
+
+    def n1(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = (payload, ctx)
+        return [Event(value="x")]
+
+    def n2(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = ctx
+        if isinstance(payload, Event):
+            seen.append(payload.value)
+        return []
+
+    runner = SyncRunner(
+        nodes={"n1": n1, "n2": n2},
+        work_queue=queue,
+        context_service=InMemoryKvContextService(InMemoryKvStore()),
+        router=RoutingService(registry=registry, strict=True),
+        observability=observer,
+    )
+    runner.run()
+
+    assert seen == ["x"]
+    assert observer._seen_parent_by_node["n1"] == "upstream-parent"
+    assert observer._seen_parent_by_node["n2"] == "span-n1"

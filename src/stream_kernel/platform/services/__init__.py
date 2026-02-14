@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from stream_kernel.integration.consumer_registry import ConsumerRegistry
-from stream_kernel.platform.services.bootstrap import BootstrapSupervisor, LocalBootstrapSupervisor
+from stream_kernel.platform.services.bootstrap import (
+    BootstrapSupervisor,
+    MultiprocessBootstrapSupervisor,
+    LocalBootstrapSupervisor,
+)
 from stream_kernel.platform.services.consumer_registry import DiscoveryConsumerRegistry
 from stream_kernel.platform.services.context import ContextService, InMemoryKvContextService, kv_store_memory
 from stream_kernel.platform.services.observability import (
@@ -37,6 +41,7 @@ __all__ = [
     "ContextService",
     "DiscoveryConsumerRegistry",
     "InMemoryKvContextService",
+    "MultiprocessBootstrapSupervisor",
     "LocalBootstrapSupervisor",
     "LocalRuntimeLifecycleManager",
     "NoOpObservabilityService",
