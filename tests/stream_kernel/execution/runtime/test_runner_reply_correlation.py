@@ -5,12 +5,12 @@ from stream_kernel.integration.consumer_registry import InMemoryConsumerRegistry
 from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.routing.routing_service import RoutingService
 from stream_kernel.integration.work_queue import InMemoryQueue
-from stream_kernel.platform.services.context import InMemoryKvContextService
+from stream_kernel.platform.services.state.context import InMemoryKvContextService
 from stream_kernel.platform.services.observability import (
     NoOpObservabilityService,
     legacy_reply_aware_observability,
 )
-from stream_kernel.platform.services.reply_waiter import (
+from stream_kernel.platform.services.messaging.reply_waiter import (
     InMemoryReplyWaiterService,
     TerminalEvent,
 )

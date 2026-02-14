@@ -22,13 +22,40 @@ _PROCESS_GROUP_SELECTOR_KEYS = {"stages", "tags", "runners", "nodes"}
 _PROCESS_GROUP_RUNTIME_KEYS = {
     "workers",
     "runner_profile",
+    "services",
     "heartbeat_seconds",
     "start_timeout_seconds",
     "stop_timeout_seconds",
 }
+_SUPPORTED_PROCESS_GROUP_RUNNER_PROFILES = {"sync", "async"}
+_SUPPORTED_PROCESS_GROUP_SERVICE_KEYS = {"api_service_profile", "rate_limiter_profile"}
 _SUPPORTED_OBSERVABILITY_TRACE_EXPORTER_KINDS = {"jsonl", "stdout", "otel_otlp", "opentracing_bridge"}
 _SUPPORTED_OBSERVABILITY_LOG_EXPORTER_KINDS = {"stdout", "jsonl", "otel_logs_otlp"}
 _SUPPORTED_OBSERVABILITY_LOG_LEVELS = {"info", "debug"}
+_SUPPORTED_API_POLICY_KEYS = {"defaults", "profiles"}
+_SUPPORTED_API_POLICY_DEFAULT_KEYS = {
+    "timeout_ms",
+    "retry",
+    "circuit_breaker",
+    "auth",
+    "telemetry",
+    "batching",
+    "rate_limit",
+    "execution_mode",
+}
+_SUPPORTED_API_POLICY_EXECUTION_MODES = {"sync", "async", "any"}
+_SUPPORTED_API_POLICY_RETRY_KEYS = {"max_attempts", "backoff_ms"}
+_SUPPORTED_API_POLICY_CIRCUIT_BREAKER_KEYS = {"failure_threshold", "reset_timeout_ms", "half_open_max_calls"}
+_SUPPORTED_API_POLICY_BATCHING_KEYS = {"max_items", "flush_interval_ms"}
+_SUPPORTED_RATE_LIMIT_KINDS = {
+    "fixed_window",
+    "sliding_window_counter",
+    "sliding_window_log",
+    "token_bucket",
+    "leaky_bucket",
+    "concurrency",
+}
+_SUPPORTED_WEB_INTERFACE_POLICY_KEYS = {"rate_limit", "request_size_bytes", "timeout_ms"}
 _SUPPORTED_RUNTIME_KEYS = {
     "strict",
     "discovery_modules",
@@ -182,6 +209,13 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
         )
     bootstrap["mode"] = bootstrap_mode
 
+    api_policies = platform.get("api_policies")
+    if api_policies is not None:
+        if not isinstance(api_policies, dict):
+            raise ConfigError("runtime.platform.api_policies must be a mapping when provided")
+        _normalize_api_policies(api_policies, prefix="runtime.platform.api_policies")
+        platform["api_policies"] = api_policies
+
     execution_ipc = platform.get("execution_ipc")
     if execution_ipc is not None:
         if not isinstance(execution_ipc, dict):
@@ -259,7 +293,35 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
                 raise ConfigError(
                     f"runtime.platform.process_groups[{index}].runner_profile must be a non-empty string when provided"
                 )
+            if runner_profile not in _SUPPORTED_PROCESS_GROUP_RUNNER_PROFILES:
+                raise ConfigError(
+                    "runtime.platform.process_groups["
+                    f"{index}].runner_profile must be one of: {sorted(_SUPPORTED_PROCESS_GROUP_RUNNER_PROFILES)}"
+                )
             group["runner_profile"] = runner_profile
+
+            services = group.get("services")
+            if services is not None:
+                if not isinstance(services, dict):
+                    raise ConfigError(
+                        f"runtime.platform.process_groups[{index}].services must be a mapping when provided"
+                    )
+                unknown_service_keys = sorted(key for key in services if key not in _SUPPORTED_PROCESS_GROUP_SERVICE_KEYS)
+                if unknown_service_keys:
+                    raise ConfigError(
+                        "runtime.platform.process_groups["
+                        f"{index}].services has unsupported keys: {unknown_service_keys}"
+                    )
+                for key in _SUPPORTED_PROCESS_GROUP_SERVICE_KEYS:
+                    value = services.get(key)
+                    if value is None:
+                        continue
+                    if not isinstance(value, str) or not value:
+                        raise ConfigError(
+                            "runtime.platform.process_groups["
+                            f"{index}].services.{key} must be a non-empty string when provided"
+                        )
+                group["services"] = services
 
             heartbeat_seconds = group.get("heartbeat_seconds", 5)
             if not isinstance(heartbeat_seconds, int):
@@ -473,6 +535,16 @@ def _normalize_runtime_web(runtime: dict[str, object]) -> None:
                 f"{sorted(_SUPPORTED_WEB_BIND_PORT_TYPES)}"
             )
 
+        policies = interface.get("policies")
+        if policies is not None:
+            if not isinstance(policies, dict):
+                raise ConfigError(f"runtime.web.interfaces[{index}].policies must be a mapping when provided")
+            _normalize_web_interface_policies(
+                policies,
+                prefix=f"runtime.web.interfaces[{index}].policies",
+            )
+            interface["policies"] = policies
+
 
 def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
     observability = runtime.get("observability")
@@ -530,6 +602,19 @@ def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
             raise ConfigError(
                 f"runtime.observability.logging.exporters[{index}].settings must be a mapping when provided"
             )
+        if kind == "jsonl":
+            path = settings.get("path")
+            if not isinstance(path, str) or not path:
+                raise ConfigError(
+                    f"runtime.observability.logging.exporters[{index}].settings.path "
+                    "must be a non-empty string for kind 'jsonl'"
+                )
+            workers_dir = settings.get("workers_dir")
+            if workers_dir is not None and (not isinstance(workers_dir, str) or not workers_dir):
+                raise ConfigError(
+                    f"runtime.observability.logging.exporters[{index}].settings.workers_dir "
+                    "must be a non-empty string when provided"
+                )
         exporter["settings"] = settings
 
     lifecycle_events = logging.get("lifecycle_events", {})
@@ -569,3 +654,263 @@ def _normalize_runtime_cli(runtime: dict[str, object]) -> None:
     if not isinstance(cli, dict):
         raise ConfigError("runtime.cli must be a mapping when provided")
     runtime["cli"] = cli
+
+
+def _normalize_api_policies(
+    api_policies: dict[str, object],
+    *,
+    prefix: str,
+) -> None:
+    unknown_keys = sorted(key for key in api_policies if key not in _SUPPORTED_API_POLICY_KEYS)
+    if unknown_keys:
+        raise ConfigError(
+            f"{prefix} has unsupported keys: {unknown_keys}"
+        )
+
+    defaults = api_policies.get("defaults", {})
+    if defaults is None:
+        defaults = {}
+    if not isinstance(defaults, dict):
+        raise ConfigError(f"{prefix}.defaults must be a mapping when provided")
+    _normalize_api_policy_profile(defaults, prefix=f"{prefix}.defaults")
+    api_policies["defaults"] = defaults
+
+    profiles = api_policies.get("profiles", {})
+    if profiles is None:
+        profiles = {}
+    if not isinstance(profiles, dict):
+        raise ConfigError(f"{prefix}.profiles must be a mapping when provided")
+    normalized_profiles: dict[str, object] = {}
+    for profile_name, profile in profiles.items():
+        if not isinstance(profile_name, str) or not profile_name:
+            raise ConfigError(f"{prefix}.profiles keys must be non-empty strings")
+        if not isinstance(profile, dict):
+            raise ConfigError(f"{prefix}.profiles.{profile_name} must be a mapping")
+        _normalize_api_policy_profile(
+            profile,
+            prefix=f"{prefix}.profiles.{profile_name}",
+        )
+        normalized_profiles[profile_name] = profile
+    api_policies["profiles"] = normalized_profiles
+
+
+def _normalize_api_policy_profile(
+    profile: dict[str, object],
+    *,
+    prefix: str,
+) -> None:
+    unknown_keys = sorted(key for key in profile if key not in _SUPPORTED_API_POLICY_DEFAULT_KEYS)
+    if unknown_keys:
+        raise ConfigError(
+            f"{prefix} has unsupported keys: {unknown_keys}"
+        )
+
+    if "timeout_ms" in profile:
+        timeout_ms = profile.get("timeout_ms")
+        if not isinstance(timeout_ms, int):
+            raise ConfigError(f"{prefix}.timeout_ms must be an integer when provided")
+        if timeout_ms <= 0:
+            raise ConfigError(f"{prefix}.timeout_ms must be > 0")
+        profile["timeout_ms"] = timeout_ms
+
+    if "execution_mode" in profile:
+        execution_mode = profile.get("execution_mode")
+        if not isinstance(execution_mode, str) or not execution_mode:
+            raise ConfigError(f"{prefix}.execution_mode must be a non-empty string when provided")
+        if execution_mode not in _SUPPORTED_API_POLICY_EXECUTION_MODES:
+            raise ConfigError(
+                f"{prefix}.execution_mode must be one of: {sorted(_SUPPORTED_API_POLICY_EXECUTION_MODES)}"
+            )
+        profile["execution_mode"] = execution_mode
+
+    if "retry" in profile:
+        retry = profile.get("retry")
+        if not isinstance(retry, dict):
+            raise ConfigError(f"{prefix}.retry must be a mapping when provided")
+        unknown_retry = sorted(key for key in retry if key not in _SUPPORTED_API_POLICY_RETRY_KEYS)
+        if unknown_retry:
+            raise ConfigError(
+                f"{prefix}.retry has unsupported keys: {unknown_retry}"
+            )
+        max_attempts = retry.get("max_attempts", 0)
+        if not isinstance(max_attempts, int):
+            raise ConfigError(f"{prefix}.retry.max_attempts must be an integer when provided")
+        if max_attempts < 0:
+            raise ConfigError(f"{prefix}.retry.max_attempts must be >= 0")
+        retry["max_attempts"] = max_attempts
+        backoff_ms = retry.get("backoff_ms", 0)
+        if not isinstance(backoff_ms, int):
+            raise ConfigError(f"{prefix}.retry.backoff_ms must be an integer when provided")
+        if backoff_ms < 0:
+            raise ConfigError(f"{prefix}.retry.backoff_ms must be >= 0")
+        retry["backoff_ms"] = backoff_ms
+        profile["retry"] = retry
+
+    if "circuit_breaker" in profile:
+        breaker = profile.get("circuit_breaker")
+        if not isinstance(breaker, dict):
+            raise ConfigError(f"{prefix}.circuit_breaker must be a mapping when provided")
+        unknown_breaker = sorted(key for key in breaker if key not in _SUPPORTED_API_POLICY_CIRCUIT_BREAKER_KEYS)
+        if unknown_breaker:
+            raise ConfigError(
+                f"{prefix}.circuit_breaker has unsupported keys: {unknown_breaker}"
+            )
+        failure_threshold = breaker.get("failure_threshold", 5)
+        if not isinstance(failure_threshold, int):
+            raise ConfigError(f"{prefix}.circuit_breaker.failure_threshold must be an integer when provided")
+        if failure_threshold <= 0:
+            raise ConfigError(f"{prefix}.circuit_breaker.failure_threshold must be > 0")
+        breaker["failure_threshold"] = failure_threshold
+        reset_timeout_ms = breaker.get("reset_timeout_ms", 30000)
+        if not isinstance(reset_timeout_ms, int):
+            raise ConfigError(f"{prefix}.circuit_breaker.reset_timeout_ms must be an integer when provided")
+        if reset_timeout_ms <= 0:
+            raise ConfigError(f"{prefix}.circuit_breaker.reset_timeout_ms must be > 0")
+        breaker["reset_timeout_ms"] = reset_timeout_ms
+        half_open_max_calls = breaker.get("half_open_max_calls", 1)
+        if not isinstance(half_open_max_calls, int):
+            raise ConfigError(f"{prefix}.circuit_breaker.half_open_max_calls must be an integer when provided")
+        if half_open_max_calls <= 0:
+            raise ConfigError(f"{prefix}.circuit_breaker.half_open_max_calls must be > 0")
+        breaker["half_open_max_calls"] = half_open_max_calls
+        profile["circuit_breaker"] = breaker
+
+    for key in {"auth", "telemetry"}:
+        if key not in profile:
+            continue
+        value = profile.get(key)
+        if not isinstance(value, dict):
+            raise ConfigError(f"{prefix}.{key} must be a mapping when provided")
+        profile[key] = value
+
+    if "batching" in profile:
+        batching = profile.get("batching")
+        if not isinstance(batching, dict):
+            raise ConfigError(f"{prefix}.batching must be a mapping when provided")
+        unknown_batching = sorted(key for key in batching if key not in _SUPPORTED_API_POLICY_BATCHING_KEYS)
+        if unknown_batching:
+            raise ConfigError(
+                f"{prefix}.batching has unsupported keys: {unknown_batching}"
+            )
+        max_items = batching.get("max_items", 100)
+        if not isinstance(max_items, int):
+            raise ConfigError(f"{prefix}.batching.max_items must be an integer when provided")
+        if max_items <= 0:
+            raise ConfigError(f"{prefix}.batching.max_items must be > 0")
+        batching["max_items"] = max_items
+        flush_interval_ms = batching.get("flush_interval_ms", 1000)
+        if not isinstance(flush_interval_ms, int):
+            raise ConfigError(f"{prefix}.batching.flush_interval_ms must be an integer when provided")
+        if flush_interval_ms <= 0:
+            raise ConfigError(f"{prefix}.batching.flush_interval_ms must be > 0")
+        batching["flush_interval_ms"] = flush_interval_ms
+        profile["batching"] = batching
+
+    if "rate_limit" in profile:
+        rate_limit = profile.get("rate_limit")
+        if not isinstance(rate_limit, dict):
+            raise ConfigError(f"{prefix}.rate_limit must be a mapping when provided")
+        _normalize_rate_limit_policy(rate_limit, prefix=f"{prefix}.rate_limit")
+        profile["rate_limit"] = rate_limit
+
+
+def _normalize_rate_limit_policy(
+    rate_limit: dict[str, object],
+    *,
+    prefix: str,
+) -> None:
+    kind = rate_limit.get("kind")
+    if not isinstance(kind, str) or not kind:
+        raise ConfigError(f"{prefix}.kind must be a non-empty string")
+    if kind not in _SUPPORTED_RATE_LIMIT_KINDS:
+        raise ConfigError(
+            f"{prefix}.kind must be one of: {sorted(_SUPPORTED_RATE_LIMIT_KINDS)}"
+        )
+    rate_limit["kind"] = kind
+
+    scope = rate_limit.get("scope")
+    if scope is not None:
+        if not isinstance(scope, str) or not scope:
+            raise ConfigError(f"{prefix}.scope must be a non-empty string when provided")
+        rate_limit["scope"] = scope
+
+    if kind in {"fixed_window", "sliding_window_counter", "sliding_window_log"}:
+        unknown_keys = sorted(key for key in rate_limit if key not in {"kind", "scope", "limit", "window_ms"})
+        if unknown_keys:
+            raise ConfigError(f"{prefix} has unsupported keys for '{kind}': {unknown_keys}")
+        limit = rate_limit.get("limit")
+        if not isinstance(limit, int):
+            raise ConfigError(f"{prefix}.limit must be an integer for '{kind}'")
+        if limit <= 0:
+            raise ConfigError(f"{prefix}.limit must be > 0 for '{kind}'")
+        rate_limit["limit"] = limit
+        window_ms = rate_limit.get("window_ms")
+        if not isinstance(window_ms, int):
+            raise ConfigError(f"{prefix}.window_ms must be an integer for '{kind}'")
+        if window_ms <= 0:
+            raise ConfigError(f"{prefix}.window_ms must be > 0 for '{kind}'")
+        rate_limit["window_ms"] = window_ms
+        return
+
+    if kind in {"token_bucket", "leaky_bucket"}:
+        unknown_keys = sorted(
+            key for key in rate_limit if key not in {"kind", "scope", "refill_rate_per_sec", "bucket_capacity"}
+        )
+        if unknown_keys:
+            raise ConfigError(f"{prefix} has unsupported keys for '{kind}': {unknown_keys}")
+        refill_rate = rate_limit.get("refill_rate_per_sec")
+        if not isinstance(refill_rate, (int, float)):
+            raise ConfigError(f"{prefix}.refill_rate_per_sec must be numeric for '{kind}'")
+        if float(refill_rate) <= 0:
+            raise ConfigError(f"{prefix}.refill_rate_per_sec must be > 0 for '{kind}'")
+        rate_limit["refill_rate_per_sec"] = float(refill_rate)
+        bucket_capacity = rate_limit.get("bucket_capacity")
+        if not isinstance(bucket_capacity, int):
+            raise ConfigError(f"{prefix}.bucket_capacity must be an integer for '{kind}'")
+        if bucket_capacity <= 0:
+            raise ConfigError(f"{prefix}.bucket_capacity must be > 0 for '{kind}'")
+        rate_limit["bucket_capacity"] = bucket_capacity
+        return
+
+    unknown_keys = sorted(key for key in rate_limit if key not in {"kind", "scope", "max_in_flight"})
+    if unknown_keys:
+        raise ConfigError(f"{prefix} has unsupported keys for 'concurrency': {unknown_keys}")
+    max_in_flight = rate_limit.get("max_in_flight")
+    if not isinstance(max_in_flight, int):
+        raise ConfigError(f"{prefix}.max_in_flight must be an integer for 'concurrency'")
+    if max_in_flight <= 0:
+        raise ConfigError(f"{prefix}.max_in_flight must be > 0 for 'concurrency'")
+    rate_limit["max_in_flight"] = max_in_flight
+
+
+def _normalize_web_interface_policies(
+    policies: dict[str, object],
+    *,
+    prefix: str,
+) -> None:
+    unknown_keys = sorted(key for key in policies if key not in _SUPPORTED_WEB_INTERFACE_POLICY_KEYS)
+    if unknown_keys:
+        raise ConfigError(f"{prefix} has unsupported keys: {unknown_keys}")
+
+    if "request_size_bytes" in policies:
+        request_size_bytes = policies.get("request_size_bytes")
+        if not isinstance(request_size_bytes, int):
+            raise ConfigError(f"{prefix}.request_size_bytes must be an integer when provided")
+        if request_size_bytes <= 0:
+            raise ConfigError(f"{prefix}.request_size_bytes must be > 0")
+        policies["request_size_bytes"] = request_size_bytes
+
+    if "timeout_ms" in policies:
+        timeout_ms = policies.get("timeout_ms")
+        if not isinstance(timeout_ms, int):
+            raise ConfigError(f"{prefix}.timeout_ms must be an integer when provided")
+        if timeout_ms <= 0:
+            raise ConfigError(f"{prefix}.timeout_ms must be > 0")
+        policies["timeout_ms"] = timeout_ms
+
+    if "rate_limit" in policies:
+        rate_limit = policies.get("rate_limit")
+        if not isinstance(rate_limit, dict):
+            raise ConfigError(f"{prefix}.rate_limit must be a mapping when provided")
+        _normalize_rate_limit_policy(rate_limit, prefix=f"{prefix}.rate_limit")
+        policies["rate_limit"] = rate_limit

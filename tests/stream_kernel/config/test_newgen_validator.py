@@ -816,6 +816,36 @@ def test_validate_newgen_config_rejects_unknown_observability_logging_lifecycle_
         validate_newgen_config(raw)
 
 
+def test_validate_newgen_config_rejects_logging_jsonl_exporter_without_path() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "logging": {
+            "exporters": [
+                {"kind": "jsonl", "settings": {}},
+            ]
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_logging_jsonl_exporter_invalid_workers_dir() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "logging": {
+            "exporters": [
+                {"kind": "jsonl", "settings": {"path": "logs/lifecycle.jsonl", "workers_dir": ""}},
+            ]
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
 def test_validate_newgen_config_rejects_invalid_execution_ipc_control_bind_host() -> None:
     raw = _phase0_base_config()
     runtime = raw["runtime"]
@@ -946,6 +976,230 @@ def test_validate_newgen_config_rejects_runtime_platform_routing_cache_bad_max_e
             "enabled": True,
             "negative_cache": True,
             "max_entries": 0,
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_accepts_runtime_platform_api_policies_and_web_interface_policies() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "api_policies": {
+            "defaults": {
+                "timeout_ms": 2000,
+                "retry": {"max_attempts": 3, "backoff_ms": 100},
+                "rate_limit": {
+                    "kind": "token_bucket",
+                    "refill_rate_per_sec": 25,
+                    "bucket_capacity": 100,
+                },
+            },
+            "profiles": {
+                "partner_api": {
+                    "timeout_ms": 1500,
+                    "rate_limit": {
+                        "kind": "fixed_window",
+                        "limit": 50,
+                        "window_ms": 1000,
+                    },
+                }
+            },
+        }
+    }
+    runtime["web"] = {
+        "interfaces": [
+            {
+                "kind": "http",
+                "binds": ["request", "response"],
+                "policies": {
+                    "request_size_bytes": 1048576,
+                    "timeout_ms": 5000,
+                    "rate_limit": {
+                        "kind": "sliding_window_counter",
+                        "limit": 200,
+                        "window_ms": 60000,
+                    },
+                },
+            }
+        ]
+    }
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    api_policies = platform.get("api_policies")
+    assert isinstance(api_policies, dict)
+    defaults = api_policies.get("defaults")
+    assert isinstance(defaults, dict)
+    assert defaults.get("timeout_ms") == 2000
+    assert defaults.get("rate_limit", {}).get("kind") == "token_bucket"
+
+    web = validated_runtime.get("web")
+    assert isinstance(web, dict)
+    interfaces = web.get("interfaces")
+    assert isinstance(interfaces, list)
+    policies = interfaces[0].get("policies")
+    assert isinstance(policies, dict)
+    assert policies.get("request_size_bytes") == 1048576
+    assert policies.get("rate_limit", {}).get("kind") == "sliding_window_counter"
+
+
+def test_validate_newgen_config_rejects_unknown_runtime_platform_api_rate_limiter_kind() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "api_policies": {
+            "defaults": {
+                "rate_limit": {
+                    "kind": "fixed_quota",
+                    "limit": 10,
+                    "window_ms": 1000,
+                }
+            }
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_token_bucket_without_capacity() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "api_policies": {
+            "defaults": {
+                "rate_limit": {
+                    "kind": "token_bucket",
+                    "refill_rate_per_sec": 10,
+                }
+            }
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_unknown_web_interface_policy_key() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["web"] = {
+        "interfaces": [
+            {
+                "kind": "http",
+                "binds": ["request", "response"],
+                "policies": {"burst_mode": True},
+            }
+        ]
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_invalid_web_interface_request_size_policy() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["web"] = {
+        "interfaces": [
+            {
+                "kind": "http",
+                "binds": ["request", "response"],
+                "policies": {"request_size_bytes": 0},
+            }
+        ]
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_accepts_process_group_services_contract() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "process_groups": [
+            {
+                "name": "execution.cpu",
+                "runner_profile": "sync",
+                "services": {
+                    "api_service_profile": "partner_api",
+                    "rate_limiter_profile": "partner_api",
+                },
+            }
+        ],
+        "api_policies": {
+            "profiles": {
+                "partner_api": {
+                    "execution_mode": "sync",
+                    "rate_limit": {"kind": "fixed_window", "limit": 10, "window_ms": 1000},
+                }
+            }
+        },
+    }
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    process_groups = platform.get("process_groups")
+    assert isinstance(process_groups, list)
+    services = process_groups[0].get("services")
+    assert isinstance(services, dict)
+    assert services.get("api_service_profile") == "partner_api"
+
+
+def test_validate_newgen_config_rejects_unknown_process_group_runner_profile() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "process_groups": [
+            {
+                "name": "execution.cpu",
+                "runner_profile": "celery",
+            }
+        ]
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_unknown_process_group_services_key() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "process_groups": [
+            {
+                "name": "execution.cpu",
+                "services": {"policy_profile": "p1"},
+            }
+        ]
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_unknown_api_policy_execution_mode() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "api_policies": {
+            "profiles": {
+                "partner_api": {
+                    "execution_mode": "io",
+                    "rate_limit": {"kind": "fixed_window", "limit": 10, "window_ms": 1000},
+                }
+            }
         }
     }
     with pytest.raises(ConfigError):

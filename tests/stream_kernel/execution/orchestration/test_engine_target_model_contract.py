@@ -22,13 +22,13 @@ from stream_kernel.integration.consumer_registry import InMemoryConsumerRegistry
 from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.routing.routing_service import RoutingService
 from stream_kernel.integration.work_queue import InMemoryQueue
-from stream_kernel.platform.services.context import ContextService, InMemoryKvContextService
+from stream_kernel.platform.services.state.context import ContextService, InMemoryKvContextService
 from stream_kernel.platform.services.observability import (
     NoOpObservabilityService,
     ReplyAwareObservabilityService,
 )
-from stream_kernel.platform.services.reply_coordinator import legacy_reply_coordinator
-from stream_kernel.platform.services.reply_waiter import InMemoryReplyWaiterService, TerminalEvent
+from stream_kernel.platform.services.messaging.reply_coordinator import legacy_reply_coordinator
+from stream_kernel.platform.services.messaging.reply_waiter import InMemoryReplyWaiterService, TerminalEvent
 from stream_kernel.routing.envelope import Envelope
 
 

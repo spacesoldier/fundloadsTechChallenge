@@ -9,10 +9,10 @@ from stream_kernel.execution.transport.bootstrap_keys import (
     build_bootstrap_key_bundle,
 )
 from stream_kernel.execution.orchestration.child_bootstrap import build_child_bootstrap_bundle
-from stream_kernel.platform.services.bootstrap import BootstrapSupervisor
-from stream_kernel.platform.services.lifecycle import RuntimeLifecycleManager
-from stream_kernel.platform.services.reply_coordinator import ReplyCoordinatorService
-from stream_kernel.platform.services.reply_waiter import TerminalEvent
+from stream_kernel.platform.services.runtime.bootstrap import BootstrapSupervisor
+from stream_kernel.platform.services.runtime.lifecycle import RuntimeLifecycleManager
+from stream_kernel.platform.services.messaging.reply_coordinator import ReplyCoordinatorService
+from stream_kernel.platform.services.messaging.reply_waiter import TerminalEvent
 from stream_kernel.routing.envelope import Envelope
 from stream_kernel.routing.router import RoutingResult
 

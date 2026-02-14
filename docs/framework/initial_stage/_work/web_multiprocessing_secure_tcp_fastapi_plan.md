@@ -18,6 +18,8 @@ This plan extends and details:
 - [engine runner/router target model plan](engine_runner_router_target_model_tdd_plan.md)
 - [engine runtime contract cleanup plan](engine_runtime_contract_cleanup_tdd_plan.md)
 - [web phase 5pre multiprocess supervisor and observability plan](web_phase5pre_multiprocess_supervisor_and_observability_tdd_plan.md)
+- [observability exporters + AsyncRunner master plan](observability_exporters_and_async_runner_master_tdd_plan.md)
+- [platform API services and rate-limiter policies plan](platform_api_services_and_rate_limiter_policies_tdd_plan.md)
 - [multiprocess bus ownership and outbound route cache analysis](../web/analysis/Multiprocess%20bus%20ownership%20and%20outbound%20route%20cache.md)
 
 ---

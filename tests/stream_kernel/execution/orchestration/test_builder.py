@@ -23,6 +23,7 @@ from stream_kernel.execution.orchestration.builder import (
     execute_runtime_artifacts,
     ensure_platform_discovery_modules,
     ensure_runtime_observability_binding,
+    ensure_runtime_api_policy_bindings,
     ensure_runtime_registry_bindings,
     ensure_runtime_transport_bindings,
     load_discovery_modules,
@@ -46,7 +47,7 @@ from stream_kernel.execution.orchestration.lifecycle_orchestration import (
     RuntimeWorkerFailedError,
 )
 from stream_kernel.application_context.service import service
-from stream_kernel.platform.services.context import ContextService, InMemoryKvContextService
+from stream_kernel.platform.services.state.context import ContextService, InMemoryKvContextService
 from stream_kernel.application_context.injection_registry import InjectionRegistry, InjectionRegistryError
 from stream_kernel.execution.observers.observer_builder import build_execution_observers_from_factories
 from stream_kernel.execution.observers.observer import ExecutionObserver, ObserverFactoryContext
@@ -62,21 +63,26 @@ from stream_kernel.platform.services.observability import (
     ObservabilityService,
     ReplyAwareObservabilityService,
 )
-from stream_kernel.platform.services.reply_coordinator import (
+from stream_kernel.platform.services.api.policy import (
+    ApiPolicyService,
+    RateLimiterService,
+)
+from stream_kernel.platform.services.api.outbound import OutboundApiService
+from stream_kernel.platform.services.messaging.reply_coordinator import (
     ReplyCoordinatorService,
     legacy_reply_coordinator,
 )
-from stream_kernel.platform.services.transport import (
+from stream_kernel.platform.services.runtime.transport import (
     MemoryRuntimeTransportService,
     RuntimeTransportService,
     TcpLocalRuntimeTransportService,
 )
-from stream_kernel.platform.services.reply_waiter import (
+from stream_kernel.platform.services.messaging.reply_waiter import (
     InMemoryReplyWaiterService,
     TerminalEvent,
 )
-from stream_kernel.platform.services.lifecycle import RuntimeLifecycleManager
-from stream_kernel.platform.services.bootstrap import BootstrapSupervisor
+from stream_kernel.platform.services.runtime.lifecycle import RuntimeLifecycleManager
+from stream_kernel.platform.services.runtime.bootstrap import BootstrapSupervisor
 from stream_kernel.kernel.scenario import StepSpec
 from stream_kernel.routing.envelope import Envelope
 from stream_kernel.routing.router import RoutingResult
@@ -412,6 +418,223 @@ def test_build_source_ingress_plan_wraps_readable_adapters() -> None:
     assert [item.trace_id for item in second if isinstance(item.payload, int)] == ["run:events_source:2"]
     assert [item.payload for item in second if isinstance(item.payload, int)] == [2]
     assert third == []
+
+
+def test_api_ing_01_source_ingress_rejects_when_web_limiter_exceeded() -> None:
+    # API-ING-01: ingress message is rejected deterministically with status 429 when limiter denies.
+    registry = AdapterRegistry()
+    registry.register("events_source", "events_source", _source_factory)
+    adapters = {"events_source": {"settings": {}}}
+    adapter_instances = {
+        "events_source": type(
+            "I",
+            (),
+            {
+                "read": lambda *_a: [
+                    Envelope(payload={"request_id": 1}, reply_to="conn-a"),
+                    Envelope(payload={"request_id": 2}, reply_to="conn-a"),
+                ]
+            },
+        )()
+    }
+    injection = InjectionRegistry()
+    injection.register_factory("service", ContextService, lambda: InMemoryKvContextService(InMemoryKvStore()))
+    ensure_runtime_api_policy_bindings(
+        injection_registry=injection,
+        runtime={
+            "platform": {},
+            "web": {
+                "interfaces": [
+                    {
+                        "kind": "http",
+                        "binds": ["request", "response"],
+                        "policies": {
+                            "rate_limit": {"kind": "fixed_window", "limit": 1, "window_ms": 60_000}
+                        },
+                    }
+                ]
+            },
+        },
+    )
+    scope = injection.instantiate_for_scenario("s1")
+    ingress = build_source_ingress_plan(
+        adapters=adapters,
+        adapter_instances=adapter_instances,
+        adapter_registry=registry,
+        scenario_scope=scope,
+        run_id="run",
+        scenario_id="scenario",
+        runtime={
+            "web": {
+                "interfaces": [
+                    {
+                        "kind": "http",
+                        "binds": ["request", "response"],
+                        "policies": {
+                            "rate_limit": {"kind": "fixed_window", "limit": 1, "window_ms": 60_000}
+                        },
+                    }
+                ]
+            }
+        },
+    )
+    node = ingress.source_steps[0].step
+
+    first = node({}, {})
+    second = node({}, {})
+    first_payloads = [item.payload for item in first if isinstance(item, Envelope) and isinstance(item.payload, dict)]
+    second_payloads = [item.payload for item in second if isinstance(item, Envelope)]
+    assert first_payloads == [{"request_id": 1}]
+    assert any(isinstance(item, TerminalEvent) and item.status == "error" for item in second_payloads)
+    terminal = next(item for item in second_payloads if isinstance(item, TerminalEvent))
+    assert isinstance(terminal.payload, dict)
+    assert terminal.payload.get("status_code") == 429
+    assert terminal.payload.get("code") == "rate_limited"
+
+
+def test_api_ing_02_source_ingress_uses_reply_to_as_rate_limit_key() -> None:
+    # API-ING-02: limiter key is derived from reply_to so independent connections are isolated.
+    registry = AdapterRegistry()
+    registry.register("events_source", "events_source", _source_factory)
+    adapters = {"events_source": {"settings": {}}}
+    adapter_instances = {
+        "events_source": type(
+            "I",
+            (),
+            {
+                "read": lambda *_a: [
+                    Envelope(payload={"request_id": 1}, reply_to="conn-a"),
+                    Envelope(payload={"request_id": 2}, reply_to="conn-b"),
+                    Envelope(payload={"request_id": 3}, reply_to="conn-a"),
+                ]
+            },
+        )()
+    }
+    injection = InjectionRegistry()
+    injection.register_factory("service", ContextService, lambda: InMemoryKvContextService(InMemoryKvStore()))
+    ensure_runtime_api_policy_bindings(
+        injection_registry=injection,
+        runtime={
+            "platform": {},
+            "web": {
+                "interfaces": [
+                    {
+                        "kind": "websocket",
+                        "binds": ["stream"],
+                        "policies": {
+                            "rate_limit": {"kind": "fixed_window", "limit": 1, "window_ms": 60_000}
+                        },
+                    }
+                ]
+            },
+        },
+    )
+    scope = injection.instantiate_for_scenario("s1")
+    ingress = build_source_ingress_plan(
+        adapters=adapters,
+        adapter_instances=adapter_instances,
+        adapter_registry=registry,
+        scenario_scope=scope,
+        run_id="run",
+        scenario_id="scenario",
+        runtime={
+            "web": {
+                "interfaces": [
+                    {
+                        "kind": "websocket",
+                        "binds": ["stream"],
+                        "policies": {
+                            "rate_limit": {"kind": "fixed_window", "limit": 1, "window_ms": 60_000}
+                        },
+                    }
+                ]
+            }
+        },
+    )
+    node = ingress.source_steps[0].step
+    out1 = node({}, {})
+    out2 = node({}, {})
+    out3 = node({}, {})
+
+    payloads1 = [item.payload for item in out1 if isinstance(item, Envelope) and isinstance(item.payload, dict)]
+    payloads2 = [item.payload for item in out2 if isinstance(item, Envelope) and isinstance(item.payload, dict)]
+    payloads3 = [item.payload for item in out3 if isinstance(item, Envelope)]
+    assert payloads1 == [{"request_id": 1}]
+    assert payloads2 == [{"request_id": 2}]
+    assert any(isinstance(item, TerminalEvent) and item.status == "error" for item in payloads3)
+
+
+def test_api_ing_03_source_ingress_emits_limiter_decision_observability_hook() -> None:
+    # API-ING-03: allow/deny decisions are emitted through observability decision hook.
+    decisions: list[dict[str, object]] = []
+
+    class _Obs:
+        def on_ingress_rate_limit_decision(self, **kwargs: object) -> None:
+            decisions.append(dict(kwargs))
+
+    registry = AdapterRegistry()
+    registry.register("events_source", "events_source", _source_factory)
+    adapters = {"events_source": {"settings": {}}}
+    adapter_instances = {
+        "events_source": type(
+            "I",
+            (),
+            {
+                "read": lambda *_a: [
+                    Envelope(payload={"request_id": 1}, reply_to="conn-a"),
+                    Envelope(payload={"request_id": 2}, reply_to="conn-a"),
+                ]
+            },
+        )()
+    }
+    injection = InjectionRegistry()
+    injection.register_factory("service", ContextService, lambda: InMemoryKvContextService(InMemoryKvStore()))
+    injection.register_factory("service", ObservabilityService, lambda: _Obs())
+    ensure_runtime_api_policy_bindings(
+        injection_registry=injection,
+        runtime={
+            "platform": {},
+            "web": {
+                "interfaces": [
+                    {
+                        "kind": "http",
+                        "binds": ["request", "response"],
+                        "policies": {
+                            "rate_limit": {"kind": "fixed_window", "limit": 1, "window_ms": 60_000}
+                        },
+                    }
+                ]
+            },
+        },
+    )
+    scope = injection.instantiate_for_scenario("s1")
+    ingress = build_source_ingress_plan(
+        adapters=adapters,
+        adapter_instances=adapter_instances,
+        adapter_registry=registry,
+        scenario_scope=scope,
+        run_id="run",
+        scenario_id="scenario",
+        runtime={
+            "web": {
+                "interfaces": [
+                    {
+                        "kind": "http",
+                        "binds": ["request", "response"],
+                        "policies": {
+                            "rate_limit": {"kind": "fixed_window", "limit": 1, "window_ms": 60_000}
+                        },
+                    }
+                ]
+            }
+        },
+    )
+    node = ingress.source_steps[0].step
+    node({}, {})
+    node({}, {})
+
+    assert [item.get("allowed") for item in decisions] == [True, False]
+    assert all(item.get("source_role") == "events_source" for item in decisions)
 
 
 def test_build_sink_runtime_nodes_wraps_consume_adapters_when_token_has_no_graph_consumer() -> None:
@@ -911,6 +1134,110 @@ def test_ensure_runtime_observability_binding_uses_platform_fanout_service() -> 
     assert isinstance(resolved, ReplyAwareObservabilityService)
     assert isinstance(resolved.inner, FanoutObservabilityService)
     assert len(resolved.inner.observers) == 1
+
+
+def test_ensure_runtime_api_policy_bindings_registers_platform_services() -> None:
+    # API-POL-DI-01: platform API policy service should be available through DI with runtime defaults/profiles.
+    registry = InjectionRegistry()
+    ensure_runtime_api_policy_bindings(
+        injection_registry=registry,
+        runtime={
+            "platform": {
+                "api_policies": {
+                    "defaults": {
+                        "timeout_ms": 2000,
+                        "rate_limit": {
+                            "kind": "token_bucket",
+                            "refill_rate_per_sec": 20,
+                            "bucket_capacity": 100,
+                        },
+                    },
+                    "profiles": {
+                        "partner_api": {
+                            "timeout_ms": 1500,
+                            "rate_limit": {
+                                "kind": "fixed_window",
+                                "limit": 50,
+                                "window_ms": 1000,
+                            },
+                        }
+                    },
+                }
+            }
+        },
+    )
+    scope = registry.instantiate_for_scenario("s1")
+    policy_service = scope.resolve("service", ApiPolicyService)
+    assert policy_service.defaults().get("timeout_ms") == 2000
+    partner = policy_service.profile("partner_api")
+    assert partner.get("timeout_ms") == 1500
+    assert partner.get("rate_limit", {}).get("kind") == "fixed_window"
+
+
+def test_ensure_runtime_api_policy_bindings_registers_rate_limiter_qualifiers() -> None:
+    # API-POL-DI-02: rate limiter service must be resolvable by qualifier/profile.
+    registry = InjectionRegistry()
+    ensure_runtime_api_policy_bindings(
+        injection_registry=registry,
+        runtime={
+            "platform": {
+                "api_policies": {
+                    "defaults": {
+                        "rate_limit": {
+                            "kind": "token_bucket",
+                            "refill_rate_per_sec": 10,
+                            "bucket_capacity": 20,
+                        }
+                    },
+                    "profiles": {
+                        "partner_api": {
+                            "rate_limit": {
+                                "kind": "concurrency",
+                                "max_in_flight": 5,
+                            }
+                        }
+                    },
+                }
+            }
+        },
+    )
+    scope = registry.instantiate_for_scenario("s1")
+    default_limiter = scope.resolve("service", RateLimiterService)
+    partner_limiter = scope.resolve("service", RateLimiterService, qualifier="partner_api")
+    default_outbound = scope.resolve("service", OutboundApiService)
+    partner_outbound = scope.resolve("service", OutboundApiService, qualifier="partner_api")
+    assert default_limiter.config().get("kind") == "token_bucket"
+    assert partner_limiter.config().get("kind") == "concurrency"
+    assert default_outbound.policy().get("rate_limit", {}).get("kind") == "token_bucket"
+    assert partner_outbound.policy().get("rate_limit", {}).get("kind") == "concurrency"
+
+
+def test_ensure_runtime_api_policy_bindings_rejects_runner_profile_mismatch() -> None:
+    # API-POL-DI-03: async-only policy profiles cannot be bound into sync runner groups.
+    registry = InjectionRegistry()
+    with pytest.raises(ValueError, match="requires runner_profile='async'"):
+        ensure_runtime_api_policy_bindings(
+            injection_registry=registry,
+            runtime={
+                "platform": {
+                    "process_groups": [
+                        {
+                            "name": "execution.cpu",
+                            "runner_profile": "sync",
+                            "services": {"rate_limiter_profile": "partner_api"},
+                        }
+                    ],
+                    "api_policies": {
+                        "profiles": {
+                            "partner_api": {
+                                "execution_mode": "async",
+                                "rate_limit": {"kind": "concurrency", "max_in_flight": 5},
+                            }
+                        }
+                    },
+                }
+            },
+        )
 
 
 def test_ensure_runtime_kv_binding_rejects_unknown_backend() -> None:

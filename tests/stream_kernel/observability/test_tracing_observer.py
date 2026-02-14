@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from stream_kernel.platform.services.context import InMemoryKvContextService
+from stream_kernel.platform.services.state.context import InMemoryKvContextService
 from stream_kernel.execution.runtime.runner import SyncRunner
 from stream_kernel.integration.consumer_registry import InMemoryConsumerRegistry
 from stream_kernel.integration.kv_store import InMemoryKvStore

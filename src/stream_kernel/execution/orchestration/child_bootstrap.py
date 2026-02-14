@@ -13,14 +13,14 @@ from stream_kernel.application_context.injection_registry import (
 )
 from stream_kernel.execution.transport.bootstrap_keys import BootstrapKeyBundle
 from stream_kernel.kernel.scenario import StepSpec
-from stream_kernel.platform.services.context import ContextService
-from stream_kernel.platform.services.lifecycle import RuntimeLifecycleManager
+from stream_kernel.platform.services.state.context import ContextService
+from stream_kernel.platform.services.runtime.lifecycle import RuntimeLifecycleManager
 from stream_kernel.platform.services.observability import (
     NoOpObservabilityService,
     ObservabilityService as ObservabilityServiceContract,
     ObservabilityService,
 )
-from stream_kernel.platform.services.transport import RuntimeTransportService
+from stream_kernel.platform.services.runtime.transport import RuntimeTransportService
 from stream_kernel.routing.envelope import Envelope
 from stream_kernel.routing.router import RoutingResult
 from stream_kernel.routing.routing_service import RoutingService
@@ -208,6 +208,7 @@ def bootstrap_child_runtime_from_bundle(bundle: ChildBootstrapBundle) -> ChildRu
             scenario_scope=scenario_scope,
             run_id=bundle.run_id,
             scenario_id=bundle.scenario_id,
+            runtime=bundle.runtime,
         )
         for token, node_names in source_ingress.source_consumers.items():
             get_consumers = getattr(consumer_registry, "get_consumers", None)
@@ -498,7 +499,7 @@ def _resolve_routing_service(scope: ScenarioScope) -> RoutingService:
 
 
 def _terminal_event_from_output(output: object) -> object | None:
-    from stream_kernel.platform.services.reply_waiter import TerminalEvent
+    from stream_kernel.platform.services.messaging.reply_waiter import TerminalEvent
 
     if isinstance(output, TerminalEvent):
         return output

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 # docs/framework/initial_stage/DAG construction.md
 # docs/framework/initial_stage/Execution runtime and routing integration.md
 from stream_kernel.application_context import ApplicationContext
-from stream_kernel.platform.services.context import InMemoryKvContextService
+from stream_kernel.platform.services.state.context import InMemoryKvContextService
 from stream_kernel.platform.services.observability import NoOpObservabilityService
 from stream_kernel.execution.runtime.runner import SyncRunner
 from stream_kernel.integration.kv_store import InMemoryKvStore

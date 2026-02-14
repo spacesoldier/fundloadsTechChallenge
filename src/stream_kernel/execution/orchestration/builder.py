@@ -33,7 +33,11 @@ from stream_kernel.execution.observers.observer_builder import build_execution_o
 from stream_kernel.execution.runtime.planning import build_execution_plan
 from stream_kernel.execution.runtime.runner import SyncRunner
 from stream_kernel.execution.transport.secure_tcp_transport import SecureTcpConfig, SecureTcpTransport
-from stream_kernel.execution.orchestration.source_ingress import BootstrapControl, build_source_ingress_plan
+from stream_kernel.execution.orchestration.source_ingress import (
+    WEB_INGRESS_LIMITER_QUALIFIER,
+    BootstrapControl,
+    build_source_ingress_plan,
+)
 from stream_kernel.integration.consumer_registry import ConsumerRegistry
 from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
 from stream_kernel.kernel.dag import NodeContract
@@ -43,7 +47,17 @@ from stream_kernel.platform.services.observability import (
     ObservabilityService,
     ReplyAwareObservabilityService,
 )
-from stream_kernel.platform.services.transport import (
+from stream_kernel.platform.services.api.policy import (
+    ApiPolicyService,
+    InMemoryApiPolicyService,
+    InMemoryRateLimiterService,
+    RateLimiterService,
+)
+from stream_kernel.platform.services.api.outbound import (
+    InMemoryOutboundApiService,
+    OutboundApiService,
+)
+from stream_kernel.platform.services.runtime.transport import (
     MemoryRuntimeTransportService,
     RuntimeTransportService,
     TcpLocalRuntimeTransportService,
@@ -265,6 +279,10 @@ def build_runtime_artifacts(
         observers=observers,
     )
     register_discovered_services(injection_registry, modules)
+    ensure_runtime_api_policy_bindings(
+        injection_registry=injection_registry,
+        runtime=runtime,
+    )
 
     scenario_id = scenario_name(config)
     ensure_runtime_transport_bindings(
@@ -290,6 +308,7 @@ def build_runtime_artifacts(
         scenario_scope=scenario_scope,
         run_id=run_id,
         scenario_id=scenario_id,
+        runtime=runtime,
     )
     for token, node_names in source_ingress.source_consumers.items():
         get_consumers = getattr(consumer_registry, "get_consumers", None)
@@ -542,6 +561,179 @@ def ensure_runtime_kv_binding(
     except InjectionRegistryError:
         # Explicit binding already exists and must win over default provisioning.
         return
+
+
+def ensure_runtime_api_policy_bindings(
+    *,
+    injection_registry: InjectionRegistry,
+    runtime: dict[str, object],
+) -> None:
+    # Runtime policy services are provided via DI and profile qualifiers.
+    ensure_runtime_kv_binding(injection_registry, runtime)
+
+    platform = runtime.get("platform", {})
+    if not isinstance(platform, dict):
+        raise ValueError("runtime.platform must be a mapping")
+    api_policies = platform.get("api_policies", {})
+    if api_policies is None:
+        api_policies = {}
+    if not isinstance(api_policies, dict):
+        raise ValueError("runtime.platform.api_policies must be a mapping when provided")
+
+    defaults_raw = api_policies.get("defaults", {})
+    defaults = dict(defaults_raw) if isinstance(defaults_raw, dict) else {}
+    profiles_raw = api_policies.get("profiles", {})
+    profiles: dict[str, dict[str, object]] = (
+        {
+            name: dict(profile)
+            for name, profile in profiles_raw.items()
+            if isinstance(name, str) and isinstance(profile, dict)
+        }
+        if isinstance(profiles_raw, dict)
+        else {}
+    )
+
+    _validate_api_policy_runner_profile_compatibility(runtime=runtime, profiles=profiles)
+
+    api_policy_service = InMemoryApiPolicyService(
+        defaults_policy=dict(defaults),
+        profiles={name: dict(profile) for name, profile in profiles.items()},
+    )
+    injection_registry.register_factory(
+        "service",
+        ApiPolicyService,
+        lambda _service=api_policy_service: _service,
+        replace=True,
+    )
+
+    default_limiter = InMemoryRateLimiterService(
+        limiter_profile_name=None,
+        limiter_config=_rate_limit_policy_from_profile(api_policy_service.profile(None)),
+    )
+    injection_registry.register_factory(
+        "service",
+        RateLimiterService,
+        lambda _service=default_limiter: _service,
+        replace=True,
+    )
+    default_outbound = InMemoryOutboundApiService(
+        profile=None,
+        policy_config=api_policy_service.profile(None),
+        limiter=default_limiter,
+    )
+    injection_registry.register_factory(
+        "service",
+        OutboundApiService,
+        lambda _service=default_outbound: _service,
+        replace=True,
+    )
+
+    for profile_name, profile in profiles.items():
+        resolved_profile = api_policy_service.profile(profile_name)
+        limiter = InMemoryRateLimiterService(
+            limiter_profile_name=profile_name,
+            limiter_config=_rate_limit_policy_from_profile(resolved_profile),
+        )
+        injection_registry.register_factory(
+            "service",
+            RateLimiterService,
+            lambda _service=limiter: _service,
+            qualifier=profile_name,
+            replace=True,
+        )
+        outbound = InMemoryOutboundApiService(
+            profile=profile_name,
+            policy_config=resolved_profile,
+            limiter=limiter,
+        )
+        injection_registry.register_factory(
+            "service",
+            OutboundApiService,
+            lambda _service=outbound: _service,
+            qualifier=profile_name,
+            replace=True,
+        )
+
+    web_ingress_policy = _web_ingress_rate_limit_policy(runtime)
+    if web_ingress_policy is not None:
+        ingress_limiter = InMemoryRateLimiterService(
+            limiter_profile_name=WEB_INGRESS_LIMITER_QUALIFIER,
+            limiter_config=web_ingress_policy,
+        )
+        injection_registry.register_factory(
+            "service",
+            RateLimiterService,
+            lambda _service=ingress_limiter: _service,
+            qualifier=WEB_INGRESS_LIMITER_QUALIFIER,
+            replace=True,
+        )
+
+
+def _validate_api_policy_runner_profile_compatibility(
+    *,
+    runtime: dict[str, object],
+    profiles: dict[str, dict[str, object]],
+) -> None:
+    # Phase B contract: service-profile execution mode must match process-group runner profile.
+    platform = runtime.get("platform", {})
+    if not isinstance(platform, dict):
+        return
+    groups_raw = platform.get("process_groups", [])
+    if not isinstance(groups_raw, list):
+        return
+    for group in groups_raw:
+        if not isinstance(group, dict):
+            continue
+        runner_profile = group.get("runner_profile", "sync")
+        if not isinstance(runner_profile, str) or not runner_profile:
+            continue
+        services = group.get("services", {})
+        if services is None:
+            services = {}
+        if not isinstance(services, dict):
+            continue
+        for key in ("api_service_profile", "rate_limiter_profile"):
+            profile_name = services.get(key)
+            if not isinstance(profile_name, str) or not profile_name:
+                continue
+            profile = profiles.get(profile_name, {})
+            if not isinstance(profile, dict):
+                continue
+            execution_mode = profile.get("execution_mode", "sync")
+            if not isinstance(execution_mode, str) or execution_mode not in {"sync", "async", "any"}:
+                continue
+            if execution_mode != "any" and execution_mode != runner_profile:
+                raise ValueError(
+                    "runtime.platform.process_groups[].services."
+                    f"{key}='{profile_name}' requires runner_profile='{execution_mode}' "
+                    f"but group '{group.get('name', '<unknown>')}' uses '{runner_profile}'"
+                )
+
+
+def _rate_limit_policy_from_profile(profile: dict[str, object]) -> dict[str, object]:
+    rate_limit = profile.get("rate_limit", {})
+    if isinstance(rate_limit, dict):
+        return dict(rate_limit)
+    return {}
+
+
+def _web_ingress_rate_limit_policy(runtime: dict[str, object]) -> dict[str, object] | None:
+    web = runtime.get("web")
+    if not isinstance(web, dict):
+        return None
+    interfaces = web.get("interfaces")
+    if not isinstance(interfaces, list):
+        return None
+    for interface in interfaces:
+        if not isinstance(interface, dict):
+            continue
+        policies = interface.get("policies")
+        if not isinstance(policies, dict):
+            continue
+        rate_limit = policies.get("rate_limit")
+        if isinstance(rate_limit, dict):
+            return dict(rate_limit)
+    return None
 
 
 def runtime_kv_backend(runtime: dict[str, object]) -> str:

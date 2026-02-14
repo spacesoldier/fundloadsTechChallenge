@@ -22,9 +22,9 @@ from stream_kernel.execution.orchestration.source_ingress import BootstrapContro
 from stream_kernel.execution.orchestration.lifecycle_orchestration import BoundaryDispatchInput
 from stream_kernel.integration.consumer_registry import ConsumerRegistry
 from stream_kernel.adapters.file_io import SinkLine
-from stream_kernel.platform.services.reply_waiter import TerminalEvent
-from stream_kernel.platform.services.lifecycle import RuntimeLifecycleManager
-from stream_kernel.platform.services.transport import RuntimeTransportService, TcpLocalRuntimeTransportService
+from stream_kernel.platform.services.messaging.reply_waiter import TerminalEvent
+from stream_kernel.platform.services.runtime.lifecycle import RuntimeLifecycleManager
+from stream_kernel.platform.services.runtime.transport import RuntimeTransportService, TcpLocalRuntimeTransportService
 
 
 def _runtime_tcp_local_generated() -> dict[str, object]:
@@ -132,7 +132,7 @@ def test_child_boundary_loop_executes_discovered_node_and_emits_terminal_envelop
         "\n".join(
             [
                 "from stream_kernel.kernel.node_annotation import node",
-                "from stream_kernel.platform.services.reply_waiter import TerminalEvent",
+                "from stream_kernel.platform.services.messaging.reply_waiter import TerminalEvent",
                 "",
                 "@node(name='child.echo', consumes=[], emits=[])",
                 "def child_echo(payload, ctx):",

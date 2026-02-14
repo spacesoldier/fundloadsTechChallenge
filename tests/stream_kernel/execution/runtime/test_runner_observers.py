@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from stream_kernel.platform.services.context import InMemoryKvContextService
+from stream_kernel.platform.services.state.context import InMemoryKvContextService
 from stream_kernel.platform.services.observability import NoOpObservabilityService
 from stream_kernel.execution.runtime.runner import SyncRunner
 from stream_kernel.integration.kv_store import InMemoryKvStore

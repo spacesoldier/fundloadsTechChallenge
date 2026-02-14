@@ -4,9 +4,9 @@ from dataclasses import dataclass, field
 
 from stream_kernel.application_context.inject import inject
 from stream_kernel.integration.work_queue import QueuePort
-from stream_kernel.platform.services.context import ContextService
+from stream_kernel.platform.services.state.context import ContextService
 from stream_kernel.platform.services.observability import ObservabilityService
-from stream_kernel.platform.services.reply_waiter import TerminalEvent
+from stream_kernel.platform.services.messaging.reply_waiter import TerminalEvent
 from stream_kernel.routing.envelope import Envelope
 from stream_kernel.routing.router import RoutingResult
 from stream_kernel.routing.routing_service import RoutingService

@@ -20,6 +20,12 @@ Codec/backend alignment:
   [web_multiprocessing_secure_tcp_fastapi_plan](web_multiprocessing_secure_tcp_fastapi_plan.md).
 - multiprocess supervisor + observability substrate prerequisite (Phase 5pre):
   [web_phase5pre_multiprocess_supervisor_and_observability_tdd_plan](web_phase5pre_multiprocess_supervisor_and_observability_tdd_plan.md).
+- exporter backends + AsyncRunner rollout roadmap (post-5pre):
+  [observability_exporters_and_async_runner_master_tdd_plan](observability_exporters_and_async_runner_master_tdd_plan.md).
+- non-blocking lifecycle logging pipeline (supervisor/workers):
+  [lifecycle_logging_async_pipeline_tdd_plan](lifecycle_logging_async_pipeline_tdd_plan.md).
+- platform API service policies (timeout/retry/circuit-breaker/auth/telemetry/rate-limit):
+  [platform_api_services_and_rate_limiter_policies_tdd_plan](platform_api_services_and_rate_limiter_policies_tdd_plan.md).
 - multiprocess bus ownership and outbound routing cache target model:
   [../web/analysis/Multiprocess bus ownership and outbound route cache](../web/analysis/Multiprocess%20bus%20ownership%20and%20outbound%20route%20cache.md).
 - bootstrap-process and generated-secret rollout details (Phase 3):
@@ -37,6 +43,8 @@ In scope:
 - mapping protocol payloads to domain models at adapter boundary;
 - request/response and stream semantics in one model;
 - observability at ingress/egress boundaries.
+- ingress/outbound policy enforcement via platform services:
+  timeout, retry, circuit-breaker, auth, telemetry, rate-limiting.
 
 Out of scope (later stages):
 
@@ -84,6 +92,11 @@ Phase ordering note:
 - [ ] HTTP response adapter (egress) integration test.
 - [ ] WebSocket stream adapter integration test.
 - [ ] GraphQL adapter integration test (query/mutation baseline).
+
+7. Policy services and rate limiters
+- [ ] Implement framework policy-service chain for inbound/outbound API calls.
+- [ ] Support limiter families: fixed window, sliding window (counter/log), token bucket, leaky bucket, concurrency cap.
+- [ ] Add deterministic observability for policy decisions (`allowed/blocked/queued/dropped`).
 
 ## TDD test matrix (starter)
 

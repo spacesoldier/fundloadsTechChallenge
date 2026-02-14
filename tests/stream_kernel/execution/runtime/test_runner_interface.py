@@ -3,7 +3,7 @@ from __future__ import annotations
 # Runner interface is part of the execution model (Execution runtime + planning docs).
 from stream_kernel.application_context.application_context import apply_injection
 from stream_kernel.application_context.injection_registry import InjectionRegistry
-from stream_kernel.platform.services.context import ContextService, InMemoryKvContextService
+from stream_kernel.platform.services.state.context import ContextService, InMemoryKvContextService
 from stream_kernel.platform.services.observability import (
     NoOpObservabilityService,
     ObservabilityService,

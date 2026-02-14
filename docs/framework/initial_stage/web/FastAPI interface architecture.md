@@ -14,6 +14,7 @@ It complements:
 - [analysis/Web-execution process isolation and Redis backbone](analysis/Web-execution%20process%20isolation%20and%20Redis%20backbone.md)
 - [analysis/Execution process port security profile](analysis/Execution%20process%20port%20security%20profile.md)
 - [analysis/Multiprocess bus ownership and outbound route cache](analysis/Multiprocess%20bus%20ownership%20and%20outbound%20route%20cache.md)
+- [_work/platform API services and rate-limiter policies plan](../_work/platform_api_services_and_rate_limiter_policies_tdd_plan.md)
 
 ---
 
@@ -111,6 +112,14 @@ Initial stage tracks hook points only:
 - auth/authz dependencies at adapter boundary
 - request-size/rate limits as ingress policies
 - deterministic timeout/cancel behavior for awaiting replies
+
+Rate-limit policy target families:
+
+- fixed window
+- sliding window (counter/log)
+- token bucket
+- leaky bucket
+- concurrency cap (max in-flight)
 
 Full policy engine is out of scope for this stage.
 

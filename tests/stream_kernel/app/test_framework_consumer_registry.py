@@ -17,7 +17,7 @@ import stream_kernel.app.runtime as runtime_module
 from stream_kernel.application_context import ApplicationContext
 from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.injection_registry import InjectionRegistry
-from stream_kernel.platform.services.context import ContextService, InMemoryKvContextService
+from stream_kernel.platform.services.state.context import ContextService, InMemoryKvContextService
 from stream_kernel.platform.services.observability import NoOpObservabilityService, ObservabilityService
 from stream_kernel.integration.consumer_registry import ConsumerRegistry, InMemoryConsumerRegistry
 from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore

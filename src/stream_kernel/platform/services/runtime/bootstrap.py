@@ -6,11 +6,12 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from threading import Lock
 from types import SimpleNamespace
 
 from stream_kernel.application_context.service import service
-from stream_kernel.observability.adapters.logging import StdoutLogSink
+from stream_kernel.observability.adapters.logging import JsonlLogSink, StdoutLogSink
 from stream_kernel.observability.domain.logging import LogMessage
 from stream_kernel.routing.envelope import Envelope
 from stream_kernel.routing.router import RoutingResult
@@ -90,6 +91,31 @@ class _WorkerHandle:
     ready: bool = False
 
 
+@dataclass(slots=True)
+class _FanoutLogSink:
+    sinks: list[object]
+
+    def emit(self, message: LogMessage) -> None:
+        for sink in list(self.sinks):
+            emit = getattr(sink, "emit", None)
+            if not callable(emit):
+                continue
+            try:
+                emit(message)
+            except Exception:
+                continue
+
+    def close(self) -> None:
+        for sink in list(self.sinks):
+            close = getattr(sink, "close", None)
+            if not callable(close):
+                continue
+            try:
+                close()
+            except Exception:
+                continue
+
+
 def _is_child_bootstrap_bundle(bundle: object | None) -> bool:
     try:
         from stream_kernel.execution.orchestration.child_bootstrap import ChildBootstrapBundle
@@ -164,21 +190,155 @@ def _close_pipe(pipe: object | None) -> None:
             return
 
 
-def _worker_loop(stop_event: object | None, control_child: object | None, child_bundle: object | None) -> None:
+def _safe_worker_file_name(worker_id: str) -> str:
+    return worker_id.replace("/", "_").replace("#", "_")
+
+
+def _resolve_lifecycle_log_sink(
+    *,
+    settings: dict[str, object] | None,
+    worker_id: str | None = None,
+    group_name: str | None = None,
+) -> object | None:
+    if not isinstance(settings, dict):
+        return None
+    exporters = settings.get("exporters", [])
+    if not isinstance(exporters, list):
+        exporters = []
+    sinks: list[object] = []
+    for exporter in exporters:
+        if not isinstance(exporter, dict):
+            continue
+        kind = exporter.get("kind")
+        if kind == "stdout":
+            sinks.append(StdoutLogSink())
+            continue
+        if kind != "jsonl":
+            continue
+        exporter_settings = exporter.get("settings", {})
+        if not isinstance(exporter_settings, dict):
+            continue
+        path = exporter_settings.get("path")
+        if not isinstance(path, str) or not path:
+            continue
+        if worker_id is None:
+            sinks.append(JsonlLogSink(Path(path)))
+            continue
+        workers_dir = exporter_settings.get("workers_dir")
+        if isinstance(workers_dir, str) and workers_dir:
+            worker_path = Path(workers_dir) / f"{_safe_worker_file_name(worker_id)}.jsonl"
+        else:
+            group_suffix = (
+                _safe_worker_file_name(group_name)
+                if isinstance(group_name, str) and group_name
+                else "group"
+            )
+            worker_path = Path(path).parent / "workers" / group_suffix / f"{_safe_worker_file_name(worker_id)}.jsonl"
+        sinks.append(JsonlLogSink(worker_path))
+    if not sinks:
+        return None
+    if len(sinks) == 1:
+        return sinks[0]
+    return _FanoutLogSink(sinks=sinks)
+
+
+def _emit_lifecycle_log(
+    sink: object | None,
+    *,
+    level: str,
+    message: str,
+    fields: dict[str, object],
+) -> None:
+    emit = getattr(sink, "emit", None)
+    if not callable(emit):
+        return
+    try:
+        emit(
+            LogMessage(
+                level=level,
+                message=message,
+                timestamp=datetime.now(tz=UTC),
+                fields=dict(fields),
+            )
+        )
+    except Exception:
+        return
+
+
+def _close_log_sink(sink: object | None) -> None:
+    close = getattr(sink, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            return
+
+
+def _worker_loop(
+    stop_event: object | None,
+    control_child: object | None,
+    child_bundle: object | None,
+    worker_id: str | None = None,
+    group_name: str | None = None,
+    logging_settings: dict[str, object] | None = None,
+) -> None:
     # Worker loop: accepts boundary execution commands and returns terminal outputs over control pipe.
+    log_sink = _resolve_lifecycle_log_sink(
+        settings=logging_settings,
+        worker_id=worker_id,
+        group_name=group_name,
+    )
+    log_level = "info"
+    if isinstance(logging_settings, dict):
+        lifecycle = logging_settings.get("lifecycle_events", {})
+        if isinstance(lifecycle, dict):
+            maybe_level = lifecycle.get("level")
+            if isinstance(maybe_level, str) and maybe_level:
+                log_level = maybe_level
+    base_fields = {
+        "worker_id": worker_id,
+        "group_name": group_name,
+        "pid": os.getpid(),
+    }
+    _emit_lifecycle_log(
+        log_sink,
+        level=log_level,
+        message="bootstrap.worker_loop_started",
+        fields=base_fields,
+    )
+
     child_runtime: object | None = None
     child_bootstrap_error: Exception | None = None
     if _is_child_bootstrap_bundle(child_bundle):
         try:
             child_runtime = _bootstrap_child_runtime(child_bundle)
+            _emit_lifecycle_log(
+                log_sink,
+                level=log_level,
+                message="bootstrap.worker_bootstrapped",
+                fields=base_fields,
+            )
         except Exception as exc:  # noqa: BLE001 - deterministic error payload is returned on execute requests.
             child_bootstrap_error = exc
+            _emit_lifecycle_log(
+                log_sink,
+                level="debug",
+                message="bootstrap.worker_bootstrap_failed",
+                fields={**base_fields, "error_type": type(exc).__name__},
+            )
 
     is_set = getattr(stop_event, "is_set", None)
     while True:
         if callable(is_set) and bool(is_set()):
+            _emit_lifecycle_log(
+                log_sink,
+                level=log_level,
+                message="bootstrap.worker_stop_event_received",
+                fields=base_fields,
+            )
             _close_child_runtime(child_runtime)
             _close_pipe(control_child)
+            _close_log_sink(log_sink)
             return
 
         poll = getattr(control_child, "poll", None)
@@ -196,6 +356,7 @@ def _worker_loop(stop_event: object | None, control_child: object | None, child_
         except (EOFError, OSError):
             _close_child_runtime(child_runtime)
             _close_pipe(control_child)
+            _close_log_sink(log_sink)
             return
 
         if not isinstance(command, dict):
@@ -205,6 +366,12 @@ def _worker_loop(stop_event: object | None, control_child: object | None, child_
         correlation_id = command.get("correlation_id", "")
 
         if kind == "stop":
+            _emit_lifecycle_log(
+                log_sink,
+                level=log_level,
+                message="bootstrap.worker_stop_command",
+                fields={**base_fields, "correlation_id": correlation_id},
+            )
             _send_pipe_message(
                 control_child,
                 {
@@ -214,9 +381,16 @@ def _worker_loop(stop_event: object | None, control_child: object | None, child_
             )
             _close_child_runtime(child_runtime)
             _close_pipe(control_child)
+            _close_log_sink(log_sink)
             return
 
         if kind != "execute_boundary":
+            _emit_lifecycle_log(
+                log_sink,
+                level="debug",
+                message="bootstrap.worker_unsupported_command",
+                fields={**base_fields, "kind": kind},
+            )
             _send_pipe_message(
                 control_child,
                 {
@@ -278,6 +452,12 @@ def _worker_loop(stop_event: object | None, control_child: object | None, child_
                 child_runtime=child_runtime,
                 inputs=list(inputs_raw),
             )
+            _emit_lifecycle_log(
+                log_sink,
+                level=log_level,
+                message="bootstrap.worker_execute_boundary_result",
+                fields={**base_fields, "outputs": len(terminal_outputs)},
+            )
             _send_pipe_message(
                 control_child,
                 {
@@ -287,6 +467,12 @@ def _worker_loop(stop_event: object | None, control_child: object | None, child_
                 },
             )
         except TimeoutError:
+            _emit_lifecycle_log(
+                log_sink,
+                level="debug",
+                message="bootstrap.worker_execute_boundary_timeout",
+                fields=base_fields,
+            )
             _send_pipe_message(
                 control_child,
                 {
@@ -297,6 +483,12 @@ def _worker_loop(stop_event: object | None, control_child: object | None, child_
                 },
             )
         except ConnectionError:
+            _emit_lifecycle_log(
+                log_sink,
+                level="debug",
+                message="bootstrap.worker_execute_boundary_transport_error",
+                fields=base_fields,
+            )
             _send_pipe_message(
                 control_child,
                 {
@@ -308,6 +500,12 @@ def _worker_loop(stop_event: object | None, control_child: object | None, child_
             )
         except Exception as exc:
             detail = f"{type(exc).__name__}: {exc}"
+            _emit_lifecycle_log(
+                log_sink,
+                level="debug",
+                message="bootstrap.worker_execute_boundary_error",
+                fields={**base_fields, "error_type": type(exc).__name__},
+            )
             _send_pipe_message(
                 control_child,
                 {
@@ -347,6 +545,7 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
         self._lifecycle_logging_enabled = False
         self._lifecycle_log_level = "info"
         self._lifecycle_log_sink: object | None = None
+        self._lifecycle_logging_settings: dict[str, object] = {}
 
     def load_bootstrap_channel(self, channel: object) -> None:
         self._bootstrap_channel = channel
@@ -398,14 +597,7 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
         if not isinstance(exporters, list):
             raise ValueError("runtime.observability.logging.exporters must be a list when provided")
 
-        sink: object | None = None
-        for exporter in exporters:
-            if not isinstance(exporter, dict):
-                continue
-            kind = exporter.get("kind")
-            if kind == "stdout":
-                sink = StdoutLogSink()
-                break
+        sink = _resolve_lifecycle_log_sink(settings=settings)
 
         if sink is None and enabled:
             # Default dev profile: if lifecycle logging is enabled, stdout sink is used unless explicitly disabled.
@@ -415,6 +607,7 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
             self._lifecycle_logging_enabled = enabled
             self._lifecycle_log_level = level
             self._lifecycle_log_sink = sink
+            self._lifecycle_logging_settings = dict(settings)
 
     def configure_process_groups(self, groups: list[dict[str, object]]) -> None:
         workers_map: dict[str, int] = {}
@@ -466,7 +659,14 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
                     worker_bundle = _build_child_bundle_for_group(self._child_bundle, group_name)
                     process = self._ctx.Process(
                         target=_worker_loop,
-                        args=(stop_event, child_pipe, worker_bundle),
+                        args=(
+                            stop_event,
+                            child_pipe,
+                            worker_bundle,
+                            worker_id,
+                            group_name,
+                            dict(self._lifecycle_logging_settings),
+                        ),
                         name=f"sk:{worker_id}",
                         daemon=True,
                     )

@@ -5,12 +5,12 @@ import pytest
 from stream_kernel.execution.orchestration.builder import RuntimeBuildArtifacts, execute_runtime_artifacts
 from stream_kernel.execution.orchestration.lifecycle_orchestration import RuntimeWorkerFailedError
 from stream_kernel.application_context.injection_registry import InjectionRegistry
-from stream_kernel.platform.services.bootstrap import BootstrapSupervisor
-from stream_kernel.platform.services.reply_coordinator import (
+from stream_kernel.platform.services.runtime.bootstrap import BootstrapSupervisor
+from stream_kernel.platform.services.messaging.reply_coordinator import (
     ReplyCoordinatorService,
     legacy_reply_coordinator,
 )
-from stream_kernel.platform.services.reply_waiter import InMemoryReplyWaiterService, TerminalEvent
+from stream_kernel.platform.services.messaging.reply_waiter import InMemoryReplyWaiterService, TerminalEvent
 from stream_kernel.routing.envelope import Envelope
 from stream_kernel.routing.router import RoutingResult
 import stream_kernel.execution.orchestration.builder as builder_module

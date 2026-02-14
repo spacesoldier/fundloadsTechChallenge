@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from stream_kernel.platform.services.reply_coordinator import (
+from stream_kernel.platform.services.messaging.reply_coordinator import (
     InMemoryReplyCoordinatorService,
     legacy_reply_coordinator,
 )
-from stream_kernel.platform.services.reply_waiter import (
+from stream_kernel.platform.services.messaging.reply_waiter import (
     InMemoryReplyWaiterService,
     TerminalEvent,
 )

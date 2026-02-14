@@ -9,8 +9,8 @@ import pytest
 from stream_kernel.execution.orchestration.child_bootstrap import build_child_bootstrap_bundle
 from stream_kernel.execution.orchestration.lifecycle_orchestration import BoundaryDispatchInput
 from stream_kernel.execution.transport.bootstrap_keys import build_bootstrap_key_bundle
-from stream_kernel.platform.services.bootstrap import MultiprocessBootstrapSupervisor
-from stream_kernel.platform.services.reply_waiter import TerminalEvent
+from stream_kernel.platform.services.runtime.bootstrap import MultiprocessBootstrapSupervisor
+from stream_kernel.platform.services.messaging.reply_waiter import TerminalEvent
 from stream_kernel.routing.envelope import Envelope
 
 
@@ -52,7 +52,7 @@ def test_p5pre_exec_01_boundary_is_executed_in_target_worker_process(tmp_path: P
             [
                 "import os",
                 "from stream_kernel.kernel.node_annotation import node",
-                "from stream_kernel.platform.services.reply_waiter import TerminalEvent",
+                "from stream_kernel.platform.services.messaging.reply_waiter import TerminalEvent",
                 "",
                 "@node(name='child.echo', consumes=[], emits=[])",
                 "def child_echo(payload, ctx):",

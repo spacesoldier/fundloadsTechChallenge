@@ -5,7 +5,7 @@ from typing import Protocol, runtime_checkable
 
 from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.service import service
-from stream_kernel.platform.services.reply_waiter import ReplyWaiterService, TerminalEvent
+from stream_kernel.platform.services.messaging.reply_waiter import ReplyWaiterService, TerminalEvent
 
 
 @runtime_checkable

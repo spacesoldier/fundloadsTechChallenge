@@ -31,6 +31,8 @@ This phase is a hard prerequisite for:
   [web_phase5pre_stepg_smoke_topology_tdd_spec](web_phase5pre_stepg_smoke_topology_tdd_spec.md)
 - Follow-up handoff/OTLP/Jaeger closure plan:
   [web_phase5pre_handoff_otlp_jaeger_tdd_plan](web_phase5pre_handoff_otlp_jaeger_tdd_plan.md)
+- Follow-up non-blocking lifecycle logging pipeline plan:
+  [lifecycle_logging_async_pipeline_tdd_plan](lifecycle_logging_async_pipeline_tdd_plan.md)
 
 ---
 

@@ -8,6 +8,7 @@ import pytest
 from stream_kernel.adapters.contracts import get_adapter_meta
 from stream_kernel.adapters.discovery import discover_adapters
 from stream_kernel.observability.adapters import (
+    log_jsonl,
     log_stdout,
     telemetry_stdout,
     trace_opentracing_bridge,
@@ -42,12 +43,16 @@ def test_trace_adapters_declare_standard_kv_stream_contract() -> None:
 
 def test_log_and_telemetry_adapters_declare_standard_stream_contract() -> None:
     # Logging and telemetry are stream-mode observability channels in the platform model.
+    log_jsonl_meta = get_adapter_meta(log_jsonl)
     log_meta = get_adapter_meta(log_stdout)
     telemetry_meta = get_adapter_meta(telemetry_stdout)
+    assert log_jsonl_meta is not None
     assert log_meta is not None
     assert telemetry_meta is not None
+    assert list(log_jsonl_meta.consumes) == [LogMessage]
     assert list(log_meta.consumes) == [LogMessage]
     assert list(telemetry_meta.consumes) == [TelemetryMessage]
+    assert list(log_jsonl_meta.binds) == [("stream", LogMessage)]
     assert list(log_meta.binds) == [("stream", LogMessage)]
     assert list(telemetry_meta.binds) == [("stream", TelemetryMessage)]
 
@@ -57,6 +62,11 @@ def test_trace_jsonl_requires_path_setting() -> None:
         trace_jsonl({})
 
 
+def test_log_jsonl_requires_path_setting() -> None:
+    with pytest.raises(ValueError):
+        log_jsonl({})
+
+
 def test_observability_adapters_are_discoverable() -> None:
     # All framework observability adapter factories are discoverable by @adapter metadata.
     module = ModuleType("stream_kernel.observability.adapters")
@@ -64,6 +74,7 @@ def test_observability_adapters_are_discoverable() -> None:
     module.trace_jsonl = trace_jsonl
     module.trace_otel_otlp = trace_otel_otlp
     module.trace_opentracing_bridge = trace_opentracing_bridge
+    module.log_jsonl = log_jsonl
     module.log_stdout = log_stdout
     module.telemetry_stdout = telemetry_stdout
     discovered = discover_adapters([module])
@@ -72,6 +83,7 @@ def test_observability_adapters_are_discoverable() -> None:
         "trace_jsonl",
         "trace_otel_otlp",
         "trace_opentracing_bridge",
+        "log_jsonl",
         "log_stdout",
         "telemetry_stdout",
     }

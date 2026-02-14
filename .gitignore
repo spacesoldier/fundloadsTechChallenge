@@ -76,3 +76,11 @@ tests/stream_kernel/execution/orchestration/__pycache__/*
 tests/stream_kernel/execution/runtime/__pycache__/*
 tests/stream_kernel/execution/transport/__pycache__/*
 tests/stream_kernel/platform/services/__pycache__/*
+src/stream_kernel/platform/services/api/__pycache__/*
+src/stream_kernel/platform/services/messaging/__pycache__/*
+src/stream_kernel/platform/services/runtime/__pycache__/*
+src/stream_kernel/platform/services/state/__pycache__/*
+tests/stream_kernel/platform/services/api/__pycache__/*
+tests/stream_kernel/platform/services/messaging/__pycache__/*
+tests/stream_kernel/platform/services/runtime/__pycache__/*
+tests/stream_kernel/platform/services/state/__pycache__/*

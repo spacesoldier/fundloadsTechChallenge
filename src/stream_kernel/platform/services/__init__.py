@@ -1,35 +1,47 @@
 from __future__ import annotations
 
 from stream_kernel.integration.consumer_registry import ConsumerRegistry
-from stream_kernel.platform.services.bootstrap import (
+from stream_kernel.platform.services.runtime.bootstrap import (
     BootstrapSupervisor,
     MultiprocessBootstrapSupervisor,
     LocalBootstrapSupervisor,
 )
-from stream_kernel.platform.services.consumer_registry import DiscoveryConsumerRegistry
-from stream_kernel.platform.services.context import ContextService, InMemoryKvContextService, kv_store_memory
+from stream_kernel.platform.services.api.policy import (
+    ApiPolicyService,
+    InMemoryApiPolicyService,
+    InMemoryRateLimiterService,
+    RateLimiterService,
+)
+from stream_kernel.platform.services.api.outbound import (
+    InMemoryOutboundApiService,
+    OutboundApiService,
+    OutboundCircuitOpenError,
+    OutboundRateLimitedError,
+)
+from stream_kernel.platform.services.state.consumer_registry import DiscoveryConsumerRegistry
+from stream_kernel.platform.services.state.context import ContextService, InMemoryKvContextService, kv_store_memory
 from stream_kernel.platform.services.observability import (
     NoOpObservabilityService,
     ObservabilityService,
     ReplyAwareObservabilityService,
     legacy_reply_aware_observability,
 )
-from stream_kernel.platform.services.reply_waiter import (
+from stream_kernel.platform.services.messaging.reply_waiter import (
     InMemoryReplyWaiterService,
     PendingReplyWaiterService,
     ReplyWaiterService,
     TerminalEvent,
 )
-from stream_kernel.platform.services.reply_coordinator import (
+from stream_kernel.platform.services.messaging.reply_coordinator import (
     InMemoryReplyCoordinatorService,
     ReplyCoordinatorService,
     legacy_reply_coordinator,
 )
-from stream_kernel.platform.services.lifecycle import (
+from stream_kernel.platform.services.runtime.lifecycle import (
     LocalRuntimeLifecycleManager,
     RuntimeLifecycleManager,
 )
-from stream_kernel.platform.services.transport import (
+from stream_kernel.platform.services.runtime.transport import (
     MemoryRuntimeTransportService,
     RuntimeTransportService,
     TcpLocalRuntimeTransportService,
@@ -38,9 +50,13 @@ from stream_kernel.platform.services.transport import (
 __all__ = [
     "ConsumerRegistry",
     "BootstrapSupervisor",
+    "ApiPolicyService",
     "ContextService",
     "DiscoveryConsumerRegistry",
+    "InMemoryApiPolicyService",
+    "InMemoryOutboundApiService",
     "InMemoryKvContextService",
+    "InMemoryRateLimiterService",
     "MultiprocessBootstrapSupervisor",
     "LocalBootstrapSupervisor",
     "LocalRuntimeLifecycleManager",
@@ -52,6 +68,10 @@ __all__ = [
     "PendingReplyWaiterService",
     "ReplyCoordinatorService",
     "ReplyWaiterService",
+    "RateLimiterService",
+    "OutboundApiService",
+    "OutboundCircuitOpenError",
+    "OutboundRateLimitedError",
     "RuntimeLifecycleManager",
     "RuntimeTransportService",
     "TerminalEvent",

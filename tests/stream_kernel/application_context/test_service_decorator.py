@@ -9,8 +9,8 @@ from fund_load.services.window_store import InMemoryWindowStore
 from stream_kernel.application_context.service import ServiceMeta, discover_services, service
 from stream_kernel.routing.routing_service import RoutingService
 from stream_kernel.integration.work_queue import InMemoryQueue, InMemoryTopic
-from stream_kernel.platform.services.consumer_registry import DiscoveryConsumerRegistry
-from stream_kernel.platform.services.context import InMemoryKvContextService
+from stream_kernel.platform.services.state.consumer_registry import DiscoveryConsumerRegistry
+from stream_kernel.platform.services.state.context import InMemoryKvContextService
 
 
 def test_service_decorator_attaches_metadata_to_class() -> None:

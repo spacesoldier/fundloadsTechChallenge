@@ -7,11 +7,11 @@ from typing import Protocol, runtime_checkable
 from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.service import service
 from stream_kernel.execution.observers.observer import ExecutionObserver
-from stream_kernel.platform.services.reply_coordinator import (
+from stream_kernel.platform.services.messaging.reply_coordinator import (
     ReplyCoordinatorService,
     legacy_reply_coordinator,
 )
-from stream_kernel.platform.services.reply_waiter import TerminalEvent
+from stream_kernel.platform.services.messaging.reply_waiter import TerminalEvent
 
 
 @runtime_checkable

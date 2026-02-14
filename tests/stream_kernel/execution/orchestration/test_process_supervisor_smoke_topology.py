@@ -5,9 +5,9 @@ from pathlib import Path
 
 from stream_kernel.application_context.injection_registry import InjectionRegistry
 from stream_kernel.execution.orchestration.builder import RuntimeBuildArtifacts, execute_runtime_artifacts
-from stream_kernel.platform.services.bootstrap import BootstrapSupervisor, MultiprocessBootstrapSupervisor
-from stream_kernel.platform.services.reply_coordinator import ReplyCoordinatorService, legacy_reply_coordinator
-from stream_kernel.platform.services.reply_waiter import InMemoryReplyWaiterService, TerminalEvent
+from stream_kernel.platform.services.runtime.bootstrap import BootstrapSupervisor, MultiprocessBootstrapSupervisor
+from stream_kernel.platform.services.messaging.reply_coordinator import ReplyCoordinatorService, legacy_reply_coordinator
+from stream_kernel.platform.services.messaging.reply_waiter import InMemoryReplyWaiterService, TerminalEvent
 from stream_kernel.routing.envelope import Envelope
 
 
@@ -86,7 +86,7 @@ def test_p5pre_smoke_01_four_group_topology_executes_end_to_end(tmp_path: Path) 
             [
                 "from stream_kernel.kernel.node_annotation import node",
                 "from stream_kernel.routing.envelope import Envelope",
-                "from stream_kernel.platform.services.reply_waiter import TerminalEvent",
+                "from stream_kernel.platform.services.messaging.reply_waiter import TerminalEvent",
                 "",
                 "@node(name='ingress.n1', consumes=[], emits=[])",
                 "def ingress_n1(payload, ctx):",

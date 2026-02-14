@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from stream_kernel.platform.services.context import InMemoryKvContextService
+from stream_kernel.platform.services.state.context import InMemoryKvContextService
 from stream_kernel.integration.kv_store import InMemoryKvStore
 
 

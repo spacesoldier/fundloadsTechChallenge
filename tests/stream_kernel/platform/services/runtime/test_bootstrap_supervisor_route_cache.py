@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from stream_kernel.platform.services.bootstrap import MultiprocessBootstrapSupervisor
+from stream_kernel.platform.services.runtime.bootstrap import MultiprocessBootstrapSupervisor
 
 
 def _resolve(supervisor: MultiprocessBootstrapSupervisor, *, target: str, source_group: str | None) -> str:
