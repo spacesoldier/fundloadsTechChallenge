@@ -12,6 +12,34 @@ Target outcome:
 - keep exporter failures isolated from business execution path;
 - preserve cross-process trace continuity (`trace_id`, `span_id`, `parent_span_id`).
 
+## Status snapshot
+
+- [x] Phase A baseline complete (`OBS-CFG-A-01..06`): exporter config contract,
+  backend selector validation, and runner-profile compatibility checks.
+- [x] Phase B complete (`OBS-REQ-01..05` + backend forwarding): requests Session backend,
+  deterministic batch flush (count/timer), and exporter-level backend wiring.
+- [x] Phase C complete (`OBS-HTTPX-01..05` + config normalization):
+  httpx sync/async paths, HTTP/2 propagation, retry/backoff, and clean shutdown.
+- [x] Phase D complete (`OBS-AIO-01..05` + queue/aiohttp config):
+  aiohttp transport, deterministic drop policies, flush-on-close semantics.
+- [x] Phase E complete (`OBS-U3-01..05` + urllib3 config normalization):
+  pooled urllib3 transport, deterministic error isolation, headers/timeout parity.
+- [x] Phase F complete (`OBS-GRPC-01..05` + grpc config normalization):
+  grpc channel/stub export path, deadline/retry mapping, failure isolation.
+- [x] Phase G complete (`OBS-OTELSDK-01..05`):
+  OTel SDK backend path (`backend=otel_sdk`), provider/processor lifecycle, context handoff mapping.
+- [x] Phase H complete (`RUN-ASYNC-01..07`):
+  AsyncRunner path + runner-profile-based selection + deterministic mixed-profile contract checks.
+- [x] Phase I complete (`OBS-MAT-01..04` + perf snapshot):
+  compatibility matrix, parity regression, trace continuity, failure isolation, and sign-off report.
+- [x] Phase J complete (`RUN-AUTO-01..06`):
+  DI-driven runner auto-selection, optional explicit override contract, and validator alignment.
+- [x] Phase K complete:
+  full observability platform rails closure (DI-only sink resolution, system nodes,
+  dependency groups, docs migration closure),
+  tracked in
+  [observability_platform_rails_no_hardcode_tdd_plan](observability_platform_rails_no_hardcode_tdd_plan.md).
+
 ---
 
 ## Scope
@@ -49,9 +77,9 @@ Out of scope (next waves):
 - deterministic fallback path must exist (`stdout/jsonl/noop`);
 - config validation rejects incompatible backend/runtime combinations.
 - runner selection is platform-owned and deterministic:
-  - `process_groups[].runner_profile` defines primary runner rail (`sync` / `async`);
-  - DI dependency contracts (`consume` vs `aconsume`, sync/async service contracts) are validated against the selected runner;
-  - invalid combinations fail at preflight/validation, not at runtime.
+  - default path: runner rail is inferred from DI dependency contracts (`sync` vs `async` bindings);
+  - override path: `process_groups[].runner_profile` is optional and used only when explicitly provided;
+  - invalid explicit override combinations fail at preflight/validation, not at runtime.
 
 ---
 
@@ -115,6 +143,19 @@ Detailed subplan:
 
 - [observability_exporters_phasei_regression_perf_tdd_plan](observability_exporters_phasei_regression_perf_tdd_plan.md)
 
+### Phase J — DI-driven runner auto-selection
+
+Detailed subplan:
+
+- [observability_exporters_phasej_runner_autoselect_tdd_plan](observability_exporters_phasej_runner_autoselect_tdd_plan.md)
+- [observability_exporters_phasej1_async_capability_propagation_tdd_plan](observability_exporters_phasej1_async_capability_propagation_tdd_plan.md)
+
+### Phase K — observability platform rails without hardcode
+
+Detailed subplan:
+
+- [observability_platform_rails_no_hardcode_tdd_plan](observability_platform_rails_no_hardcode_tdd_plan.md)
+
 ---
 
 ## Delivery order
@@ -128,6 +169,7 @@ Detailed subplan:
 7. Phase F
 8. Phase G
 9. Phase I
+10. Phase J
 
 Reason:
 

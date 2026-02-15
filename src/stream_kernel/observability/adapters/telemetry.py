@@ -12,7 +12,13 @@ class StdoutTelemetrySink:
         print(json.dumps(_telemetry_to_dict(message), separators=(",", ":"), ensure_ascii=False))
 
 
-@adapter(name="telemetry_stdout", consumes=[TelemetryMessage], emits=[], binds=[("stream", TelemetryMessage)])
+@adapter(
+    name="telemetry_stdout",
+    consumes=[TelemetryMessage],
+    emits=[],
+    binds=[("stream", TelemetryMessage)],
+    execution_mode="async",
+)
 def telemetry_stdout(settings: dict[str, object]) -> StdoutTelemetrySink:
     # Framework-owned stdout telemetry sink over standard stream channel.
     _ = settings

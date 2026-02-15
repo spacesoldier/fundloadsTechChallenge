@@ -29,11 +29,14 @@ def build_injection_registry(
         if not isinstance(role_cfg, dict):
             raise AdapterWiringError(f"adapters.{role} must be a mapping")
         adapter = registry.build(role, role_cfg)
+        kind = role_cfg.get("kind")
+        meta = registry.get_meta(role, kind) if isinstance(kind, str) else None
+        is_async = bool(getattr(meta, "execution_mode", None) == "async")
         if isinstance(binding, list):
             for port_type, data_type in binding:
-                injection.register_factory(port_type, data_type, lambda _a=adapter: _a)
+                injection.register_factory(port_type, data_type, lambda _a=adapter: _a, is_async=is_async)
         else:
             port_type, data_type = binding
-            injection.register_factory(port_type, data_type, lambda _a=adapter: _a)
+            injection.register_factory(port_type, data_type, lambda _a=adapter: _a, is_async=is_async)
 
     return injection

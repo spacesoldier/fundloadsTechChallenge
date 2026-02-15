@@ -17,6 +17,7 @@ from stream_kernel.execution.orchestration.builder import (
     build_adapter_contracts,
     build_adapter_bindings,
     build_adapter_instances_from_registry,
+    build_runtime_observability_adapter_instances,
     build_runtime_artifacts,
     build_sink_runtime_nodes,
     build_injection_registry_from_bindings,
@@ -24,6 +25,7 @@ from stream_kernel.execution.orchestration.builder import (
     ensure_platform_discovery_modules,
     ensure_runtime_observability_binding,
     ensure_runtime_api_policy_bindings,
+    ensure_runtime_bootstrap_binding,
     ensure_runtime_registry_bindings,
     ensure_runtime_transport_bindings,
     load_discovery_modules,
@@ -37,6 +39,11 @@ from stream_kernel.execution.orchestration.builder import (
     trace_id,
 )
 from stream_kernel.execution.orchestration.source_ingress import build_source_ingress_plan
+from stream_kernel.execution.orchestration.observability_system_nodes import (
+    MetricDispatchEvent,
+    TraceDispatchEvent,
+    build_observability_system_plan,
+)
 from stream_kernel.execution.transport.bootstrap_keys import BootstrapChannelStateError
 from stream_kernel.execution.orchestration.lifecycle_orchestration import (
     RuntimeBootstrapStopError,
@@ -47,10 +54,12 @@ from stream_kernel.execution.orchestration.lifecycle_orchestration import (
     RuntimeWorkerFailedError,
 )
 from stream_kernel.application_context.service import service
+from stream_kernel.application_context.inject import inject
 from stream_kernel.platform.services.state.context import ContextService, InMemoryKvContextService
 from stream_kernel.application_context.injection_registry import InjectionRegistry, InjectionRegistryError
 from stream_kernel.execution.observers.observer_builder import build_execution_observers_from_factories
 from stream_kernel.execution.observers.observer import ExecutionObserver, ObserverFactoryContext
+from stream_kernel.execution.runtime.planning import plan_pools
 from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
 from stream_kernel.application_context.application_context import ApplicationContext
 from stream_kernel.integration.consumer_registry import ConsumerRegistry, InMemoryConsumerRegistry
@@ -60,6 +69,7 @@ from stream_kernel.execution.transport.secure_tcp_transport import SecureTcpConf
 from stream_kernel.platform.services.observability import (
     FanoutObservabilityService,
     NoOpObservabilityService,
+    ObservabilityPipelineService,
     ObservabilityService,
     ReplyAwareObservabilityService,
 )
@@ -82,7 +92,11 @@ from stream_kernel.platform.services.messaging.reply_waiter import (
     TerminalEvent,
 )
 from stream_kernel.platform.services.runtime.lifecycle import RuntimeLifecycleManager
-from stream_kernel.platform.services.runtime.bootstrap import BootstrapSupervisor
+from stream_kernel.platform.services.runtime.bootstrap import (
+    BootstrapSupervisor,
+    LocalBootstrapSupervisor,
+    MultiprocessBootstrapSupervisor,
+)
 from stream_kernel.kernel.scenario import StepSpec
 from stream_kernel.routing.envelope import Envelope
 from stream_kernel.routing.router import RoutingResult
@@ -104,6 +118,27 @@ class _StreamPort:
 
 class _KvPort:
     pass
+
+
+class _RunnerAutoToken:
+    pass
+
+
+class _AsyncServicePort:
+    pass
+
+
+class _RunnerAutoAsyncNode:
+    # Async dependency marker used by auto-runner selection tests.
+    stream = inject.stream(_RunnerAutoToken)
+
+    def __call__(self, _payload: object, _ctx: object | None) -> list[object]:
+        return []
+
+
+class _RunnerAutoSyncNode:
+    def __call__(self, _payload: object, _ctx: object | None) -> list[object]:
+        return []
 
 
 def _write_file(path: Path, text: str) -> None:
@@ -170,9 +205,172 @@ def test_build_adapter_instances_from_registry_requires_mapping() -> None:
         build_adapter_instances_from_registry({"source": "nope"}, registry)  # type: ignore[arg-type]
 
 
+def test_build_runtime_observability_adapter_instances_builds_from_registry_and_forwards_backend() -> None:
+    # OBS-K-B-01: runtime observability exporters must be materialized via AdapterRegistry only.
+    registry = AdapterRegistry()
+    captured: dict[str, object] = {}
+
+    def _factory(settings: dict[str, object]) -> object:
+        captured.update(settings)
+        return object()
+
+    registry.register("trace_otel_otlp", "trace_otel_otlp", _factory)
+
+    instances = build_runtime_observability_adapter_instances(
+        runtime={
+            "strict": True,
+            "observability": {
+                "tracing": {
+                    "exporters": [
+                        {
+                            "kind": "otel_otlp",
+                            "backend": "requests",
+                            "settings": {"endpoint": "http://collector:4318/v1/traces"},
+                        }
+                    ]
+                }
+            },
+        },
+        registry=registry,
+    )
+
+    assert "trace_otel_otlp#0" in instances
+    assert "trace_otel_otlp" in instances
+    assert captured["backend"] == "requests"
+    assert captured["endpoint"] == "http://collector:4318/v1/traces"
+
+
+def test_build_runtime_observability_adapter_instances_raises_in_strict_mode_when_binding_missing() -> None:
+    # OBS-K-B-02: strict mode must fail when runtime exporter adapter cannot be built from registry.
+    with pytest.raises(ValueError, match="failed to build adapter 'trace_otel_otlp'"):
+        build_runtime_observability_adapter_instances(
+            runtime={
+                "strict": True,
+                "observability": {"tracing": {"exporters": [{"kind": "otel_otlp", "settings": {}}]}},
+            },
+            registry=AdapterRegistry(),
+        )
+
+
+def test_build_runtime_observability_adapter_instances_reports_deterministic_dependency_error() -> None:
+    # OBS-K-E-05: strict startup error should include deterministic dependency diagnostics.
+    registry = AdapterRegistry()
+
+    def _factory(_settings: dict[str, object]) -> object:
+        raise ValueError("trace_otel_otlp dependency missing for backend 'requests'")
+
+    registry.register("trace_otel_otlp", "trace_otel_otlp", _factory)
+
+    with pytest.raises(ValueError, match="dependency missing for backend 'requests'"):
+        build_runtime_observability_adapter_instances(
+            runtime={
+                "strict": True,
+                "observability": {
+                    "tracing": {
+                        "exporters": [
+                            {
+                                "kind": "otel_otlp",
+                                "backend": "requests",
+                                "settings": {"endpoint": "http://collector:4318/v1/traces"},
+                            }
+                        ]
+                    }
+                },
+            },
+            registry=registry,
+        )
+
+
+def test_build_runtime_observability_adapter_instances_allows_explicit_degrade_mode() -> None:
+    # OBS-K-E-06: explicit degrade mode should keep strict startup path deterministic and non-fatal.
+    registry = AdapterRegistry()
+
+    def _factory(settings: dict[str, object]) -> object:
+        if settings.get("dependency_missing") == "degrade_noop":
+            return object()
+        raise ValueError("trace_otel_otlp dependency missing for backend 'requests'")
+
+    registry.register("trace_otel_otlp", "trace_otel_otlp", _factory)
+
+    instances = build_runtime_observability_adapter_instances(
+        runtime={
+            "strict": True,
+            "observability": {
+                "tracing": {
+                    "exporters": [
+                        {
+                            "kind": "otel_otlp",
+                            "backend": "requests",
+                            "settings": {
+                                "endpoint": "http://collector:4318/v1/traces",
+                                "dependency_missing": "degrade_noop",
+                            },
+                        }
+                    ]
+                }
+            },
+        },
+        registry=registry,
+    )
+
+    assert "trace_otel_otlp#0" in instances
+
+
+def test_build_runtime_observability_adapter_instances_skips_missing_binding_in_non_strict_mode() -> None:
+    # OBS-K-B-03: non-strict mode may skip exporter adapters that are not registered.
+    instances = build_runtime_observability_adapter_instances(
+        runtime={
+            "strict": False,
+            "observability": {"tracing": {"exporters": [{"kind": "otel_otlp", "settings": {}}]}},
+        },
+        registry=AdapterRegistry(),
+    )
+    assert instances == {}
+
+
+def test_build_runtime_observability_adapter_instances_uses_indexed_keys_for_duplicate_exporter_kind() -> None:
+    # OBS-K-B-04: duplicate exporters of same kind must stay addressable by index.
+    registry = AdapterRegistry()
+    created: list[object] = []
+
+    def _factory(_settings: dict[str, object]) -> object:
+        instance = object()
+        created.append(instance)
+        return instance
+
+    registry.register("trace_stdout", "trace_stdout", _factory)
+    instances = build_runtime_observability_adapter_instances(
+        runtime={
+            "strict": True,
+            "observability": {
+                "tracing": {
+                    "exporters": [
+                        {"kind": "stdout", "settings": {}},
+                        {"kind": "stdout", "settings": {}},
+                    ]
+                }
+            },
+        },
+        registry=registry,
+    )
+
+    assert instances["trace_stdout#0"] is created[0]
+    assert instances["trace_stdout#1"] is created[1]
+    assert instances["trace_stdout"] is created[0]
+
+
 def test_build_injection_registry_from_bindings_requires_instance() -> None:
     with pytest.raises(ValueError):
         build_injection_registry_from_bindings({}, {"source": [("stream", _StreamPort)]})
+
+
+def test_build_injection_registry_from_bindings_marks_async_roles() -> None:
+    registry = build_injection_registry_from_bindings(
+        {"source": object()},
+        {"source": [("stream", _StreamPort)]},
+        adapter_async_roles={"source"},
+    )
+    assert registry.is_async_binding("stream", _StreamPort) is True
 
 
 def test_ensure_platform_discovery_modules_appends_framework_modules() -> None:
@@ -384,6 +582,50 @@ def test_register_discovered_services_keeps_existing_binding() -> None:
     register_discovered_services(registry, [module])
     scope = registry.instantiate_for_scenario("s1")
     assert scope.resolve("service", ContextService) is custom
+
+
+def test_register_discovered_services_marks_service_async_from_async_adapter_dependency() -> None:
+    # Async adapter dependency should mark discovered service binding as async.
+    module = ModuleType("fake.services.async_adapter")
+
+    @service(name="async_dep")
+    class _AsyncDependentService:
+        dep = inject.stream(_AsyncServicePort, qualifier="external")
+
+    module._AsyncDependentService = _AsyncDependentService
+
+    registry = InjectionRegistry()
+    registry.register_factory(
+        "stream",
+        _AsyncServicePort,
+        lambda: object(),
+        qualifier="external",
+        is_async=True,
+    )
+    register_discovered_services(registry, [module])
+    assert registry.is_async_binding("service", _AsyncDependentService) is True
+
+
+def test_register_discovered_services_marks_transitive_service_async() -> None:
+    # Service->service injection chain should propagate async capability transitively.
+    module = ModuleType("fake.services.transitive_async")
+
+    @service(name="leaf")
+    class _LeafService:
+        dep = inject.stream(_AsyncServicePort)
+
+    @service(name="root")
+    class _RootService:
+        leaf = inject.service(_LeafService)
+
+    module._LeafService = _LeafService
+    module._RootService = _RootService
+
+    registry = InjectionRegistry()
+    registry.register_factory("stream", _AsyncServicePort, lambda: object(), is_async=True)
+    register_discovered_services(registry, [module])
+    assert registry.is_async_binding("service", _LeafService) is True
+    assert registry.is_async_binding("service", _RootService) is True
 
 
 def test_build_source_ingress_plan_wraps_readable_adapters() -> None:
@@ -852,6 +1094,29 @@ def test_runtime_transport_tcp_local_generated_secret_mode_builds_signing_secret
     assert secret != b"runtime-session-secret"
 
 
+def test_ensure_runtime_bootstrap_binding_prefers_multiprocess_for_process_supervisor_mode() -> None:
+    # Bootstrap supervisor must be selected by runtime.bootstrap.mode, not by service discovery order.
+    registry = InjectionRegistry()
+    ensure_runtime_bootstrap_binding(
+        injection_registry=registry,
+        runtime={"platform": {"bootstrap": {"mode": "process_supervisor"}}},
+    )
+    scope = registry.instantiate_for_scenario("s1")
+    resolved = scope.resolve("service", BootstrapSupervisor)
+    assert isinstance(resolved, MultiprocessBootstrapSupervisor)
+
+
+def test_ensure_runtime_bootstrap_binding_uses_local_for_inline_mode() -> None:
+    registry = InjectionRegistry()
+    ensure_runtime_bootstrap_binding(
+        injection_registry=registry,
+        runtime={"platform": {"bootstrap": {"mode": "inline"}}},
+    )
+    scope = registry.instantiate_for_scenario("s1")
+    resolved = scope.resolve("service", BootstrapSupervisor)
+    assert isinstance(resolved, LocalBootstrapSupervisor)
+
+
 def test_runtime_transport_secret_resolution_error_redacts_secret_value() -> None:
     # KEY-IPC-04: runtime transport errors must not leak secret material representations.
     class _SecretObject:
@@ -1131,9 +1396,129 @@ def test_ensure_runtime_observability_binding_uses_platform_fanout_service() -> 
     )
     scope = registry.instantiate_for_scenario("s1")
     resolved = scope.resolve("service", ObservabilityService)
+    resolved_pipeline = scope.resolve("service", ObservabilityPipelineService)
     assert isinstance(resolved, ReplyAwareObservabilityService)
+    assert isinstance(resolved_pipeline, ReplyAwareObservabilityService)
     assert isinstance(resolved.inner, FanoutObservabilityService)
     assert len(resolved.inner.observers) == 1
+
+
+def test_build_observability_system_plan_builds_enabled_nodes_and_consumers() -> None:
+    class _PipelineRecorder(NoOpObservabilityService):
+        def __init__(self) -> None:
+            self.trace_calls = 0
+            self.metric_calls = 0
+
+        def publish_trace(
+            self,
+            *,
+            event: object,
+            trace_id: str | None = None,
+            attributes: dict[str, object] | None = None,
+        ) -> None:
+            _ = (event, trace_id, attributes)
+            self.trace_calls += 1
+
+        def publish_metric(
+            self,
+            *,
+            event: object,
+            trace_id: str | None = None,
+            attributes: dict[str, object] | None = None,
+        ) -> None:
+            _ = (event, trace_id, attributes)
+            self.metric_calls += 1
+
+    default_pipeline = _PipelineRecorder()
+    qualified_pipeline = _PipelineRecorder()
+    registry = InjectionRegistry()
+    registry.register_factory(
+        "service",
+        ObservabilityPipelineService,
+        lambda _svc=default_pipeline: _svc,
+    )
+    registry.register_factory(
+        "service",
+        ObservabilityPipelineService,
+        lambda _svc=qualified_pipeline: _svc,
+        qualifier="obs.async",
+    )
+    scope = registry.instantiate_for_scenario("s1")
+
+    plan = build_observability_system_plan(
+        runtime={
+            "observability": {
+                "pipeline": {
+                    "system_nodes": [
+                        {"kind": "system.obs.trace_dispatch", "enabled": True},
+                        {"kind": "system.obs.log_dispatch", "enabled": False},
+                        {"kind": "system.obs.metric_dispatch", "enabled": True, "qualifier": "obs.async"},
+                    ]
+                }
+            }
+        },
+        scenario_scope=scope,
+    )
+
+    names = [step.name for step in plan.system_steps]
+    assert names == ["system.obs.trace_dispatch", "system.obs.metric_dispatch:obs.async"]
+    assert plan.system_consumers == {
+        TraceDispatchEvent: ["system.obs.trace_dispatch"],
+        MetricDispatchEvent: ["system.obs.metric_dispatch:obs.async"],
+    }
+
+    steps = {step.name: step.step for step in plan.system_steps}
+    assert steps["system.obs.trace_dispatch"](TraceDispatchEvent(payload={"kind": "trace"}), {}) == []
+    assert (
+        steps["system.obs.metric_dispatch:obs.async"](
+            MetricDispatchEvent(payload={"value": 1}),
+            {},
+        )
+        == []
+    )
+    assert default_pipeline.trace_calls == 1
+    assert qualified_pipeline.metric_calls == 1
+
+
+def test_build_observability_system_plan_async_qualifier_propagates_to_pool_planning() -> None:
+    registry = InjectionRegistry()
+    registry.register_factory(
+        "service",
+        ObservabilityPipelineService,
+        NoOpObservabilityService,
+        is_async=False,
+    )
+    registry.register_factory(
+        "service",
+        ObservabilityPipelineService,
+        NoOpObservabilityService,
+        qualifier="obs.async",
+        is_async=True,
+    )
+    scope = registry.instantiate_for_scenario("s1")
+
+    plan = build_observability_system_plan(
+        runtime={
+            "observability": {
+                "pipeline": {
+                    "system_nodes": [
+                        {"kind": "system.obs.trace_dispatch", "enabled": True},
+                        {"kind": "system.obs.log_dispatch", "enabled": True, "qualifier": "obs.async"},
+                        {"kind": "system.obs.metric_dispatch", "enabled": False},
+                        {"kind": "system.obs.monitor_dispatch", "enabled": True},
+                    ]
+                }
+            }
+        },
+        scenario_scope=scope,
+    )
+    nodes = {step.name: step.step for step in plan.system_steps}
+    pools = plan_pools(nodes, registry)
+
+    assert pools["system.obs.trace_dispatch"] == "sync"
+    assert pools["system.obs.log_dispatch:obs.async"] == "async"
+    assert pools["system.obs.monitor_dispatch"] == "sync"
+    assert "system.obs.metric_dispatch" not in pools
 
 
 def test_ensure_runtime_api_policy_bindings_registers_platform_services() -> None:
@@ -1269,6 +1654,148 @@ def test_execute_runtime_artifacts_delegates_to_sync_runner(monkeypatch: pytest.
     assert captured["run_id"] == "run"
     assert captured["scenario_id"] == "scenario"
     assert captured["strict"] is True
+
+
+def test_execute_runtime_artifacts_selects_async_runner_from_injected_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # RUN-AUTO-04: without explicit runner_profile, builder must infer async runner from DI contracts.
+    sync_calls: list[dict[str, object]] = []
+    async_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        "stream_kernel.execution.orchestration.builder.run_with_sync_runner",
+        lambda **kwargs: sync_calls.append(dict(kwargs)),
+    )
+    monkeypatch.setattr(
+        "stream_kernel.execution.orchestration.builder.run_with_async_runner",
+        lambda **kwargs: async_calls.append(dict(kwargs)),
+    )
+
+    injection_registry = InjectionRegistry()
+    injection_registry.register_factory("stream", _RunnerAutoToken, lambda: object(), is_async=True)
+
+    artifacts = RuntimeBuildArtifacts(
+        scenario=SimpleNamespace(
+            steps=[
+                StepSpec(name="auto.async", step=_RunnerAutoAsyncNode()),
+            ]
+        ),
+        inputs=[],
+        strict=True,
+        run_id="run",
+        scenario_id="scenario",
+        scenario_scope=InjectionRegistry().instantiate_for_scenario("scenario"),
+        full_context_nodes=set(),
+        injection_registry=injection_registry,
+        runtime={
+            "platform": {
+                "process_groups": [
+                    {"name": "execution.group"},
+                ]
+            }
+        },
+    )
+    execute_runtime_artifacts(artifacts)
+
+    assert sync_calls == []
+    assert len(async_calls) == 1
+    assert async_calls[0]["queue_qualifier"] == "execution.group"
+
+
+def test_execute_runtime_artifacts_selects_sync_runner_when_dependencies_are_sync_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # RUN-AUTO-05: default path must stay sync when no async DI dependencies are detected.
+    sync_calls: list[dict[str, object]] = []
+    async_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        "stream_kernel.execution.orchestration.builder.run_with_sync_runner",
+        lambda **kwargs: sync_calls.append(dict(kwargs)),
+    )
+    monkeypatch.setattr(
+        "stream_kernel.execution.orchestration.builder.run_with_async_runner",
+        lambda **kwargs: async_calls.append(dict(kwargs)),
+    )
+
+    injection_registry = InjectionRegistry()
+    injection_registry.register_factory("stream", _RunnerAutoToken, lambda: object(), is_async=False)
+
+    artifacts = RuntimeBuildArtifacts(
+        scenario=SimpleNamespace(
+            steps=[
+                StepSpec(name="auto.sync", step=_RunnerAutoSyncNode()),
+            ]
+        ),
+        inputs=[],
+        strict=True,
+        run_id="run",
+        scenario_id="scenario",
+        scenario_scope=InjectionRegistry().instantiate_for_scenario("scenario"),
+        full_context_nodes=set(),
+        injection_registry=injection_registry,
+        runtime={
+            "platform": {
+                "process_groups": [
+                    {"name": "execution.group"},
+                ]
+            }
+        },
+    )
+    execute_runtime_artifacts(artifacts)
+
+    assert len(sync_calls) == 1
+    assert sync_calls[0]["queue_qualifier"] == "execution.group"
+    assert async_calls == []
+
+
+def test_execute_runtime_artifacts_explicit_runner_profile_overrides_auto_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # RUN-AUTO-06: explicit runner_profile remains a hard override for exceptional cases.
+    sync_calls: list[dict[str, object]] = []
+    async_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        "stream_kernel.execution.orchestration.builder.run_with_sync_runner",
+        lambda **kwargs: sync_calls.append(dict(kwargs)),
+    )
+    monkeypatch.setattr(
+        "stream_kernel.execution.orchestration.builder.run_with_async_runner",
+        lambda **kwargs: async_calls.append(dict(kwargs)),
+    )
+
+    injection_registry = InjectionRegistry()
+    injection_registry.register_factory("stream", _RunnerAutoToken, lambda: object(), is_async=True)
+
+    artifacts = RuntimeBuildArtifacts(
+        scenario=SimpleNamespace(
+            steps=[
+                StepSpec(name="auto.async", step=_RunnerAutoAsyncNode()),
+            ]
+        ),
+        inputs=[],
+        strict=True,
+        run_id="run",
+        scenario_id="scenario",
+        scenario_scope=InjectionRegistry().instantiate_for_scenario("scenario"),
+        full_context_nodes=set(),
+        injection_registry=injection_registry,
+        runtime={
+            "platform": {
+                "process_groups": [
+                    {"name": "execution.group", "runner_profile": "sync"},
+                ]
+            }
+        },
+    )
+
+    execute_runtime_artifacts(artifacts)
+
+    assert len(sync_calls) == 1
+    assert sync_calls[0]["queue_qualifier"] == "execution.group"
+    assert async_calls == []
 
 
 def test_run_with_sync_runner_closes_scenario_scope_after_execution() -> None:

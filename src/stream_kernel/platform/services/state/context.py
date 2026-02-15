@@ -79,6 +79,7 @@ class InMemoryKvContextService(ContextService):
     consumes=[],
     emits=[],
     binds=[("kv", KVStore)],
+    execution_mode="sync",
 )
 def kv_store_memory(settings: dict[str, object]) -> InMemoryKvStore:
     # Default platform KV adapter used by services requiring key-value persistence.

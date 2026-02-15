@@ -26,7 +26,7 @@ Obsidian plugin, but the narrative below is the human-friendly entry point.
   See: [[docs/framework/initial_stage/Scenario vs node axes|Scenario vs node axes]]
 - **Auto-discovery policy** → module scanning rules and exclusions.  
   See: [[docs/framework/initial_stage/Auto-discovery policy|Auto-discovery policy]]
-- **Tracing runtime** → runtime tracing configuration and sinks.  
+- **Tracing runtime** → observability pipeline tracing configuration (with legacy compatibility notes).  
   See: [[docs/framework/initial_stage/Tracing runtime|Tracing runtime]]
 - **Execution runtime + routing** → how Runner integrates with Router and queues.  
   See: [[docs/framework/initial_stage/Execution runtime and routing integration|Execution runtime and routing integration]]

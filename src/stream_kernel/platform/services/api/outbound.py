@@ -7,6 +7,7 @@ from typing import Protocol, TypeVar, runtime_checkable
 
 from stream_kernel.application_context.service import service
 from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
+from stream_kernel.platform.services.observability import coerce_pipeline_observability
 from stream_kernel.platform.services.api.policy import RateLimiterService
 
 T = TypeVar("T")
@@ -322,16 +323,14 @@ class InMemoryOutboundApiService(OutboundApiService):
         self._events.append(event)
         if len(self._events) > max(16, int(self.max_diagnostic_events)):
             self._events = self._events[-max(16, int(self.max_diagnostic_events)) :]
-        callback = getattr(self.observability, "on_outbound_policy_decision", None)
-        if callable(callback):
-            callback(
-                stage=stage,
-                decision=decision,
-                trace_id=trace_id,
-                key=key,
-                profile=self.profile,
-                attempt=attempt,
-            )
+        coerce_pipeline_observability(self.observability).on_outbound_policy_decision(
+            stage=stage,
+            decision=decision,
+            trace_id=trace_id,
+            key=key,
+            profile=self.profile,
+            attempt=attempt,
+        )
 
     def _increment(self, key: str) -> None:
         self._counters[key] = self._counters.get(key, 0) + 1

@@ -5,21 +5,35 @@ from pathlib import Path
 from stream_kernel.adapters.contracts import adapter
 from stream_kernel.adapters.trace_sinks import (
     JsonlTraceSink,
+    NoOpTraceSink,
     OpenTracingBridgeTraceSink,
     OTelOtlpTraceSink,
     StdoutTraceSink,
+    check_otel_backend_dependencies,
 )
 from stream_kernel.observability.domain.tracing import TraceMessage
 
 
-@adapter(name="trace_stdout", consumes=[TraceMessage], emits=[], binds=[("kv_stream", TraceMessage)])
+@adapter(
+    name="trace_stdout",
+    consumes=[TraceMessage],
+    emits=[],
+    binds=[("kv_stream", TraceMessage)],
+    execution_mode="async",
+)
 def trace_stdout(settings: dict[str, object]) -> StdoutTraceSink:
     # Framework-owned stdout trace sink adapter.
     _ = settings
     return StdoutTraceSink()
 
 
-@adapter(name="trace_jsonl", consumes=[TraceMessage], emits=[], binds=[("kv_stream", TraceMessage)])
+@adapter(
+    name="trace_jsonl",
+    consumes=[TraceMessage],
+    emits=[],
+    binds=[("kv_stream", TraceMessage)],
+    execution_mode="async",
+)
 def trace_jsonl(settings: dict[str, object]) -> JsonlTraceSink:
     # Framework-owned JSONL trace sink adapter.
     path = settings.get("path")
@@ -34,9 +48,29 @@ def trace_jsonl(settings: dict[str, object]) -> JsonlTraceSink:
     )
 
 
-@adapter(name="trace_otel_otlp", consumes=[TraceMessage], emits=[], binds=[("kv_stream", TraceMessage)])
-def trace_otel_otlp(settings: dict[str, object]) -> OTelOtlpTraceSink:
+@adapter(
+    name="trace_otel_otlp",
+    consumes=[TraceMessage],
+    emits=[],
+    binds=[("kv_stream", TraceMessage)],
+    execution_mode="async",
+)
+def trace_otel_otlp(settings: dict[str, object]) -> OTelOtlpTraceSink | NoOpTraceSink:
     # Framework-owned OpenTelemetry OTLP trace exporter sink.
+    backend = settings.get("backend", "urllib")
+    if not isinstance(backend, str) or not backend:
+        raise ValueError("trace_otel_otlp.settings.backend must be a non-empty string when provided")
+    dependency_missing = settings.get("dependency_missing", "error")
+    if not isinstance(dependency_missing, str) or dependency_missing not in {"error", "degrade_noop"}:
+        raise ValueError(
+            "trace_otel_otlp.settings.dependency_missing must be one of: ['error', 'degrade_noop']"
+        )
+    try:
+        check_otel_backend_dependencies(backend)
+    except Exception as exc:
+        if dependency_missing == "degrade_noop":
+            return NoOpTraceSink(reason=f"trace_otel_otlp:{backend}:dependency_missing")
+        raise ValueError(f"trace_otel_otlp dependency missing for backend '{backend}'") from exc
     endpoint = settings.get("endpoint", "http://127.0.0.1:4318/v1/traces")
     if not isinstance(endpoint, str) or not endpoint:
         raise ValueError("trace_otel_otlp.settings.endpoint must be a non-empty string")
@@ -80,8 +114,123 @@ def trace_otel_otlp(settings: dict[str, object]) -> OTelOtlpTraceSink:
     span_kind = settings.get("span_kind", "SPAN_KIND_INTERNAL")
     if not isinstance(span_kind, str) or not span_kind:
         raise ValueError("trace_otel_otlp.settings.span_kind must be a non-empty string when provided")
+    batch = settings.get("batch", {})
+    if not isinstance(batch, dict):
+        raise ValueError("trace_otel_otlp.settings.batch must be a mapping when provided")
+    batch_max_items = batch.get("max_items", 1)
+    if not isinstance(batch_max_items, int) or batch_max_items <= 0:
+        raise ValueError("trace_otel_otlp.settings.batch.max_items must be an integer > 0 when provided")
+    batch_flush_interval_ms = batch.get("flush_interval_ms", 0)
+    if not isinstance(batch_flush_interval_ms, int) or batch_flush_interval_ms < 0:
+        raise ValueError(
+            "trace_otel_otlp.settings.batch.flush_interval_ms must be an integer >= 0 when provided"
+        )
+    queue = settings.get("queue", {})
+    if not isinstance(queue, dict):
+        raise ValueError("trace_otel_otlp.settings.queue must be a mapping when provided")
+    queue_max_items = queue.get("max_items", 10000)
+    if not isinstance(queue_max_items, int) or queue_max_items <= 0:
+        raise ValueError("trace_otel_otlp.settings.queue.max_items must be an integer > 0 when provided")
+    queue_drop_policy = queue.get("drop_policy", "drop_newest")
+    if not isinstance(queue_drop_policy, str) or queue_drop_policy not in {
+        "drop_newest",
+        "drop_oldest",
+        "block_with_timeout",
+    }:
+        raise ValueError(
+            "trace_otel_otlp.settings.queue.drop_policy must be one of: "
+            "['drop_newest', 'drop_oldest', 'block_with_timeout']"
+        )
+    retry = settings.get("retry", {})
+    if not isinstance(retry, dict):
+        raise ValueError("trace_otel_otlp.settings.retry must be a mapping when provided")
+    retry_max_attempts = retry.get("max_attempts", 0)
+    if not isinstance(retry_max_attempts, int) or retry_max_attempts < 0:
+        raise ValueError("trace_otel_otlp.settings.retry.max_attempts must be an integer >= 0 when provided")
+    retry_backoff_ms = retry.get("backoff_ms", 0)
+    if not isinstance(retry_backoff_ms, int) or retry_backoff_ms < 0:
+        raise ValueError("trace_otel_otlp.settings.retry.backoff_ms must be an integer >= 0 when provided")
+    httpx = settings.get("httpx", {})
+    if not isinstance(httpx, dict):
+        raise ValueError("trace_otel_otlp.settings.httpx must be a mapping when provided")
+    httpx_mode = httpx.get("mode", "sync")
+    if not isinstance(httpx_mode, str) or httpx_mode not in {"sync", "async"}:
+        raise ValueError("trace_otel_otlp.settings.httpx.mode must be one of: ['sync', 'async']")
+    httpx_http2 = httpx.get("http2", False)
+    if not isinstance(httpx_http2, bool):
+        raise ValueError("trace_otel_otlp.settings.httpx.http2 must be a boolean when provided")
+    httpx_max_connections = httpx.get("max_connections")
+    if httpx_max_connections is not None and (
+        not isinstance(httpx_max_connections, int) or httpx_max_connections <= 0
+    ):
+        raise ValueError("trace_otel_otlp.settings.httpx.max_connections must be an integer > 0 when provided")
+    httpx_max_keepalive_connections = httpx.get("max_keepalive_connections")
+    if httpx_max_keepalive_connections is not None and (
+        not isinstance(httpx_max_keepalive_connections, int) or httpx_max_keepalive_connections <= 0
+    ):
+        raise ValueError(
+            "trace_otel_otlp.settings.httpx.max_keepalive_connections must be an integer > 0 when provided"
+        )
+    grpc = settings.get("grpc", {})
+    if not isinstance(grpc, dict):
+        raise ValueError("trace_otel_otlp.settings.grpc must be a mapping when provided")
+    grpc_insecure = grpc.get("insecure", True)
+    if not isinstance(grpc_insecure, bool):
+        raise ValueError("trace_otel_otlp.settings.grpc.insecure must be a boolean when provided")
+    grpc_timeout_seconds = grpc.get("timeout_seconds")
+    if grpc_timeout_seconds is not None and (
+        not isinstance(grpc_timeout_seconds, (int, float)) or float(grpc_timeout_seconds) <= 0
+    ):
+        raise ValueError("trace_otel_otlp.settings.grpc.timeout_seconds must be numeric > 0 when provided")
+    grpc_retryable_status_codes = grpc.get("retryable_status_codes", ["UNAVAILABLE", "DEADLINE_EXCEEDED"])
+    if not isinstance(grpc_retryable_status_codes, list) or not all(
+        isinstance(item, str) and item for item in grpc_retryable_status_codes
+    ):
+        raise ValueError(
+            "trace_otel_otlp.settings.grpc.retryable_status_codes must be a list of non-empty strings"
+        )
+    urllib3 = settings.get("urllib3", {})
+    if not isinstance(urllib3, dict):
+        raise ValueError("trace_otel_otlp.settings.urllib3 must be a mapping when provided")
+    urllib3_num_pools = urllib3.get("num_pools")
+    if urllib3_num_pools is not None and (not isinstance(urllib3_num_pools, int) or urllib3_num_pools <= 0):
+        raise ValueError("trace_otel_otlp.settings.urllib3.num_pools must be an integer > 0 when provided")
+    urllib3_maxsize = urllib3.get("maxsize")
+    if urllib3_maxsize is not None and (not isinstance(urllib3_maxsize, int) or urllib3_maxsize <= 0):
+        raise ValueError("trace_otel_otlp.settings.urllib3.maxsize must be an integer > 0 when provided")
+    urllib3_block = urllib3.get("block")
+    if urllib3_block is not None and not isinstance(urllib3_block, bool):
+        raise ValueError("trace_otel_otlp.settings.urllib3.block must be a boolean when provided")
+    urllib3_timeout_seconds = urllib3.get("timeout_seconds")
+    if urllib3_timeout_seconds is not None and (
+        not isinstance(urllib3_timeout_seconds, (int, float)) or float(urllib3_timeout_seconds) <= 0
+    ):
+        raise ValueError(
+            "trace_otel_otlp.settings.urllib3.timeout_seconds must be numeric > 0 when provided"
+        )
+    aiohttp = settings.get("aiohttp", {})
+    if not isinstance(aiohttp, dict):
+        raise ValueError("trace_otel_otlp.settings.aiohttp must be a mapping when provided")
+    aiohttp_shutdown_timeout_seconds = aiohttp.get("shutdown_timeout_seconds", 2.0)
+    if not isinstance(aiohttp_shutdown_timeout_seconds, (int, float)) or float(aiohttp_shutdown_timeout_seconds) <= 0:
+        raise ValueError(
+            "trace_otel_otlp.settings.aiohttp.shutdown_timeout_seconds must be numeric > 0 when provided"
+        )
+    aiohttp_connector_limit = aiohttp.get("connector_limit")
+    if aiohttp_connector_limit is not None and (
+        not isinstance(aiohttp_connector_limit, int) or aiohttp_connector_limit <= 0
+    ):
+        raise ValueError("trace_otel_otlp.settings.aiohttp.connector_limit must be an integer > 0 when provided")
+    aiohttp_connector_limit_per_host = aiohttp.get("connector_limit_per_host")
+    if aiohttp_connector_limit_per_host is not None and (
+        not isinstance(aiohttp_connector_limit_per_host, int) or aiohttp_connector_limit_per_host <= 0
+    ):
+        raise ValueError(
+            "trace_otel_otlp.settings.aiohttp.connector_limit_per_host must be an integer > 0 when provided"
+        )
     return OTelOtlpTraceSink(
         endpoint=endpoint,
+        backend=backend,
         headers=headers,
         service_name=service_name,
         service_namespace=service_namespace if isinstance(service_namespace, str) else None,
@@ -92,11 +241,43 @@ def trace_otel_otlp(settings: dict[str, object]) -> OTelOtlpTraceSink:
         include_runtime_resource=include_runtime_resource,
         span_kind=span_kind,
         timeout_seconds=float(timeout_seconds),
+        batch_max_items=batch_max_items,
+        batch_flush_interval_ms=batch_flush_interval_ms,
+        queue_max_items=queue_max_items,
+        queue_drop_policy=queue_drop_policy,
+        retry_max_attempts=retry_max_attempts,
+        retry_backoff_ms=retry_backoff_ms,
+        httpx_mode=httpx_mode,
+        httpx_http2=httpx_http2,
+        httpx_max_connections=httpx_max_connections if isinstance(httpx_max_connections, int) else None,
+        httpx_max_keepalive_connections=(
+            httpx_max_keepalive_connections if isinstance(httpx_max_keepalive_connections, int) else None
+        ),
+        grpc_insecure=grpc_insecure,
+        grpc_timeout_seconds=float(grpc_timeout_seconds) if isinstance(grpc_timeout_seconds, (int, float)) else None,
+        grpc_retryable_status_codes=tuple(grpc_retryable_status_codes),
+        urllib3_num_pools=urllib3_num_pools if isinstance(urllib3_num_pools, int) else None,
+        urllib3_maxsize=urllib3_maxsize if isinstance(urllib3_maxsize, int) else None,
+        urllib3_block=urllib3_block if isinstance(urllib3_block, bool) else None,
+        urllib3_timeout_seconds=(
+            float(urllib3_timeout_seconds) if isinstance(urllib3_timeout_seconds, (int, float)) else None
+        ),
+        aiohttp_shutdown_timeout_seconds=float(aiohttp_shutdown_timeout_seconds),
+        aiohttp_connector_limit=aiohttp_connector_limit if isinstance(aiohttp_connector_limit, int) else None,
+        aiohttp_connector_limit_per_host=(
+            aiohttp_connector_limit_per_host if isinstance(aiohttp_connector_limit_per_host, int) else None
+        ),
         export_fn=export_fn if callable(export_fn) else None,
     )
 
 
-@adapter(name="trace_opentracing_bridge", consumes=[TraceMessage], emits=[], binds=[("kv_stream", TraceMessage)])
+@adapter(
+    name="trace_opentracing_bridge",
+    consumes=[TraceMessage],
+    emits=[],
+    binds=[("kv_stream", TraceMessage)],
+    execution_mode="async",
+)
 def trace_opentracing_bridge(settings: dict[str, object]) -> OpenTracingBridgeTraceSink:
     # Framework-owned OpenTracing compatibility bridge sink.
     bridge_name = settings.get("bridge_name", "opentracing")

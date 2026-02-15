@@ -9,7 +9,7 @@ from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.routing.routing_service import RoutingService
 from stream_kernel.integration.work_queue import InMemoryQueue
 from stream_kernel.kernel.trace import TraceRecorder
-from stream_kernel.observability.observers.tracing import TracingObserver
+from stream_kernel.observability.observers.tracing import TracingObserver, _FanoutTraceSink
 from stream_kernel.platform.services.observability import FanoutObservabilityService
 from stream_kernel.routing.envelope import Envelope
 
@@ -239,3 +239,53 @@ def test_tracing_does_not_add_extra_span_for_injected_adapter_call() -> None:
 
     assert emitted == ["seed"]
     assert [record.step_name for record in sink.records] == ["worker"]
+
+
+def test_tracing_fanout_exporter_failure_is_isolated_from_business_execution() -> None:
+    # OBS-MAT-04: exporter/sink failure must not break business pipeline when fanout sink is used.
+    emitted: list[str] = []
+
+    class _FailingSink:
+        def emit(self, record: object) -> None:
+            _ = record
+            raise RuntimeError("exporter down")
+
+        def flush(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    recorder = TraceRecorder()
+    ok_sink = _Sink()
+    fanout_sink = _FanoutTraceSink([_FailingSink(), ok_sink])
+    observer = TracingObserver(
+        recorder=recorder,
+        sink=fanout_sink,
+        run_id="run",
+        scenario_id="s1",
+        step_indices={"worker": 0},
+    )
+
+    def worker(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = ctx
+        emitted.append(str(payload))
+        return []
+
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="seed", target="worker", trace_id="t1"))
+    context_store = InMemoryKvStore()
+    context_store.set("t1", {"run_id": "run"})
+    context_service = InMemoryKvContextService(context_store)
+
+    runner = SyncRunner(
+        nodes={"worker": worker},
+        work_queue=queue,
+        context_service=context_service,
+        router=RoutingService(registry=InMemoryConsumerRegistry(), strict=True),
+        observability=FanoutObservabilityService(observers=[observer]),
+    )
+    runner.run()
+
+    assert emitted == ["seed"]
+    assert len(ok_sink.records) == 1

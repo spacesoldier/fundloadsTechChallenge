@@ -235,20 +235,8 @@ def _build_sinks_from_observability_exporters(ctx: ObserverFactoryContext) -> li
     exporters = tracing_cfg.get("exporters", [])
     if not isinstance(exporters, list):
         return []
+    strict = bool(ctx.runtime.get("strict", True))
 
-    from stream_kernel.observability.adapters.tracing import (
-        trace_jsonl,
-        trace_opentracing_bridge,
-        trace_otel_otlp,
-        trace_stdout,
-    )
-
-    factories = {
-        "jsonl": trace_jsonl,
-        "stdout": trace_stdout,
-        "otel_otlp": trace_otel_otlp,
-        "opentracing_bridge": trace_opentracing_bridge,
-    }
     adapter_aliases = {
         "jsonl": "trace_jsonl",
         "stdout": "trace_stdout",
@@ -257,29 +245,36 @@ def _build_sinks_from_observability_exporters(ctx: ObserverFactoryContext) -> li
     }
 
     sinks: list[TraceSinkLike] = []
-    for exporter in exporters:
+    for index, exporter in enumerate(exporters):
         if not isinstance(exporter, dict):
             continue
         kind = exporter.get("kind")
         if not isinstance(kind, str) or not kind:
             continue
-        settings = exporter.get("settings", {})
-        if not isinstance(settings, dict):
-            settings = {}
 
         alias = adapter_aliases.get(kind)
-        candidate = ctx.adapter_instances.get(alias) if isinstance(alias, str) else None
+        if not isinstance(alias, str):
+            if strict:
+                raise ValueError(
+                    f"runtime.observability.tracing.exporters[{index}] kind '{kind}' is not supported"
+                )
+            continue
+        candidate = ctx.adapter_instances.get(f"{alias}#{index}")
+        if candidate is None:
+            candidate = ctx.adapter_instances.get(alias)
         if _is_trace_sink_like(candidate):
             sinks.append(candidate)
             continue
 
-        factory = factories.get(kind)
-        if factory is None:
+        if candidate is None:
+            if strict:
+                raise ValueError(
+                    "runtime.observability.tracing."
+                    f"exporters[{index}] sink binding is missing for adapter '{alias}'"
+                )
             continue
-        built = factory(settings)
-        if not _is_trace_sink_like(built):
-            raise ValueError("Tracing exporter adapter must expose emit(record), flush(), close()")
-        sinks.append(built)
+
+        raise ValueError("Tracing exporter adapter must expose emit(record), flush(), close()")
 
     return sinks
 

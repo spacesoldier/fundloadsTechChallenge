@@ -21,10 +21,13 @@ from stream_kernel.platform.services.api.outbound import (
 from stream_kernel.platform.services.state.consumer_registry import DiscoveryConsumerRegistry
 from stream_kernel.platform.services.state.context import ContextService, InMemoryKvContextService, kv_store_memory
 from stream_kernel.platform.services.observability import (
+    coerce_pipeline_observability,
     NoOpObservabilityService,
+    ObservabilityPipelineService,
     ObservabilityService,
     ReplyAwareObservabilityService,
     legacy_reply_aware_observability,
+    resolve_pipeline_observability,
 )
 from stream_kernel.platform.services.messaging.reply_waiter import (
     InMemoryReplyWaiterService,
@@ -61,6 +64,8 @@ __all__ = [
     "LocalBootstrapSupervisor",
     "LocalRuntimeLifecycleManager",
     "NoOpObservabilityService",
+    "coerce_pipeline_observability",
+    "ObservabilityPipelineService",
     "ObservabilityService",
     "ReplyAwareObservabilityService",
     "InMemoryReplyWaiterService",
@@ -76,6 +81,7 @@ __all__ = [
     "RuntimeTransportService",
     "TerminalEvent",
     "legacy_reply_aware_observability",
+    "resolve_pipeline_observability",
     "legacy_reply_coordinator",
     "MemoryRuntimeTransportService",
     "TcpLocalRuntimeTransportService",

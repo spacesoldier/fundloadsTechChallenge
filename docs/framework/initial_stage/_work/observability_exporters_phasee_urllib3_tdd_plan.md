@@ -1,5 +1,11 @@
 # Phase E: urllib3 backend (TDD)
 
+## Status
+
+- [x] `urllib3` backend implemented (pooled sync transport).
+- [x] `OBS-U3-01..05` tests added and green.
+- [x] `settings.urllib3` config contract normalized and wired.
+
 ## Objective
 
 Add low-level pooled sync backend using `urllib3.PoolManager`.
@@ -9,6 +15,7 @@ Add low-level pooled sync backend using `urllib3.PoolManager`.
 - `urllib3` transport implementation;
 - explicit pool sizing and timeout settings;
 - deterministic retry strategy mapping.
+- config-level `settings.urllib3` normalization.
 
 ## RED tests
 
@@ -31,3 +38,19 @@ Add low-level pooled sync backend using `urllib3.PoolManager`.
 
 - backend tests green;
 - transport-specific diagnostics visible in exporter diagnostics snapshot.
+
+## Implementation notes
+
+- keep common OTLP payload builder untouched;
+- support optional `settings.urllib3`:
+  - `num_pools`
+  - `maxsize`
+  - `block`
+  - `timeout_seconds` (transport timeout override)
+- keep exporter-failure isolation invariant.
+
+## Validation commands
+
+- `.venv/bin/pytest -q tests/adapters/test_trace_sinks.py -k 'obs_u3_'`
+- `.venv/bin/pytest -q tests/adapters/test_trace_sinks.py -k 'otel_otlp_trace_sink'`
+- `.venv/bin/pytest -q tests/stream_kernel/config/test_newgen_validator.py -k 'obs_u3_cfg_'`

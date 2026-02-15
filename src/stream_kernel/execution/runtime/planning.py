@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from stream_kernel.application_context.inject import Injected
-from stream_kernel.application_context.injection_registry import InjectionRegistry
+from stream_kernel.application_context.injection_registry import InjectionRegistry, InjectionRegistryError
 from stream_kernel.kernel.dag import Dag
 
 
@@ -18,9 +18,7 @@ def plan_pools(nodes: dict[str, object], registry: InjectionRegistry) -> dict[st
     plan: dict[str, str] = {}
     for name, node in nodes.items():
         injected = _iter_injected(node)
-        is_async = any(
-            registry.is_async_binding(dep.port_type, dep.data_type) for dep in injected
-        )
+        is_async = any(_is_async_dependency(registry, dep) for dep in injected)
         plan[name] = "async" if is_async else "sync"
     return plan
 
@@ -28,13 +26,40 @@ def plan_pools(nodes: dict[str, object], registry: InjectionRegistry) -> dict[st
 def _iter_injected(obj: object) -> list[Injected]:
     # Collect @inject fields from both instance and class (Injection model §3.3).
     injected: list[Injected] = []
-    for value in vars(obj).values():
-        if isinstance(value, Injected):
-            injected.append(value)
-    for value in vars(obj.__class__).values():
-        if isinstance(value, Injected):
-            injected.append(value)
-    return injected
+
+    def _collect(target: object) -> None:
+        for value in getattr(target, "__dict__", {}).values():
+            if isinstance(value, Injected):
+                injected.append(value)
+        target_cls = getattr(target, "__class__", None)
+        if target_cls is not None:
+            for value in getattr(target_cls, "__dict__", {}).values():
+                if isinstance(value, Injected):
+                    injected.append(value)
+
+    _collect(obj)
+    container = getattr(obj, "__self__", None)
+    if container is not None:
+        _collect(container)
+
+    deduped: dict[tuple[str, type[object], str | None], Injected] = {}
+    for marker in injected:
+        key = (marker.port_type, marker.data_type, marker.qualifier)
+        deduped[key] = marker
+    return list(deduped.values())
+
+
+def _is_async_dependency(registry: InjectionRegistry, dependency: Injected) -> bool:
+    try:
+        return registry.is_async_binding(
+            dependency.port_type,
+            dependency.data_type,
+            qualifier=dependency.qualifier,
+        )
+    except InjectionRegistryError:
+        # Planning fallback: unresolved bindings are treated as sync here;
+        # strict DI validation still fails during scenario injection.
+        return False
 
 
 def build_execution_plan(dag: Dag) -> list[str]:

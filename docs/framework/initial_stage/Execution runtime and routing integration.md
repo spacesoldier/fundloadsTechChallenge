@@ -146,8 +146,8 @@ Runtime wiring rule:
 - runtime/bootstrap binds `service<ApplicationContext>` once per scenario scope;
 - `DiscoveryConsumerRegistry` (platform service) resolves consumer mapping from
   discovered node contracts;
-- `RoutingPort` resolves registry via `inject.service(ConsumerRegistry)`;
-- `SyncRunner` resolves only `service<RoutingPort>` (it does not receive
+- `RoutingService` resolves registry via `inject.service(ConsumerRegistry)`;
+- `SyncRunner` resolves only `service<RoutingService>` (it does not receive
   consumer registry directly).
 
 ### 4.3 Context service over `kv`
@@ -166,7 +166,7 @@ context is always available.
 Implementation reference:
 
 - [src/stream_kernel/integration/kv_store.py](../../../../src/stream_kernel/integration/kv_store.py)
-- [src/stream_kernel/execution/runner.py](../../../../src/stream_kernel/execution/runner.py)
+- [src/stream_kernel/execution/runtime/runner.py](../../../../src/stream_kernel/execution/runtime/runner.py)
 
 #### Context KV behavior (logic)
 
@@ -286,18 +286,18 @@ Runner responsibilities:
 1. Pull `Envelope` from queue
 2. Execute node
 3. Normalize outputs into `Envelope` list
-4. Ask **RoutingPort** for destinations
+4. Ask **RoutingService** for destinations
 5. Push new envelopes into queue
 
 Runner dependencies are injected through framework DI:
 
 - `work_queue` via `inject.queue(Envelope, qualifier=\"execution.cpu\")`
-- `routing_port` via `inject.service(RoutingPort)`
+- `router` via `inject.service(RoutingService)`
 - `context_service` via `inject.service(ContextService)`
 
 No manual object lifecycle must be hardcoded in runner construction.
 
-RoutingPort responsibilities:
+RoutingService responsibilities:
 
 1. Normalize outputs to `Envelope`
 2. Pull consumer map from `ConsumerRegistry`
@@ -538,11 +538,12 @@ processing. Preflight moves these failures to startup and keeps runs determinist
 ## 9) Implementation references
 
 - `stream_kernel.routing.router` (routing logic)
-- `stream_kernel.integration.routing_port` (routing adapter)
+- `stream_kernel.routing.routing_service` (routing service facade over consumer registry)
 - `stream_kernel.integration.work_queue` (deque adapter)
 - `stream_kernel.integration.kv_store` (in-memory KV adapter)
-- `stream_kernel.execution.context_service` (service facade over KV)
-- `stream_kernel.execution` (runners, planned)
+- `stream_kernel.platform.services.state.context` (service facade over KV)
+- `stream_kernel.execution.runtime` (runner implementations)
+- `stream_kernel.execution.orchestration` (runtime artifact builder/orchestration)
 
 ---
 
@@ -552,4 +553,4 @@ processing. Preflight moves these failures to startup and keeps runs determinist
 - `run_with_config(config, ...)` is also framework-first by default and can
   resolve discovery/adapters from config without external wiring.
 - Runtime bootstrap is expected to use execution builder APIs for artifact
-  assembly (`stream_kernel.execution.builder`) and then execute via runner APIs.
+  assembly (`stream_kernel.execution.orchestration.builder`) and then execute via runner APIs.

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable, TypeVar
 
 T = TypeVar("T")
+_SUPPORTED_ADAPTER_EXECUTION_MODES = {"sync", "async", "any"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -14,6 +15,14 @@ class AdapterMeta:
     consumes: tuple[type[object], ...]
     emits: tuple[type[object], ...]
     binds: tuple[tuple[str, type[Any]], ...]
+    execution_mode: str = "sync"
+
+    def __post_init__(self) -> None:
+        if self.execution_mode not in _SUPPORTED_ADAPTER_EXECUTION_MODES:
+            raise ValueError(
+                "AdapterMeta.execution_mode must be one of: "
+                f"{sorted(_SUPPORTED_ADAPTER_EXECUTION_MODES)}"
+            )
 
 
 def adapter(
@@ -23,6 +32,7 @@ def adapter(
     consumes: Iterable[type[object]] | None = None,
     emits: Iterable[type[object]] | None = None,
     binds: Iterable[tuple[str, type[Any]]] | None = None,
+    execution_mode: str = "sync",
 ) -> Callable[[T], T]:
     # Decorator attaches typed consumes/emits contracts to adapter factories.
 
@@ -36,6 +46,7 @@ def adapter(
             consumes=tuple(consumes or ()),
             emits=tuple(emits or ()),
             binds=tuple(binds or ()),
+            execution_mode=execution_mode,
         )
         setattr(target, "__adapter_meta__", meta)
         return target

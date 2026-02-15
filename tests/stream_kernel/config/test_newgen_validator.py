@@ -846,6 +846,672 @@ def test_validate_newgen_config_rejects_logging_jsonl_exporter_invalid_workers_d
         validate_newgen_config(raw)
 
 
+def test_validate_newgen_config_obs_k_a_01_rejects_mixed_pipeline_and_legacy_exporters() -> None:
+    # OBS-K-A-01: unified observability pipeline cannot be mixed with legacy exporter blocks.
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "pipeline": {
+            "mode": "tracing_only",
+        },
+        "tracing": {
+            "exporters": [
+                {"kind": "stdout", "settings": {}},
+            ]
+        },
+    }
+    with pytest.raises(ConfigError, match="pipeline cannot be combined"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_obs_k_a_02_rejects_unknown_pipeline_system_node_kind() -> None:
+    # OBS-K-A-02: system node kinds must be from the frozen allow-list.
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "pipeline": {
+            "mode": "tracing_only",
+            "system_nodes": [
+                {"kind": "system.obs.custom_dispatch"},
+            ],
+        }
+    }
+    with pytest.raises(ConfigError, match="system_nodes\\[0\\]\\.kind must be one of"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_obs_k_a_03_accepts_tracing_only_pipeline_defaults() -> None:
+    # OBS-K-A-03: tracing-only profile is valid with default stream set.
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "pipeline": {
+            "mode": "tracing_only",
+            "system_nodes": [
+                {"kind": "system.obs.trace_dispatch"},
+            ],
+        }
+    }
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    observability = validated_runtime.get("observability")
+    assert isinstance(observability, dict)
+    pipeline = observability.get("pipeline")
+    assert isinstance(pipeline, dict)
+    assert pipeline.get("mode") == "tracing_only"
+    assert pipeline.get("streams") == ["tracing"]
+
+
+def test_validate_newgen_config_obs_k_a_04_accepts_full_multi_stream_pipeline() -> None:
+    # OBS-K-A-04: full multi-stream profile is valid and keeps declared streams.
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "pipeline": {
+            "mode": "full_multi_stream",
+            "streams": ["tracing", "logging", "telemetry", "monitoring"],
+            "system_nodes": [
+                {"kind": "system.obs.trace_dispatch"},
+                {"kind": "system.obs.log_dispatch"},
+                {"kind": "system.obs.metric_dispatch"},
+                {"kind": "system.obs.monitor_dispatch"},
+            ],
+            "strict_bindings": True,
+        }
+    }
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    observability = validated_runtime.get("observability")
+    assert isinstance(observability, dict)
+    pipeline = observability.get("pipeline")
+    assert isinstance(pipeline, dict)
+    assert pipeline.get("mode") == "full_multi_stream"
+    streams = pipeline.get("streams")
+    assert isinstance(streams, list)
+    assert set(streams) == {"tracing", "logging", "telemetry", "monitoring"}
+
+
+def test_validate_newgen_config_obs_k_a_05_rejects_invalid_full_multi_stream_shape() -> None:
+    # OBS-K-A-05: full_multi_stream must include all frozen stream kinds.
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "pipeline": {
+            "mode": "full_multi_stream",
+            "streams": ["tracing", "logging"],
+        }
+    }
+    with pytest.raises(ConfigError, match="mode=full_multi_stream requires streams"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_obs_cfg_a_01_rejects_unknown_otel_backend() -> None:
+    # OBS-CFG-A-01
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "backend": "curl",
+                    "settings": {"endpoint": "http://collector:4318/v1/traces"},
+                }
+            ]
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_obs_cfg_a_02_rejects_async_backend_for_sync_runner_without_bridge() -> None:
+    # OBS-CFG-A-02
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "process_groups": [
+            {"name": "execution.cpu", "runner_profile": "sync"},
+        ]
+    }
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "backend": "aiohttp",
+                    "settings": {"endpoint": "http://collector:4318/v1/traces"},
+                }
+            ]
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_obs_cfg_a_03_rejects_invalid_batching_and_retry_bounds() -> None:
+    # OBS-CFG-A-03
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "backend": "urllib",
+                    "settings": {
+                        "endpoint": "http://collector:4318/v1/traces",
+                        "batch": {"max_items": 0},
+                        "retry": {"max_attempts": -1},
+                    },
+                }
+            ]
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_obs_cfg_a_04_backward_compat_defaults_backend_to_urllib() -> None:
+    # OBS-CFG-A-04
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "settings": {"endpoint": "http://collector:4318/v1/traces"},
+                }
+            ]
+        }
+    }
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    observability = validated_runtime.get("observability")
+    assert isinstance(observability, dict)
+    tracing = observability.get("tracing")
+    assert isinstance(tracing, dict)
+    exporters = tracing.get("exporters")
+    assert isinstance(exporters, list)
+    assert exporters[0].get("backend") == "urllib"
+
+
+def test_validate_newgen_config_obs_cfg_e_01_rejects_invalid_dependency_missing_mode() -> None:
+    # OBS-K-E-03: dependency_missing mode must be explicit and constrained.
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "backend": "requests",
+                    "settings": {
+                        "endpoint": "http://collector:4318/v1/traces",
+                        "dependency_missing": "fallback_to_stdout",
+                    },
+                }
+            ]
+        }
+    }
+    with pytest.raises(ConfigError, match="dependency_missing must be one of"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_obs_cfg_e_02_accepts_degrade_noop_dependency_mode() -> None:
+    # OBS-K-E-04: explicit degrade mode should be normalized and preserved.
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "backend": "requests",
+                    "settings": {
+                        "endpoint": "http://collector:4318/v1/traces",
+                        "dependency_missing": "degrade_noop",
+                    },
+                }
+            ]
+        }
+    }
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    observability = validated_runtime.get("observability")
+    assert isinstance(observability, dict)
+    tracing = observability.get("tracing")
+    assert isinstance(tracing, dict)
+    exporters = tracing.get("exporters")
+    assert isinstance(exporters, list)
+    exporter0 = exporters[0]
+    assert isinstance(exporter0, dict)
+    settings = exporter0.get("settings")
+    assert isinstance(settings, dict)
+    assert settings.get("dependency_missing") == "degrade_noop"
+
+
+def test_validate_newgen_config_obs_cfg_a_05_rejects_sync_group_with_async_only_dependency_without_bridge() -> None:
+    # OBS-CFG-A-05
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "process_groups": [
+            {"name": "execution.sync", "runner_profile": "sync"},
+            {"name": "execution.async", "runner_profile": "async"},
+        ]
+    }
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "backend": "aiohttp",
+                    "settings": {"endpoint": "http://collector:4318/v1/traces"},
+                }
+            ]
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_obs_cfg_a_05b_allows_async_backend_without_explicit_runner_profile() -> None:
+    # RUN-AUTO-CFG-02: backend/profile compatibility checks apply only to explicit overrides.
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "process_groups": [
+            {"name": "execution.group"},
+        ]
+    }
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "backend": "aiohttp",
+                    "settings": {"endpoint": "http://collector:4318/v1/traces"},
+                }
+            ]
+        }
+    }
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    observability = validated_runtime.get("observability")
+    assert isinstance(observability, dict)
+    tracing = observability.get("tracing")
+    assert isinstance(tracing, dict)
+    exporters = tracing.get("exporters")
+    assert isinstance(exporters, list)
+    exporter0 = exporters[0]
+    assert isinstance(exporter0, dict)
+    assert exporter0.get("backend") == "aiohttp"
+
+
+def test_validate_newgen_config_obs_cfg_a_06_rejects_async_group_with_sync_dependency_without_bridge() -> None:
+    # OBS-CFG-A-06
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "process_groups": [
+            {"name": "execution.async", "runner_profile": "async"},
+        ]
+    }
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "backend": "urllib3",
+                    "settings": {"endpoint": "http://collector:4318/v1/traces"},
+                }
+            ]
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+@pytest.mark.parametrize(
+    ("runner_profile", "backend", "should_pass"),
+    [
+        ("sync", "urllib", True),
+        ("sync", "requests", True),
+        ("sync", "httpx", True),
+        ("sync", "aiohttp", False),
+        ("sync", "urllib3", True),
+        ("sync", "grpcio", True),
+        ("sync", "otel_sdk", True),
+        ("async", "urllib", False),
+        ("async", "requests", False),
+        ("async", "httpx", True),
+        ("async", "aiohttp", True),
+        ("async", "urllib3", False),
+        ("async", "grpcio", False),
+        ("async", "otel_sdk", False),
+    ],
+)
+def test_validate_newgen_config_obs_mat_01_backend_runner_profile_matrix(
+    runner_profile: str,
+    backend: str,
+    should_pass: bool,
+) -> None:
+    # OBS-MAT-01: full backend/profile matrix must either pass or fail with deterministic validation reason.
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "process_groups": [
+            {"name": "execution.group", "runner_profile": runner_profile},
+        ]
+    }
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "backend": backend,
+                    "settings": {"endpoint": "http://collector:4318/v1/traces"},
+                }
+            ]
+        }
+    }
+
+    if should_pass:
+        validated = validate_newgen_config(raw)
+        validated_runtime = validated["runtime"]
+        assert isinstance(validated_runtime, dict)
+        observability = validated_runtime.get("observability")
+        assert isinstance(observability, dict)
+        tracing = observability.get("tracing")
+        assert isinstance(tracing, dict)
+        exporters = tracing.get("exporters")
+        assert isinstance(exporters, list)
+        assert exporters[0].get("backend") == backend
+        return
+
+    with pytest.raises(ConfigError, match="requires settings\\.bridge=true"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_obs_httpx_cfg_01_accepts_httpx_settings() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "backend": "httpx",
+                    "settings": {
+                        "endpoint": "http://collector:4318/v1/traces",
+                        "httpx": {
+                            "mode": "async",
+                            "http2": True,
+                            "max_connections": 64,
+                            "max_keepalive_connections": 16,
+                        },
+                    },
+                }
+            ]
+        }
+    }
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    observability = validated_runtime.get("observability")
+    assert isinstance(observability, dict)
+    tracing = observability.get("tracing")
+    assert isinstance(tracing, dict)
+    exporters = tracing.get("exporters")
+    assert isinstance(exporters, list)
+    settings = exporters[0].get("settings")
+    assert isinstance(settings, dict)
+    httpx = settings.get("httpx")
+    assert isinstance(httpx, dict)
+    assert httpx.get("mode") == "async"
+    assert httpx.get("http2") is True
+    assert httpx.get("max_connections") == 64
+    assert httpx.get("max_keepalive_connections") == 16
+
+
+def test_validate_newgen_config_obs_httpx_cfg_02_rejects_invalid_httpx_mode() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "backend": "httpx",
+                    "settings": {
+                        "endpoint": "http://collector:4318/v1/traces",
+                        "httpx": {"mode": "cooperative"},
+                    },
+                }
+            ]
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_obs_aio_cfg_01_accepts_aiohttp_settings() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "backend": "aiohttp",
+                    "settings": {
+                        "endpoint": "http://collector:4318/v1/traces",
+                        "aiohttp": {
+                            "shutdown_timeout_seconds": 3.5,
+                            "connector_limit": 128,
+                            "connector_limit_per_host": 32,
+                        },
+                    },
+                }
+            ]
+        }
+    }
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    observability = validated_runtime.get("observability")
+    assert isinstance(observability, dict)
+    tracing = observability.get("tracing")
+    assert isinstance(tracing, dict)
+    exporters = tracing.get("exporters")
+    assert isinstance(exporters, list)
+    settings = exporters[0].get("settings")
+    assert isinstance(settings, dict)
+    aiohttp = settings.get("aiohttp")
+    assert isinstance(aiohttp, dict)
+    assert aiohttp.get("shutdown_timeout_seconds") == 3.5
+    assert aiohttp.get("connector_limit") == 128
+    assert aiohttp.get("connector_limit_per_host") == 32
+
+
+def test_validate_newgen_config_obs_aio_cfg_02_rejects_invalid_shutdown_timeout() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "backend": "aiohttp",
+                    "settings": {
+                        "endpoint": "http://collector:4318/v1/traces",
+                        "aiohttp": {"shutdown_timeout_seconds": 0},
+                    },
+                }
+            ]
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_obs_u3_cfg_01_accepts_urllib3_settings() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "backend": "urllib3",
+                    "settings": {
+                        "endpoint": "http://collector:4318/v1/traces",
+                        "urllib3": {
+                            "num_pools": 8,
+                            "maxsize": 32,
+                            "block": True,
+                            "timeout_seconds": 1.75,
+                        },
+                    },
+                }
+            ]
+        }
+    }
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    observability = validated_runtime.get("observability")
+    assert isinstance(observability, dict)
+    tracing = observability.get("tracing")
+    assert isinstance(tracing, dict)
+    exporters = tracing.get("exporters")
+    assert isinstance(exporters, list)
+    settings = exporters[0].get("settings")
+    assert isinstance(settings, dict)
+    urllib3 = settings.get("urllib3")
+    assert isinstance(urllib3, dict)
+    assert urllib3.get("num_pools") == 8
+    assert urllib3.get("maxsize") == 32
+    assert urllib3.get("block") is True
+    assert urllib3.get("timeout_seconds") == 1.75
+
+
+def test_validate_newgen_config_obs_u3_cfg_02_rejects_invalid_urllib3_timeout() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "backend": "urllib3",
+                    "settings": {
+                        "endpoint": "http://collector:4318/v1/traces",
+                        "urllib3": {"timeout_seconds": 0},
+                    },
+                }
+            ]
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_obs_grpc_cfg_01_accepts_grpc_settings() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "backend": "grpcio",
+                    "settings": {
+                        "endpoint": "collector:4317",
+                        "grpc": {
+                            "insecure": False,
+                            "timeout_seconds": 1.5,
+                            "retryable_status_codes": ["UNAVAILABLE", "DEADLINE_EXCEEDED"],
+                        },
+                    },
+                }
+            ]
+        }
+    }
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    observability = validated_runtime.get("observability")
+    assert isinstance(observability, dict)
+    tracing = observability.get("tracing")
+    assert isinstance(tracing, dict)
+    exporters = tracing.get("exporters")
+    assert isinstance(exporters, list)
+    settings = exporters[0].get("settings")
+    assert isinstance(settings, dict)
+    grpc = settings.get("grpc")
+    assert isinstance(grpc, dict)
+    assert grpc.get("insecure") is False
+    assert grpc.get("timeout_seconds") == 1.5
+    retryable = grpc.get("retryable_status_codes")
+    assert isinstance(retryable, list)
+    assert retryable == ["UNAVAILABLE", "DEADLINE_EXCEEDED"]
+
+
+def test_validate_newgen_config_obs_grpc_cfg_02_rejects_invalid_retryable_status_codes() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "backend": "grpcio",
+                    "settings": {
+                        "endpoint": "collector:4317",
+                        "grpc": {"retryable_status_codes": [123]},
+                    },
+                }
+            ]
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
 def test_validate_newgen_config_rejects_invalid_execution_ipc_control_bind_host() -> None:
     raw = _phase0_base_config()
     runtime = raw["runtime"]
@@ -1170,6 +1836,31 @@ def test_validate_newgen_config_rejects_unknown_process_group_runner_profile() -
     }
     with pytest.raises(ConfigError):
         validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_allows_process_group_without_runner_profile() -> None:
+    # RUN-AUTO-CFG-01: runner_profile is optional; runtime can infer runner automatically.
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "process_groups": [
+            {
+                "name": "execution.cpu",
+                "workers": 2,
+            }
+        ]
+    }
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    groups = platform.get("process_groups")
+    assert isinstance(groups, list)
+    group = groups[0]
+    assert isinstance(group, dict)
+    assert "runner_profile" not in group
 
 
 def test_validate_newgen_config_rejects_unknown_process_group_services_key() -> None:

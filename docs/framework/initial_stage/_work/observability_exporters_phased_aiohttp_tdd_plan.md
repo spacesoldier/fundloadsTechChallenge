@@ -1,5 +1,11 @@
 # Phase D: aiohttp backend (TDD)
 
+## Status
+
+- [x] `aiohttp` backend implemented with async transport path.
+- [x] `OBS-AIO-01..05` tests added and green.
+- [x] Queue drop-policy and `settings.aiohttp` config contract are validated and wired.
+
 ## Objective
 
 Add high-throughput async OTLP HTTP backend using `aiohttp`.
@@ -9,6 +15,7 @@ Add high-throughput async OTLP HTTP backend using `aiohttp`.
 - `aiohttp.ClientSession` exporter transport;
 - async batch worker + bounded queue + drop policy handling;
 - graceful shutdown drain semantics.
+- config-level `settings.aiohttp` contract normalization.
 
 ## RED tests
 
@@ -21,7 +28,7 @@ Add high-throughput async OTLP HTTP backend using `aiohttp`.
 ## GREEN target
 
 - backend selectable via `backend=aiohttp`;
-- requires async runtime rails;
+- compatible with current sync rails via bridge-style execution and ready for AsyncRunner rollout;
 - batching/backpressure behavior observable through diagnostics counters.
 
 ## Refactor
@@ -32,3 +39,20 @@ Add high-throughput async OTLP HTTP backend using `aiohttp`.
 
 - async backend tests green;
 - no unbounded memory growth under synthetic burst test.
+
+## Implementation notes
+
+- keep shared OTLP payload model unchanged;
+- support queue controls from common contract:
+  - `queue.max_items`
+  - `queue.drop_policy` (`drop_newest | drop_oldest | block_with_timeout`)
+- add optional `settings.aiohttp` section:
+  - `shutdown_timeout_seconds`
+  - `connector_limit`
+  - `connector_limit_per_host`
+
+## Validation commands
+
+- `.venv/bin/pytest -q tests/adapters/test_trace_sinks.py -k 'obs_aio_'`
+- `.venv/bin/pytest -q tests/adapters/test_trace_sinks.py -k 'otel_otlp_trace_sink'`
+- `.venv/bin/pytest -q tests/stream_kernel/config/test_newgen_validator.py -k 'obs_aio_cfg_'`

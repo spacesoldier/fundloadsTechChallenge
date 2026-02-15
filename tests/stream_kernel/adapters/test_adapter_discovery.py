@@ -4,7 +4,7 @@ from types import ModuleType
 
 import pytest
 
-from stream_kernel.adapters.contracts import adapter
+from stream_kernel.adapters.contracts import adapter, get_adapter_meta
 from stream_kernel.adapters.discovery import AdapterDiscoveryError, discover_adapters
 
 
@@ -19,6 +19,11 @@ def _reader(settings: dict[str, object]) -> object:
 
 @adapter(name="writer", kind="file.line_writer", binds=[("stream", _PortType)])
 def _writer(settings: dict[str, object]) -> object:
+    return object()
+
+
+@adapter(name="async_writer", kind="http.writer", binds=[("stream", _PortType)], execution_mode="async")
+def _async_writer(settings: dict[str, object]) -> object:
     return object()
 
 
@@ -55,3 +60,10 @@ def test_discover_adapters_allows_reexport_of_same_factory() -> None:
     discovered = discover_adapters([module_a, module_b])
     assert set(discovered.keys()) == {"reader"}
     assert discovered["reader"] is _reader
+
+
+def test_adapter_metadata_exposes_execution_mode() -> None:
+    # Async capability must be discoverable from adapter metadata for DI planning.
+    meta = get_adapter_meta(_async_writer)
+    assert meta is not None
+    assert meta.execution_mode == "async"

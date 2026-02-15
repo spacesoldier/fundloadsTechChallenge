@@ -103,6 +103,7 @@ class SinkLineFileSink:
     consumes=[],
     emits=[ByteRecord, TextRecord],
     binds=[("stream", FileLineInputSource)],
+    execution_mode="async",
 )
 def ingress_file_source(settings: dict[str, object]) -> FileLineInputSource:
     # Framework-owned file ingress adapter: maps physical file records to text/binary transport payloads.
@@ -134,6 +135,7 @@ def ingress_file_source(settings: dict[str, object]) -> FileLineInputSource:
     consumes=[],
     emits=[ByteRecord, TextRecord],
     binds=[("stream", FileLineInputSource)],
+    execution_mode="async",
 )
 def source_file_source(settings: dict[str, object]) -> FileLineInputSource:
     # Alias for generic role naming: `source` instead of `ingress_file`.
@@ -146,6 +148,7 @@ def source_file_source(settings: dict[str, object]) -> FileLineInputSource:
     consumes=[SinkLine],
     emits=[],
     binds=[("stream", FileOutputSink)],
+    execution_mode="async",
 )
 def egress_file_sink(settings: dict[str, object]) -> SinkLineFileSink:
     # Framework-owned file egress adapter: persists SinkLine payloads as NDJSON/text lines.
@@ -173,6 +176,7 @@ def egress_file_sink(settings: dict[str, object]) -> SinkLineFileSink:
     consumes=[SinkLine],
     emits=[],
     binds=[("stream", FileOutputSink)],
+    execution_mode="async",
 )
 def sink_file_sink(settings: dict[str, object]) -> SinkLineFileSink:
     # Alias for generic role naming: `sink` instead of `egress_file`.

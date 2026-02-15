@@ -143,7 +143,7 @@ to module discovery + config-driven composition.
 - Application context assembly: [src/stream_kernel/application_context/application_context.py](../../../../src/stream_kernel/application_context/application_context.py)
 - Discovery and metadata: [src/stream_kernel/kernel/discovery.py](../../../../src/stream_kernel/kernel/discovery.py), [src/stream_kernel/kernel/node.py](../../../../src/stream_kernel/kernel/node.py), [src/stream_kernel/kernel/stage.py](../../../../src/stream_kernel/kernel/stage.py)
 - Scenario build from discovered nodes: [src/stream_kernel/application_context/application_context.py](../../../../src/stream_kernel/application_context/application_context.py)
-- Runtime artifact assembly: [src/stream_kernel/execution/builder.py](../../../../src/stream_kernel/execution/builder.py)
+- Runtime artifact assembly: [src/stream_kernel/execution/orchestration/builder.py](../../../../src/stream_kernel/execution/orchestration/builder.py)
 - Injection/config: [src/stream_kernel/application_context/inject.py](../../../../src/stream_kernel/application_context/inject.py), [src/stream_kernel/application_context/injection_registry.py](../../../../src/stream_kernel/application_context/injection_registry.py), [src/stream_kernel/application_context/config_inject.py](../../../../src/stream_kernel/application_context/config_inject.py)
 
 ---

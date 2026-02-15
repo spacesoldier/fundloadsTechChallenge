@@ -32,6 +32,18 @@ _SUPPORTED_PROCESS_GROUP_SERVICE_KEYS = {"api_service_profile", "rate_limiter_pr
 _SUPPORTED_OBSERVABILITY_TRACE_EXPORTER_KINDS = {"jsonl", "stdout", "otel_otlp", "opentracing_bridge"}
 _SUPPORTED_OBSERVABILITY_LOG_EXPORTER_KINDS = {"stdout", "jsonl", "otel_logs_otlp"}
 _SUPPORTED_OBSERVABILITY_LOG_LEVELS = {"info", "debug"}
+_SUPPORTED_OBSERVABILITY_OTEL_BACKENDS = {"urllib", "requests", "httpx", "aiohttp", "urllib3", "grpcio", "otel_sdk"}
+_OBSERVABILITY_ASYNC_ONLY_BACKENDS = {"aiohttp"}
+_OBSERVABILITY_SYNC_ONLY_BACKENDS = {"urllib", "requests", "urllib3", "grpcio", "otel_sdk"}
+_SUPPORTED_OBSERVABILITY_QUEUE_DROP_POLICIES = {"drop_newest", "drop_oldest", "block_with_timeout"}
+_SUPPORTED_OBSERVABILITY_PIPELINE_MODES = {"tracing_only", "full_multi_stream"}
+_SUPPORTED_OBSERVABILITY_PIPELINE_STREAMS = {"tracing", "logging", "telemetry", "monitoring"}
+_SUPPORTED_OBSERVABILITY_PIPELINE_SYSTEM_NODE_KINDS = {
+    "system.obs.trace_dispatch",
+    "system.obs.log_dispatch",
+    "system.obs.metric_dispatch",
+    "system.obs.monitor_dispatch",
+}
 _SUPPORTED_API_POLICY_KEYS = {"defaults", "profiles"}
 _SUPPORTED_API_POLICY_DEFAULT_KEYS = {
     "timeout_ms",
@@ -288,17 +300,19 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
                 raise ConfigError(f"runtime.platform.process_groups[{index}].workers must be > 0")
             group["workers"] = workers
 
-            runner_profile = group.get("runner_profile", "sync")
-            if not isinstance(runner_profile, str) or not runner_profile:
-                raise ConfigError(
-                    f"runtime.platform.process_groups[{index}].runner_profile must be a non-empty string when provided"
-                )
-            if runner_profile not in _SUPPORTED_PROCESS_GROUP_RUNNER_PROFILES:
-                raise ConfigError(
-                    "runtime.platform.process_groups["
-                    f"{index}].runner_profile must be one of: {sorted(_SUPPORTED_PROCESS_GROUP_RUNNER_PROFILES)}"
-                )
-            group["runner_profile"] = runner_profile
+            if "runner_profile" in group:
+                runner_profile = group.get("runner_profile")
+                if not isinstance(runner_profile, str) or not runner_profile:
+                    raise ConfigError(
+                        "runtime.platform.process_groups["
+                        f"{index}].runner_profile must be a non-empty string when provided"
+                    )
+                if runner_profile not in _SUPPORTED_PROCESS_GROUP_RUNNER_PROFILES:
+                    raise ConfigError(
+                        "runtime.platform.process_groups["
+                        f"{index}].runner_profile must be one of: {sorted(_SUPPORTED_PROCESS_GROUP_RUNNER_PROFILES)}"
+                    )
+                group["runner_profile"] = runner_profile
 
             services = group.get("services")
             if services is not None:
@@ -553,6 +567,7 @@ def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
     if not isinstance(observability, dict):
         raise ConfigError("runtime.observability must be a mapping when provided")
     runtime["observability"] = observability
+    _normalize_observability_pipeline(observability)
 
     tracing = observability.get("tracing", {})
     if not isinstance(tracing, dict):
@@ -577,7 +592,29 @@ def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
             raise ConfigError(
                 f"runtime.observability.tracing.exporters[{index}].settings must be a mapping when provided"
             )
+        if kind == "otel_otlp":
+            backend = exporter.get("backend", "urllib")
+            if not isinstance(backend, str) or not backend:
+                raise ConfigError(
+                    f"runtime.observability.tracing.exporters[{index}].backend must be a non-empty string"
+                )
+            if backend not in _SUPPORTED_OBSERVABILITY_OTEL_BACKENDS:
+                raise ConfigError(
+                    "runtime.observability.tracing.exporters["
+                    f"{index}].backend must be one of: {sorted(_SUPPORTED_OBSERVABILITY_OTEL_BACKENDS)}"
+                )
+            exporter["backend"] = backend
+            _normalize_observability_otel_exporter_settings(
+                settings,
+                prefix=f"runtime.observability.tracing.exporters[{index}].settings",
+            )
+        elif "backend" in exporter:
+            raise ConfigError(
+                f"runtime.observability.tracing.exporters[{index}].backend is supported only for kind 'otel_otlp'"
+            )
         exporter["settings"] = settings
+
+    _validate_observability_exporter_runner_compatibility(runtime=runtime, exporters=tracing_exporters)
 
     logging = observability.get("logging", {})
     if not isinstance(logging, dict):
@@ -634,6 +671,339 @@ def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
             f"{sorted(_SUPPORTED_OBSERVABILITY_LOG_LEVELS)}"
         )
     lifecycle_events["level"] = level
+
+    pipeline = observability.get("pipeline")
+    if pipeline is not None and (tracing_exporters or log_exporters):
+        raise ConfigError(
+            "runtime.observability.pipeline cannot be combined with "
+            "runtime.observability.tracing.exporters or runtime.observability.logging.exporters"
+        )
+
+
+def _normalize_observability_pipeline(observability: dict[str, object]) -> None:
+    pipeline = observability.get("pipeline")
+    if pipeline is None:
+        return
+    if not isinstance(pipeline, dict):
+        raise ConfigError("runtime.observability.pipeline must be a mapping when provided")
+    observability["pipeline"] = pipeline
+
+    unknown_keys = sorted(
+        key for key in pipeline if key not in {"mode", "streams", "system_nodes", "strict_bindings"}
+    )
+    if unknown_keys:
+        raise ConfigError(
+            "runtime.observability.pipeline has unsupported keys: "
+            f"{unknown_keys}"
+        )
+
+    mode = pipeline.get("mode", "tracing_only")
+    if not isinstance(mode, str) or not mode:
+        raise ConfigError("runtime.observability.pipeline.mode must be a non-empty string when provided")
+    if mode not in _SUPPORTED_OBSERVABILITY_PIPELINE_MODES:
+        raise ConfigError(
+            "runtime.observability.pipeline.mode must be one of: "
+            f"{sorted(_SUPPORTED_OBSERVABILITY_PIPELINE_MODES)}"
+        )
+    pipeline["mode"] = mode
+
+    streams = pipeline.get("streams")
+    if streams is None:
+        if mode == "tracing_only":
+            streams = ["tracing"]
+        else:
+            streams = ["tracing", "logging", "telemetry", "monitoring"]
+    if not isinstance(streams, list):
+        raise ConfigError("runtime.observability.pipeline.streams must be a list when provided")
+    if not all(isinstance(item, str) and item for item in streams):
+        raise ConfigError("runtime.observability.pipeline.streams entries must be non-empty strings")
+    unknown_streams = sorted(item for item in streams if item not in _SUPPORTED_OBSERVABILITY_PIPELINE_STREAMS)
+    if unknown_streams:
+        raise ConfigError(
+            "runtime.observability.pipeline.streams entries must be one of: "
+            f"{sorted(_SUPPORTED_OBSERVABILITY_PIPELINE_STREAMS)}"
+        )
+    streams_set = set(streams)
+    if mode == "tracing_only" and streams_set != {"tracing"}:
+        raise ConfigError(
+            "runtime.observability.pipeline.mode=tracing_only requires streams=['tracing']"
+        )
+    if mode == "full_multi_stream" and streams_set != _SUPPORTED_OBSERVABILITY_PIPELINE_STREAMS:
+        raise ConfigError(
+            "runtime.observability.pipeline.mode=full_multi_stream requires streams="
+            "['tracing', 'logging', 'telemetry', 'monitoring']"
+        )
+    pipeline["streams"] = list(streams)
+
+    strict_bindings = pipeline.get("strict_bindings", True)
+    if not isinstance(strict_bindings, bool):
+        raise ConfigError("runtime.observability.pipeline.strict_bindings must be a boolean when provided")
+    pipeline["strict_bindings"] = strict_bindings
+
+    system_nodes = pipeline.get("system_nodes", [])
+    if not isinstance(system_nodes, list):
+        raise ConfigError("runtime.observability.pipeline.system_nodes must be a list when provided")
+    normalized_nodes: list[dict[str, object]] = []
+    for index, node in enumerate(system_nodes):
+        if not isinstance(node, dict):
+            raise ConfigError(
+                f"runtime.observability.pipeline.system_nodes[{index}] must be a mapping"
+            )
+        unknown_node_keys = sorted(key for key in node if key not in {"kind", "enabled", "qualifier"})
+        if unknown_node_keys:
+            raise ConfigError(
+                "runtime.observability.pipeline.system_nodes["
+                f"{index}] has unsupported keys: {unknown_node_keys}"
+            )
+        kind = node.get("kind")
+        if not isinstance(kind, str) or not kind:
+            raise ConfigError(
+                f"runtime.observability.pipeline.system_nodes[{index}].kind must be a non-empty string"
+            )
+        if kind not in _SUPPORTED_OBSERVABILITY_PIPELINE_SYSTEM_NODE_KINDS:
+            raise ConfigError(
+                "runtime.observability.pipeline.system_nodes["
+                f"{index}].kind must be one of: {sorted(_SUPPORTED_OBSERVABILITY_PIPELINE_SYSTEM_NODE_KINDS)}"
+            )
+        enabled = node.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ConfigError(
+                f"runtime.observability.pipeline.system_nodes[{index}].enabled must be a boolean when provided"
+            )
+        qualifier = node.get("qualifier")
+        if qualifier is not None and (not isinstance(qualifier, str) or not qualifier):
+            raise ConfigError(
+                f"runtime.observability.pipeline.system_nodes[{index}].qualifier "
+                "must be a non-empty string when provided"
+            )
+        normalized: dict[str, object] = {"kind": kind, "enabled": enabled}
+        if isinstance(qualifier, str):
+            normalized["qualifier"] = qualifier
+        normalized_nodes.append(normalized)
+    pipeline["system_nodes"] = normalized_nodes
+
+
+def _normalize_observability_otel_exporter_settings(
+    settings: dict[str, object],
+    *,
+    prefix: str,
+) -> None:
+    endpoint = settings.get("endpoint")
+    if endpoint is not None and (not isinstance(endpoint, str) or not endpoint):
+        raise ConfigError(f"{prefix}.endpoint must be a non-empty string when provided")
+
+    headers = settings.get("headers")
+    if headers is not None:
+        if not isinstance(headers, dict):
+            raise ConfigError(f"{prefix}.headers must be a mapping when provided")
+        for key, value in headers.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise ConfigError(f"{prefix}.headers must be a string-to-string mapping")
+
+    timeout_seconds = settings.get("timeout_seconds")
+    if timeout_seconds is not None:
+        if not isinstance(timeout_seconds, (int, float)):
+            raise ConfigError(f"{prefix}.timeout_seconds must be numeric when provided")
+        if float(timeout_seconds) <= 0:
+            raise ConfigError(f"{prefix}.timeout_seconds must be > 0 when provided")
+        settings["timeout_seconds"] = float(timeout_seconds)
+
+    bridge = settings.get("bridge", False)
+    if not isinstance(bridge, bool):
+        raise ConfigError(f"{prefix}.bridge must be a boolean when provided")
+    settings["bridge"] = bridge
+
+    dependency_missing = settings.get("dependency_missing", "error")
+    if not isinstance(dependency_missing, str) or dependency_missing not in {"error", "degrade_noop"}:
+        raise ConfigError(
+            f"{prefix}.dependency_missing must be one of: ['error', 'degrade_noop']"
+        )
+    settings["dependency_missing"] = dependency_missing
+
+    batch = settings.get("batch", {})
+    if not isinstance(batch, dict):
+        raise ConfigError(f"{prefix}.batch must be a mapping when provided")
+    max_items = batch.get("max_items", 100)
+    if not isinstance(max_items, int) or max_items <= 0:
+        raise ConfigError(f"{prefix}.batch.max_items must be an integer > 0 when provided")
+    batch["max_items"] = max_items
+    flush_interval_ms = batch.get("flush_interval_ms", 1000)
+    if not isinstance(flush_interval_ms, int) or flush_interval_ms <= 0:
+        raise ConfigError(f"{prefix}.batch.flush_interval_ms must be an integer > 0 when provided")
+    batch["flush_interval_ms"] = flush_interval_ms
+    settings["batch"] = batch
+
+    queue = settings.get("queue", {})
+    if not isinstance(queue, dict):
+        raise ConfigError(f"{prefix}.queue must be a mapping when provided")
+    queue_max_items = queue.get("max_items", 10000)
+    if not isinstance(queue_max_items, int) or queue_max_items <= 0:
+        raise ConfigError(f"{prefix}.queue.max_items must be an integer > 0 when provided")
+    queue["max_items"] = queue_max_items
+    drop_policy = queue.get("drop_policy", "drop_newest")
+    if not isinstance(drop_policy, str) or not drop_policy:
+        raise ConfigError(f"{prefix}.queue.drop_policy must be a non-empty string when provided")
+    if drop_policy not in _SUPPORTED_OBSERVABILITY_QUEUE_DROP_POLICIES:
+        raise ConfigError(
+            f"{prefix}.queue.drop_policy must be one of: {sorted(_SUPPORTED_OBSERVABILITY_QUEUE_DROP_POLICIES)}"
+        )
+    queue["drop_policy"] = drop_policy
+    settings["queue"] = queue
+
+    retry = settings.get("retry", {})
+    if not isinstance(retry, dict):
+        raise ConfigError(f"{prefix}.retry must be a mapping when provided")
+    max_attempts = retry.get("max_attempts", 0)
+    if not isinstance(max_attempts, int) or max_attempts < 0:
+        raise ConfigError(f"{prefix}.retry.max_attempts must be an integer >= 0 when provided")
+    retry["max_attempts"] = max_attempts
+    backoff_ms = retry.get("backoff_ms", 0)
+    if not isinstance(backoff_ms, int) or backoff_ms < 0:
+        raise ConfigError(f"{prefix}.retry.backoff_ms must be an integer >= 0 when provided")
+    retry["backoff_ms"] = backoff_ms
+    settings["retry"] = retry
+
+    httpx = settings.get("httpx", {})
+    if not isinstance(httpx, dict):
+        raise ConfigError(f"{prefix}.httpx must be a mapping when provided")
+    mode = httpx.get("mode", "sync")
+    if not isinstance(mode, str) or mode not in {"sync", "async"}:
+        raise ConfigError(f"{prefix}.httpx.mode must be one of: ['sync', 'async']")
+    httpx["mode"] = mode
+    http2 = httpx.get("http2", False)
+    if not isinstance(http2, bool):
+        raise ConfigError(f"{prefix}.httpx.http2 must be a boolean when provided")
+    httpx["http2"] = http2
+    max_connections = httpx.get("max_connections")
+    if max_connections is not None and (not isinstance(max_connections, int) or max_connections <= 0):
+        raise ConfigError(f"{prefix}.httpx.max_connections must be an integer > 0 when provided")
+    max_keepalive_connections = httpx.get("max_keepalive_connections")
+    if max_keepalive_connections is not None and (
+        not isinstance(max_keepalive_connections, int) or max_keepalive_connections <= 0
+    ):
+        raise ConfigError(
+            f"{prefix}.httpx.max_keepalive_connections must be an integer > 0 when provided"
+        )
+    settings["httpx"] = httpx
+
+    grpc = settings.get("grpc", {})
+    if not isinstance(grpc, dict):
+        raise ConfigError(f"{prefix}.grpc must be a mapping when provided")
+    insecure = grpc.get("insecure", True)
+    if not isinstance(insecure, bool):
+        raise ConfigError(f"{prefix}.grpc.insecure must be a boolean when provided")
+    grpc["insecure"] = insecure
+    grpc_timeout_seconds = grpc.get("timeout_seconds")
+    if grpc_timeout_seconds is not None:
+        if not isinstance(grpc_timeout_seconds, (int, float)):
+            raise ConfigError(f"{prefix}.grpc.timeout_seconds must be numeric when provided")
+        if float(grpc_timeout_seconds) <= 0:
+            raise ConfigError(f"{prefix}.grpc.timeout_seconds must be > 0 when provided")
+        grpc["timeout_seconds"] = float(grpc_timeout_seconds)
+    retryable_status_codes = grpc.get("retryable_status_codes", ["UNAVAILABLE", "DEADLINE_EXCEEDED"])
+    if not isinstance(retryable_status_codes, list) or not all(
+        isinstance(item, str) and item for item in retryable_status_codes
+    ):
+        raise ConfigError(
+            f"{prefix}.grpc.retryable_status_codes must be a list of non-empty strings when provided"
+        )
+    grpc["retryable_status_codes"] = retryable_status_codes
+    settings["grpc"] = grpc
+
+    urllib3 = settings.get("urllib3", {})
+    if not isinstance(urllib3, dict):
+        raise ConfigError(f"{prefix}.urllib3 must be a mapping when provided")
+    num_pools = urllib3.get("num_pools")
+    if num_pools is not None and (not isinstance(num_pools, int) or num_pools <= 0):
+        raise ConfigError(f"{prefix}.urllib3.num_pools must be an integer > 0 when provided")
+    maxsize = urllib3.get("maxsize")
+    if maxsize is not None and (not isinstance(maxsize, int) or maxsize <= 0):
+        raise ConfigError(f"{prefix}.urllib3.maxsize must be an integer > 0 when provided")
+    block = urllib3.get("block")
+    if block is not None and not isinstance(block, bool):
+        raise ConfigError(f"{prefix}.urllib3.block must be a boolean when provided")
+    timeout_seconds = urllib3.get("timeout_seconds")
+    if timeout_seconds is not None:
+        if not isinstance(timeout_seconds, (int, float)):
+            raise ConfigError(f"{prefix}.urllib3.timeout_seconds must be numeric when provided")
+        if float(timeout_seconds) <= 0:
+            raise ConfigError(f"{prefix}.urllib3.timeout_seconds must be > 0 when provided")
+        urllib3["timeout_seconds"] = float(timeout_seconds)
+    settings["urllib3"] = urllib3
+
+    aiohttp = settings.get("aiohttp", {})
+    if not isinstance(aiohttp, dict):
+        raise ConfigError(f"{prefix}.aiohttp must be a mapping when provided")
+    shutdown_timeout_seconds = aiohttp.get("shutdown_timeout_seconds", 2.0)
+    if not isinstance(shutdown_timeout_seconds, (int, float)):
+        raise ConfigError(f"{prefix}.aiohttp.shutdown_timeout_seconds must be numeric when provided")
+    if float(shutdown_timeout_seconds) <= 0:
+        raise ConfigError(f"{prefix}.aiohttp.shutdown_timeout_seconds must be > 0 when provided")
+    aiohttp["shutdown_timeout_seconds"] = float(shutdown_timeout_seconds)
+    connector_limit = aiohttp.get("connector_limit")
+    if connector_limit is not None and (not isinstance(connector_limit, int) or connector_limit <= 0):
+        raise ConfigError(f"{prefix}.aiohttp.connector_limit must be an integer > 0 when provided")
+    connector_limit_per_host = aiohttp.get("connector_limit_per_host")
+    if connector_limit_per_host is not None and (
+        not isinstance(connector_limit_per_host, int) or connector_limit_per_host <= 0
+    ):
+        raise ConfigError(f"{prefix}.aiohttp.connector_limit_per_host must be an integer > 0 when provided")
+    settings["aiohttp"] = aiohttp
+
+
+def _validate_observability_exporter_runner_compatibility(
+    *,
+    runtime: dict[str, object],
+    exporters: list[object],
+) -> None:
+    platform = runtime.get("platform", {})
+    if not isinstance(platform, dict):
+        return
+    groups = platform.get("process_groups", [])
+    if not isinstance(groups, list) or not groups:
+        return
+    runner_profiles: list[str] = []
+    for index, group in enumerate(groups):
+        if not isinstance(group, dict):
+            continue
+        if "runner_profile" not in group:
+            continue
+        runner_profile = group.get("runner_profile")
+        if not isinstance(runner_profile, str) or runner_profile not in _SUPPORTED_PROCESS_GROUP_RUNNER_PROFILES:
+            raise ConfigError(
+                "runtime.platform.process_groups["
+                f"{index}].runner_profile must be one of: {sorted(_SUPPORTED_PROCESS_GROUP_RUNNER_PROFILES)}"
+            )
+        runner_profiles.append(runner_profile)
+    if not runner_profiles:
+        return
+
+    for index, exporter in enumerate(exporters):
+        if not isinstance(exporter, dict):
+            continue
+        if exporter.get("kind") != "otel_otlp":
+            continue
+        backend = exporter.get("backend", "urllib")
+        if not isinstance(backend, str):
+            continue
+        settings = exporter.get("settings", {})
+        bridge = False
+        if isinstance(settings, dict):
+            bridge_raw = settings.get("bridge", False)
+            bridge = bool(bridge_raw) if isinstance(bridge_raw, bool) else False
+        for runner_profile in runner_profiles:
+            if runner_profile == "sync" and backend in _OBSERVABILITY_ASYNC_ONLY_BACKENDS and not bridge:
+                raise ConfigError(
+                    "runtime.observability.tracing.exporters["
+                    f"{index}] backend '{backend}' is async-only and requires settings.bridge=true "
+                    "for runner_profile='sync'"
+                )
+            if runner_profile == "async" and backend in _OBSERVABILITY_SYNC_ONLY_BACKENDS and not bridge:
+                raise ConfigError(
+                    "runtime.observability.tracing.exporters["
+                    f"{index}] backend '{backend}' is sync-only and requires settings.bridge=true "
+                    "for runner_profile='async'"
+                )
 
 
 def _normalize_runtime_tracing(runtime: dict[str, object]) -> None:

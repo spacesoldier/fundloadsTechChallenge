@@ -1,5 +1,11 @@
 # Phase C: httpx backend (sync + async) (TDD)
 
+## Status
+
+- [x] `httpx` backend implemented (`sync` + `async` modes).
+- [x] `OBS-HTTPX-01..05` tests added and green.
+- [x] Runtime config contract extended with `settings.httpx` normalization.
+
 ## Objective
 
 Add `httpx` exporter backend supporting both sync and async clients, including optional HTTP/2.
@@ -9,6 +15,7 @@ Add `httpx` exporter backend supporting both sync and async clients, including o
 - `httpx.Client` path for sync runtime;
 - `httpx.AsyncClient` path for async runtime;
 - HTTP/2 toggle and connection pool settings.
+- deterministic retry/backoff hooks shared with sync/async httpx modes.
 
 ## RED tests
 
@@ -21,7 +28,7 @@ Add `httpx` exporter backend supporting both sync and async clients, including o
 ## GREEN target
 
 - backend selectable via `backend=httpx`;
-- async mode integrates with AsyncRunner lifecycle hooks;
+- async mode supports bridge execution from sync rails and stays compatible with future AsyncRunner hooks;
 - shutdown path does not leak pending tasks/connections.
 
 ## Refactor
@@ -32,3 +39,23 @@ Add `httpx` exporter backend supporting both sync and async clients, including o
 
 - sync and async test paths green;
 - no regression in trace continuity across process-group hops.
+
+## Implementation notes
+
+- keep current framework behavior backward-compatible:
+  - default backend remains `urllib`;
+  - default httpx mode is `sync`.
+- introduce httpx-specific settings under exporter settings:
+  - `httpx.mode: sync | async`
+  - `httpx.http2: bool`
+  - `httpx.max_connections: int | null`
+  - `httpx.max_keepalive_connections: int | null`
+- reuse common retry config from Phase A:
+  - `retry.max_attempts`
+  - `retry.backoff_ms`
+
+## Validation commands
+
+- `.venv/bin/pytest -q tests/adapters/test_trace_sinks.py -k 'obs_httpx_'`
+- `.venv/bin/pytest -q tests/adapters/test_trace_sinks.py -k 'otel_otlp_trace_sink'`
+- `.venv/bin/pytest -q tests/stream_kernel/observability/test_tracing_observer_factory.py`

@@ -1,5 +1,10 @@
 # Phase A: exporter contract and config freeze (TDD)
 
+## Status
+
+- [x] Contract and validator baseline implemented.
+- [x] `OBS-CFG-A-01..06` coverage added and green.
+
 ## Objective
 
 Freeze one unified exporter contract and runtime config schema before backend-specific implementations.
@@ -57,3 +62,9 @@ Shared settings:
 
 - contract tests green;
 - no behavior change for existing current configs by default.
+
+## Validation commands
+
+- `.venv/bin/pytest -q tests/stream_kernel/config/test_newgen_validator.py -k 'obs_cfg_a_'`
+- `.venv/bin/pytest -q tests/stream_kernel/config/test_newgen_validator.py -k 'observability or logging_jsonl or phase5pre_stepa_contract'`
+- `.venv/bin/pytest -q tests/stream_kernel/config/test_newgen_validator.py`

@@ -10,7 +10,13 @@ class StdoutMonitoringSink:
         print(f"{message.name}:{message.status}")
 
 
-@adapter(name="monitoring_stdout", consumes=[MonitoringMessage], emits=[], binds=[("stream", MonitoringMessage)])
+@adapter(
+    name="monitoring_stdout",
+    consumes=[MonitoringMessage],
+    emits=[],
+    binds=[("stream", MonitoringMessage)],
+    execution_mode="async",
+)
 def monitoring_stdout(settings: dict[str, object]) -> StdoutMonitoringSink:
     # Framework-owned stdout monitoring sink over standard stream channel.
     _ = settings

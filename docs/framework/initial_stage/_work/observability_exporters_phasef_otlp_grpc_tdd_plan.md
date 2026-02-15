@@ -1,5 +1,11 @@
 # Phase F: OTLP gRPC backend (grpcio) (TDD)
 
+## Status
+
+- [x] `grpcio` backend implemented (channel/stub export path).
+- [x] `OBS-GRPC-01..05` tests added and green.
+- [x] `settings.grpc` config contract normalized and wired.
+
 ## Objective
 
 Add binary OTLP gRPC exporter backend for lower overhead and collector-native pipeline.
@@ -9,6 +15,7 @@ Add binary OTLP gRPC exporter backend for lower overhead and collector-native pi
 - gRPC channel/stub exporter path for OTLP traces;
 - secure/insecure channel config model;
 - retry/deadline mapping for gRPC status codes.
+- config-level `settings.grpc` normalization.
 
 ## RED tests
 
@@ -32,3 +39,18 @@ Add binary OTLP gRPC exporter backend for lower overhead and collector-native pi
 
 - gRPC backend tests green;
 - collector integration smoke test passes with local OTLP gRPC endpoint.
+
+## Implementation notes
+
+- keep runner/business path transport-agnostic; grpc details stay inside observability adapter rails;
+- support optional `settings.grpc`:
+  - `insecure` (bool)
+  - `timeout_seconds` (numeric > 0)
+  - `retryable_status_codes` (list[str], e.g. `UNAVAILABLE`, `DEADLINE_EXCEEDED`)
+- keep deterministic exporter-failure isolation.
+
+## Validation commands
+
+- `.venv/bin/pytest -q tests/adapters/test_trace_sinks.py -k 'obs_grpc_'`
+- `.venv/bin/pytest -q tests/adapters/test_trace_sinks.py -k 'otel_otlp_trace_sink'`
+- `.venv/bin/pytest -q tests/stream_kernel/config/test_newgen_validator.py -k 'obs_grpc_cfg_'`

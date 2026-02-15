@@ -1,5 +1,11 @@
 # Phase B: requests Session backend (TDD)
 
+## Status
+
+- [x] `requests` backend implemented in OTLP trace sink.
+- [x] `OBS-REQ-01..05` tests added and green.
+- [x] Exporter `backend` is forwarded from runtime exporter entry into tracing adapter settings.
+
 ## Objective
 
 Add `requests`-based OTLP HTTP exporter backend with pooled connections and deterministic failure isolation.
@@ -32,3 +38,9 @@ Add `requests`-based OTLP HTTP exporter backend with pooled connections and dete
 
 - focused backend tests green;
 - parity with existing OTLP payload fields preserved.
+
+## Validation commands
+
+- `.venv/bin/pytest -q tests/adapters/test_trace_sinks.py -k 'obs_req_'`
+- `.venv/bin/pytest -q tests/stream_kernel/observability/test_tracing_observer_factory.py -k 'forwards_otel_backend'`
+- `.venv/bin/pytest -q tests/adapters/test_trace_sinks.py -k 'otel_otlp_trace_sink'`

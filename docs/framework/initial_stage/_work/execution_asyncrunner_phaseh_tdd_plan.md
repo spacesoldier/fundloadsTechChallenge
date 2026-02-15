@@ -1,5 +1,21 @@
 # Phase H: AsyncRunner rollout (TDD)
 
+## Status
+
+- [x] `RUN-ASYNC-01` implemented in `tests/stream_kernel/execution/runtime/test_async_runner.py`
+- [x] `RUN-ASYNC-02` implemented in `tests/stream_kernel/execution/runtime/test_async_runner.py`
+- [x] `RUN-ASYNC-03` implemented in `tests/stream_kernel/execution/runtime/test_async_runner.py`
+- [x] `RUN-ASYNC-04` implemented in `tests/stream_kernel/execution/orchestration/test_builder.py`
+- [x] `RUN-ASYNC-05` covered by validator contract (`OBS-CFG-A-05`)
+- [x] `RUN-ASYNC-06` implemented in `tests/stream_kernel/execution/orchestration/test_builder.py`
+- [x] `RUN-ASYNC-07` covered by validator contract (`OBS-CFG-A-06`)
+
+Green runs:
+
+- `.venv/bin/pytest -q tests/stream_kernel/execution/runtime`
+- `.venv/bin/pytest -q tests/stream_kernel/execution/orchestration/test_builder.py`
+- `.venv/bin/pytest -q tests/stream_kernel/config/test_newgen_validator.py -k 'obs_cfg_a_05 or obs_cfg_a_06'`
+
 ## Objective
 
 Introduce `AsyncRunner` to execute async nodes and async platform services without blocking sync execution rails.

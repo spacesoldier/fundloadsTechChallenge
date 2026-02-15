@@ -12,6 +12,9 @@ from stream_kernel.application_context.injection_registry import (
     ScenarioScope,
 )
 from stream_kernel.execution.transport.bootstrap_keys import BootstrapKeyBundle
+from stream_kernel.execution.orchestration.observability_system_nodes import (
+    build_observability_system_plan,
+)
 from stream_kernel.kernel.scenario import StepSpec
 from stream_kernel.platform.services.state.context import ContextService
 from stream_kernel.platform.services.runtime.lifecycle import RuntimeLifecycleManager
@@ -133,22 +136,30 @@ def bootstrap_child_runtime_from_bundle(bundle: ChildBootstrapBundle) -> ChildRu
     consumer_registry = app_context.build_consumer_registry()
 
     injection_registry = InjectionRegistry()
-    adapter_instances: dict[str, object] = {}
-    adapter_registry = None
-    adapter_bindings: dict[str, object] = {}
-    if bundle_adapters:
-        adapter_registry, adapter_bindings = execution_builder.resolve_runtime_adapters(
-            adapters=bundle_adapters,
-            discovery_modules=discovery_modules,
+    adapter_registry, adapter_bindings = execution_builder.resolve_runtime_adapters(
+        adapters=bundle_adapters,
+        discovery_modules=discovery_modules,
+    )
+    adapter_instances = execution_builder.build_adapter_instances_from_registry(
+        bundle_adapters,
+        adapter_registry,
+    )
+    adapter_instances.update(
+        execution_builder.build_runtime_observability_adapter_instances(
+            runtime=bundle.runtime,
+            registry=adapter_registry,
+            existing_instances=adapter_instances,
         )
-        adapter_instances = execution_builder.build_adapter_instances_from_registry(
-            bundle_adapters,
-            adapter_registry,
-        )
+    )
+    if adapter_bindings:
         _register_adapter_bindings(
             injection_registry=injection_registry,
             instances=adapter_instances,
             bindings=adapter_bindings,
+            adapter_async_roles=execution_builder.resolve_async_adapter_roles(
+                adapters=bundle_adapters,
+                adapter_registry=adapter_registry,
+            ),
         )
 
     execution_builder.register_discovered_services(injection_registry, modules)
@@ -244,8 +255,25 @@ def bootstrap_child_runtime_from_bundle(bundle: ChildBootstrapBundle) -> ChildRu
         )
         source_step_names = set(source_ingress.source_node_names)
 
+    observability_system = build_observability_system_plan(
+        runtime=bundle.runtime,
+        scenario_scope=scenario_scope,
+    )
+    for token, node_names in observability_system.system_consumers.items():
+        get_consumers = getattr(consumer_registry, "get_consumers", None)
+        register = getattr(consumer_registry, "register", None)
+        if not callable(get_consumers) or not callable(register):
+            continue
+        existing = list(get_consumers(token))
+        register(token, [*existing, *node_names])
+    combined_steps.extend(observability_system.system_steps)
+
     scenario_steps = {spec.name: spec.step for spec in combined_steps}
-    full_context_nodes = {node_def.meta.name for node_def in app_context.nodes if node_def.meta.service} | source_step_names
+    full_context_nodes = (
+        {node_def.meta.name for node_def in app_context.nodes if node_def.meta.service}
+        | source_step_names
+        | set(observability_system.system_node_names)
+    )
 
     try:
         runtime_transport_obj = scenario_scope.resolve("service", RuntimeTransportService)
@@ -571,14 +599,27 @@ def _register_adapter_bindings(
     injection_registry: InjectionRegistry,
     instances: dict[str, object],
     bindings: dict[str, object],
+    adapter_async_roles: set[str] | None = None,
 ) -> None:
+    async_roles = set(adapter_async_roles or ())
     for role, binding in bindings.items():
         if role not in instances:
             raise ChildRuntimeBootstrapError(f"Missing adapter instance for role: {role}")
         adapter = instances[role]
+        is_async = role in async_roles
         if isinstance(binding, list):
             for port_type, data_type in binding:
-                injection_registry.register_factory(port_type, data_type, lambda _a=adapter: _a)
+                injection_registry.register_factory(
+                    port_type,
+                    data_type,
+                    lambda _a=adapter: _a,
+                    is_async=is_async,
+                )
             continue
         port_type, data_type = binding
-        injection_registry.register_factory(port_type, data_type, lambda _a=adapter: _a)
+        injection_registry.register_factory(
+            port_type,
+            data_type,
+            lambda _a=adapter: _a,
+            is_async=is_async,
+        )

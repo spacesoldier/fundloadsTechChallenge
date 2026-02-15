@@ -51,7 +51,7 @@ def test_run_with_config_builds_consumer_registry(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         "stream_kernel.execution.orchestration.builder.build_injection_registry_from_bindings",
-        lambda _instances, _bindings: InjectionRegistry(),
+        lambda _instances, _bindings, **_kwargs: InjectionRegistry(),
     )
     monkeypatch.setattr("stream_kernel.execution.orchestration.builder.build_execution_observers", lambda *_a, **_k: [])
     monkeypatch.setattr(
@@ -109,7 +109,7 @@ def test_run_with_config_uses_sync_runner_when_tracing_disabled(monkeypatch) -> 
     )
     monkeypatch.setattr(
         "stream_kernel.execution.orchestration.builder.build_injection_registry_from_bindings",
-        lambda _instances, _bindings: InjectionRegistry(),
+        lambda _instances, _bindings, **_kwargs: InjectionRegistry(),
     )
     monkeypatch.setattr("stream_kernel.execution.orchestration.builder.build_execution_observers", lambda *_a, **_k: [])
     assert not hasattr(runtime_module, "Runner")
@@ -164,7 +164,7 @@ def test_run_with_config_uses_sync_runner_when_tracing_enabled(monkeypatch) -> N
     )
     monkeypatch.setattr(
         "stream_kernel.execution.orchestration.builder.build_injection_registry_from_bindings",
-        lambda _instances, _bindings: InjectionRegistry(),
+        lambda _instances, _bindings, **_kwargs: InjectionRegistry(),
     )
     assert not hasattr(runtime_module, "Runner")
 
@@ -276,7 +276,7 @@ def test_run_with_config_uses_di_context_service_and_reuses_scenario_scope(monke
     )
     monkeypatch.setattr(
         "stream_kernel.execution.orchestration.builder.build_injection_registry_from_bindings",
-        lambda _instances, _bindings: registry,
+        lambda _instances, _bindings, **_kwargs: registry,
     )
     monkeypatch.setattr("stream_kernel.execution.orchestration.builder.build_execution_observers", lambda *_a, **_k: [])
 

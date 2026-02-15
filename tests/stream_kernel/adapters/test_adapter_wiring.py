@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from stream_kernel.adapters.registry import AdapterRegistry, AdapterRegistryError
+from stream_kernel.adapters.contracts import adapter
 from stream_kernel.adapters.wiring import build_injection_registry, AdapterWiringError
 from stream_kernel.application_context.injection_registry import InjectionRegistry
 from stream_kernel.integration.kv_store import KVStore
@@ -28,6 +29,12 @@ class _PrimeKVStore(KVStore):
 @dataclass(frozen=True, slots=True)
 class _FileOutput:
     path: Path
+
+
+@adapter(name="output_sink", kind="http", binds=[("stream", _OutputPort)], execution_mode="async")
+def _async_output_factory(settings: dict[str, object]) -> object:
+    _ = settings
+    return object()
 
 
 def test_build_injection_registry_binds_output_sink() -> None:
@@ -102,3 +109,16 @@ def test_build_injection_registry_supports_multiple_bindings_for_role() -> None:
     registry = build_injection_registry(adapters_cfg, adapter_registry, bindings)
     scope = registry.instantiate_for_scenario("s1")
     assert scope.resolve("kv", _WindowKVStore) is scope.resolve("kv", _PrimeKVStore)
+
+
+def test_build_injection_registry_propagates_adapter_async_capability() -> None:
+    # Async-capable adapter metadata must set binding is_async for planner.
+    adapter_registry = AdapterRegistry()
+    adapter_registry.register("output_sink", "http", _async_output_factory)
+    adapters_cfg = {
+        "output_sink": {"kind": "http", "settings": {}},
+    }
+    bindings = {"output_sink": ("stream", _OutputPort)}
+
+    registry = build_injection_registry(adapters_cfg, adapter_registry, bindings)
+    assert registry.is_async_binding("stream", _OutputPort) is True

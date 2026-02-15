@@ -8,7 +8,7 @@ from stream_kernel.platform.services.observability import (
     NoOpObservabilityService,
     ObservabilityService,
 )
-from stream_kernel.execution.runtime.runner import SyncRunner
+from stream_kernel.execution.runtime.runner import AsyncRunner, SyncRunner
 from stream_kernel.execution.runtime.runner_port import RunnerPort
 from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.routing.routing_service import RoutingService
@@ -34,6 +34,20 @@ def _build_sync_runner() -> SyncRunner:
 def test_sync_runner_implements_runner_port() -> None:
     # SyncRunner should conform to the RunnerPort interface.
     runner = _build_sync_runner()
+    assert isinstance(runner, RunnerPort)
+
+
+def test_async_runner_implements_runner_port() -> None:
+    # AsyncRunner should conform to the same RunnerPort interface via run() facade.
+    registry = InMemoryConsumerRegistry({})
+    routing = RoutingService(registry=registry, strict=True)
+    runner = AsyncRunner(
+        nodes={},
+        work_queue=InMemoryQueue(),
+        context_service=InMemoryKvContextService(InMemoryKvStore()),
+        router=routing,
+        observability=NoOpObservabilityService(),
+    )
     assert isinstance(runner, RunnerPort)
 
 

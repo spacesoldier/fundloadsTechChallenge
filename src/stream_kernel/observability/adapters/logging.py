@@ -29,14 +29,26 @@ class JsonlLogSink:
         self._file.close()
 
 
-@adapter(name="log_stdout", consumes=[LogMessage], emits=[], binds=[("stream", LogMessage)])
+@adapter(
+    name="log_stdout",
+    consumes=[LogMessage],
+    emits=[],
+    binds=[("stream", LogMessage)],
+    execution_mode="async",
+)
 def log_stdout(settings: dict[str, object]) -> StdoutLogSink:
     # Framework-owned stdout logging sink over standard stream channel.
     _ = settings
     return StdoutLogSink()
 
 
-@adapter(name="log_jsonl", consumes=[LogMessage], emits=[], binds=[("stream", LogMessage)])
+@adapter(
+    name="log_jsonl",
+    consumes=[LogMessage],
+    emits=[],
+    binds=[("stream", LogMessage)],
+    execution_mode="async",
+)
 def log_jsonl(settings: dict[str, object]) -> JsonlLogSink:
     # Framework-owned JSONL logging sink for process lifecycle/diagnostics.
     path = settings.get("path")

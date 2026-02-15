@@ -18,6 +18,45 @@ pytest-cov = "^7.0"
 ruff = "^0.14"
 mypy = "^1.19"
 
+[tool.poetry.group.observability-http]
+optional = true
+
+[tool.poetry.group.observability-http.dependencies]
+requests = "^2.32"
+urllib3 = "^2.5"
+
+[tool.poetry.group.observability-async-http]
+optional = true
+
+[tool.poetry.group.observability-async-http.dependencies]
+httpx = "^0.28"
+aiohttp = "^3.12"
+
+[tool.poetry.group.observability-grpc]
+optional = true
+
+[tool.poetry.group.observability-grpc.dependencies]
+grpcio = "^1.76"
+
+[tool.poetry.group.observability-otel-sdk]
+optional = true
+
+[tool.poetry.group.observability-otel-sdk.dependencies]
+opentelemetry-sdk = "^1.38"
+opentelemetry-exporter-otlp-proto-http = "^1.38"
+
+[tool.poetry.group.observability-all]
+optional = true
+
+[tool.poetry.group.observability-all.dependencies]
+requests = "^2.32"
+urllib3 = "^2.5"
+httpx = "^0.28"
+aiohttp = "^3.12"
+grpcio = "^1.76"
+opentelemetry-sdk = "^1.38"
+opentelemetry-exporter-otlp-proto-http = "^1.38"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = [

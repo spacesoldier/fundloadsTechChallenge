@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from stream_kernel.execution.observers.observer import ObserverFactoryContext
 from stream_kernel.observability.observers.tracing import build_tracing_observer
 
@@ -13,6 +15,19 @@ class _Sink:
 
     def close(self) -> None:
         return None
+
+
+class _FailingSink(_Sink):
+    def emit(self, _record: object) -> None:
+        raise RuntimeError("boom")
+
+
+class _CollectingSink(_Sink):
+    def __init__(self, collector: list[object]) -> None:
+        self._collector = collector
+
+    def emit(self, record: object) -> None:
+        self._collector.append(record)
 
 
 def test_build_tracing_observer_returns_none_when_disabled() -> None:
@@ -54,7 +69,10 @@ def test_build_tracing_observer_builds_from_observability_exporters() -> None:
                     }
                 }
             },
-            adapter_instances={},
+            adapter_instances={
+                "trace_otel_otlp#0": _Sink(),
+                "trace_opentracing_bridge#1": _Sink(),
+            },
             run_id="r1",
             scenario_id="s1",
             node_order=["n1"],
@@ -64,7 +82,7 @@ def test_build_tracing_observer_builds_from_observability_exporters() -> None:
 
 
 def test_build_tracing_observer_observability_exporter_failure_is_isolated() -> None:
-    exported: list[dict[str, object]] = []
+    exported: list[object] = []
 
     observer = build_tracing_observer(
         ObserverFactoryContext(
@@ -72,22 +90,16 @@ def test_build_tracing_observer_observability_exporter_failure_is_isolated() -> 
                 "observability": {
                     "tracing": {
                         "exporters": [
-                            {
-                                "kind": "otel_otlp",
-                                "settings": {
-                                    "endpoint": "http://collector:4318/v1/traces",
-                                    "_export_fn": lambda _span: (_ for _ in ()).throw(RuntimeError("boom")),
-                                },
-                            },
-                            {
-                                "kind": "opentracing_bridge",
-                                "settings": {"bridge_name": "legacy", "_emit_fn": lambda span: exported.append(span)},
-                            },
+                            {"kind": "otel_otlp"},
+                            {"kind": "opentracing_bridge"},
                         ]
                     }
                 }
             },
-            adapter_instances={},
+            adapter_instances={
+                "trace_otel_otlp#0": _FailingSink(),
+                "trace_opentracing_bridge#1": _CollectingSink(exported),
+            },
             run_id="r1",
             scenario_id="s1",
             node_order=["n1"],
@@ -105,4 +117,48 @@ def test_build_tracing_observer_observability_exporter_failure_is_isolated() -> 
     )
     observer.on_run_end()
     assert len(exported) == 1
-    assert exported[0]["trace_id"] == "t1"
+    assert getattr(exported[0], "trace_id", None) == "t1"
+
+
+def test_build_tracing_observer_raises_when_exporter_binding_missing_in_strict_mode() -> None:
+    with pytest.raises(ValueError, match="runtime.observability.tracing.exporters\\[0\\] sink binding is missing"):
+        build_tracing_observer(
+            ObserverFactoryContext(
+                runtime={
+                    "strict": True,
+                    "observability": {
+                        "tracing": {
+                            "exporters": [
+                                {"kind": "otel_otlp", "settings": {"endpoint": "http://collector:4318/v1/traces"}}
+                            ]
+                        }
+                    },
+                },
+                adapter_instances={},
+                run_id="r1",
+                scenario_id="s1",
+                node_order=["n1"],
+            )
+        )
+
+
+def test_build_tracing_observer_skips_missing_exporter_binding_in_non_strict_mode() -> None:
+    observer = build_tracing_observer(
+        ObserverFactoryContext(
+            runtime={
+                "strict": False,
+                "observability": {
+                    "tracing": {
+                        "exporters": [
+                            {"kind": "otel_otlp", "settings": {"endpoint": "http://collector:4318/v1/traces"}}
+                        ]
+                    }
+                }
+            },
+            adapter_instances={},
+            run_id="r1",
+            scenario_id="s1",
+            node_order=["n1"],
+        )
+    )
+    assert observer is None

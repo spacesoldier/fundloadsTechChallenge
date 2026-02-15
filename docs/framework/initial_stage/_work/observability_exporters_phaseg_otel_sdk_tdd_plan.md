@@ -1,5 +1,14 @@
 # Phase G: OpenTelemetry SDK exporter backend (TDD)
 
+## Status
+
+- [x] RED tests implemented (`OBS-OTELSDK-01..05` in `tests/adapters/test_trace_sinks.py`)
+- [x] GREEN implementation completed (`backend=otel_sdk` in `src/stream_kernel/adapters/trace_sinks.py`)
+- [x] Regression subset passed:
+  - `.venv/bin/pytest -q tests/adapters/test_trace_sinks.py`
+  - `.venv/bin/pytest -q tests/stream_kernel/adapters/test_observability_adapters.py`
+  - `.venv/bin/pytest -q tests/stream_kernel/observability/test_tracing_observer_factory.py`
+
 ## Objective
 
 Integrate official OpenTelemetry SDK tracing pipeline as a backend option (`BatchSpanProcessor` + OTLP exporter).

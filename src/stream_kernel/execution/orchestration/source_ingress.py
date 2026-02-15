@@ -9,7 +9,11 @@ from stream_kernel.application_context.injection_registry import ScenarioScope
 from stream_kernel.kernel.scenario import StepSpec
 from stream_kernel.platform.services.api.policy import RateLimiterService
 from stream_kernel.platform.services.state.context import ContextService
-from stream_kernel.platform.services.observability import ObservabilityService
+from stream_kernel.platform.services.observability import (
+    ObservabilityPipelineService,
+    ObservabilityService,
+    coerce_pipeline_observability,
+)
 from stream_kernel.platform.services.messaging.reply_waiter import TerminalEvent
 from stream_kernel.routing.envelope import Envelope
 
@@ -162,20 +166,19 @@ class SourceBootstrapNode:
         return None
 
     def _emit_ingress(self, *, trace_id: str | None, reply_to: str | None) -> None:
-        on_ingress = getattr(self.observability, "on_ingress", None)
-        if callable(on_ingress):
-            on_ingress(trace_id=trace_id, reply_to=reply_to)
+        coerce_pipeline_observability(self.observability).on_ingress(
+            trace_id=trace_id,
+            reply_to=reply_to,
+        )
 
     def _emit_limiter_decision(self, *, trace_id: str | None, allowed: bool) -> None:
-        emit = getattr(self.observability, "on_ingress_rate_limit_decision", None)
-        if callable(emit):
-            emit(
-                trace_id=trace_id,
-                allowed=allowed,
-                source_node=self.node_name,
-                source_role=self.role,
-                limiter_profile=self.ingress_limiter_qualifier,
-            )
+        coerce_pipeline_observability(self.observability).on_ingress_rate_limit_decision(
+            trace_id=trace_id,
+            allowed=allowed,
+            source_node=self.node_name,
+            source_role=self.role,
+            limiter_profile=self.ingress_limiter_qualifier,
+        )
 
     def _prime_next(self) -> None:
         if self.exhausted:
@@ -292,11 +295,11 @@ def _resolve_web_ingress_limiter(
     return None, None
 
 
-def _resolve_observability_service(scenario_scope: ScenarioScope) -> object | None:
+def _resolve_observability_service(scenario_scope: ScenarioScope) -> ObservabilityPipelineService:
     try:
-        return scenario_scope.resolve("service", ObservabilityService)
+        return coerce_pipeline_observability(scenario_scope.resolve("service", ObservabilityService))
     except InjectionRegistryError:
-        return None
+        return coerce_pipeline_observability(None)
 
 
 def _runtime_has_web_ingress_rate_limit(runtime: dict[str, object] | None) -> bool:

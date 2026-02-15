@@ -4,15 +4,19 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from stream_kernel.application_context.injection_registry import ScenarioScope
+from stream_kernel.execution.orchestration.child_bootstrap import build_child_bootstrap_bundle
 from stream_kernel.execution.transport.bootstrap_keys import (
     OneShotBootstrapChannel,
     build_bootstrap_key_bundle,
 )
-from stream_kernel.execution.orchestration.child_bootstrap import build_child_bootstrap_bundle
-from stream_kernel.platform.services.runtime.bootstrap import BootstrapSupervisor
-from stream_kernel.platform.services.runtime.lifecycle import RuntimeLifecycleManager
 from stream_kernel.platform.services.messaging.reply_coordinator import ReplyCoordinatorService
 from stream_kernel.platform.services.messaging.reply_waiter import TerminalEvent
+from stream_kernel.platform.services.observability import (
+    ObservabilityService,
+    coerce_pipeline_observability,
+)
+from stream_kernel.platform.services.runtime.bootstrap import BootstrapSupervisor
+from stream_kernel.platform.services.runtime.lifecycle import RuntimeLifecycleManager
 from stream_kernel.routing.envelope import Envelope
 from stream_kernel.routing.router import RoutingResult
 
@@ -139,7 +143,16 @@ def runtime_bootstrap_mode(runtime: dict[str, object]) -> str:
         bootstrap = {}
     if not isinstance(bootstrap, dict):
         raise ValueError("runtime.platform.bootstrap must be a mapping")
-    mode = bootstrap.get("mode", "inline")
+    mode_raw = bootstrap.get("mode")
+    if mode_raw is None:
+        process_groups = platform.get("process_groups", [])
+        mode = (
+            "process_supervisor"
+            if isinstance(process_groups, list) and len(process_groups) > 0
+            else "inline"
+        )
+    else:
+        mode = mode_raw
     if not isinstance(mode, str) or not mode:
         raise ValueError("runtime.platform.bootstrap.mode must be a non-empty string")
     return mode
@@ -174,22 +187,62 @@ def execute_with_runtime_lifecycle(
 ) -> None:
     # Execute runner call under lifecycle manager semantics.
     lifecycle = resolve_runtime_lifecycle_manager(scenario_scope)
+    observability = _resolve_pipeline_observability(scenario_scope)
     policy = runtime_lifecycle_policy(runtime)
     started = False
     try:
+        _emit_runtime_lifecycle_event(
+            observability=observability,
+            event="runtime_lifecycle_starting",
+            process_group="local",
+            details={"mode": "runtime_lifecycle"},
+        )
         lifecycle.start()
         started = True
         if not lifecycle.ready(policy.ready_timeout_seconds):
             raise RuntimeLifecycleReadyError("execution lifecycle ready check failed")
+        _emit_runtime_lifecycle_event(
+            observability=observability,
+            event="runtime_lifecycle_ready",
+            process_group="local",
+            details={"ready_timeout_seconds": policy.ready_timeout_seconds},
+        )
         try:
+            _emit_runtime_lifecycle_event(
+                observability=observability,
+                event="runtime_run_started",
+                process_group="local",
+                details=None,
+            )
             run()
+            _emit_runtime_lifecycle_event(
+                observability=observability,
+                event="runtime_run_completed",
+                process_group="local",
+                details=None,
+            )
         except Exception as exc:
+            _emit_runtime_lifecycle_event(
+                observability=observability,
+                event="runtime_run_failed",
+                process_group="local",
+                details={"error_type": type(exc).__name__},
+            )
             raise RuntimeWorkerFailedError("execution worker failed") from exc
     finally:
         if started:
             lifecycle.stop(
                 graceful_timeout_seconds=policy.graceful_timeout_seconds,
                 drain_inflight=policy.drain_inflight,
+            )
+            _emit_runtime_lifecycle_event(
+                observability=observability,
+                event="runtime_lifecycle_stopped",
+                process_group="local",
+                details={
+                    "graceful_timeout_seconds": policy.graceful_timeout_seconds,
+                    "drain_inflight": policy.drain_inflight,
+                },
             )
 
 
@@ -529,6 +582,32 @@ def _resolve_dispatch_group_for_target(
     raise ValueError(
         f"Missing process-group placement for target '{target}' in runtime.platform.process_groups[].nodes"
     )
+
+
+def _resolve_pipeline_observability(scope: ScenarioScope):
+    try:
+        resolved = scope.resolve("service", ObservabilityService)
+    except Exception:  # noqa: BLE001 - observability is optional in this orchestration path.
+        resolved = None
+    return coerce_pipeline_observability(resolved)
+
+
+def _emit_runtime_lifecycle_event(
+    *,
+    observability: object,
+    event: str,
+    process_group: str | None,
+    details: dict[str, object] | None,
+) -> None:
+    try:
+        coerce_pipeline_observability(observability).on_runtime_lifecycle_event(
+            event=event,
+            process_group=process_group,
+            details=dict(details or {}),
+        )
+    except Exception:
+        # Observability callbacks must never break runtime lifecycle orchestration.
+        return
 
 
 def _wait_boundary_drain_if_available(

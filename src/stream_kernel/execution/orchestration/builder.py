@@ -15,6 +15,7 @@ from stream_kernel.application_context import (
     discover_services,
     service_contract_types,
 )
+from stream_kernel.application_context.inject import Injected, inject
 from stream_kernel.application_context.injection_registry import (
     InjectionRegistry,
     InjectionRegistryError,
@@ -30,13 +31,16 @@ from stream_kernel.execution.orchestration.lifecycle_orchestration import (
     runtime_bootstrap_mode,
 )
 from stream_kernel.execution.observers.observer_builder import build_execution_observers
-from stream_kernel.execution.runtime.planning import build_execution_plan
-from stream_kernel.execution.runtime.runner import SyncRunner
+from stream_kernel.execution.runtime.planning import build_execution_plan, plan_pools
+from stream_kernel.execution.runtime.runner import AsyncRunner, SyncRunner
 from stream_kernel.execution.transport.secure_tcp_transport import SecureTcpConfig, SecureTcpTransport
 from stream_kernel.execution.orchestration.source_ingress import (
     WEB_INGRESS_LIMITER_QUALIFIER,
     BootstrapControl,
     build_source_ingress_plan,
+)
+from stream_kernel.execution.orchestration.observability_system_nodes import (
+    build_observability_system_plan,
 )
 from stream_kernel.integration.consumer_registry import ConsumerRegistry
 from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
@@ -44,6 +48,7 @@ from stream_kernel.kernel.dag import NodeContract
 from stream_kernel.kernel.scenario import Scenario, StepSpec
 from stream_kernel.platform.services.observability import (
     FanoutObservabilityService,
+    ObservabilityPipelineService,
     ObservabilityService,
     ReplyAwareObservabilityService,
 )
@@ -62,11 +67,17 @@ from stream_kernel.platform.services.runtime.transport import (
     RuntimeTransportService,
     TcpLocalRuntimeTransportService,
 )
+from stream_kernel.platform.services.runtime.bootstrap import (
+    BootstrapSupervisor,
+    LocalBootstrapSupervisor,
+    MultiprocessBootstrapSupervisor,
+)
 from stream_kernel.routing.envelope import Envelope
 
 BUILD_TIME_REGISTRY_TYPES = (AdapterRegistry, InjectionRegistry)
 RUNTIME_SERVICE_REGISTRY_CONTRACTS = (ApplicationContext,)
 DEFAULT_EXECUTION_QUEUE_QUALIFIER = "execution.cpu"
+DEFAULT_ASYNC_QUEUE_QUALIFIER = "execution.asyncio"
 
 
 @dataclass(slots=True)
@@ -127,10 +138,29 @@ def load_discovery_modules(discovery_modules: list[str]) -> list[ModuleType]:
 
 def register_discovered_services(registry: InjectionRegistry, modules: list[object]) -> None:
     # Register services discovered in framework/user modules into DI unless overridden.
-    for service_cls in discover_services(modules):  # type: ignore[arg-type]
+    discovered = discover_services(modules)  # type: ignore[arg-type]
+    contract_to_service: dict[type[object], type[object]] = {}
+    for service_cls in discovered:
+        for contract in service_contract_types(service_cls):
+            contract_to_service.setdefault(contract, service_cls)
+
+    async_cache: dict[type[object], bool] = {}
+    for service_cls in discovered:
+        service_is_async = _service_requires_async_capability(
+            service_cls=service_cls,
+            registry=registry,
+            contract_to_service=contract_to_service,
+            cache=async_cache,
+            visiting=set(),
+        )
         for contract in service_contract_types(service_cls):
             try:
-                registry.register_factory("service", contract, lambda _cls=service_cls: _cls())
+                registry.register_factory(
+                    "service",
+                    contract,
+                    lambda _cls=service_cls: _cls(),
+                    is_async=service_is_async,
+                )
             except InjectionRegistryError:
                 # Explicit bindings win over auto-discovered defaults.
                 continue
@@ -146,6 +176,7 @@ def run_with_sync_runner(
     scenario_scope: ScenarioScope,
     full_context_nodes: set[str] | None = None,
     ordered_sink_mode: str = "completion",
+    queue_qualifier: str = DEFAULT_EXECUTION_QUEUE_QUALIFIER,
 ) -> None:
     # Build execution components (Execution runtime and routing integration §6).
     nodes = {spec.name: spec.step for spec in scenario.steps}
@@ -154,6 +185,37 @@ def run_with_sync_runner(
         full_context_nodes=set(full_context_nodes or ()),
         ordered_sink_mode=ordered_sink_mode,
     )
+    if queue_qualifier != DEFAULT_EXECUTION_QUEUE_QUALIFIER:
+        runner.work_queue = inject.queue(Envelope, qualifier=queue_qualifier)
+    apply_injection(runner, scenario_scope, strict)
+    try:
+        runner.run_inputs(inputs, run_id=run_id, scenario_id=scenario_id)
+    finally:
+        runner.on_run_end()
+        close_scenario_scope(scenario_scope)
+
+
+def run_with_async_runner(
+    *,
+    scenario,
+    inputs,
+    strict: bool,
+    run_id: str,
+    scenario_id: str,
+    scenario_scope: ScenarioScope,
+    full_context_nodes: set[str] | None = None,
+    ordered_sink_mode: str = "completion",
+    queue_qualifier: str = DEFAULT_ASYNC_QUEUE_QUALIFIER,
+) -> None:
+    # Build async execution components under the same DI/discovery rails as SyncRunner.
+    nodes = {spec.name: spec.step for spec in scenario.steps}
+    runner = AsyncRunner(
+        nodes=nodes,
+        full_context_nodes=set(full_context_nodes or ()),
+        ordered_sink_mode=ordered_sink_mode,
+    )
+    if queue_qualifier != DEFAULT_ASYNC_QUEUE_QUALIFIER:
+        runner.work_queue = inject.queue(Envelope, qualifier=queue_qualifier)
     apply_injection(runner, scenario_scope, strict)
     try:
         runner.run_inputs(inputs, run_id=run_id, scenario_id=scenario_id)
@@ -189,6 +251,20 @@ def execute_runtime_artifacts(artifacts: RuntimeBuildArtifacts) -> None:
 
 def _execute_runner(artifacts: RuntimeBuildArtifacts) -> None:
     ordered_sink_mode = runtime_ordering_sink_mode(artifacts.runtime)
+    runner_profile, queue_qualifier = _resolve_runner_profile_and_queue(artifacts)
+    if runner_profile == "async":
+        run_with_async_runner(
+            scenario=artifacts.scenario,
+            inputs=artifacts.inputs,
+            strict=artifacts.strict,
+            run_id=artifacts.run_id,
+            scenario_id=artifacts.scenario_id,
+            scenario_scope=artifacts.scenario_scope,
+            full_context_nodes=artifacts.full_context_nodes,
+            ordered_sink_mode=ordered_sink_mode,
+            queue_qualifier=queue_qualifier,
+        )
+        return
     run_with_sync_runner(
         scenario=artifacts.scenario,
         inputs=artifacts.inputs,
@@ -198,6 +274,7 @@ def _execute_runner(artifacts: RuntimeBuildArtifacts) -> None:
         scenario_scope=artifacts.scenario_scope,
         full_context_nodes=artifacts.full_context_nodes,
         ordered_sink_mode=ordered_sink_mode,
+        queue_qualifier=queue_qualifier,
     )
 
 
@@ -250,7 +327,21 @@ def build_runtime_artifacts(
         adapter_bindings = build_adapter_bindings(adapters, adapter_registry)
 
     adapter_instances = build_adapter_instances_from_registry(adapters, adapter_registry)
-    injection_registry = build_injection_registry_from_bindings(adapter_instances, adapter_bindings)
+    adapter_instances.update(
+        build_runtime_observability_adapter_instances(
+            runtime=runtime,
+            registry=adapter_registry,
+            existing_instances=adapter_instances,
+        )
+    )
+    injection_registry = build_injection_registry_from_bindings(
+        adapter_instances,
+        adapter_bindings,
+        adapter_async_roles=resolve_async_adapter_roles(
+            adapters=adapters,
+            adapter_registry=adapter_registry,
+        ),
+    )
     ensure_runtime_kv_binding(injection_registry, runtime)
 
     ctx = ApplicationContext()
@@ -279,6 +370,10 @@ def build_runtime_artifacts(
         observers=observers,
     )
     register_discovered_services(injection_registry, modules)
+    ensure_runtime_bootstrap_binding(
+        injection_registry=injection_registry,
+        runtime=runtime,
+    )
     ensure_runtime_api_policy_bindings(
         injection_registry=injection_registry,
         runtime=runtime,
@@ -337,15 +432,41 @@ def build_runtime_artifacts(
         existing = list(get_consumers(token))
         register(token, [*existing, *node_names])
 
+    observability_system = build_observability_system_plan(
+        runtime=runtime,
+        scenario_scope=scenario_scope,
+    )
+    for token, node_names in observability_system.system_consumers.items():
+        get_consumers = getattr(consumer_registry, "get_consumers", None)
+        register = getattr(consumer_registry, "register", None)
+        if not callable(get_consumers) or not callable(register):
+            continue
+        existing = list(get_consumers(token))
+        register(token, [*existing, *node_names])
+
     sink_steps = [StepSpec(name=name, step=step) for name, step in sink_nodes.items()]
     existing_steps = list(getattr(scenario, "steps", []))
     if isinstance(scenario, Scenario):
         scenario = Scenario(
             scenario_id=scenario.scenario_id,
-            steps=tuple([*source_ingress.source_steps, *existing_steps, *sink_steps]),
+            steps=tuple(
+                [
+                    *source_ingress.source_steps,
+                    *existing_steps,
+                    *observability_system.system_steps,
+                    *sink_steps,
+                ]
+            ),
         )
     else:
-        scenario = SimpleNamespace(steps=[*source_ingress.source_steps, *existing_steps, *sink_steps])
+        scenario = SimpleNamespace(
+            steps=[
+                *source_ingress.source_steps,
+                *existing_steps,
+                *observability_system.system_steps,
+                *sink_steps,
+            ]
+        )
 
     return RuntimeBuildArtifacts(
         scenario=scenario,
@@ -359,7 +480,8 @@ def build_runtime_artifacts(
             for node_def in ctx.nodes
             if bool(getattr(node_def.meta, "service", False))
         }
-        | set(source_ingress.source_node_names),
+        | set(source_ingress.source_node_names)
+        | set(observability_system.system_node_names),
         adapter_registry=adapter_registry,
         injection_registry=injection_registry,
         consumer_registry=consumer_registry,
@@ -377,14 +499,16 @@ def ensure_runtime_observability_binding(
     replace: bool = True,
 ) -> None:
     # Bind platform observability service to runtime fan-out implementation for this run.
-    injection_registry.register_factory(
-        "service",
-        ObservabilityService,
-        lambda _observers=list(observers): ReplyAwareObservabilityService(
-            inner=FanoutObservabilityService(observers=list(_observers))
-        ),
-        replace=replace,
+    factory = lambda _observers=list(observers): ReplyAwareObservabilityService(
+        inner=FanoutObservabilityService(observers=list(_observers))
     )
+    for contract in (ObservabilityService, ObservabilityPipelineService):
+        injection_registry.register_factory(
+            "service",
+            contract,
+            factory,
+            replace=replace,
+        )
 
 
 @dataclass(slots=True)
@@ -492,6 +616,84 @@ def resolve_adapter_meta(
     return None
 
 
+def resolve_async_adapter_roles(
+    *,
+    adapters: dict[str, object],
+    adapter_registry: AdapterRegistry | None,
+) -> set[str]:
+    async_roles: set[str] = set()
+    for role, cfg in adapters.items():
+        if not isinstance(cfg, dict):
+            continue
+        meta = resolve_adapter_meta(role, cfg, adapter_registry=adapter_registry)
+        mode = getattr(meta, "execution_mode", "sync")
+        if mode == "async":
+            async_roles.add(role)
+    return async_roles
+
+
+def _service_requires_async_capability(
+    *,
+    service_cls: type[object],
+    registry: InjectionRegistry,
+    contract_to_service: dict[type[object], type[object]],
+    cache: dict[type[object], bool],
+    visiting: set[type[object]],
+) -> bool:
+    if service_cls in cache:
+        return cache[service_cls]
+    if service_cls in visiting:
+        return False
+    visiting.add(service_cls)
+    try:
+        for marker in _iter_injected_markers_from_type(service_cls):
+            if marker.port_type == "service":
+                target_service = contract_to_service.get(marker.data_type)
+                if isinstance(target_service, type) and _service_requires_async_capability(
+                    service_cls=target_service,
+                    registry=registry,
+                    contract_to_service=contract_to_service,
+                    cache=cache,
+                    visiting=visiting,
+                ):
+                    cache[service_cls] = True
+                    return True
+            try:
+                if registry.is_async_binding(
+                    marker.port_type,
+                    marker.data_type,
+                    qualifier=marker.qualifier,
+                ):
+                    cache[service_cls] = True
+                    return True
+            except InjectionRegistryError:
+                continue
+        cache[service_cls] = False
+        return False
+    finally:
+        visiting.discard(service_cls)
+
+
+def _iter_injected_markers_from_type(component_type: type[object]) -> list[Injected]:
+    markers: list[Injected] = []
+    for cls in component_type.__mro__:
+        if cls is object:
+            continue
+        for value in getattr(cls, "__dict__", {}).values():
+            if isinstance(value, Injected):
+                markers.append(value)
+        dataclass_fields = getattr(cls, "__dataclass_fields__", {})
+        if isinstance(dataclass_fields, dict):
+            for field_def in dataclass_fields.values():
+                default = getattr(field_def, "default", None)
+                if isinstance(default, Injected):
+                    markers.append(default)
+    deduped: dict[tuple[str, type[object], str | None], Injected] = {}
+    for marker in markers:
+        deduped[(marker.port_type, marker.data_type, marker.qualifier)] = marker
+    return list(deduped.values())
+
+
 def trace_id(run_id: str, _payload: object, index: int) -> str:
     # Keep per-message trace ids deterministic without relying on project payload fields.
     return f"{run_id}:{index}"
@@ -532,19 +734,23 @@ def build_adapter_instances_from_registry(
 def build_injection_registry_from_bindings(
     instances: dict[str, object],
     bindings: dict[str, object],
+    *,
+    adapter_async_roles: set[str] | None = None,
 ) -> InjectionRegistry:
     # Build InjectionRegistry from explicit bindings using shared instances (runtime wiring).
     injection = InjectionRegistry()
+    async_roles = set(adapter_async_roles or ())
     for role, binding in bindings.items():
         if role not in instances:
             raise ValueError(f"Missing adapter instance for role: {role}")
         adapter = instances[role]
+        is_async = role in async_roles
         if isinstance(binding, list):
             for port_type, data_type in binding:
-                injection.register_factory(port_type, data_type, lambda _a=adapter: _a)
+                injection.register_factory(port_type, data_type, lambda _a=adapter: _a, is_async=is_async)
         else:
             port_type, data_type = binding
-            injection.register_factory(port_type, data_type, lambda _a=adapter: _a)
+            injection.register_factory(port_type, data_type, lambda _a=adapter: _a, is_async=is_async)
     return injection
 
 
@@ -684,8 +890,10 @@ def _validate_api_policy_runner_profile_compatibility(
     for group in groups_raw:
         if not isinstance(group, dict):
             continue
-        runner_profile = group.get("runner_profile", "sync")
-        if not isinstance(runner_profile, str) or not runner_profile:
+        if "runner_profile" not in group:
+            continue
+        runner_profile = group.get("runner_profile")
+        if not isinstance(runner_profile, str) or runner_profile not in {"sync", "async"}:
             continue
         services = group.get("services", {})
         if services is None:
@@ -823,7 +1031,7 @@ def ensure_runtime_transport_bindings(
 ) -> None:
     # Runtime-level default queue/topic transport for SyncRunner.
     # Future runners can bind alternative qualifiers (execution.asyncio/celery/gpu).
-    qualifier = DEFAULT_EXECUTION_QUEUE_QUALIFIER
+    qualifiers = _runtime_queue_qualifiers(runtime)
     transport_service = _build_runtime_transport_service(runtime, bootstrap_key_bundle=bootstrap_key_bundle)
     try:
         injection_registry.register_factory(
@@ -836,26 +1044,143 @@ def ensure_runtime_transport_bindings(
         pass
     queue_factory = lambda _service=transport_service: _service.build_queue()
     topic_factory = lambda _service=transport_service: _service.build_topic()
-    try:
-        injection_registry.register_factory(
-            "queue",
-            Envelope,
-            queue_factory,
-            qualifier=qualifier,
+    for qualifier in qualifiers:
+        try:
+            injection_registry.register_factory(
+                "queue",
+                Envelope,
+                queue_factory,
+                qualifier=qualifier,
+            )
+        except InjectionRegistryError:
+            # Explicit project/runtime binding wins.
+            pass
+        try:
+            injection_registry.register_factory(
+                "topic",
+                Envelope,
+                topic_factory,
+                qualifier=qualifier,
+            )
+        except InjectionRegistryError:
+            # Explicit project/runtime binding wins.
+            pass
+
+
+def ensure_runtime_bootstrap_binding(
+    *,
+    injection_registry: InjectionRegistry,
+    runtime: dict[str, object],
+) -> None:
+    # Runtime bootstrap supervisor contract is selected explicitly by bootstrap.mode
+    # so discovery order cannot silently switch process-supervisor behavior.
+    mode = runtime_bootstrap_mode(runtime)
+    supervisor_cls = (
+        MultiprocessBootstrapSupervisor if mode == "process_supervisor" else LocalBootstrapSupervisor
+    )
+    injection_registry.register_factory(
+        "service",
+        BootstrapSupervisor,
+        lambda _cls=supervisor_cls: _cls(),
+        replace=True,
+    )
+
+
+def _runtime_queue_qualifiers(runtime: dict[str, object]) -> list[str]:
+    qualifiers: list[str] = [DEFAULT_EXECUTION_QUEUE_QUALIFIER]
+    platform = runtime.get("platform", {})
+    if not isinstance(platform, dict):
+        return qualifiers
+    process_groups = platform.get("process_groups", [])
+    if not isinstance(process_groups, list):
+        return qualifiers
+    for group in process_groups:
+        if not isinstance(group, dict):
+            continue
+        group_name = group.get("name")
+        if isinstance(group_name, str) and group_name and group_name not in qualifiers:
+            qualifiers.append(group_name)
+    if DEFAULT_ASYNC_QUEUE_QUALIFIER not in qualifiers:
+        qualifiers.append(DEFAULT_ASYNC_QUEUE_QUALIFIER)
+    return qualifiers
+
+
+def _resolve_runner_profile_and_queue(artifacts: RuntimeBuildArtifacts) -> tuple[str, str]:
+    runtime = artifacts.runtime
+    platform = runtime.get("platform", {})
+    if not isinstance(platform, dict):
+        inferred = _infer_runner_profile_from_dependencies(artifacts)
+        qualifier = (
+            DEFAULT_ASYNC_QUEUE_QUALIFIER
+            if inferred == "async"
+            else DEFAULT_EXECUTION_QUEUE_QUALIFIER
         )
-    except InjectionRegistryError:
-        # Explicit project/runtime binding wins.
-        pass
-    try:
-        injection_registry.register_factory(
-            "topic",
-            Envelope,
-            topic_factory,
-            qualifier=qualifier,
+        return (inferred, qualifier)
+    process_groups = platform.get("process_groups", [])
+    if not isinstance(process_groups, list) or not process_groups:
+        inferred = _infer_runner_profile_from_dependencies(artifacts)
+        qualifier = (
+            DEFAULT_ASYNC_QUEUE_QUALIFIER
+            if inferred == "async"
+            else DEFAULT_EXECUTION_QUEUE_QUALIFIER
         )
-    except InjectionRegistryError:
-        # Explicit project/runtime binding wins.
-        pass
+        return (inferred, qualifier)
+
+    resolved_group: dict[str, object] | None = None
+    for group in process_groups:
+        if not isinstance(group, dict):
+            continue
+        name = group.get("name")
+        if isinstance(name, str) and name == "web":
+            continue
+        resolved_group = group
+        break
+    if resolved_group is None:
+        resolved_group = next((group for group in process_groups if isinstance(group, dict)), None)
+    explicit_profile: str | None = None
+    if resolved_group is not None:
+        runner_profile = resolved_group.get("runner_profile")
+        if isinstance(runner_profile, str) and runner_profile in {"sync", "async"}:
+            explicit_profile = runner_profile
+
+    inferred_profile = _infer_runner_profile_from_dependencies(artifacts)
+    final_profile = explicit_profile or inferred_profile
+    queue_qualifier = resolved_group.get("name") if isinstance(resolved_group, dict) else None
+    if not isinstance(queue_qualifier, str) or not queue_qualifier:
+        queue_qualifier = (
+            DEFAULT_ASYNC_QUEUE_QUALIFIER
+            if final_profile == "async"
+            else DEFAULT_EXECUTION_QUEUE_QUALIFIER
+        )
+    return (final_profile, queue_qualifier)
+
+
+def _infer_runner_profile_from_dependencies(artifacts: RuntimeBuildArtifacts) -> str:
+    registry = artifacts.injection_registry
+    if not isinstance(registry, InjectionRegistry):
+        return "sync"
+
+    scenario_steps = getattr(artifacts.scenario, "steps", ())
+    if not isinstance(scenario_steps, (list, tuple)):
+        return "sync"
+
+    nodes: dict[str, object] = {}
+    for step_spec in scenario_steps:
+        name = getattr(step_spec, "name", None)
+        step = getattr(step_spec, "step", None)
+        if not isinstance(name, str) or not name:
+            continue
+        if step is None:
+            continue
+        nodes[name] = step
+
+    if not nodes:
+        return "sync"
+
+    pools = plan_pools(nodes, registry)
+    if any(pool == "async" for pool in pools.values()):
+        return "async"
+    return "sync"
 
 
 def _build_runtime_transport_service(
@@ -921,6 +1246,9 @@ def resolve_runtime_adapters(
     discovered = discover_adapters(modules)
 
     registry = AdapterRegistry()
+    for name, factory in discovered.items():
+        registry.register(name, name, factory)
+
     for role, cfg in adapters.items():
         if not isinstance(cfg, dict):
             raise ValueError(f"adapters.{role} must be a mapping")
@@ -928,14 +1256,86 @@ def resolve_runtime_adapters(
             raise ValueError(
                 f"adapters.{role}.kind is not supported; adapter name is defined by adapters.{role}"
             )
-        factory = discovered.get(role)
-        if factory is None:
+        if role not in discovered:
             raise ValueError(f"Unknown adapter name: {role}")
-        # Reuse role as registry key-kind to keep AdapterRegistry API unchanged.
-        registry.register(role, role, factory)
 
     bindings = build_adapter_bindings(adapters, registry)
     return registry, bindings
+
+
+def build_runtime_observability_adapter_instances(
+    *,
+    runtime: dict[str, object],
+    registry: AdapterRegistry,
+    existing_instances: dict[str, object] | None = None,
+) -> dict[str, object]:
+    # Build observability adapter instances from runtime config via AdapterRegistry only.
+    strict = bool(runtime.get("strict", True))
+    existing = existing_instances or {}
+    built: dict[str, object] = {}
+
+    kind_to_alias = {
+        "tracing": {
+            "jsonl": "trace_jsonl",
+            "stdout": "trace_stdout",
+            "otel_otlp": "trace_otel_otlp",
+            "opentracing_bridge": "trace_opentracing_bridge",
+        },
+        "logging": {
+            "stdout": "log_stdout",
+            "jsonl": "log_jsonl",
+            "otel_logs_otlp": "log_otel_otlp",
+        },
+    }
+
+    observability = runtime.get("observability", {})
+    if not isinstance(observability, dict):
+        return built
+
+    for channel, alias_map in kind_to_alias.items():
+        channel_cfg = observability.get(channel, {})
+        if not isinstance(channel_cfg, dict):
+            continue
+        exporters = channel_cfg.get("exporters", [])
+        if not isinstance(exporters, list):
+            continue
+        for index, exporter in enumerate(exporters):
+            if not isinstance(exporter, dict):
+                continue
+            kind = exporter.get("kind")
+            if not isinstance(kind, str) or not kind:
+                continue
+            alias = alias_map.get(kind)
+            if not isinstance(alias, str) or not alias:
+                if strict:
+                    raise ValueError(
+                        f"runtime.observability.{channel}.exporters[{index}] kind '{kind}' is not supported"
+                    )
+                continue
+            settings = exporter.get("settings", {})
+            settings_for_build = dict(settings) if isinstance(settings, dict) else {}
+            if channel == "tracing" and kind == "otel_otlp":
+                backend = exporter.get("backend")
+                if isinstance(backend, str) and backend:
+                    settings_for_build["backend"] = backend
+
+            try:
+                instance = registry.build(alias, {"kind": alias, "settings": settings_for_build})
+            except Exception as exc:
+                if strict:
+                    detail = str(exc).strip()
+                    suffix = f": {detail}" if detail else ""
+                    raise ValueError(
+                        "runtime.observability."
+                        f"{channel}.exporters[{index}] failed to build adapter '{alias}'{suffix}"
+                    ) from exc
+                continue
+
+            indexed_key = f"{alias}#{index}"
+            built[indexed_key] = instance
+            if alias not in existing and alias not in built:
+                built[alias] = instance
+    return built
 
 
 def build_adapter_bindings(
