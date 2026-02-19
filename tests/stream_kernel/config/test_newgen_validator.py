@@ -831,6 +831,161 @@ def test_validate_newgen_config_rejects_unknown_observability_logging_exporter_k
         validate_newgen_config(raw)
 
 
+def test_validate_newgen_config_rejects_invalid_observability_tracing_dispatch_queue_drop_policy() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "dispatch_queue": {
+                "drop_policy": "drop_everything",
+            }
+        }
+    }
+    with pytest.raises(ConfigError, match="dispatch_queue\\.drop_policy must be one of"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_invalid_observability_tracing_dispatch_queue_max_items() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "dispatch_queue": {
+                "max_items": 0,
+            }
+        }
+    }
+    with pytest.raises(ConfigError, match="dispatch_queue\\.max_items must be an integer > 0"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_invalid_observability_tracing_dispatch_queue_block_timeout() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "dispatch_queue": {
+                "drop_policy": "block_with_timeout",
+                "block_timeout_ms": 0,
+            }
+        }
+    }
+    with pytest.raises(ConfigError, match="dispatch_queue\\.block_timeout_ms must be an integer > 0"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_normalizes_observability_tracing_dispatch_queue_defaults() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "dispatch_queue": {
+                "drop_policy": "block_with_timeout",
+            }
+        }
+    }
+    validated = validate_newgen_config(raw)
+    vruntime = validated.get("runtime")
+    assert isinstance(vruntime, dict)
+    observability = vruntime.get("observability")
+    assert isinstance(observability, dict)
+    tracing = observability.get("tracing")
+    assert isinstance(tracing, dict)
+    dispatch_queue = tracing.get("dispatch_queue")
+    assert isinstance(dispatch_queue, dict)
+    assert dispatch_queue.get("drop_policy") == "block_with_timeout"
+    assert dispatch_queue.get("max_items") == 8192
+    assert dispatch_queue.get("block_timeout_ms") == 100
+
+
+def test_validate_newgen_config_rejects_unknown_observability_monitoring_exporter_kind() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "monitoring": {
+            "exporters": [
+                {"kind": "graphite", "settings": {}},
+            ]
+        }
+    }
+    with pytest.raises(ConfigError, match="monitoring\\.exporters\\[0\\]\\.kind must be one of"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_invalid_observability_monitoring_prometheus_mode() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "monitoring": {
+            "exporters": [
+                {"kind": "prometheus", "settings": {"mode": "pushgateway"}},
+            ]
+        }
+    }
+    with pytest.raises(ConfigError, match="monitoring\\.exporters\\[0\\]\\.settings\\.mode must be one of"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_accepts_observability_monitoring_prometheus_http_pull_defaults() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "monitoring": {
+            "exporters": [
+                {"kind": "prometheus", "settings": {"mode": "http_pull"}},
+            ]
+        }
+    }
+    validated = validate_newgen_config(raw)
+    vruntime = validated.get("runtime")
+    assert isinstance(vruntime, dict)
+    observability = vruntime.get("observability")
+    assert isinstance(observability, dict)
+    monitoring = observability.get("monitoring")
+    assert isinstance(monitoring, dict)
+    exporters = monitoring.get("exporters")
+    assert isinstance(exporters, list)
+    settings = exporters[0].get("settings")
+    assert isinstance(settings, dict)
+    http = settings.get("http")
+    assert isinstance(http, dict)
+    assert http.get("host") == "127.0.0.1"
+    assert http.get("port") == 9464
+    assert http.get("path") == "/metrics"
+
+
+def test_validate_newgen_config_rejects_invalid_otel_exporter_queue_block_timeout() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "backend": "urllib",
+                    "settings": {
+                        "endpoint": "http://collector:4318/v1/traces",
+                        "queue": {
+                            "drop_policy": "block_with_timeout",
+                            "block_timeout_ms": 0,
+                        },
+                    },
+                }
+            ]
+        }
+    }
+    with pytest.raises(ConfigError, match="queue\\.block_timeout_ms must be an integer > 0"):
+        validate_newgen_config(raw)
+
+
 def test_validate_newgen_config_rejects_unknown_observability_logging_lifecycle_level() -> None:
     raw = _phase0_base_config()
     runtime = raw["runtime"]
@@ -1167,6 +1322,24 @@ def test_validate_newgen_config_obs_k_a_01_rejects_mixed_pipeline_and_legacy_exp
             "exporters": [
                 {"kind": "stdout", "settings": {}},
             ]
+        },
+    }
+    with pytest.raises(ConfigError, match="pipeline cannot be combined"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_mixed_pipeline_and_monitoring_exporters() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "pipeline": {
+            "mode": "tracing_only",
+        },
+        "monitoring": {
+            "exporters": [
+                {"kind": "prometheus", "settings": {"mode": "textfile"}},
+            ],
         },
     }
     with pytest.raises(ConfigError, match="pipeline cannot be combined"):
@@ -2184,6 +2357,7 @@ def test_validate_newgen_config_accepts_runtime_platform_boundary_dispatch_contr
     assert isinstance(boundary_dispatch, dict)
     assert boundary_dispatch.get("mode") == "batch"
     assert boundary_dispatch.get("batch_max_items") == 16
+    assert boundary_dispatch.get("stream_batch_max_items") == 1
     assert boundary_dispatch.get("control_poll_ms") == 2.5
     assert boundary_dispatch.get("timeout_seconds") == 10.0
 
@@ -2234,6 +2408,41 @@ def test_validate_newgen_config_accepts_runtime_platform_boundary_dispatch_timeo
     boundary_dispatch = platform.get("boundary_dispatch")
     assert isinstance(boundary_dispatch, dict)
     assert boundary_dispatch.get("timeout_seconds") == 45.0
+
+
+def test_validate_newgen_config_accepts_runtime_platform_boundary_dispatch_stream_batch_max_items() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "boundary_dispatch": {
+            "mode": "stream",
+            "stream_batch_max_items": 8,
+        }
+    }
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    boundary_dispatch = platform.get("boundary_dispatch")
+    assert isinstance(boundary_dispatch, dict)
+    assert boundary_dispatch.get("stream_batch_max_items") == 8
+
+
+def test_validate_newgen_config_rejects_runtime_platform_boundary_dispatch_bad_stream_batch_max_items() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "boundary_dispatch": {
+            "mode": "stream",
+            "stream_batch_max_items": 0,
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
 
 
 def test_validate_multiprocess_jaeger_config_uses_async_otel_backend_experiment() -> None:

@@ -1,0 +1,44 @@
+services:
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: sk-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - sk_prometheus_data:/prometheus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - sk_observability
+
+  grafana:
+    image: grafana/grafana:11.1.5
+    container_name: sk-grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_DEFAULT_THEME=light
+    volumes:
+      - sk_grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    networks:
+      - sk_observability
+
+volumes:
+  sk_prometheus_data:
+  sk_grafana_data:
+
+networks:
+  sk_observability:
+    name: sk_observability

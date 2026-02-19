@@ -23,6 +23,9 @@ from stream_kernel.observability.adapters.tracing import (
     trace_otel_otlp,
     trace_stdout,
 )
+from stream_kernel.observability.adapters.monitoring import (
+    monitoring_prometheus,
+)
 from stream_kernel.observability.adapters.logging import (
     JsonlLogSink,
     PlainFileLogSink,
@@ -31,8 +34,17 @@ from stream_kernel.observability.adapters.logging import (
     resolve_log_output_path,
 )
 from stream_kernel.observability.domain.logging import LogMessage
-from stream_kernel.observability.events import TraceDispatchEvent
+from stream_kernel.observability.domain.monitoring import MonitoringMessage
+from stream_kernel.observability.events import (
+    MonitoringMetricsSnapshotEvent,
+    MonitoringMetricsSnapshotResult,
+    TraceDispatchEvent,
+)
 from stream_kernel.platform.services.observability import (
+    DefaultObservabilityMetricsDispatchService,
+    InMemoryObservabilityMetricsService,
+    ObservabilityMetricsDispatchService,
+    ObservabilityMetricsService,
     ObservabilityService as ObservabilityServiceContract,
 )
 from stream_kernel.platform.services.runtime.process_group_router import (
@@ -68,6 +80,11 @@ class BootstrapSupervisor:
 
     def configure_tracing(self, settings: dict[str, object], *, strict: bool = True) -> None:
         # Optional hook: configure supervisor-owned trace sink fanout for boundary transport diagnostics.
+        _ = (settings, strict)
+        return None
+
+    def configure_monitoring(self, settings: dict[str, object], *, strict: bool = True) -> None:
+        # Optional hook: configure supervisor-owned monitoring exporters (e.g., Prometheus).
         _ = (settings, strict)
         return None
 
@@ -314,6 +331,12 @@ def _is_trace_sink_like(candidate: object) -> bool:
     return callable(emit) and callable(flush) and callable(close)
 
 
+def _build_supervisor_monitoring_sink(*, kind: str, settings: dict[str, object]) -> object:
+    if kind == "prometheus":
+        return monitoring_prometheus(settings)
+    raise ValueError(f"unsupported monitoring exporter kind: {kind}")
+
+
 def _extract_trace_record(payload: object) -> TraceRecord | None:
     if isinstance(payload, TraceRecord):
         return payload
@@ -373,6 +396,85 @@ def _coerce_route_hop(value: object) -> int | None:
 
 def _as_type_name(value: object) -> str:
     return type(value).__name__
+
+
+def _boundary_trace_ids(items: list[object], *, limit: int = 32) -> list[str]:
+    trace_ids: list[str] = []
+    for item in items:
+        trace_id = getattr(item, "trace_id", None)
+        if isinstance(trace_id, str) and trace_id:
+            trace_ids.append(trace_id)
+        if len(trace_ids) >= limit:
+            break
+    return trace_ids
+
+
+def _boundary_targets(items: list[object], *, limit: int = 32) -> list[str]:
+    targets: list[str] = []
+    for item in items:
+        target = getattr(item, "target", None)
+        if isinstance(target, str) and target:
+            targets.append(target)
+        if len(targets) >= limit:
+            break
+    return targets
+
+
+def _boundary_payload_type_names(items: list[object], *, limit: int = 32) -> list[str]:
+    names: list[str] = []
+    for item in items:
+        payload = getattr(item, "payload", item)
+        names.append(_as_type_name(payload))
+        if len(names) >= limit:
+            break
+    return names
+
+
+def _augment_lifecycle_trace_fields(fields: dict[str, object]) -> dict[str, object]:
+    # Add grep-friendly single-value keys for lifecycle logs that carry batch arrays.
+    augmented = dict(fields)
+    raw_trace_ids = augmented.get("trace_ids")
+    if isinstance(raw_trace_ids, list):
+        trace_ids = [
+            trace_id
+            for trace_id in raw_trace_ids
+            if isinstance(trace_id, str) and trace_id
+        ]
+        if trace_ids:
+            if "trace_id_first" not in augmented:
+                augmented["trace_id_first"] = trace_ids[0]
+            if "trace_count" not in augmented:
+                augmented["trace_count"] = len(trace_ids)
+            if len(trace_ids) == 1 and "trace_id" not in augmented:
+                augmented["trace_id"] = trace_ids[0]
+
+    raw_targets = augmented.get("targets")
+    if isinstance(raw_targets, list):
+        targets = [
+            target
+            for target in raw_targets
+            if isinstance(target, str) and target
+        ]
+        if targets:
+            if "target_first" not in augmented:
+                augmented["target_first"] = targets[0]
+            if "target_count" not in augmented:
+                augmented["target_count"] = len(targets)
+
+    raw_payload_types = augmented.get("payload_types")
+    if isinstance(raw_payload_types, list):
+        payload_types = [
+            payload_type
+            for payload_type in raw_payload_types
+            if isinstance(payload_type, str) and payload_type
+        ]
+        if payload_types:
+            if "payload_type_first" not in augmented:
+                augmented["payload_type_first"] = payload_types[0]
+            if "payload_type_count" not in augmented:
+                augmented["payload_type_count"] = len(payload_types)
+
+    return augmented
 
 
 def _make_system_span_id(*, material: str) -> str:
@@ -450,10 +552,13 @@ _SUPERVISOR_EVENT_MIN_LEVEL: dict[str, str] = {
     "route_cache_configured": "debug",
     "route_cache_invalidated": "debug",
     "worker_failed": "debug",
+    "trace_dispatch_diagnostics": "info",
     "stop_event_unavailable": "debug",
     "control_channel_unavailable": "debug",
     "boundary_dispatch_started": "full",
     "boundary_dispatch_completed": "full",
+    "boundary_dispatch_item": "full",
+    "boundary_receive_item": "full",
 }
 
 _WORKER_MESSAGE_MIN_LEVEL: dict[str, str] = {
@@ -847,10 +952,17 @@ def _worker_loop(
                     },
                 )
                 _emit_worker_trace_record(control_child, record=emit_record)
+            result_fields = {
+                **base_fields,
+                "outputs": len(terminal_outputs),
+                "trace_ids": _boundary_trace_ids(terminal_outputs),
+                "targets": _boundary_targets(terminal_outputs),
+                "payload_types": _boundary_payload_type_names(terminal_outputs),
+            }
             _emit_worker_lifecycle_event(
                 control_child,
                 message="bootstrap.worker_execute_boundary_result",
-                fields={**base_fields, "outputs": len(terminal_outputs)},
+                fields=result_fields,
             )
             _send_pipe_message(
                 control_child,
@@ -934,13 +1046,23 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
         self._lifecycle_logging_settings: dict[str, object] = {}
         self._boundary_dispatch_mode = "stream"
         self._boundary_batch_max_items = 1000
+        self._boundary_stream_batch_max_items = 1
         self._boundary_control_poll_seconds = 0.001
         self._trace_sinks: list[object] = []
         self._tracing_enabled = False
         self._trace_dispatch_loop: AsyncDispatchLoop[TraceRecord] | None = None
         self._trace_dispatch_dropped = 0
+        self._trace_dispatch_queue_max_items = 8192
+        self._trace_dispatch_drop_policy = "drop_newest"
+        self._trace_dispatch_submit_timeout_seconds = 0.2
+        self._monitoring_exporters: list[object] = []
+        self._monitoring_metrics_dispatch_node: object | None = None
         self._last_output_closed = True
         self.process_group_router: ProcessGroupRouterService = InMemoryProcessGroupRouterService()
+        self.observability_metrics_service: ObservabilityMetricsService = InMemoryObservabilityMetricsService()
+        self.observability_metrics_dispatch_service: ObservabilityMetricsDispatchService = (
+            DefaultObservabilityMetricsDispatchService(metrics_service=self.observability_metrics_service)
+        )
 
     def load_bootstrap_channel(self, channel: object) -> None:
         self._bootstrap_channel = channel
@@ -1000,6 +1122,31 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
     def configure_tracing(self, settings: dict[str, object], *, strict: bool = True) -> None:
         if not isinstance(settings, dict):
             settings = {}
+        dispatch_queue = settings.get("dispatch_queue", {})
+        if not isinstance(dispatch_queue, dict):
+            if strict:
+                raise ValueError("runtime.observability.tracing.dispatch_queue must be a mapping when provided")
+            dispatch_queue = {}
+        queue_max_items = dispatch_queue.get("max_items", 8192)
+        if not isinstance(queue_max_items, int) or queue_max_items <= 0:
+            if strict:
+                raise ValueError("runtime.observability.tracing.dispatch_queue.max_items must be an integer > 0")
+            queue_max_items = 8192
+        drop_policy = dispatch_queue.get("drop_policy", "drop_newest")
+        if not isinstance(drop_policy, str) or drop_policy not in {"drop_newest", "drop_oldest", "block_with_timeout"}:
+            if strict:
+                raise ValueError(
+                    "runtime.observability.tracing.dispatch_queue.drop_policy must be one of: "
+                    "['drop_newest', 'drop_oldest', 'block_with_timeout']"
+                )
+            drop_policy = "drop_newest"
+        block_timeout_ms = dispatch_queue.get("block_timeout_ms", 100)
+        if not isinstance(block_timeout_ms, int) or block_timeout_ms <= 0:
+            if strict:
+                raise ValueError("runtime.observability.tracing.dispatch_queue.block_timeout_ms must be an integer > 0")
+            block_timeout_ms = 100
+        submit_timeout_seconds = max(0.001, float(block_timeout_ms) / 1000.0)
+
         exporters = settings.get("exporters", [])
         if not isinstance(exporters, list):
             raise ValueError("runtime.observability.tracing.exporters must be a list when provided")
@@ -1046,9 +1193,45 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
         with self._lock:
             self._stop_trace_dispatch_loop_locked()
             self._trace_sinks = sinks
+            self._trace_dispatch_queue_max_items = queue_max_items
+            self._trace_dispatch_drop_policy = drop_policy
+            self._trace_dispatch_submit_timeout_seconds = submit_timeout_seconds
             self._tracing_enabled = bool(sinks)
             if self._tracing_enabled:
                 self._start_trace_dispatch_loop_locked()
+
+    def configure_monitoring(self, settings: dict[str, object], *, strict: bool = True) -> None:
+        if not isinstance(settings, dict):
+            settings = {}
+        exporters = settings.get("exporters", [])
+        if not isinstance(exporters, list):
+            raise ValueError("runtime.observability.monitoring.exporters must be a list when provided")
+        sinks: list[object] = []
+        for index, exporter in enumerate(exporters):
+            if not isinstance(exporter, dict):
+                continue
+            if exporter.get("enabled") is False:
+                continue
+            kind = exporter.get("kind")
+            if not isinstance(kind, str) or not kind:
+                continue
+            exporter_settings = exporter.get("settings", {})
+            settings_for_build = dict(exporter_settings) if isinstance(exporter_settings, dict) else {}
+            try:
+                sink = _build_supervisor_monitoring_sink(kind=kind, settings=settings_for_build)
+            except Exception as exc:
+                if strict:
+                    detail = str(exc).strip()
+                    suffix = f": {detail}" if detail else ""
+                    raise ValueError(
+                        "runtime.observability.monitoring.exporters["
+                        f"{index}] failed to build monitoring sink for kind '{kind}'{suffix}"
+                    )
+                continue
+            sinks.append(sink)
+        with self._lock:
+            self._close_monitoring_sinks_locked()
+            self._monitoring_exporters = sinks
 
     def configure_dispatch_policy(self, settings: dict[str, object]) -> None:
         if not isinstance(settings, dict):
@@ -1066,6 +1249,12 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
             raise ValueError(
                 "runtime.platform.boundary_dispatch.batch_max_items must be an integer > 0 when provided"
             )
+        stream_batch_max_items = settings.get("stream_batch_max_items", 1)
+        if not isinstance(stream_batch_max_items, int) or stream_batch_max_items <= 0:
+            raise ValueError(
+                "runtime.platform.boundary_dispatch.stream_batch_max_items "
+                "must be an integer > 0 when provided"
+            )
         control_poll_ms = settings.get("control_poll_ms", 1.0)
         if not isinstance(control_poll_ms, (int, float)) or control_poll_ms <= 0:
             raise ValueError(
@@ -1079,6 +1268,7 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
         with self._lock:
             self._boundary_dispatch_mode = mode
             self._boundary_batch_max_items = batch_max_items
+            self._boundary_stream_batch_max_items = stream_batch_max_items
             self._boundary_control_poll_seconds = float(control_poll_ms) / 1000.0
             self._boundary_timeout_seconds = float(timeout_seconds)
 
@@ -1238,42 +1428,60 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
             if iterations > max_iterations:
                 raise RuntimeError("remote handoff failed: boundary dispatch recursion limit exceeded")
 
+            stream_batch_size = max(1, int(self._boundary_stream_batch_max_items))
             item = pending.popleft()
-            grouped = self._group_boundary_inputs([item])
+            batch_items = [item]
+            first_group = self._peek_stream_dispatch_group(item)
+            while len(batch_items) < stream_batch_size and pending:
+                peek = pending[0]
+                if self._peek_stream_dispatch_group(peek) != first_group:
+                    break
+                batch_items.append(pending.popleft())
+
+            grouped = self._group_boundary_inputs(batch_items)
             for group_name, group_inputs in grouped.items():
+                dispatched_total += len(group_inputs)
+                handle = self._select_worker_for_group(group_name)
+                if handle is None:
+                    raise ConnectionError(f"remote handoff transport failed for group '{group_name}'")
                 for dispatched in group_inputs:
-                    dispatched_total += 1
-                    handle = self._select_worker_for_group(group_name)
-                    if handle is None:
-                        raise ConnectionError(f"remote handoff transport failed for group '{group_name}'")
                     self._emit_supervisor_dispatch_trace(
                         dispatched_item=dispatched,
                         dispatch_group=group_name,
                         scenario_id=scenario_id,
                     )
-                    command = {
-                        "kind": "execute_boundary",
-                        "correlation_id": f"{run_id}:{scenario_id}:{group_name}:{time.time_ns()}",
-                        "run_id": run_id,
-                        "scenario_id": scenario_id,
-                        "inputs": [dispatched],
-                    }
-                    response = self._send_boundary_command(
-                        handle,
-                        command=command,
-                        timeout_seconds=self._boundary_timeout_seconds,
-                    )
-                    output_count, requeued_count, terminal_count = self._consume_boundary_response(
-                        response=response,
-                        group_name=group_name,
-                        scenario_id=scenario_id,
-                        dispatched_item=dispatched,
-                        pending=pending,
-                        terminal_outputs=terminal_outputs,
-                    )
-                    outputs_total += output_count
-                    requeued_total += requeued_count
-                    terminal_total += terminal_count
+                command = {
+                    "kind": "execute_boundary",
+                    "correlation_id": f"{run_id}:{scenario_id}:{group_name}:{time.time_ns()}",
+                    "run_id": run_id,
+                    "scenario_id": scenario_id,
+                    "inputs": list(group_inputs),
+                }
+                self._emit_event(
+                    kind="boundary_dispatch_item",
+                    mode="stream",
+                    group_name=group_name,
+                    batch_size=len(group_inputs),
+                    trace_ids=_boundary_trace_ids(group_inputs),
+                    targets=_boundary_targets(group_inputs),
+                    payload_types=_boundary_payload_type_names(group_inputs),
+                )
+                response = self._send_boundary_command(
+                    handle,
+                    command=command,
+                    timeout_seconds=self._boundary_timeout_seconds,
+                )
+                output_count, requeued_count, terminal_count = self._consume_boundary_response(
+                    response=response,
+                    group_name=group_name,
+                    scenario_id=scenario_id,
+                    dispatched_item=group_inputs[-1],
+                    pending=pending,
+                    terminal_outputs=terminal_outputs,
+                )
+                outputs_total += output_count
+                requeued_total += requeued_count
+                terminal_total += terminal_count
 
         self._emit_event(
             kind="boundary_dispatch_completed",
@@ -1332,6 +1540,15 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
                         "scenario_id": scenario_id,
                         "inputs": list(chunk),
                     }
+                    self._emit_event(
+                        kind="boundary_dispatch_item",
+                        mode="batch",
+                        group_name=group_name,
+                        batch_size=len(chunk),
+                        trace_ids=_boundary_trace_ids(chunk),
+                        targets=_boundary_targets(chunk),
+                        payload_types=_boundary_payload_type_names(chunk),
+                    )
                     response = self._send_boundary_command(
                         handle,
                         command=command,
@@ -1460,6 +1677,16 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
                     )
                 )
                 requeued_count += 1
+            self._emit_event(
+                kind="boundary_receive_item",
+                source_group=group_name,
+                output_count=output_count,
+                terminal_count=terminal_count,
+                requeued_count=requeued_count,
+                trace_ids=_boundary_trace_ids(outputs),
+                targets=_boundary_targets(outputs),
+                payload_types=_boundary_payload_type_names(outputs),
+            )
             return output_count, requeued_count, terminal_count
 
         category = response.get("category", "execution")
@@ -1539,6 +1766,7 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
         return False
 
     def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
+        self._emit_trace_dispatch_diagnostics(stage="stop_requested")
         with self._lock:
             self._last_output_closed = True
             deadline = time.monotonic() + max(1, graceful_timeout_seconds)
@@ -1606,6 +1834,7 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
             self._workers.clear()
             self._group_rr_cursor.clear()
         self._close_trace_sinks()
+        self._close_monitoring_sinks()
 
     def wait_output_closed(self, timeout_seconds: int) -> bool:
         if timeout_seconds <= 0:
@@ -1622,6 +1851,7 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
         return False
 
     def force_terminate_groups(self, group_names: list[str]) -> None:
+        self._emit_trace_dispatch_diagnostics(stage="force_terminate_requested")
         with self._lock:
             target_groups = set(group_names)
             for group_name, handles in list(self._workers.items()):
@@ -1632,6 +1862,7 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
                 self._workers[group_name] = []
                 self._group_rr_cursor.pop(group_name, None)
         self._close_trace_sinks()
+        self._close_monitoring_sinks()
 
     def snapshot(self) -> dict[str, list[dict[str, object]]]:
         with self._lock:
@@ -1707,6 +1938,12 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
                 raise RuntimeError(f"remote handoff failed for group '{dispatch_group}'")
             grouped.setdefault(dispatch_group, []).append(item)
         return grouped
+
+    def _peek_stream_dispatch_group(self, item: object) -> str | None:
+        grouped = self._group_boundary_inputs([item])
+        if not grouped:
+            return None
+        return next(iter(grouped.keys()))
 
     def _build_boundary_input_from_envelope(
         self,
@@ -1870,7 +2107,7 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
 
     def _emit_event(self, *, kind: str, **fields: object) -> None:
         event_level = _supervisor_event_level(kind)
-        event_fields = dict(fields)
+        event_fields = _augment_lifecycle_trace_fields(fields)
         worker_pid = event_fields.pop("pid", None)
         if worker_pid is not None and "worker_pid" not in event_fields:
             event_fields["worker_pid"] = worker_pid
@@ -1922,8 +2159,9 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
     def _emit_trace_record(self, record: TraceRecord) -> None:
         with self._lock:
             loop = self._trace_dispatch_loop
+            submit_timeout_seconds = self._trace_dispatch_submit_timeout_seconds
         if loop is not None:
-            submitted = loop.submit(record, timeout_seconds=0.2)
+            submitted = loop.submit(record, timeout_seconds=submit_timeout_seconds)
             if submitted:
                 return
             with self._lock:
@@ -1967,6 +2205,7 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
                     continue
 
     def _close_trace_sinks(self) -> None:
+        self._emit_trace_dispatch_diagnostics(stage="close_begin")
         with self._lock:
             self._stop_trace_dispatch_loop_locked()
         for sink in list(self._trace_sinks):
@@ -1978,6 +2217,247 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
                     continue
         self._trace_sinks = []
         self._tracing_enabled = False
+        self._emit_trace_dispatch_diagnostics(stage="close_end")
+
+    def _close_monitoring_sinks(self) -> None:
+        with self._lock:
+            self._close_monitoring_sinks_locked()
+
+    def _close_monitoring_sinks_locked(self) -> None:
+        exporters = list(self._monitoring_exporters)
+        self._monitoring_exporters = []
+        for exporter in exporters:
+            close = getattr(exporter, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    continue
+
+    def _collect_trace_dispatch_diagnostics(self) -> dict[str, object]:
+        with self._lock:
+            loop = self._trace_dispatch_loop
+            sinks = list(self._trace_sinks)
+            trace_dispatch_dropped = int(self._trace_dispatch_dropped)
+            tracing_enabled = bool(self._tracing_enabled)
+
+        loop_metrics_raw: dict[str, object] = {}
+        if loop is not None:
+            metrics = getattr(loop, "metrics", None)
+            if callable(metrics):
+                try:
+                    raw = metrics()
+                except Exception:
+                    raw = {}
+                if isinstance(raw, dict):
+                    loop_metrics_raw = raw
+
+        dispatch_submitted = int(loop_metrics_raw.get("submitted", 0) or 0)
+        dispatch_processed = int(loop_metrics_raw.get("processed", 0) or 0)
+        dispatch_failed = int(loop_metrics_raw.get("failed", 0) or 0)
+        dispatch_dropped = int(loop_metrics_raw.get("dropped", 0) or 0)
+        dispatch_queue_depth = int(loop_metrics_raw.get("queue_depth", 0) or 0)
+        dispatch_pending = int(loop_metrics_raw.get("pending", 0) or 0)
+        dispatch_submit_block_count = int(loop_metrics_raw.get("submit_block_count", 0) or 0)
+        dispatch_submit_timeout_count = int(loop_metrics_raw.get("submit_timeout_count", 0) or 0)
+        dispatch_submit_block_wait_ms_total = int(loop_metrics_raw.get("submit_block_wait_ms_total", 0) or 0)
+        dispatch_pending = max(
+            0,
+            dispatch_pending,
+            dispatch_queue_depth,
+            dispatch_submitted - dispatch_processed - dispatch_failed,
+        )
+
+        sink_reports: list[dict[str, object]] = []
+        sink_pending_total = 0
+        for index, sink in enumerate(sinks):
+            report: dict[str, object] = {
+                "sink_index": index,
+                "sink_kind": type(sink).__name__,
+            }
+            diagnostics = getattr(sink, "diagnostics", None)
+            raw_diag: dict[str, object] = {}
+            if callable(diagnostics):
+                try:
+                    diag_value = diagnostics()
+                except Exception:
+                    diag_value = {}
+                if isinstance(diag_value, dict):
+                    raw_diag = diag_value
+            for key, value in raw_diag.items():
+                if isinstance(key, str) and key:
+                    report[key] = value
+            sink_pending = 0
+            for key in ("buffered", "pending", "queue_depth"):
+                value = raw_diag.get(key)
+                if isinstance(value, int) and value > 0:
+                    sink_pending = max(sink_pending, value)
+            report["pending_estimate"] = sink_pending
+            sink_pending_total += sink_pending
+            sink_reports.append(report)
+
+        return {
+            "tracing_enabled": tracing_enabled,
+            "dispatch_submitted": dispatch_submitted,
+            "dispatch_processed": dispatch_processed,
+            "dispatch_failed": dispatch_failed,
+            "dispatch_dropped": dispatch_dropped,
+            "dispatch_queue_depth": dispatch_queue_depth,
+            "dispatch_pending": dispatch_pending,
+            "dispatch_submit_block_count": dispatch_submit_block_count,
+            "dispatch_submit_timeout_count": dispatch_submit_timeout_count,
+            "dispatch_submit_block_wait_ms_total": dispatch_submit_block_wait_ms_total,
+            "dispatch_submit_dropped_total": trace_dispatch_dropped,
+            "sink_count": len(sinks),
+            "sink_pending_total": sink_pending_total,
+            "pending_total_estimate": dispatch_pending + sink_pending_total,
+            "sink_diagnostics": sink_reports,
+        }
+
+    def _emit_trace_dispatch_diagnostics(self, *, stage: str) -> None:
+        snapshot = self._collect_trace_dispatch_diagnostics()
+        metric_records = self._collect_monitoring_metric_records(
+            stage=stage,
+            snapshot=snapshot,
+        )
+        self._publish_monitoring_metrics_snapshot(
+            stage=stage,
+            snapshot=snapshot,
+            metric_records=metric_records,
+        )
+        self._emit_event(
+            kind="trace_dispatch_diagnostics",
+            stage=stage,
+            **snapshot,
+        )
+
+    def _resolve_observability_metrics_service(self) -> ObservabilityMetricsService | None:
+        candidate: object = getattr(self, "observability_metrics_service", None)
+        if isinstance(candidate, ObservabilityMetricsService):
+            return candidate
+        if (
+            candidate is not None
+            and callable(getattr(candidate, "ingest_trace_dispatch_snapshot", None))
+            and callable(getattr(candidate, "snapshot", None))
+            and callable(getattr(candidate, "metric_records", None))
+        ):
+            return candidate  # type: ignore[return-value]
+        return None
+
+    def _resolve_observability_metrics_dispatch_service(self) -> ObservabilityMetricsDispatchService | None:
+        candidate: object = getattr(self, "observability_metrics_dispatch_service", None)
+        metrics_service = self._resolve_observability_metrics_service()
+        if (
+            isinstance(candidate, DefaultObservabilityMetricsDispatchService)
+            and metrics_service is not None
+            and getattr(candidate, "metrics_service", None) is not metrics_service
+        ):
+            candidate = DefaultObservabilityMetricsDispatchService(metrics_service=metrics_service)
+            self.observability_metrics_dispatch_service = candidate
+        if isinstance(candidate, ObservabilityMetricsDispatchService):
+            return candidate
+        if candidate is not None and callable(getattr(candidate, "dispatch_snapshot", None)):
+            return candidate  # type: ignore[return-value]
+        if metrics_service is None:
+            return None
+        service = DefaultObservabilityMetricsDispatchService(metrics_service=metrics_service)
+        self.observability_metrics_dispatch_service = service
+        return service
+
+    def _resolve_monitoring_metrics_dispatch_node(self) -> object | None:
+        node = self._monitoring_metrics_dispatch_node
+        if node is not None:
+            return node
+        service = self._resolve_observability_metrics_dispatch_service()
+        if service is None:
+            return None
+        from stream_kernel.execution.orchestration.observability_system_nodes import (
+            MonitoringMetricsDispatchNode,
+        )
+
+        node = MonitoringMetricsDispatchNode(service=service)
+        self._monitoring_metrics_dispatch_node = node
+        return node
+
+    def _collect_monitoring_metric_records(
+        self,
+        *,
+        stage: str,
+        snapshot: dict[str, object],
+    ) -> list[dict[str, object]]:
+        node = self._resolve_monitoring_metrics_dispatch_node()
+        if callable(node):
+            try:
+                outputs = node(
+                    MonitoringMetricsSnapshotEvent(
+                        stage=stage,
+                        snapshot=dict(snapshot),
+                    ),
+                    None,
+                )
+            except Exception:
+                outputs = []
+            if isinstance(outputs, list):
+                for item in outputs:
+                    if not isinstance(item, MonitoringMetricsSnapshotResult):
+                        continue
+                    records = [
+                        record
+                        for record in item.metric_records
+                        if isinstance(record, dict)
+                    ]
+                    if records:
+                        return records
+            return []
+
+        metrics_service = self._resolve_observability_metrics_service()
+        if metrics_service is None:
+            return []
+        try:
+            metrics_service.ingest_trace_dispatch_snapshot(stage=stage, snapshot=dict(snapshot))
+            raw_records = metrics_service.metric_records()
+        except Exception:
+            raw_records = []
+        return [item for item in raw_records if isinstance(item, dict)] if isinstance(raw_records, list) else []
+
+    def _publish_monitoring_metrics_snapshot(
+        self,
+        *,
+        stage: str,
+        snapshot: dict[str, object],
+        metric_records: list[dict[str, object]],
+    ) -> None:
+        with self._lock:
+            exporters = list(self._monitoring_exporters)
+        if not exporters:
+            return
+        for exporter in exporters:
+            publish_metrics = getattr(exporter, "publish_metrics", None)
+            if callable(publish_metrics):
+                try:
+                    publish_metrics(
+                        records=list(metric_records),
+                        snapshot=dict(snapshot),
+                        stage=stage,
+                    )
+                except Exception:
+                    continue
+                continue
+            emit = getattr(exporter, "emit", None)
+            if callable(emit):
+                try:
+                    emit(
+                        MonitoringMessage(
+                            name="trace_dispatch_diagnostics",
+                            status=stage,
+                            details={
+                                "metric_count": len(metric_records),
+                                "pending_total_estimate": snapshot.get("pending_total_estimate"),
+                            },
+                        )
+                    )
+                except Exception:
+                    continue
 
     async def _emit_trace_record_async(self, record: TraceRecord) -> None:
         sinks = list(self._trace_sinks)
@@ -2002,7 +2482,9 @@ class MultiprocessBootstrapSupervisor(BootstrapSupervisor):
         loop = AsyncDispatchLoop[TraceRecord](
             name=f"trace.dispatch.supervisor.{os.getpid()}",
             handler=self._emit_trace_record_async,
-            queue_max_items=8192,
+            queue_max_items=self._trace_dispatch_queue_max_items,
+            drop_policy=self._trace_dispatch_drop_policy,
+            block_timeout_seconds=self._trace_dispatch_submit_timeout_seconds,
         )
         loop.start()
         self._trace_dispatch_loop = loop

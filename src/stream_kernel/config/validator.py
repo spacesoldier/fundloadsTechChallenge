@@ -43,6 +43,8 @@ _SUPPORTED_OBSERVABILITY_TRACE_JSONL_SLICES = {"all", "business_logic", "platfor
 _SUPPORTED_OBSERVABILITY_LOG_EXPORTER_KINDS = {"stdout", "stdout_plain", "jsonl", "file_plain", "otel_logs_otlp"}
 _SUPPORTED_OBSERVABILITY_LOG_EXPORTER_MODES = {"lifecycle", "all"}
 _SUPPORTED_OBSERVABILITY_LOG_LEVELS = {"off", "none", "info", "debug", "full"}
+_SUPPORTED_OBSERVABILITY_MONITORING_EXPORTER_KINDS = {"prometheus"}
+_SUPPORTED_OBSERVABILITY_PROMETHEUS_MODES = {"http_pull", "textfile"}
 _SUPPORTED_OBSERVABILITY_OTEL_BACKENDS = {"urllib", "requests", "httpx", "aiohttp", "urllib3", "grpcio", "otel_sdk"}
 _OBSERVABILITY_ASYNC_ONLY_BACKENDS = {"aiohttp"}
 _OBSERVABILITY_SYNC_ONLY_BACKENDS = {"urllib", "requests", "urllib3", "grpcio", "otel_sdk"}
@@ -532,7 +534,7 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
         unknown_keys = [
             key
             for key in boundary_dispatch
-            if key not in {"mode", "batch_max_items", "control_poll_ms", "timeout_seconds"}
+            if key not in {"mode", "batch_max_items", "stream_batch_max_items", "control_poll_ms", "timeout_seconds"}
         ]
         if unknown_keys:
             raise ConfigError(
@@ -554,6 +556,14 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
         if batch_max_items <= 0:
             raise ConfigError("runtime.platform.boundary_dispatch.batch_max_items must be > 0")
         boundary_dispatch["batch_max_items"] = batch_max_items
+        stream_batch_max_items = boundary_dispatch.get("stream_batch_max_items", 1)
+        if not isinstance(stream_batch_max_items, int):
+            raise ConfigError(
+                "runtime.platform.boundary_dispatch.stream_batch_max_items must be an integer when provided"
+            )
+        if stream_batch_max_items <= 0:
+            raise ConfigError("runtime.platform.boundary_dispatch.stream_batch_max_items must be > 0")
+        boundary_dispatch["stream_batch_max_items"] = stream_batch_max_items
         control_poll_ms = boundary_dispatch.get("control_poll_ms", 1.0)
         if not isinstance(control_poll_ms, (int, float)):
             raise ConfigError("runtime.platform.boundary_dispatch.control_poll_ms must be a number when provided")
@@ -724,6 +734,33 @@ def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
     if not isinstance(tracing, dict):
         raise ConfigError("runtime.observability.tracing must be a mapping when provided")
     observability["tracing"] = tracing
+    dispatch_queue = tracing.get("dispatch_queue", {})
+    if not isinstance(dispatch_queue, dict):
+        raise ConfigError("runtime.observability.tracing.dispatch_queue must be a mapping when provided")
+    max_items = dispatch_queue.get("max_items", 8192)
+    if not isinstance(max_items, int) or max_items <= 0:
+        raise ConfigError("runtime.observability.tracing.dispatch_queue.max_items must be an integer > 0")
+    dispatch_queue["max_items"] = max_items
+    drop_policy = dispatch_queue.get("drop_policy", "drop_newest")
+    if not isinstance(drop_policy, str) or not drop_policy:
+        raise ConfigError("runtime.observability.tracing.dispatch_queue.drop_policy must be a non-empty string")
+    if drop_policy not in _SUPPORTED_OBSERVABILITY_QUEUE_DROP_POLICIES:
+        raise ConfigError(
+            "runtime.observability.tracing.dispatch_queue.drop_policy must be one of: "
+            f"{sorted(_SUPPORTED_OBSERVABILITY_QUEUE_DROP_POLICIES)}"
+        )
+    dispatch_queue["drop_policy"] = drop_policy
+    if drop_policy == "block_with_timeout":
+        block_timeout_ms = dispatch_queue.get("block_timeout_ms", 100)
+        if not isinstance(block_timeout_ms, int) or block_timeout_ms <= 0:
+            raise ConfigError("runtime.observability.tracing.dispatch_queue.block_timeout_ms must be an integer > 0")
+        dispatch_queue["block_timeout_ms"] = block_timeout_ms
+    elif "block_timeout_ms" in dispatch_queue:
+        block_timeout_ms = dispatch_queue.get("block_timeout_ms")
+        if not isinstance(block_timeout_ms, int) or block_timeout_ms <= 0:
+            raise ConfigError("runtime.observability.tracing.dispatch_queue.block_timeout_ms must be an integer > 0")
+    tracing["dispatch_queue"] = dispatch_queue
+
     tracing_exporters = tracing.get("exporters", [])
     if not isinstance(tracing_exporters, list):
         raise ConfigError("runtime.observability.tracing.exporters must be a list when provided")
@@ -904,11 +941,116 @@ def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
         )
     lifecycle_events["level"] = level
 
+    monitoring = observability.get("monitoring", {})
+    if not isinstance(monitoring, dict):
+        raise ConfigError("runtime.observability.monitoring must be a mapping when provided")
+    observability["monitoring"] = monitoring
+    monitoring_exporters = monitoring.get("exporters", [])
+    if not isinstance(monitoring_exporters, list):
+        raise ConfigError("runtime.observability.monitoring.exporters must be a list when provided")
+    for index, exporter in enumerate(monitoring_exporters):
+        if not isinstance(exporter, dict):
+            raise ConfigError(f"runtime.observability.monitoring.exporters[{index}] must be a mapping")
+        kind = exporter.get("kind")
+        if not isinstance(kind, str) or not kind:
+            raise ConfigError(f"runtime.observability.monitoring.exporters[{index}].kind must be a non-empty string")
+        if kind not in _SUPPORTED_OBSERVABILITY_MONITORING_EXPORTER_KINDS:
+            raise ConfigError(
+                "runtime.observability.monitoring.exporters["
+                f"{index}].kind must be one of: {sorted(_SUPPORTED_OBSERVABILITY_MONITORING_EXPORTER_KINDS)}"
+            )
+        settings = exporter.get("settings", {})
+        if not isinstance(settings, dict):
+            raise ConfigError(
+                f"runtime.observability.monitoring.exporters[{index}].settings must be a mapping when provided"
+            )
+        if kind == "prometheus":
+            mode = settings.get("mode", "http_pull")
+            if not isinstance(mode, str) or not mode:
+                raise ConfigError(
+                    f"runtime.observability.monitoring.exporters[{index}].settings.mode "
+                    "must be a non-empty string when provided"
+                )
+            mode = mode.lower()
+            if mode not in _SUPPORTED_OBSERVABILITY_PROMETHEUS_MODES:
+                raise ConfigError(
+                    "runtime.observability.monitoring.exporters["
+                    f"{index}].settings.mode must be one of: {sorted(_SUPPORTED_OBSERVABILITY_PROMETHEUS_MODES)}"
+                )
+            settings["mode"] = mode
+
+            for field in ("namespace", "subsystem"):
+                value = settings.get(field)
+                if value is not None and (not isinstance(value, str) or not value):
+                    raise ConfigError(
+                        "runtime.observability.monitoring.exporters["
+                        f"{index}].settings.{field} must be a non-empty string when provided"
+                    )
+
+            include_labels = settings.get("include_labels")
+            if include_labels is not None:
+                if not isinstance(include_labels, dict):
+                    raise ConfigError(
+                        "runtime.observability.monitoring.exporters["
+                        f"{index}].settings.include_labels must be a mapping when provided"
+                    )
+                for key, value in include_labels.items():
+                    if not isinstance(key, str) or not isinstance(value, bool):
+                        raise ConfigError(
+                            "runtime.observability.monitoring.exporters["
+                            f"{index}].settings.include_labels must be a string-to-boolean mapping"
+                        )
+
+            if mode == "http_pull":
+                http = settings.get("http", {})
+                if not isinstance(http, dict):
+                    raise ConfigError(
+                        f"runtime.observability.monitoring.exporters[{index}].settings.http must be a mapping"
+                    )
+                host = http.get("host", "127.0.0.1")
+                if not isinstance(host, str) or not host:
+                    raise ConfigError(
+                        "runtime.observability.monitoring.exporters["
+                        f"{index}].settings.http.host must be a non-empty string"
+                    )
+                port = http.get("port", 9464)
+                if not isinstance(port, int) or port <= 0:
+                    raise ConfigError(
+                        "runtime.observability.monitoring.exporters["
+                        f"{index}].settings.http.port must be an integer > 0"
+                    )
+                path = http.get("path", "/metrics")
+                if not isinstance(path, str) or not path:
+                    raise ConfigError(
+                        "runtime.observability.monitoring.exporters["
+                        f"{index}].settings.http.path must be a non-empty string"
+                    )
+                http["host"] = host
+                http["port"] = port
+                http["path"] = path
+                settings["http"] = http
+            else:
+                textfile = settings.get("textfile", {})
+                if not isinstance(textfile, dict):
+                    raise ConfigError(
+                        f"runtime.observability.monitoring.exporters[{index}].settings.textfile must be a mapping"
+                    )
+                path = textfile.get("path", "metrics/stream_kernel.prom")
+                if not isinstance(path, str) or not path:
+                    raise ConfigError(
+                        "runtime.observability.monitoring.exporters["
+                        f"{index}].settings.textfile.path must be a non-empty string"
+                    )
+                textfile["path"] = path
+                settings["textfile"] = textfile
+        exporter["settings"] = settings
+
     pipeline = observability.get("pipeline")
-    if pipeline is not None and (tracing_exporters or log_exporters):
+    if pipeline is not None and (tracing_exporters or log_exporters or monitoring_exporters):
         raise ConfigError(
             "runtime.observability.pipeline cannot be combined with "
-            "runtime.observability.tracing.exporters or runtime.observability.logging.exporters"
+            "runtime.observability.tracing.exporters or runtime.observability.logging.exporters "
+            "or runtime.observability.monitoring.exporters"
         )
 
 
@@ -1106,6 +1248,10 @@ def _normalize_observability_otel_exporter_settings(
             f"{prefix}.queue.drop_policy must be one of: {sorted(_SUPPORTED_OBSERVABILITY_QUEUE_DROP_POLICIES)}"
         )
     queue["drop_policy"] = drop_policy
+    block_timeout_ms = queue.get("block_timeout_ms", 100)
+    if not isinstance(block_timeout_ms, int) or block_timeout_ms <= 0:
+        raise ConfigError(f"{prefix}.queue.block_timeout_ms must be an integer > 0 when provided")
+    queue["block_timeout_ms"] = block_timeout_ms
     settings["queue"] = queue
 
     retry = settings.get("retry", {})

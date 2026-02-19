@@ -271,11 +271,49 @@ def test_boundary_dispatch_batch_mode_uses_configured_chunk_size() -> None:
     assert sent_sizes == [2, 1]
 
 
+def test_boundary_dispatch_stream_mode_uses_configured_micro_batch_size() -> None:
+    supervisor = MultiprocessBootstrapSupervisor()
+    supervisor.configure_process_groups([{"name": "execution.cpu", "workers": 1, "nodes": ["child.echo"]}])
+    supervisor.configure_dispatch_policy({"mode": "stream", "stream_batch_max_items": 2})
+    sent_sizes: list[int] = []
+    handle = SimpleNamespace(group_name="execution.cpu")
+
+    setattr(supervisor, "_select_worker_for_group", lambda _group_name: handle)
+
+    def _send(_handle, *, command, timeout_seconds, raise_on_timeout=True):  # noqa: ANN001
+        _ = (_handle, timeout_seconds, raise_on_timeout)
+        sent_sizes.append(len(command["inputs"]))
+        return {"kind": "execute_boundary_result", "terminal_outputs": []}
+
+    setattr(supervisor, "_send_boundary_command", _send)
+
+    result = supervisor.execute_boundary(
+        run=lambda: None,
+        run_id="run",
+        scenario_id="scenario",
+        inputs=[
+            BoundaryDispatchInput(payload={"i": 1}, dispatch_group="execution.cpu", target="child.echo", trace_id="t1"),
+            BoundaryDispatchInput(payload={"i": 2}, dispatch_group="execution.cpu", target="child.echo", trace_id="t2"),
+            BoundaryDispatchInput(payload={"i": 3}, dispatch_group="execution.cpu", target="child.echo", trace_id="t3"),
+        ],
+    )
+
+    assert result.terminal_outputs == []
+    assert sent_sizes == [2, 1]
+
+
 def test_boundary_dispatch_config_accepts_control_poll_ms() -> None:
     supervisor = MultiprocessBootstrapSupervisor()
     supervisor.configure_dispatch_policy({"mode": "stream", "control_poll_ms": 3.5})
 
     assert getattr(supervisor, "_boundary_control_poll_seconds") == 0.0035  # noqa: SLF001
+
+
+def test_boundary_dispatch_config_accepts_stream_batch_max_items() -> None:
+    supervisor = MultiprocessBootstrapSupervisor()
+    supervisor.configure_dispatch_policy({"mode": "stream", "stream_batch_max_items": 8})
+
+    assert getattr(supervisor, "_boundary_stream_batch_max_items") == 8  # noqa: SLF001
 
 
 def test_boundary_dispatch_config_accepts_timeout_seconds() -> None:

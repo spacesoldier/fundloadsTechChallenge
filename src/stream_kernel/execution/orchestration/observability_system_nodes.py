@@ -17,9 +17,12 @@ from stream_kernel.observability.events import (
     LogDispatchEvent,
     MetricDispatchEvent,
     MonitorDispatchEvent,
+    MonitoringMetricsSnapshotEvent,
+    MonitoringMetricsSnapshotResult,
     TraceDispatchEvent,
 )
 from stream_kernel.platform.services.observability import (
+    ObservabilityMetricsDispatchService,
     ObservabilityPipelineService,
     coerce_pipeline_observability,
 )
@@ -33,6 +36,7 @@ _SYSTEM_NODE_KIND_TO_EVENT = {
     "system.obs.log_dispatch": LogDispatchEvent,
     "system.obs.metric_dispatch": MetricDispatchEvent,
     "system.obs.monitor_dispatch": MonitorDispatchEvent,
+    "system.obs.monitoring_metrics_dispatch": MonitoringMetricsSnapshotEvent,
 }
 
 # ---------------------------------------------------------------------------
@@ -214,6 +218,24 @@ class MonitorDispatchNode:
         return []
 
 
+@node(name="system.obs.monitoring_metrics_dispatch", consumes=[MonitoringMetricsSnapshotEvent], emits=[MonitoringMetricsSnapshotResult])
+@dataclass
+class MonitoringMetricsDispatchNode:
+    service: ObservabilityMetricsDispatchService
+    qualifier: str | None = None
+    _metrics_marker: object = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._metrics_marker = inject.service(ObservabilityMetricsDispatchService, qualifier=self.qualifier)
+
+    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
+        payload = msg.payload if isinstance(msg, Envelope) else msg
+        if not isinstance(payload, MonitoringMetricsSnapshotEvent):
+            return []
+        result = self.service.dispatch_snapshot(event=payload)
+        return [result] if isinstance(result, MonitoringMetricsSnapshotResult) else []
+
+
 @node(name="system.obs.trace_sink", consumes=[], emits=[])
 @dataclass
 class TraceSinkNode:
@@ -243,6 +265,7 @@ _KIND_TO_NODE_CLS: dict[str, type] = {
     "system.obs.log_dispatch": LogDispatchNode,
     "system.obs.metric_dispatch": MetricDispatchNode,
     "system.obs.monitor_dispatch": MonitorDispatchNode,
+    "system.obs.monitoring_metrics_dispatch": MonitoringMetricsDispatchNode,
 }
 
 

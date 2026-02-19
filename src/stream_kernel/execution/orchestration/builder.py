@@ -1329,6 +1329,12 @@ def build_runtime_observability_adapter_instances(
 ) -> dict[str, object]:
     # Build observability adapter instances from runtime config via AdapterRegistry only.
     strict = bool(runtime.get("strict", True))
+    is_worker_process = runtime.get("__process_role") == "worker"
+    supervisor_owns_monitoring = False
+    try:
+        supervisor_owns_monitoring = runtime_bootstrap_mode(runtime) == "process_supervisor"
+    except Exception:
+        supervisor_owns_monitoring = False
     existing = existing_instances or {}
     built: dict[str, object] = {}
 
@@ -1348,6 +1354,10 @@ def build_runtime_observability_adapter_instances(
             "file_plain": "log_file_plain",
             "otel_logs_otlp": "log_otel_otlp",
         },
+        "monitoring": {
+            "stdout": "monitoring_stdout",
+            "prometheus": "monitoring_prometheus",
+        },
     }
 
     observability = runtime.get("observability", {})
@@ -1355,6 +1365,11 @@ def build_runtime_observability_adapter_instances(
         return built
 
     for channel, alias_map in kind_to_alias.items():
+        if channel == "monitoring" and (is_worker_process or supervisor_owns_monitoring):
+            # Monitoring sinks are supervisor-owned in process-supervisor runtime.
+            # Worker/runtime adapter materialization must skip monitoring exporters
+            # to avoid duplicate HTTP bind in build phase vs supervisor configure_monitoring().
+            continue
         channel_cfg = observability.get(channel, {})
         if not isinstance(channel_cfg, dict):
             continue

@@ -43,6 +43,10 @@ Target outcome:
   runner-level observability service dispatch and strict `system.obs.*` recursion guard,
   tracked in
   [observability_phaseL_runner_dispatch_and_recursion_guard_tdd_plan](observability_phaseL_runner_dispatch_and_recursion_guard_tdd_plan.md).
+- [ ] Phase M planned:
+  backpressure hardening + Prometheus monitoring exporter integration,
+  tracked in
+  [observability_backpressure_and_prometheus_exporter_tdd_plan](observability_backpressure_and_prometheus_exporter_tdd_plan.md).
 - [x] Patch M complete:
   grouped OTLP exporter config (`settings.otlp/transport/service/view`) + deterministic backend
   selection contract (`exporter.backend -> settings.transport.backend -> settings.backend -> urllib`),
@@ -170,6 +174,12 @@ Detailed subplan:
 Detailed subplan:
 
 - [observability_phaseL_runner_dispatch_and_recursion_guard_tdd_plan](observability_phaseL_runner_dispatch_and_recursion_guard_tdd_plan.md)
+
+### Phase M — backpressure closure + Prometheus monitoring exporter
+
+Detailed subplan:
+
+- [observability_backpressure_and_prometheus_exporter_tdd_plan](observability_backpressure_and_prometheus_exporter_tdd_plan.md)
 
 ### Patch M — grouped exporter config + backend resolver fix
 

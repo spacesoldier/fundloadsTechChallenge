@@ -17,6 +17,7 @@ def test_trace_dispatch_nodes_are_in_node_registry() -> None:
         LogDispatchNode,
         MetricDispatchNode,
         MonitorDispatchNode,
+        MonitoringMetricsDispatchNode,
         TraceDispatchNode,
     )
     from stream_kernel.kernel.node import NodeMeta
@@ -26,6 +27,7 @@ def test_trace_dispatch_nodes_are_in_node_registry() -> None:
         LogDispatchNode: "system.obs.log_dispatch",
         MetricDispatchNode: "system.obs.metric_dispatch",
         MonitorDispatchNode: "system.obs.monitor_dispatch",
+        MonitoringMetricsDispatchNode: "system.obs.monitoring_metrics_dispatch",
     }
     for cls, expected_name in expected.items():
         meta = getattr(cls, "__node_meta__", None)

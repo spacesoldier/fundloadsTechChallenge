@@ -9,6 +9,7 @@ No ad-hoc background threads or queues are introduced outside these rails.
 Follow-up execution track (2026-02-18):
 
 - [runtime IPC bytes + non-blocking observability plan](runtime_ipc_bytes_and_nonblocking_observability_tdd_plan.md)
+- [observability backpressure + Prometheus exporter plan](observability_backpressure_and_prometheus_exporter_tdd_plan.md)
 
 ---
 

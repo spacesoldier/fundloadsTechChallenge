@@ -36,6 +36,7 @@ class JsonlTraceSink:
         trace_slice: str = "all",
     ) -> None:
         self._path = path
+        self._path.parent.mkdir(parents=True, exist_ok=True)
         self._write_mode = write_mode
         self._flush_every_n = max(1, flush_every_n)
         self._flush_every_ms = flush_every_ms  # reserved, not used in sync runtime
@@ -98,6 +99,13 @@ class JsonlTraceSink:
     def close(self) -> None:
         self.flush()
         self._handle.close()
+
+    def diagnostics(self) -> dict[str, int]:
+        return {
+            "exported": self._emit_count,
+            "dropped": 0,
+            "buffered": len(self._buffer),
+        }
 
     def _write_lines(self, lines: Iterable[str]) -> None:
         for line in lines:
@@ -188,6 +196,7 @@ class OTelOtlpTraceSink:
         batch_flush_interval_ms: int = 0,
         queue_max_items: int = 10_000,
         queue_drop_policy: str = "drop_newest",
+        queue_block_timeout_ms: int = 100,
         retry_max_attempts: int = 0,
         retry_backoff_ms: int = 0,
         sleep_fn: Callable[[float], None] | None = None,
@@ -230,6 +239,7 @@ class OTelOtlpTraceSink:
         self._batch_flush_interval_ms = max(0, int(batch_flush_interval_ms))
         self._queue_max_items = max(1, int(queue_max_items))
         self._queue_drop_policy = queue_drop_policy
+        self._queue_block_timeout_ms = max(1, int(queue_block_timeout_ms))
         self._retry_max_attempts = max(0, int(retry_max_attempts))
         self._retry_backoff_ms = max(0, int(retry_backoff_ms))
         self._sleep_fn = sleep_fn if callable(sleep_fn) else _default_sleep
@@ -267,6 +277,8 @@ class OTelOtlpTraceSink:
         self._span_visibility_limit = max(1024, self._queue_max_items * 32)
         self._exported = 0
         self._dropped = 0
+        self._submit_timeout_total = 0
+        self._block_wait_ms_total = 0
 
     def emit(self, record: "TraceRecord") -> None:
         span_id_text = record.span_id if isinstance(record.span_id, str) and record.span_id else None
@@ -292,20 +304,8 @@ class OTelOtlpTraceSink:
             span=span,
             parent_span_id=parent_span_id_text,
         )
-        if len(self._span_buffer) >= self._queue_max_items:
-            if self._queue_drop_policy == "drop_newest":
-                self._dropped += 1
-                return
-            if self._queue_drop_policy == "drop_oldest":
-                self._span_buffer.pop(0)
-                self._dropped += 1
-            elif self._queue_drop_policy == "block_with_timeout":
-                self._dropped += 1
-                return
-            else:
-                self._dropped += 1
-                return
-        self._span_buffer.append(span)
+        if not self._admit_span_sync(span):
+            return
         now = self._time_fn()
         if self._batch_started_at is None:
             self._batch_started_at = now
@@ -345,14 +345,9 @@ class OTelOtlpTraceSink:
             span=span,
             parent_span_id=parent_span_id_text,
         )
-        if len(self._span_buffer) >= self._queue_max_items:
-            if self._queue_drop_policy == "drop_oldest":
-                self._span_buffer.pop(0)
-                self._dropped += 1
-            else:
-                self._dropped += 1
-                return
-        self._span_buffer.append(span)
+        admitted = await self._admit_span_async(span)
+        if not admitted:
+            return
         now = self._time_fn()
         if self._batch_started_at is None:
             self._batch_started_at = now
@@ -385,7 +380,95 @@ class OTelOtlpTraceSink:
         self._close_otel_sdk_provider()
 
     def diagnostics(self) -> dict[str, int]:
-        return {"exported": self._exported, "dropped": self._dropped}
+        return {
+            "exported": self._exported,
+            "dropped": self._dropped,
+            "buffered": len(self._span_buffer),
+            "queue_max_items": self._queue_max_items,
+            "submit_timeout_total": self._submit_timeout_total,
+            "block_wait_ms_total": self._block_wait_ms_total,
+        }
+
+    def _admit_span_sync(self, span: dict[str, object]) -> bool:
+        if len(self._span_buffer) < self._queue_max_items:
+            self._span_buffer.append(span)
+            return True
+        if self._queue_drop_policy == "drop_newest":
+            self._dropped += 1
+            return False
+        if self._queue_drop_policy == "drop_oldest":
+            self._span_buffer.pop(0)
+            self._dropped += 1
+            self._span_buffer.append(span)
+            return True
+        if self._queue_drop_policy != "block_with_timeout":
+            self._dropped += 1
+            return False
+
+        started_at = self._time_fn()
+        while len(self._span_buffer) >= self._queue_max_items:
+            now = self._time_fn()
+            if self._timer_flush_due(now):
+                self._flush_batch()
+                if len(self._span_buffer) < self._queue_max_items:
+                    break
+            elapsed_ms = max(0, int((now - started_at) * 1000))
+            if elapsed_ms >= self._queue_block_timeout_ms:
+                self._dropped += 1
+                self._submit_timeout_total += 1
+                self._block_wait_ms_total += elapsed_ms
+                return False
+            remaining_seconds = max(0.0, (self._queue_block_timeout_ms - elapsed_ms) / 1000.0)
+            self._sleep_fn(min(0.001, remaining_seconds))
+
+        waited_ms = max(0, int((self._time_fn() - started_at) * 1000))
+        self._block_wait_ms_total += waited_ms
+        self._span_buffer.append(span)
+        return True
+
+    async def _admit_span_async(self, span: dict[str, object]) -> bool:
+        if len(self._span_buffer) < self._queue_max_items:
+            self._span_buffer.append(span)
+            return True
+        if self._queue_drop_policy == "drop_newest":
+            self._dropped += 1
+            return False
+        if self._queue_drop_policy == "drop_oldest":
+            self._span_buffer.pop(0)
+            self._dropped += 1
+            self._span_buffer.append(span)
+            return True
+        if self._queue_drop_policy != "block_with_timeout":
+            self._dropped += 1
+            return False
+
+        started_at = self._time_fn()
+        while len(self._span_buffer) >= self._queue_max_items:
+            now = self._time_fn()
+            if self._timer_flush_due(now):
+                await self._flush_batch_async()
+                if len(self._span_buffer) < self._queue_max_items:
+                    break
+            elapsed_ms = max(0, int((now - started_at) * 1000))
+            if elapsed_ms >= self._queue_block_timeout_ms:
+                self._dropped += 1
+                self._submit_timeout_total += 1
+                self._block_wait_ms_total += elapsed_ms
+                return False
+            remaining_seconds = max(0.0, (self._queue_block_timeout_ms - elapsed_ms) / 1000.0)
+            await asyncio.sleep(min(0.001, remaining_seconds))
+
+        waited_ms = max(0, int((self._time_fn() - started_at) * 1000))
+        self._block_wait_ms_total += waited_ms
+        self._span_buffer.append(span)
+        return True
+
+    def _timer_flush_due(self, now: float) -> bool:
+        return (
+            self._batch_flush_interval_ms > 0
+            and self._batch_started_at is not None
+            and (now - self._batch_started_at) * 1000 >= self._batch_flush_interval_ms
+        )
 
     def _remember_span_visibility(self, span_id: str | None, *, visible: bool) -> None:
         if not isinstance(span_id, str) or not span_id:
@@ -1180,7 +1263,7 @@ def _otlp_kwargs(settings: dict[str, object]) -> dict[str, object]:
             kwargs[key] = bool(settings[key])
     for key in (
         "batch_max_items", "batch_flush_interval_ms", "queue_max_items",
-        "retry_max_attempts", "retry_backoff_ms",
+        "queue_block_timeout_ms", "retry_max_attempts", "retry_backoff_ms",
     ):
         if key in settings:
             kwargs[key] = int(settings[key])  # type: ignore[arg-type]

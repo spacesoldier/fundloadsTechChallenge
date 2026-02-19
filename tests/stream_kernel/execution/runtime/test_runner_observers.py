@@ -305,6 +305,86 @@ def test_runner_routes_observability_service_outputs_via_router_queue() -> None:
     assert dispatched.trace_id == "t1"
 
 
+def test_runner_autofills_trace_id_and_attributes_for_node_emitted_trace_dispatch_event() -> None:
+    routed: list[object] = []
+
+    class _DispatchingObserver:
+        def before_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+        ) -> object | None:
+            _ = (node_name, payload, ctx, trace_id)
+            return None
+
+        def after_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            outputs: list[object],
+            state: object | None,
+        ) -> list[object] | None:
+            _ = (payload, ctx, outputs, state)
+            if node_name != "worker":
+                return None
+            return [TraceDispatchEvent(payload={"kind": "trace"})]
+
+        def on_node_error(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            error: Exception,
+            state: object | None,
+        ) -> None:
+            _ = (node_name, payload, ctx, trace_id, error, state)
+            return None
+
+        def on_run_end(self) -> None:
+            return None
+
+    def worker(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = (payload, ctx)
+        return []
+
+    def trace_dispatch(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = ctx
+        routed.append(payload)
+        return []
+
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="seed", target="worker", trace_id="t1"))
+    registry = InMemoryConsumerRegistry({TraceDispatchEvent: ["system.obs.trace_dispatch"]})
+
+    runner = SyncRunner(
+        nodes={
+            "worker": worker,
+            "system.obs.trace_dispatch": trace_dispatch,
+        },
+        work_queue=queue,
+        context_service=InMemoryKvContextService(InMemoryKvStore()),
+        router=RoutingService(registry=registry, strict=True),
+        observability=_DispatchingObserver(),
+    )
+    runner.run()
+
+    assert len(routed) == 1
+    dispatched = routed[0]
+    assert isinstance(dispatched, TraceDispatchEvent)
+    assert dispatched.trace_id == "t1"
+    assert dispatched.attributes.get("source_node") == "worker"
+    assert dispatched.attributes.get("event_payload_type") == "dict"
+    assert dispatched.attributes.get("correlation_id") == "t1"
+
+
 def test_runner_guard_prevents_observability_self_dispatch_recursion_on_system_nodes() -> None:
     # RUN-UNI-D1: system.obs.* execution must not re-enter observability callbacks.
     system_exec_calls = 0

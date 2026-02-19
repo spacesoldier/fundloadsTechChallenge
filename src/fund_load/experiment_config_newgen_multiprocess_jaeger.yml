@@ -41,8 +41,8 @@ runtime:
               backend: httpx
               timeout_seconds: 2.0
               batch:
-                max_items: 5000
-                flush_interval_ms: 0
+                max_items: 64
+                flush_interval_ms: 100
               httpx:
                 mode: async
             service:
@@ -67,8 +67,8 @@ runtime:
               backend: httpx
               timeout_seconds: 2.0
               batch:
-                max_items: 5000
-                flush_interval_ms: 0
+                max_items: 64
+                flush_interval_ms: 100
               httpx:
                 mode: async
             service:
@@ -103,6 +103,18 @@ runtime:
       lifecycle_events:
         enabled: true
         level: info
+    monitoring:
+      exporters:
+        - kind: prometheus
+          enabled: true
+          settings:
+            mode: http_pull
+            namespace: stream_kernel
+            subsystem: observability
+            http:
+              host: 0.0.0.0
+              port: 9465
+              path: /metrics
   discovery_modules:
     - fund_load
   platform:
@@ -123,6 +135,7 @@ runtime:
       mode: stream
       control_poll_ms: 1.0
       batch_max_items: 10
+      stream_batch_max_items: 10
       timeout_seconds: 600.0
     process_groups:
       - name: execution.ingress

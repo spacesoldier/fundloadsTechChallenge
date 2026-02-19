@@ -14,13 +14,14 @@ from stream_kernel.observability.adapters import (
     log_jsonl,
     log_stdout_plain,
     log_stdout,
+    monitoring_prometheus,
+    monitoring_stdout,
     telemetry_stdout,
     trace_opentracing_bridge,
     trace_otel_otlp,
     trace_jsonl,
     trace_stdout,
 )
-from stream_kernel.observability.adapters.monitoring import monitoring_stdout
 from stream_kernel.observability.domain.logging import LogMessage
 from stream_kernel.observability.domain.monitoring import MonitoringMessage
 from stream_kernel.observability.domain.telemetry import TelemetryMessage
@@ -59,12 +60,14 @@ def test_log_and_telemetry_adapters_declare_standard_stream_contract() -> None:
     log_meta = get_adapter_meta(log_stdout)
     telemetry_meta = get_adapter_meta(telemetry_stdout)
     monitoring_meta = get_adapter_meta(monitoring_stdout)
+    monitoring_prometheus_meta = get_adapter_meta(monitoring_prometheus)
     assert log_jsonl_meta is not None
     assert log_plain_file_meta is not None
     assert log_plain_meta is not None
     assert log_meta is not None
     assert telemetry_meta is not None
     assert monitoring_meta is not None
+    assert monitoring_prometheus_meta is not None
     assert list(log_jsonl_meta.consumes) == [LogMessage]
     assert list(log_plain_file_meta.consumes) == [LogMessage]
     assert list(log_plain_meta.consumes) == [LogMessage]
@@ -77,12 +80,15 @@ def test_log_and_telemetry_adapters_declare_standard_stream_contract() -> None:
     assert list(telemetry_meta.binds) == [("stream", TelemetryMessage)]
     assert list(monitoring_meta.consumes) == [MonitoringMessage]
     assert list(monitoring_meta.binds) == [("stream", MonitoringMessage)]
+    assert list(monitoring_prometheus_meta.consumes) == [MonitoringMessage]
+    assert list(monitoring_prometheus_meta.binds) == [("stream", MonitoringMessage)]
     assert log_jsonl_meta.execution_mode == "async"
     assert log_plain_file_meta.execution_mode == "async"
     assert log_plain_meta.execution_mode == "async"
     assert log_meta.execution_mode == "async"
     assert telemetry_meta.execution_mode == "async"
     assert monitoring_meta.execution_mode == "async"
+    assert monitoring_prometheus_meta.execution_mode == "async"
 
 
 def test_trace_jsonl_requires_path_setting() -> None:
@@ -129,6 +135,7 @@ def test_observability_adapters_are_discoverable() -> None:
     module.log_stdout = log_stdout
     module.telemetry_stdout = telemetry_stdout
     module.monitoring_stdout = monitoring_stdout
+    module.monitoring_prometheus = monitoring_prometheus
     discovered = discover_adapters([module])
     assert set(discovered) == {
         "trace_stdout",
@@ -141,6 +148,7 @@ def test_observability_adapters_are_discoverable() -> None:
         "log_stdout",
         "telemetry_stdout",
         "monitoring_stdout",
+        "monitoring_prometheus",
     }
     # Smoke build for jsonl adapter to ensure factory signature remains valid.
     sink = discovered["trace_jsonl"]({"path": str(Path("trace.jsonl"))})
@@ -324,3 +332,31 @@ def test_trace_otel_otlp_transport_group_backend_overrides_settings_backend(
     )
     assert isinstance(sink, OTelOtlpTraceSink)
     assert sink._backend == "requests"
+
+
+def test_trace_otel_otlp_passes_queue_block_timeout_to_sink() -> None:
+    sink = trace_otel_otlp(
+        {
+            "endpoint": "http://collector:4318/v1/traces",
+            "queue": {
+                "drop_policy": "block_with_timeout",
+                "block_timeout_ms": 250,
+            },
+        }
+    )
+    assert isinstance(sink, OTelOtlpTraceSink)
+    assert sink._queue_drop_policy == "block_with_timeout"
+    assert sink._queue_block_timeout_ms == 250
+
+
+def test_trace_otel_otlp_rejects_invalid_queue_block_timeout() -> None:
+    with pytest.raises(ValueError, match="queue\\.block_timeout_ms must be an integer > 0"):
+        trace_otel_otlp(
+            {
+                "endpoint": "http://collector:4318/v1/traces",
+                "queue": {
+                    "drop_policy": "block_with_timeout",
+                    "block_timeout_ms": 0,
+                },
+            }
+        )

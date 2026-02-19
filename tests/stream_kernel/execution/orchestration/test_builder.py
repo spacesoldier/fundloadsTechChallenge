@@ -530,6 +530,78 @@ def test_build_runtime_observability_adapter_instances_supports_file_plain_loggi
     assert instances["log_file_plain"] is created[0]
 
 
+def test_build_runtime_observability_adapter_instances_skips_monitoring_exporters_for_worker_role() -> None:
+    # monitoring sinks are supervisor-owned; worker runtime must not bind monitoring HTTP/textfile exporters.
+    registry = AdapterRegistry()
+    created: list[dict[str, object]] = []
+
+    def _factory(settings: dict[str, object]) -> object:
+        created.append(dict(settings))
+        return object()
+
+    registry.register("monitoring_prometheus", "monitoring_prometheus", _factory)
+
+    instances = build_runtime_observability_adapter_instances(
+        runtime={
+            "__process_role": "worker",
+            "strict": True,
+            "observability": {
+                "monitoring": {
+                    "exporters": [
+                        {
+                            "kind": "prometheus",
+                            "settings": {
+                                "mode": "http_pull",
+                                "http": {"host": "0.0.0.0", "port": 9465, "path": "/metrics"},
+                            },
+                        }
+                    ]
+                }
+            },
+        },
+        registry=registry,
+    )
+
+    assert instances == {}
+    assert created == []
+
+
+def test_build_runtime_observability_adapter_instances_skips_monitoring_exporters_for_process_supervisor_mode() -> None:
+    # In process_supervisor mode monitoring sinks are created only via supervisor.configure_monitoring().
+    registry = AdapterRegistry()
+    created: list[dict[str, object]] = []
+
+    def _factory(settings: dict[str, object]) -> object:
+        created.append(dict(settings))
+        return object()
+
+    registry.register("monitoring_prometheus", "monitoring_prometheus", _factory)
+
+    instances = build_runtime_observability_adapter_instances(
+        runtime={
+            "strict": True,
+            "platform": {"bootstrap": {"mode": "process_supervisor"}},
+            "observability": {
+                "monitoring": {
+                    "exporters": [
+                        {
+                            "kind": "prometheus",
+                            "settings": {
+                                "mode": "http_pull",
+                                "http": {"host": "0.0.0.0", "port": 9465, "path": "/metrics"},
+                            },
+                        }
+                    ]
+                }
+            },
+        },
+        registry=registry,
+    )
+
+    assert instances == {}
+    assert created == []
+
+
 def test_build_injection_registry_from_bindings_requires_instance() -> None:
     with pytest.raises(ValueError):
         build_injection_registry_from_bindings({}, {"source": [("stream", _StreamPort)]})

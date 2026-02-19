@@ -29,3 +29,16 @@ class MonitorDispatchEvent:
     payload: object
     trace_id: str | None = None
     attributes: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class MonitoringMetricsSnapshotEvent:
+    stage: str
+    snapshot: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class MonitoringMetricsSnapshotResult:
+    stage: str
+    snapshot: dict[str, object]
+    metric_records: list[dict[str, object]] = field(default_factory=list)

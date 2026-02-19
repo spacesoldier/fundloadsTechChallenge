@@ -436,3 +436,115 @@ continues until the queue is empty before exiting.
 
 - `tests/stream_kernel/execution/runtime/test_sync_runner_stop.py` — graceful stop
 - `tests/stream_kernel/execution/runtime/test_phase_e_async_emit.py` — async emit path
+
+---
+
+## 10. Backpressure and trace-loss diagnostics
+
+This section defines how to reason about missing spans in multiprocess mode and
+which metrics must be observed before changing batching parameters.
+
+### 10.1 Trace delivery stages (where pressure can accumulate)
+
+For multiprocess tracing, one business event crosses several queues/buffers:
+
+1. worker runtime emits `worker_trace` over control channel;
+2. supervisor ingests records and submits into trace dispatch loop queue;
+3. dispatch loop invokes sink callbacks (`jsonl`, `otel_otlp_*`, etc.);
+4. sink-level batch buffers flush by item count or timer.
+
+There are two independent pressure points:
+
+- supervisor dispatch queue (`AsyncDispatchLoop`);
+- sink-local buffers (for example OTLP span buffer).
+
+### 10.2 Distinguish filtering from losses
+
+Not every "missing span" is a transport loss.
+
+- **View filtering** (`trace_view=logical|topology`, `trace_slice=business_logic|platform_internals`)
+  can remove spans by design.
+- **Runtime drop** means a record was accepted upstream but dropped due to queue policy.
+- **Shutdown truncation** means pending data remained at stop/close boundary.
+
+The required diagnosis sequence:
+
+1. verify exporter view/slice rules;
+2. inspect `trace_dispatch_diagnostics` lifecycle events;
+3. inspect sink diagnostics (`exported`, `dropped`, `buffered`);
+4. only then tune `batch.max_items` / `flush_interval_ms`.
+
+### 10.3 Lifecycle diagnostics event contract (`bootstrap.trace_dispatch_diagnostics`)
+
+Supervisor emits this event at:
+
+- `stage=stop_requested`
+- `stage=close_begin`
+- `stage=close_end`
+
+Key fields:
+
+- `dispatch_submitted` — records accepted by dispatch queue.
+- `dispatch_processed` — records processed by dispatch worker.
+- `dispatch_failed` — handler failures in dispatch worker.
+- `dispatch_dropped` — queue-level drops counted by dispatch worker.
+- `dispatch_queue_depth` — queue depth snapshot.
+- `dispatch_pending` — pending estimate (`submitted - processed - failed`, clamped).
+- `dispatch_submit_dropped_total` — submit-time drops at supervisor ingress.
+- `sink_pending_total` — sum of sink pending estimates.
+- `pending_total_estimate` — `dispatch_pending + sink_pending_total`.
+- `sink_diagnostics[]`:
+  - `sink_kind`, `sink_index`
+  - `exported`, `dropped`
+  - optional `buffered`, `queue_max_items`
+  - `pending_estimate` per sink
+
+Interpretation rules:
+
+- `pending_total_estimate > 0` at `close_end` -> shutdown likely cut in-flight observability.
+- `pending_total_estimate == 0` and `dispatch_submit_dropped_total > 0` ->
+  losses happened during steady-state overload (not at shutdown).
+- sink `dropped > 0` with dispatch drops near zero -> sink-local backpressure overload.
+
+### 10.4 Backpressure policy target
+
+Lossy policies are acceptable for exploratory runs, but production profile should
+favor bounded blocking over drops:
+
+- dispatch queue policy: `block_with_timeout` (instead of immediate drop);
+- sink queue policy: `block_with_timeout` when end-to-end trace completeness matters;
+- keep explicit timeout budget to prevent deadlocks under collector outage.
+
+Recommended baseline tuning order:
+
+1. ensure drop counters are observable (`dispatch_submit_dropped_total`, sink `dropped`);
+2. increase batch size moderately (`64 -> 128`) before increasing queue capacity;
+3. then increase queue capacity as burst absorber;
+4. only then reduce flush interval for lower latency.
+
+### 10.5 Prometheus mapping (target metric names)
+
+Prometheus integration should expose diagnostics as numeric series (supervisor-owned):
+
+- `stream_kernel_trace_dispatch_submitted_total`
+- `stream_kernel_trace_dispatch_processed_total`
+- `stream_kernel_trace_dispatch_failed_total`
+- `stream_kernel_trace_dispatch_dropped_total`
+- `stream_kernel_trace_dispatch_queue_depth`
+- `stream_kernel_trace_dispatch_pending`
+- `stream_kernel_trace_dispatch_submit_dropped_total`
+- `stream_kernel_trace_sink_exported_total{sink_kind,sink_index}`
+- `stream_kernel_trace_sink_dropped_total{sink_kind,sink_index}`
+- `stream_kernel_trace_sink_buffered{sink_kind,sink_index}`
+- `stream_kernel_trace_pending_total_estimate`
+
+Optional latency/size histograms for OTLP exporters:
+
+- `stream_kernel_otlp_export_batch_items`
+- `stream_kernel_otlp_export_payload_bytes`
+- `stream_kernel_otlp_export_duration_seconds`
+- `stream_kernel_otlp_export_retries_total`
+
+Prometheus exporter design and rollout plan is tracked separately:
+
+- `docs/framework/initial_stage/_work/observability_backpressure_and_prometheus_exporter_tdd_plan.md`

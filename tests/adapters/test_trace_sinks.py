@@ -260,6 +260,28 @@ def test_jsonl_trace_sink_flush_writes_buffered_lines(tmp_path: Path) -> None:
     assert json.loads(lines[0])["step_name"] == "step-a"
 
 
+def test_jsonl_trace_sink_diagnostics_report_buffered_records(tmp_path: Path) -> None:
+    path = tmp_path / "trace_diag.jsonl"
+    sink = JsonlTraceSink(path=path, write_mode="batch", flush_every_n=10, fsync_every_n=None)
+    sink.emit(_record("step-a", 0))
+    diagnostics_before_flush = sink.diagnostics()
+    sink.flush()
+    diagnostics_after_flush = sink.diagnostics()
+    sink.close()
+
+    assert diagnostics_before_flush["buffered"] == 1
+    assert diagnostics_before_flush["exported"] == 1
+    assert diagnostics_after_flush["buffered"] == 0
+
+
+def test_jsonl_trace_sink_creates_parent_directory(tmp_path: Path) -> None:
+    path = tmp_path / "nested" / "traces" / "trace.jsonl"
+    sink = JsonlTraceSink(path=path, write_mode="line", flush_every_n=1, fsync_every_n=None)
+    sink.emit(_record("step-a", 0))
+    sink.close()
+    assert path.exists()
+
+
 def test_jsonl_trace_sink_emit_async_batch_offloads_only_flush_boundaries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1331,6 +1353,75 @@ def test_otel_otlp_trace_sink_obs_aio_02_queue_drop_policy_is_deterministic(
     assert len(posted_drop_oldest) == 1
     spans_oldest = posted_drop_oldest[0]["resourceSpans"][0]["scopeSpans"][0]["spans"]
     assert spans_oldest[0]["name"] == "step-b"
+
+
+def test_otel_otlp_trace_sink_obs_aio_02b_block_with_timeout_tracks_timeout_metrics() -> None:
+    # OBS-AIO-02B: block_with_timeout should fail deterministically and expose timeout diagnostics.
+    exported: list[str] = []
+    clock = {"now": 0.0}
+
+    def _time_fn() -> float:
+        return float(clock["now"])
+
+    def _sleep_fn(seconds: float) -> None:
+        clock["now"] = float(clock["now"]) + max(0.0, seconds)
+
+    sink = OTelOtlpTraceSink(
+        endpoint="http://collector:4318/v1/traces",
+        backend="aiohttp",
+        export_fn=lambda span: exported.append(str(span.get("name"))),
+        batch_max_items=10,
+        queue_max_items=1,
+        queue_drop_policy="block_with_timeout",
+        queue_block_timeout_ms=5,
+        time_fn=_time_fn,
+        sleep_fn=_sleep_fn,
+    )
+    sink.emit(_record("step-a", 0))
+    sink.emit(_record("step-b", 1))
+    sink.close()
+    diagnostics = sink.diagnostics()
+
+    assert exported == ["step-a"]
+    assert diagnostics["exported"] == 1
+    assert diagnostics["dropped"] == 1
+    assert diagnostics["submit_timeout_total"] == 1
+    assert diagnostics["block_wait_ms_total"] >= 5
+
+
+def test_otel_otlp_trace_sink_obs_aio_02c_block_with_timeout_can_flush_and_admit() -> None:
+    # OBS-AIO-02C: block_with_timeout may recover by timer-driven flush and preserve payload.
+    exported: list[str] = []
+    clock = {"now": 0.0}
+
+    def _time_fn() -> float:
+        return float(clock["now"])
+
+    def _sleep_fn(seconds: float) -> None:
+        clock["now"] = float(clock["now"]) + max(0.0, seconds)
+
+    sink = OTelOtlpTraceSink(
+        endpoint="http://collector:4318/v1/traces",
+        backend="aiohttp",
+        export_fn=lambda span: exported.append(str(span.get("name"))),
+        batch_max_items=10,
+        batch_flush_interval_ms=2,
+        queue_max_items=1,
+        queue_drop_policy="block_with_timeout",
+        queue_block_timeout_ms=10,
+        time_fn=_time_fn,
+        sleep_fn=_sleep_fn,
+    )
+    sink.emit(_record("step-a", 0))
+    sink.emit(_record("step-b", 1))
+    sink.close()
+    diagnostics = sink.diagnostics()
+
+    assert exported == ["step-a", "step-b"]
+    assert diagnostics["exported"] == 2
+    assert diagnostics["dropped"] == 0
+    assert diagnostics["submit_timeout_total"] == 0
+    assert diagnostics["block_wait_ms_total"] >= 1
 
 
 def test_otel_otlp_trace_sink_obs_aio_03_flush_interval_sends_under_low_throughput(

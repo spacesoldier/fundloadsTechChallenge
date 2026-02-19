@@ -10,7 +10,11 @@ import pytest
 
 from stream_kernel.application_context.service import discover_services
 from stream_kernel.kernel.trace import MessageSignature, TraceRecord
-from stream_kernel.observability.events import TraceDispatchEvent
+from stream_kernel.observability.events import (
+    MonitoringMetricsSnapshotEvent,
+    MonitoringMetricsSnapshotResult,
+    TraceDispatchEvent,
+)
 from stream_kernel.observability.domain.logging import LogMessage
 from stream_kernel.platform.services.runtime.bootstrap import (
     BootstrapSupervisor,
@@ -132,6 +136,43 @@ def test_p5pre_sup_07_lifecycle_events_can_emit_structured_logs(monkeypatch) -> 
     assert message.level == "debug"
     assert message.message == "bootstrap.test_event"
     assert message.fields.get("group_name") == "execution.cpu"
+
+
+def test_p5pre_sup_07a_lifecycle_events_add_trace_summary_fields_for_grep() -> None:
+    supervisor = MultiprocessBootstrapSupervisor()
+
+    supervisor._emit_event(  # noqa: SLF001 - contract probe
+        kind="boundary_dispatch_item",
+        trace_ids=["run:1", "run:2", "", 123],  # type: ignore[list-item]
+        targets=["node.a", "node.b", ""],
+        payload_types=["LoadAttempt", "TraceDispatchEvent", ""],
+    )
+
+    events = _lifecycle_events(supervisor)
+    last = events[-1]
+    assert last.get("trace_ids") == ["run:1", "run:2", "", 123]
+    assert last.get("trace_id_first") == "run:1"
+    assert last.get("trace_count") == 2
+    assert "trace_id" not in last
+    assert last.get("target_first") == "node.a"
+    assert last.get("target_count") == 2
+    assert last.get("payload_type_first") == "LoadAttempt"
+    assert last.get("payload_type_count") == 2
+
+
+def test_p5pre_sup_07b_lifecycle_events_promote_single_trace_id_for_grep() -> None:
+    supervisor = MultiprocessBootstrapSupervisor()
+
+    supervisor._emit_event(  # noqa: SLF001 - contract probe
+        kind="boundary_receive_item",
+        trace_ids=["run:single"],
+    )
+
+    events = _lifecycle_events(supervisor)
+    last = events[-1]
+    assert last.get("trace_id_first") == "run:single"
+    assert last.get("trace_count") == 1
+    assert last.get("trace_id") == "run:single"
 
 
 def test_p5pre_sup_08_worker_stop_closes_child_runtime_scope(monkeypatch) -> None:
@@ -342,6 +383,361 @@ def test_supervisor_tracing_dispatch_does_not_call_asyncio_run_per_record(tmp_pa
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(rows) == 1
     assert rows[0]["step_name"] == "compute_time_keys"
+
+
+def test_supervisor_trace_dispatch_diagnostics_expose_pending_at_stop() -> None:
+    class _LoopStub:
+        def metrics(self) -> dict[str, int]:
+            return {
+                "submitted": 11,
+                "processed": 7,
+                "failed": 1,
+                "dropped": 0,
+                "queue_depth": 3,
+                "pending": 3,
+                "running": 1,
+            }
+
+    class _SinkStub:
+        def diagnostics(self) -> dict[str, int]:
+            return {"exported": 7, "dropped": 0, "buffered": 2}
+
+    supervisor = MultiprocessBootstrapSupervisor()
+    supervisor._trace_dispatch_loop = _LoopStub()  # noqa: SLF001 - contract probe.
+    supervisor._trace_sinks = [_SinkStub()]  # noqa: SLF001 - contract probe.
+    supervisor._tracing_enabled = True  # noqa: SLF001 - contract probe.
+    supervisor._trace_dispatch_dropped = 4  # noqa: SLF001 - contract probe.
+
+    supervisor._emit_trace_dispatch_diagnostics(stage="stop_requested")  # noqa: SLF001 - contract probe.
+    events = _lifecycle_events(supervisor)
+    event = events[-1]
+
+    assert event.get("kind") == "trace_dispatch_diagnostics"
+    assert event.get("stage") == "stop_requested"
+    assert event.get("dispatch_pending") == 3
+    assert event.get("sink_pending_total") == 2
+    assert event.get("pending_total_estimate") == 5
+    assert event.get("dispatch_submit_dropped_total") == 4
+    sink_diagnostics = event.get("sink_diagnostics")
+    assert isinstance(sink_diagnostics, list)
+    assert sink_diagnostics
+    first = sink_diagnostics[0]
+    assert isinstance(first, dict)
+    assert first.get("buffered") == 2
+    assert first.get("pending_estimate") == 2
+
+
+def test_supervisor_trace_dispatch_diagnostics_feed_metrics_service() -> None:
+    class _LoopStub:
+        def metrics(self) -> dict[str, int]:
+            return {
+                "submitted": 2,
+                "processed": 2,
+                "failed": 0,
+                "dropped": 0,
+                "queue_depth": 0,
+                "pending": 0,
+                "running": 1,
+            }
+
+    class _MetricsStub:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object]]] = []
+
+        def ingest_trace_dispatch_snapshot(self, *, stage: str, snapshot: dict[str, object]) -> None:
+            self.calls.append((stage, dict(snapshot)))
+
+        def snapshot(self) -> dict[str, object]:
+            return {}
+
+        def metric_records(self) -> list[dict[str, object]]:
+            return []
+
+    supervisor = MultiprocessBootstrapSupervisor()
+    supervisor._trace_dispatch_loop = _LoopStub()  # noqa: SLF001 - contract probe.
+    supervisor._trace_sinks = []  # noqa: SLF001 - contract probe.
+    supervisor._tracing_enabled = True  # noqa: SLF001 - contract probe.
+    metrics_stub = _MetricsStub()
+    supervisor.observability_metrics_service = metrics_stub  # noqa: SLF001 - contract probe.
+
+    supervisor._emit_trace_dispatch_diagnostics(stage="stop_requested")  # noqa: SLF001 - contract probe.
+
+    assert len(metrics_stub.calls) == 1
+    stage, snapshot = metrics_stub.calls[0]
+    assert stage == "stop_requested"
+    assert snapshot.get("dispatch_submitted") == 2
+    assert snapshot.get("dispatch_pending") == 0
+
+
+def test_supervisor_trace_dispatch_queue_policy_is_wired_from_tracing_settings(tmp_path) -> None:
+    path = tmp_path / "supervisor_trace_dispatch_policy.jsonl"
+    supervisor = MultiprocessBootstrapSupervisor()
+    supervisor.configure_tracing(
+        {
+            "dispatch_queue": {
+                "max_items": 32,
+                "drop_policy": "block_with_timeout",
+                "block_timeout_ms": 250,
+            },
+            "exporters": [
+                {
+                    "kind": "jsonl",
+                    "settings": {"path": str(path), "write_mode": "line", "flush_every_n": 1},
+                }
+            ],
+        },
+        strict=True,
+    )
+
+    loop = supervisor._trace_dispatch_loop  # noqa: SLF001 - contract probe.
+    assert loop is not None
+    metrics = loop.metrics()
+    assert metrics.get("queue_max_items") == 32
+    assert metrics.get("drop_policy") == "block_with_timeout"
+    assert supervisor._trace_dispatch_submit_timeout_seconds == 0.25  # noqa: SLF001 - contract probe.
+    supervisor._close_trace_sinks()  # noqa: SLF001 - contract probe.
+
+
+def test_supervisor_monitoring_prometheus_textfile_exports_metrics_snapshot(tmp_path) -> None:
+    class _LoopStub:
+        def metrics(self) -> dict[str, int]:
+            return {
+                "submitted": 3,
+                "processed": 2,
+                "failed": 0,
+                "dropped": 0,
+                "queue_depth": 1,
+                "pending": 1,
+                "running": 1,
+            }
+
+    path = tmp_path / "metrics.prom"
+    supervisor = MultiprocessBootstrapSupervisor()
+    supervisor._trace_dispatch_loop = _LoopStub()  # noqa: SLF001 - contract probe.
+    supervisor._trace_sinks = []  # noqa: SLF001 - contract probe.
+    supervisor._tracing_enabled = True  # noqa: SLF001 - contract probe.
+    supervisor.configure_monitoring(
+        {
+            "exporters": [
+                {
+                    "kind": "prometheus",
+                    "settings": {
+                        "mode": "textfile",
+                        "textfile": {"path": str(path)},
+                    },
+                }
+            ]
+        },
+        strict=True,
+    )
+
+    supervisor._emit_trace_dispatch_diagnostics(stage="stop_requested")  # noqa: SLF001 - contract probe.
+    supervisor._close_monitoring_sinks()  # noqa: SLF001 - contract probe.
+    payload = path.read_text(encoding="utf-8")
+    assert "stream_kernel_observability_dispatch_submitted_total" in payload
+    assert "stream_kernel_observability_dispatch_pending" in payload
+
+
+def test_supervisor_monitoring_exporter_failure_is_isolated() -> None:
+    class _LoopStub:
+        def metrics(self) -> dict[str, int]:
+            return {
+                "submitted": 1,
+                "processed": 1,
+                "failed": 0,
+                "dropped": 0,
+                "queue_depth": 0,
+                "pending": 0,
+                "running": 1,
+            }
+
+    class _BrokenMonitoringExporter:
+        def publish_metrics(self, *, records: list[dict[str, object]], snapshot: dict[str, object], stage: str) -> None:
+            _ = (records, snapshot, stage)
+            raise RuntimeError("monitoring-exporter-failed")
+
+        def close(self) -> None:
+            return None
+
+    supervisor = MultiprocessBootstrapSupervisor()
+    supervisor._trace_dispatch_loop = _LoopStub()  # noqa: SLF001 - contract probe.
+    supervisor._trace_sinks = []  # noqa: SLF001 - contract probe.
+    supervisor._tracing_enabled = True  # noqa: SLF001 - contract probe.
+    supervisor._monitoring_exporters = [_BrokenMonitoringExporter()]  # noqa: SLF001 - contract probe.
+
+    supervisor._emit_trace_dispatch_diagnostics(stage="close_begin")  # noqa: SLF001 - contract probe.
+    events = _lifecycle_events(supervisor)
+    assert events[-1].get("kind") == "trace_dispatch_diagnostics"
+    assert events[-1].get("stage") == "close_begin"
+
+
+def test_supervisor_stop_groups_flushes_monitoring_metrics_before_exporter_close() -> None:
+    class _LoopStub:
+        def metrics(self) -> dict[str, int]:
+            return {
+                "submitted": 5,
+                "processed": 5,
+                "failed": 0,
+                "dropped": 0,
+                "queue_depth": 0,
+                "pending": 0,
+                "running": 1,
+            }
+
+        def stop(self, *, drain: bool, timeout_seconds: float) -> None:
+            _ = (drain, timeout_seconds)
+            return None
+
+    class _SinkStub:
+        def diagnostics(self) -> dict[str, int]:
+            return {"exported": 5, "dropped": 0, "buffered": 0}
+
+        def close(self) -> None:
+            return None
+
+    class _MonitoringProbe:
+        def __init__(self) -> None:
+            self.closed = False
+            self.calls: list[dict[str, object]] = []
+
+        def publish_metrics(self, *, records: list[dict[str, object]], snapshot: dict[str, object], stage: str) -> None:
+            assert self.closed is False
+            self.calls.append(
+                {
+                    "stage": stage,
+                    "pending_total_estimate": snapshot.get("pending_total_estimate"),
+                    "metric_count": len(records),
+                }
+            )
+
+        def close(self) -> None:
+            self.closed = True
+
+    supervisor = MultiprocessBootstrapSupervisor()
+    supervisor._trace_dispatch_loop = _LoopStub()  # noqa: SLF001 - contract probe.
+    supervisor._trace_sinks = [_SinkStub()]  # noqa: SLF001 - contract probe.
+    supervisor._tracing_enabled = True  # noqa: SLF001 - contract probe.
+    probe = _MonitoringProbe()
+    supervisor._monitoring_exporters = [probe]  # noqa: SLF001 - contract probe.
+
+    supervisor.stop_groups(graceful_timeout_seconds=1, drain_inflight=True)
+
+    assert probe.closed is True
+    assert [call["stage"] for call in probe.calls] == ["stop_requested", "close_begin", "close_end"]
+    assert probe.calls[-1]["pending_total_estimate"] == 0
+
+
+def test_supervisor_overload_metrics_are_alertable_for_monitoring_exporters() -> None:
+    class _LoopStub:
+        def metrics(self) -> dict[str, int]:
+            return {
+                "submitted": 50,
+                "processed": 20,
+                "failed": 1,
+                "dropped": 4,
+                "queue_depth": 12,
+                "pending": 12,
+                "running": 1,
+            }
+
+    class _SinkStub:
+        def diagnostics(self) -> dict[str, int]:
+            return {"exported": 20, "dropped": 2, "buffered": 8}
+
+    class _MonitoringProbe:
+        def __init__(self) -> None:
+            self.records_by_stage: dict[str, list[dict[str, object]]] = {}
+
+        def publish_metrics(self, *, records: list[dict[str, object]], snapshot: dict[str, object], stage: str) -> None:
+            _ = snapshot
+            self.records_by_stage[stage] = [item for item in records if isinstance(item, dict)]
+
+        def close(self) -> None:
+            return None
+
+    supervisor = MultiprocessBootstrapSupervisor()
+    supervisor._trace_dispatch_loop = _LoopStub()  # noqa: SLF001 - contract probe.
+    supervisor._trace_sinks = [_SinkStub()]  # noqa: SLF001 - contract probe.
+    supervisor._trace_dispatch_dropped = 3  # noqa: SLF001 - contract probe.
+    supervisor._tracing_enabled = True  # noqa: SLF001 - contract probe.
+    probe = _MonitoringProbe()
+    supervisor._monitoring_exporters = [probe]  # noqa: SLF001 - contract probe.
+
+    supervisor._emit_trace_dispatch_diagnostics(stage="stop_requested")  # noqa: SLF001 - contract probe.
+
+    records = probe.records_by_stage.get("stop_requested", [])
+    metric_map = {
+        str(item.get("name")): int(item.get("value", 0))
+        for item in records
+        if isinstance(item.get("name"), str) and isinstance(item.get("value"), int)
+    }
+    assert metric_map.get("stream_kernel_observability_dispatch_dropped_total") == 4
+    assert metric_map.get("stream_kernel_observability_dispatch_submit_dropped_total") == 3
+    assert metric_map.get("stream_kernel_observability_sink_dropped_total") == 2
+    assert metric_map.get("stream_kernel_observability_loss_estimate_total") == 9
+
+
+def test_supervisor_trace_dispatch_diagnostics_uses_monitoring_metrics_system_node_contract() -> None:
+    class _LoopStub:
+        def metrics(self) -> dict[str, int]:
+            return {
+                "submitted": 2,
+                "processed": 2,
+                "failed": 0,
+                "dropped": 0,
+                "queue_depth": 0,
+                "pending": 0,
+                "running": 1,
+            }
+
+    class _MonitoringProbe:
+        def __init__(self) -> None:
+            self.metric_counts: list[int] = []
+
+        def publish_metrics(self, *, records: list[dict[str, object]], snapshot: dict[str, object], stage: str) -> None:
+            _ = (snapshot, stage)
+            self.metric_counts.append(len(records))
+
+        def close(self) -> None:
+            return None
+
+    class _NodeProbe:
+        def __init__(self) -> None:
+            self.events: list[MonitoringMetricsSnapshotEvent] = []
+
+        def __call__(self, event: object, _ctx: object | None) -> list[object]:
+            if isinstance(event, MonitoringMetricsSnapshotEvent):
+                self.events.append(event)
+                return [
+                    MonitoringMetricsSnapshotResult(
+                        stage=event.stage,
+                        snapshot=dict(event.snapshot),
+                        metric_records=[
+                            {
+                                "name": "stream_kernel_observability_dispatch_submitted_total",
+                                "type": "counter",
+                                "value": 2,
+                                "labels": {"scope": "observability_transport"},
+                            }
+                        ],
+                    )
+                ]
+            return []
+
+    supervisor = MultiprocessBootstrapSupervisor()
+    supervisor._trace_dispatch_loop = _LoopStub()  # noqa: SLF001 - contract probe.
+    supervisor._trace_sinks = []  # noqa: SLF001 - contract probe.
+    supervisor._tracing_enabled = True  # noqa: SLF001 - contract probe.
+    node_probe = _NodeProbe()
+    supervisor._monitoring_metrics_dispatch_node = node_probe  # noqa: SLF001 - contract probe.
+    exporter = _MonitoringProbe()
+    supervisor._monitoring_exporters = [exporter]  # noqa: SLF001 - contract probe.
+
+    supervisor._emit_trace_dispatch_diagnostics(stage="stop_requested")  # noqa: SLF001 - contract probe.
+
+    assert len(node_probe.events) == 1
+    assert node_probe.events[0].stage == "stop_requested"
+    assert exporter.metric_counts == [1]
 
 
 def test_supervisor_tracing_view_aliases_apply_slice_defaults() -> None:

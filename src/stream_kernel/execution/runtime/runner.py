@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable
 
 from stream_kernel.application_context.inject import inject
@@ -13,6 +13,12 @@ from stream_kernel.platform.services.observability import (
     ObservabilityPipelineService,
     ObservabilityService,
     resolve_pipeline_observability,
+)
+from stream_kernel.observability.events import (
+    LogDispatchEvent,
+    MetricDispatchEvent,
+    MonitorDispatchEvent,
+    TraceDispatchEvent,
 )
 from stream_kernel.platform.services.state.context import ContextService
 from stream_kernel.routing.envelope import Envelope
@@ -506,6 +512,11 @@ class SyncRunner:
         router: RoutingService,
     ) -> None:
         for output in self._coerce_observability_service_outputs(service_outputs):
+            output = self._normalize_observability_output(
+                output=output,
+                source_node=source_node,
+                trace_id=trace_id,
+            )
             explicit_trace_id = output.trace_id if isinstance(output, Envelope) else None
             explicit_reply_to = output.reply_to if isinstance(output, Envelope) else None
             explicit_span_id = output.span_id if isinstance(output, Envelope) else None
@@ -560,6 +571,30 @@ class SyncRunner:
                     self._collect_external_delivery(envelope_out)
                     continue
                 work_queue.push(envelope_out)
+
+    @staticmethod
+    def _normalize_observability_output(
+        *,
+        output: object,
+        source_node: str,
+        trace_id: str | None,
+    ) -> object:
+        if not isinstance(trace_id, str) or not trace_id:
+            return output
+        if not isinstance(
+            output,
+            (TraceDispatchEvent, LogDispatchEvent, MetricDispatchEvent, MonitorDispatchEvent),
+        ):
+            return output
+        attrs = dict(output.attributes)
+        attrs.setdefault("source_node", source_node)
+        attrs.setdefault("event_payload_type", type(output.payload).__name__)
+        attrs.setdefault("correlation_id", trace_id)
+        if output.trace_id is None:
+            return replace(output, trace_id=trace_id, attributes=attrs)
+        if attrs != output.attributes:
+            return replace(output, attributes=attrs)
+        return output
 
     def _collect_external_delivery(self, envelope: Envelope) -> None:
         if isinstance(self.external_deliveries, list):
@@ -942,6 +977,19 @@ class AsyncRunner:
     @staticmethod
     def _coerce_observability_service_outputs(candidate: object) -> list[object]:
         return SyncRunner._coerce_observability_service_outputs(candidate)
+
+    @staticmethod
+    def _normalize_observability_output(
+        *,
+        output: object,
+        source_node: str,
+        trace_id: str | None,
+    ) -> object:
+        return SyncRunner._normalize_observability_output(
+            output=output,
+            source_node=source_node,
+            trace_id=trace_id,
+        )
 
     def _route_observability_service_outputs(
         self,

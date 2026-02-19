@@ -101,6 +101,7 @@ runtime:
       mode: stream
       control_poll_ms: 1.0
       batch_max_items: 1000
+      stream_batch_max_items: 1000
       timeout_seconds: 600.0
     process_groups:
       - name: execution.ingress

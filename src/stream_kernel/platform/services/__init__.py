@@ -22,7 +22,9 @@ from stream_kernel.platform.services.state.consumer_registry import DiscoveryCon
 from stream_kernel.platform.services.state.context import ContextService, InMemoryKvContextService, kv_store_memory
 from stream_kernel.platform.services.observability import (
     coerce_pipeline_observability,
+    InMemoryObservabilityMetricsService,
     NoOpObservabilityService,
+    ObservabilityMetricsService,
     ObservabilityPipelineService,
     ObservabilityService,
     ReplyAwareObservabilityService,
@@ -69,7 +71,9 @@ __all__ = [
     "LocalBootstrapSupervisor",
     "LocalRuntimeLifecycleManager",
     "NoOpObservabilityService",
+    "InMemoryObservabilityMetricsService",
     "coerce_pipeline_observability",
+    "ObservabilityMetricsService",
     "ObservabilityPipelineService",
     "ObservabilityService",
     "ReplyAwareObservabilityService",

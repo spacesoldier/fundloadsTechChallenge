@@ -8,6 +8,10 @@ from typing import Protocol, runtime_checkable
 from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.service import service
 from stream_kernel.execution.observers.observer import ExecutionObserver
+from stream_kernel.observability.events import (
+    MonitoringMetricsSnapshotEvent,
+    MonitoringMetricsSnapshotResult,
+)
 from stream_kernel.platform.services.messaging.reply_coordinator import (
     ReplyCoordinatorService,
     legacy_reply_coordinator,
@@ -149,6 +153,221 @@ class ObservabilityPipelineService(ObservabilityService, Protocol):
         raise NotImplementedError(
             "ObservabilityPipelineService.on_runtime_lifecycle_event must be implemented"
         )
+
+
+@runtime_checkable
+class ObservabilityMetricsService(Protocol):
+    # Aggregates supervisor transport diagnostics into exporter-friendly metrics snapshots.
+    def ingest_trace_dispatch_snapshot(self, *, stage: str, snapshot: dict[str, object]) -> None:
+        raise NotImplementedError(
+            "ObservabilityMetricsService.ingest_trace_dispatch_snapshot must be implemented"
+        )
+
+    def snapshot(self) -> dict[str, object]:
+        raise NotImplementedError("ObservabilityMetricsService.snapshot must be implemented")
+
+    def metric_records(self) -> list[dict[str, object]]:
+        raise NotImplementedError("ObservabilityMetricsService.metric_records must be implemented")
+
+
+@runtime_checkable
+class ObservabilityMetricsDispatchService(Protocol):
+    # System-level dispatch service for monitoring metrics snapshots.
+    # Called by system.obs.monitoring_metrics_dispatch node.
+    def dispatch_snapshot(
+        self,
+        *,
+        event: MonitoringMetricsSnapshotEvent,
+    ) -> MonitoringMetricsSnapshotResult:
+        raise NotImplementedError("ObservabilityMetricsDispatchService.dispatch_snapshot must be implemented")
+
+
+@service(name="observability_metrics_service")
+@dataclass(slots=True)
+class InMemoryObservabilityMetricsService(ObservabilityMetricsService):
+    # In-memory metrics aggregator for supervisor observability-transport diagnostics.
+    _labels: dict[str, str] = field(
+        default_factory=lambda: {
+            "scope": "observability_transport",
+            "component": "trace_dispatch",
+        }
+    )
+    _counters: dict[str, int] = field(default_factory=dict)
+    _gauges: dict[str, int] = field(default_factory=dict)
+    _last_stage: str | None = None
+    _stage_seen: dict[str, bool] = field(default_factory=dict)
+    _stage_counts: dict[str, int] = field(default_factory=dict)
+
+    def ingest_trace_dispatch_snapshot(self, *, stage: str, snapshot: dict[str, object]) -> None:
+        data = dict(snapshot) if isinstance(snapshot, dict) else {}
+        self._last_stage = stage
+        self._stage_seen[stage] = True
+        self._stage_counts[stage] = int(self._stage_counts.get(stage, 0)) + 1
+        self._counters["lifecycle_event_total"] = int(self._counters.get("lifecycle_event_total", 0)) + 1
+        self._counters[f"stage_{stage}_total"] = int(self._stage_counts[stage])
+
+        dispatch_counter_map = {
+            "dispatch_submitted": "dispatch_submitted_total",
+            "dispatch_processed": "dispatch_processed_total",
+            "dispatch_failed": "dispatch_failed_total",
+            "dispatch_dropped": "dispatch_dropped_total",
+            "dispatch_submit_dropped_total": "dispatch_submit_dropped_total",
+            "dispatch_submit_block_count": "dispatch_submit_block_total",
+            "dispatch_submit_timeout_count": "dispatch_submit_timeout_total",
+            "dispatch_submit_block_wait_ms_total": "dispatch_submit_block_wait_ms_total",
+        }
+        for source, target in dispatch_counter_map.items():
+            value = data.get(source)
+            if isinstance(value, int) and value >= 0:
+                self._set_counter_max(target, value)
+
+        sink_diagnostics = data.get("sink_diagnostics")
+        sink_exported_total = 0
+        sink_dropped_total = 0
+        sink_pending_total_derived = 0
+        if isinstance(sink_diagnostics, list):
+            for item in sink_diagnostics:
+                if not isinstance(item, dict):
+                    continue
+                exported = item.get("exported")
+                dropped = item.get("dropped")
+                pending_estimate = item.get("pending_estimate")
+                if isinstance(exported, int) and exported > 0:
+                    sink_exported_total += exported
+                if isinstance(dropped, int) and dropped > 0:
+                    sink_dropped_total += dropped
+                if isinstance(pending_estimate, int) and pending_estimate > 0:
+                    sink_pending_total_derived += pending_estimate
+        self._set_counter_max("sink_exported_total", sink_exported_total)
+        self._set_counter_max("sink_dropped_total", sink_dropped_total)
+
+        tracing_enabled = data.get("tracing_enabled")
+        if isinstance(tracing_enabled, bool):
+            self._gauges["tracing_enabled"] = 1 if tracing_enabled else 0
+        elif isinstance(tracing_enabled, int):
+            self._gauges["tracing_enabled"] = 1 if tracing_enabled > 0 else 0
+
+        gauge_keys = {
+            "dispatch_queue_depth": "dispatch_queue_depth",
+            "dispatch_pending": "dispatch_pending",
+            "sink_count": "sink_count",
+            "pending_total_estimate": "pending_total_estimate",
+        }
+        for source, target in gauge_keys.items():
+            value = data.get(source)
+            if isinstance(value, int) and value >= 0:
+                self._gauges[target] = value
+
+        sink_pending_total_value = data.get("sink_pending_total")
+        sink_pending_total = (
+            sink_pending_total_value
+            if isinstance(sink_pending_total_value, int) and sink_pending_total_value >= 0
+            else sink_pending_total_derived
+        )
+        self._gauges["sink_pending_total"] = sink_pending_total
+
+        dispatch_dropped = int(data.get("dispatch_dropped", 0) or 0)
+        submit_dropped = int(data.get("dispatch_submit_dropped_total", 0) or 0)
+        loss_estimate = max(0, dispatch_dropped) + max(0, submit_dropped) + max(0, sink_dropped_total)
+        self._set_counter_max("loss_estimate_total", loss_estimate)
+
+    def snapshot(self) -> dict[str, object]:
+        stages = {key: bool(value) for key, value in sorted(self._stage_seen.items())}
+        return {
+            "labels": dict(self._labels),
+            "counters": dict(sorted(self._counters.items())),
+            "gauges": dict(sorted(self._gauges.items())),
+            "lifecycle": {
+                "last_stage": self._last_stage,
+                "stages": stages,
+                "stage_counts": dict(sorted(self._stage_counts.items())),
+            },
+        }
+
+    def metric_records(self) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        labels = dict(self._labels)
+        for key, value in sorted(self._counters.items()):
+            records.append(
+                {
+                    "name": f"stream_kernel_observability_{_metric_token(key)}",
+                    "type": "counter",
+                    "value": int(value),
+                    "labels": dict(labels),
+                }
+            )
+        for key, value in sorted(self._gauges.items()):
+            records.append(
+                {
+                    "name": f"stream_kernel_observability_{_metric_token(key)}",
+                    "type": "gauge",
+                    "value": int(value),
+                    "labels": dict(labels),
+                }
+            )
+        for stage, seen in sorted(self._stage_seen.items()):
+            stage_labels = dict(labels)
+            stage_labels["stage"] = stage
+            records.append(
+                {
+                    "name": "stream_kernel_observability_lifecycle_stage_active",
+                    "type": "gauge",
+                    "value": 1 if seen else 0,
+                    "labels": stage_labels,
+                }
+            )
+        return sorted(records, key=lambda item: str(item.get("name")))
+
+    def _set_counter_max(self, key: str, value: int) -> None:
+        self._counters[key] = max(int(self._counters.get(key, 0)), int(value))
+
+
+@service(name="observability_metrics_dispatch_service")
+@dataclass(slots=True)
+class DefaultObservabilityMetricsDispatchService(ObservabilityMetricsDispatchService):
+    # Bridges system node snapshots to metrics aggregation service.
+    metrics_service: object = inject.service(ObservabilityMetricsService)
+
+    def dispatch_snapshot(
+        self,
+        *,
+        event: MonitoringMetricsSnapshotEvent,
+    ) -> MonitoringMetricsSnapshotResult:
+        stage = event.stage if isinstance(event.stage, str) and event.stage else "runtime"
+        snapshot = dict(event.snapshot) if isinstance(event.snapshot, dict) else {}
+        service = self._metrics_service()
+        if service is None:
+            return MonitoringMetricsSnapshotResult(stage=stage, snapshot=snapshot, metric_records=[])
+        try:
+            service.ingest_trace_dispatch_snapshot(stage=stage, snapshot=dict(snapshot))
+            raw_records = service.metric_records()
+        except Exception:
+            raw_records = []
+        records = [item for item in raw_records if isinstance(item, dict)] if isinstance(raw_records, list) else []
+        return MonitoringMetricsSnapshotResult(
+            stage=stage,
+            snapshot=snapshot,
+            metric_records=records,
+        )
+
+    def _metrics_service(self) -> ObservabilityMetricsService | None:
+        candidate = self.metrics_service
+        if isinstance(candidate, ObservabilityMetricsService):
+            return candidate
+        if (
+            candidate is not None
+            and callable(getattr(candidate, "ingest_trace_dispatch_snapshot", None))
+            and callable(getattr(candidate, "metric_records", None))
+        ):
+            return candidate  # type: ignore[return-value]
+        return None
+
+
+def _metric_token(name: str) -> str:
+    token = "".join(char if char.isalnum() else "_" for char in name.strip().lower())
+    while "__" in token:
+        token = token.replace("__", "_")
+    return token.strip("_") or "metric"
 
 
 @service(name="observability_service")

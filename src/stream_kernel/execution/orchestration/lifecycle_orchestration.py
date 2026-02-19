@@ -348,6 +348,15 @@ def execute_with_bootstrap_supervisor(
         if not isinstance(tracing_cfg, dict):
             tracing_cfg = {}
         configure_tracing(dict(tracing_cfg), strict=bool(runtime.get("strict", True)))
+    configure_monitoring = getattr(supervisor, "configure_monitoring", None)
+    if callable(configure_monitoring):
+        observability = runtime.get("observability", {})
+        if not isinstance(observability, dict):
+            observability = {}
+        monitoring_cfg = observability.get("monitoring", {})
+        if not isinstance(monitoring_cfg, dict):
+            monitoring_cfg = {}
+        configure_monitoring(dict(monitoring_cfg), strict=bool(runtime.get("strict", True)))
     boundary_inputs, dispatch_group, trace_aliases = _build_boundary_dispatch_inputs(
         runtime=runtime,
         inputs=inputs,
