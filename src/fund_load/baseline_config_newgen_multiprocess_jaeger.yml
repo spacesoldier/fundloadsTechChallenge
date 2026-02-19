@@ -11,17 +11,76 @@ runtime:
   observability:
     tracing:
       exporters:
-        - kind: otel_otlp
+        - kind: jsonl
+          enabled: true
           settings:
-            endpoint: http://127.0.0.1:4318/v1/traces
-            service_name: fund-load-multiprocess
-            timeout_seconds: 2.0
+            path: trace_baseline_multiprocess_jaeger.jsonl
+            write_mode: batch
+            flush_every_n: 256
+        - kind: otel_otlp_topology
+          enabled: true
+          settings:
+            otlp:
+              endpoint: http://127.0.0.1:4318/v1/traces
+            transport:
+              backend: httpx
+              timeout_seconds: 2.0
+              batch:
+                max_items: 256
+                flush_interval_ms: 100
+              httpx:
+                mode: async
+            service:
+              service_name: fund-load-experiment-multiprocess
+              service_namespace: stream-kernel
+              service_version: 1.0.0-dev
+              deployment_environment: local-dev
+            view:
+              trace_view: topology
+              service_name_by_step: false
+              service_name_by_process_group: true
+              service_name_suffix: .topology
+              isolate_view_ids: true
+              include_runtime_resource: true
+              span_kind: SPAN_KIND_INTERNAL
+        - kind: otel_otlp_logical
+          enabled: false
+          settings:
+            otlp:
+              endpoint: http://127.0.0.1:4318/v1/traces
+            transport:
+              backend: httpx
+              timeout_seconds: 2.0
+              batch:
+                max_items: 256
+                flush_interval_ms: 100
+              httpx:
+                mode: async
+            service:
+              service_name: fund-load-experiment-multiprocess
+              service_namespace: stream-kernel
+              service_version: 1.0.0-dev
+              deployment_environment: local-dev
+            view:
+              trace_view: logical
+              service_name_by_step: true
+              service_name_by_process_group: false
+              service_name_suffix: .logical
+              isolate_view_ids: true
+              include_runtime_resource: true
+              span_kind: SPAN_KIND_INTERNAL
     logging:
       exporters:
-        - kind: stdout
+        - kind: stdout_plain
+        - kind: file_plain
+          settings:
+            path: logs/lifecycle_baseline_multiprocess_jaeger.log
+        - kind: jsonl
+          settings:
+            path: logs/lifecycle_baseline_multiprocess_jaeger.jsonl
       lifecycle_events:
         enabled: true
-        level: debug
+        level: info   # off | none | info | debug | full
   discovery_modules:
     - fund_load
   platform:
@@ -38,6 +97,11 @@ runtime:
       max_payload_bytes: 1048576
     bootstrap:
       mode: process_supervisor
+    boundary_dispatch:
+      mode: stream
+      control_poll_ms: 1.0
+      batch_max_items: 1000
+      timeout_seconds: 600.0
     process_groups:
       - name: execution.ingress
         workers: 1
@@ -112,7 +176,7 @@ adapters:
       - stream
   sink:
     settings:
-      path: output_multiprocess_jaeger.txt
+      path: output_baseline_multiprocess_jaeger.txt
       format: text/jsonl
       encoding: utf-8
     binds:

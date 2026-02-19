@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, TypeVar
+from typing import Any, Callable, Iterable, Protocol, TypeVar, runtime_checkable
 
 T = TypeVar("T")
 _SUPPORTED_ADAPTER_EXECUTION_MODES = {"sync", "async", "any"}
@@ -60,3 +60,14 @@ def get_adapter_meta(target: object) -> AdapterMeta | None:
     if isinstance(meta, AdapterMeta):
         return meta
     return None
+
+
+@runtime_checkable
+class TraceSinkPort(Protocol):
+    # Platform port for trace record emission.
+    # All trace sink adapters must implement these three methods.
+    # Async capability is declared via @adapter(execution_mode=...) on the factory,
+    # not via this interface — the interface itself is execution-mode agnostic.
+    def emit(self, record: object) -> None: ...
+    def flush(self) -> None: ...
+    def close(self) -> None: ...

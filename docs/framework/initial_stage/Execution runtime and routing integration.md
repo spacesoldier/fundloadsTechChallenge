@@ -235,6 +235,10 @@ Adapters live in the **framework**, but are wired by config.
 - single‑threaded, processes queue until empty
 - deterministic ordering
 - ideal for baseline reference outputs
+- graceful stop: `request_stop()` sets `_stop_requested`; `drain_on_stop=True`
+  (default) empties the queue before exit so no in-flight messages are dropped
+  (including pending observability `TraceRecord` envelopes enqueued by the tracing
+  observer)
 
 ### 6.2 AsyncRunner
 
@@ -268,14 +272,37 @@ Point-to-point queue and pub/sub topic are distinct runtime semantics:
 If both are needed, use separate transport adapters under port contracts rather
 than overloading one concrete queue implementation.
 
+### 6.3.2 Boundary execution unification
+
+Child boundary execution (process-supervisor handoff path) uses the same runner
+engines (`SyncRunner` / `AsyncRunner`) as local execution.
+
+There is no separate node-invocation loop for boundary mode anymore.
+
+Boundary semantics now follow runner channels:
+
+- local chain execution inside worker group (when `runtime.platform.process_groups`
+  maps node placement);
+- external deliveries for out-of-group targets;
+- terminal outputs for reply completion.
+
 ### 6.4 Runner interface (contract)
 
 All runners implement a shared interface (`RunnerPort`):
 
-- `run() -> None`
-- consumes from WorkQueue until empty (or until a stop policy triggers)
+- `run() -> None` — consumes from WorkQueue until empty (or until a stop policy triggers)
+- `request_stop() -> None` — graceful stop signal; runner finishes the current item,
+  optionally drains remaining queue (`drain_on_stop`), then exits
+- `drain_on_stop: bool` — when `True` (default), runner empties the queue before
+  honouring a stop request; when `False`, stops after current item
 
-This allows swapping runners without changing routing or application wiring.
+Both `SyncRunner` and `AsyncRunner` implement this interface. The lifecycle manager
+calls `request_stop()` on the active runner as part of the shutdown sequence, before
+triggering supervisor `stop_groups()`.
+
+**Runner does not own sink lifecycle.** Trace/log sink teardown (`flush`/`close`) is
+the responsibility of the `system.obs.*` sink nodes, invoked naturally as the queue
+drains. Runner does not call `sink.flush()` or `sink.close()` directly.
 
 ---
 
@@ -334,6 +361,11 @@ Process-boundary rule:
 
 - boundary dispatch is placement-driven (`target node -> process_group`),
   not global batch-level group selection.
+- default dispatch mode is **stream** (one boundary item per control command);
+- batch dispatch remains available as fallback via `runtime.platform.boundary_dispatch`:
+  - `mode: stream | batch`
+  - `batch_max_items: <int>`
+  - `control_poll_ms: <number > 0>` (worker control-pipe poll timeout for stream mode; default `1.0`)
 
 Reference migration plan:
 
@@ -347,6 +379,22 @@ This defines a strict boundary:
 - runner-targeted node call => one execution span;
 - adapter attached to DAG as node => traced as its own node span;
 - adapter injected inside node code => no standalone span unless explicitly modeled.
+
+**Routing-native observer (non-blocking):**
+`TracingObserver.after_node()` does **not** call `sink.emit(record)` directly.
+Instead it enqueues a `TraceRecord` envelope targeting `system.obs.trace_sink` in
+the work queue. The runner processes this envelope on a subsequent iteration and
+calls the `TraceSinkPort` adapter then — outside the business node's execution
+context. This means the runner hot path pays only the cost of an in-memory enqueue,
+not the cost of I/O (file write, OTLP HTTP call, etc.).
+
+Recursion guard is enforced on two layers:
+
+- observer layer: tracing observer excludes `system.obs.*` nodes;
+- runner layer: `system.obs.*` node execution skips observability callbacks
+  (`before_node`, `after_node`, `on_node_error`) in both sync and async engines.
+
+This prevents self-amplifying observability dispatch loops.
 
 ---
 

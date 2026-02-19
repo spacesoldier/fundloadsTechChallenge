@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from dataclasses import field
 from typing import Protocol, runtime_checkable
@@ -288,6 +289,7 @@ class NoOpObservabilityService(ObservabilityPipelineService):
         return None
 
 
+@service(name="fanout_observability_service")
 @dataclass(slots=True)
 class FanoutObservabilityService(ObservabilityPipelineService):
     # Runtime fan-out service: forwards lifecycle events to discovered observers.
@@ -320,10 +322,11 @@ class FanoutObservabilityService(ObservabilityPipelineService):
         trace_id: str | None,
         outputs: list[object],
         state: object | None,
-    ) -> None:
+    ) -> object | None:
         states = state if isinstance(state, list) else [None] * len(self.observers)
+        routed_outputs: list[object] = []
         for observer, observer_state in zip(self.observers, states, strict=False):
-            observer.after_node(
+            produced = observer.after_node(
                 node_name=node_name,
                 payload=payload,
                 ctx=ctx,
@@ -331,6 +334,10 @@ class FanoutObservabilityService(ObservabilityPipelineService):
                 outputs=outputs,
                 state=observer_state,
             )
+            routed_outputs.extend(_coerce_optional_outputs(produced))
+        if not routed_outputs:
+            return None
+        return routed_outputs
 
     def on_node_error(
         self,
@@ -341,10 +348,11 @@ class FanoutObservabilityService(ObservabilityPipelineService):
         trace_id: str | None,
         error: Exception,
         state: object | None,
-    ) -> None:
+    ) -> object | None:
         states = state if isinstance(state, list) else [None] * len(self.observers)
+        routed_outputs: list[object] = []
         for observer, observer_state in zip(self.observers, states, strict=False):
-            observer.on_node_error(
+            produced = observer.on_node_error(
                 node_name=node_name,
                 payload=payload,
                 ctx=ctx,
@@ -352,6 +360,10 @@ class FanoutObservabilityService(ObservabilityPipelineService):
                 error=error,
                 state=observer_state,
             )
+            routed_outputs.extend(_coerce_optional_outputs(produced))
+        if not routed_outputs:
+            return None
+        return routed_outputs
 
     def on_run_end(self) -> None:
         for observer in self.observers:
@@ -377,6 +389,29 @@ class FanoutObservabilityService(ObservabilityPipelineService):
             attributes=dict(attributes or {}),
         )
 
+    async def publish_trace_async(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> None:
+        attrs = dict(attributes or {})
+        await self._fanout_optional_async(
+            "publish_trace_async",
+            fallback_method_name="publish_trace",
+            event=event,
+            trace_id=trace_id,
+            attributes=attrs,
+        )
+        await self._fanout_optional_async(
+            "on_trace_event_async",
+            fallback_method_name="on_trace_event",
+            event=event,
+            trace_id=trace_id,
+            attributes=attrs,
+        )
+
     def publish_log(
         self,
         *,
@@ -395,6 +430,29 @@ class FanoutObservabilityService(ObservabilityPipelineService):
             event=event,
             trace_id=trace_id,
             attributes=dict(attributes or {}),
+        )
+
+    async def publish_log_async(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> None:
+        attrs = dict(attributes or {})
+        await self._fanout_optional_async(
+            "publish_log_async",
+            fallback_method_name="publish_log",
+            event=event,
+            trace_id=trace_id,
+            attributes=attrs,
+        )
+        await self._fanout_optional_async(
+            "on_log_event_async",
+            fallback_method_name="on_log_event",
+            event=event,
+            trace_id=trace_id,
+            attributes=attrs,
         )
 
     def publish_metric(
@@ -417,6 +475,29 @@ class FanoutObservabilityService(ObservabilityPipelineService):
             attributes=dict(attributes or {}),
         )
 
+    async def publish_metric_async(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> None:
+        attrs = dict(attributes or {})
+        await self._fanout_optional_async(
+            "publish_metric_async",
+            fallback_method_name="publish_metric",
+            event=event,
+            trace_id=trace_id,
+            attributes=attrs,
+        )
+        await self._fanout_optional_async(
+            "on_metric_event_async",
+            fallback_method_name="on_metric_event",
+            event=event,
+            trace_id=trace_id,
+            attributes=attrs,
+        )
+
     def publish_monitoring(
         self,
         *,
@@ -435,6 +516,29 @@ class FanoutObservabilityService(ObservabilityPipelineService):
             event=event,
             trace_id=trace_id,
             attributes=dict(attributes or {}),
+        )
+
+    async def publish_monitoring_async(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> None:
+        attrs = dict(attributes or {})
+        await self._fanout_optional_async(
+            "publish_monitoring_async",
+            fallback_method_name="publish_monitoring",
+            event=event,
+            trace_id=trace_id,
+            attributes=attrs,
+        )
+        await self._fanout_optional_async(
+            "on_monitoring_event_async",
+            fallback_method_name="on_monitoring_event",
+            event=event,
+            trace_id=trace_id,
+            attributes=attrs,
         )
 
     def on_ingress(
@@ -516,11 +620,33 @@ class FanoutObservabilityService(ObservabilityPipelineService):
                     # when one optional stream/exporter callback fails.
                     continue
 
+    async def _fanout_optional_async(
+        self,
+        method_name: str,
+        *,
+        fallback_method_name: str | None = None,
+        **kwargs: object,
+    ) -> None:
+        for observer in self.observers:
+            callback = getattr(observer, method_name, None)
+            if not callable(callback) and isinstance(fallback_method_name, str):
+                callback = getattr(observer, fallback_method_name, None)
+            if not callable(callback):
+                continue
+            try:
+                result = callback(**kwargs)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                continue
 
+
+@service(name="reply_aware_observability_service")
 @dataclass(slots=True)
 class ReplyAwareObservabilityService(ObservabilityPipelineService):
     # Decorates base observability with correlated request/reply policy hooks.
-    inner: object
+    # inner=None so DI can auto-instantiate without args; _inner() degrades to NoOp gracefully.
+    inner: object = None
     reply_coordinator: object = inject.service(ReplyCoordinatorService)
 
     def before_node(
@@ -547,8 +673,8 @@ class ReplyAwareObservabilityService(ObservabilityPipelineService):
         trace_id: str | None,
         outputs: list[object],
         state: object | None,
-    ) -> None:
-        self._inner().after_node(
+    ) -> object | None:
+        return self._inner().after_node(
             node_name=node_name,
             payload=payload,
             ctx=ctx,
@@ -566,8 +692,8 @@ class ReplyAwareObservabilityService(ObservabilityPipelineService):
         trace_id: str | None,
         error: Exception,
         state: object | None,
-    ) -> None:
-        self._inner().on_node_error(
+    ) -> object | None:
+        return self._inner().on_node_error(
             node_name=node_name,
             payload=payload,
             ctx=ctx,
@@ -588,6 +714,21 @@ class ReplyAwareObservabilityService(ObservabilityPipelineService):
     ) -> None:
         self._inner().publish_trace(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
 
+    async def publish_trace_async(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> None:
+        callback = getattr(self._inner(), "publish_trace_async", None)
+        if callable(callback):
+            result = callback(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
+            if inspect.isawaitable(result):
+                await result
+            return
+        self._inner().publish_trace(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
+
     def publish_log(
         self,
         *,
@@ -595,6 +736,21 @@ class ReplyAwareObservabilityService(ObservabilityPipelineService):
         trace_id: str | None = None,
         attributes: dict[str, object] | None = None,
     ) -> None:
+        self._inner().publish_log(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
+
+    async def publish_log_async(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> None:
+        callback = getattr(self._inner(), "publish_log_async", None)
+        if callable(callback):
+            result = callback(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
+            if inspect.isawaitable(result):
+                await result
+            return
         self._inner().publish_log(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
 
     def publish_metric(
@@ -606,6 +762,21 @@ class ReplyAwareObservabilityService(ObservabilityPipelineService):
     ) -> None:
         self._inner().publish_metric(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
 
+    async def publish_metric_async(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> None:
+        callback = getattr(self._inner(), "publish_metric_async", None)
+        if callable(callback):
+            result = callback(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
+            if inspect.isawaitable(result):
+                await result
+            return
+        self._inner().publish_metric(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
+
     def publish_monitoring(
         self,
         *,
@@ -613,6 +784,25 @@ class ReplyAwareObservabilityService(ObservabilityPipelineService):
         trace_id: str | None = None,
         attributes: dict[str, object] | None = None,
     ) -> None:
+        self._inner().publish_monitoring(
+            event=event,
+            trace_id=trace_id,
+            attributes=dict(attributes or {}),
+        )
+
+    async def publish_monitoring_async(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> None:
+        callback = getattr(self._inner(), "publish_monitoring_async", None)
+        if callable(callback):
+            result = callback(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
+            if inspect.isawaitable(result):
+                await result
+            return
         self._inner().publish_monitoring(
             event=event,
             trace_id=trace_id,
@@ -751,10 +941,10 @@ class _PipelineObservabilityAdapter(ObservabilityPipelineService):
         trace_id: str | None,
         outputs: list[object],
         state: object | None,
-    ) -> None:
+    ) -> object | None:
         callback = getattr(self.inner, "after_node", None)
         if callable(callback):
-            callback(
+            return callback(
                 node_name=node_name,
                 payload=payload,
                 ctx=ctx,
@@ -762,6 +952,7 @@ class _PipelineObservabilityAdapter(ObservabilityPipelineService):
                 outputs=outputs,
                 state=state,
             )
+        return None
 
     def on_node_error(
         self,
@@ -772,10 +963,10 @@ class _PipelineObservabilityAdapter(ObservabilityPipelineService):
         trace_id: str | None,
         error: Exception,
         state: object | None,
-    ) -> None:
+    ) -> object | None:
         callback = getattr(self.inner, "on_node_error", None)
         if callable(callback):
-            callback(
+            return callback(
                 node_name=node_name,
                 payload=payload,
                 ctx=ctx,
@@ -783,6 +974,7 @@ class _PipelineObservabilityAdapter(ObservabilityPipelineService):
                 error=error,
                 state=state,
             )
+        return None
 
     def on_run_end(self) -> None:
         callback = getattr(self.inner, "on_run_end", None)
@@ -804,6 +996,21 @@ class _PipelineObservabilityAdapter(ObservabilityPipelineService):
         if callable(fallback):
             fallback(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
 
+    async def publish_trace_async(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> None:
+        callback = getattr(self.inner, "publish_trace_async", None)
+        if callable(callback):
+            result = callback(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
+            if inspect.isawaitable(result):
+                await result
+            return
+        self.publish_trace(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
+
     def publish_log(
         self,
         *,
@@ -818,6 +1025,21 @@ class _PipelineObservabilityAdapter(ObservabilityPipelineService):
         fallback = getattr(self.inner, "on_log_event", None)
         if callable(fallback):
             fallback(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
+
+    async def publish_log_async(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> None:
+        callback = getattr(self.inner, "publish_log_async", None)
+        if callable(callback):
+            result = callback(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
+            if inspect.isawaitable(result):
+                await result
+            return
+        self.publish_log(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
 
     def publish_metric(
         self,
@@ -834,6 +1056,21 @@ class _PipelineObservabilityAdapter(ObservabilityPipelineService):
         if callable(fallback):
             fallback(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
 
+    async def publish_metric_async(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> None:
+        callback = getattr(self.inner, "publish_metric_async", None)
+        if callable(callback):
+            result = callback(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
+            if inspect.isawaitable(result):
+                await result
+            return
+        self.publish_metric(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
+
     def publish_monitoring(
         self,
         *,
@@ -848,6 +1085,21 @@ class _PipelineObservabilityAdapter(ObservabilityPipelineService):
         fallback = getattr(self.inner, "on_monitoring_event", None)
         if callable(fallback):
             fallback(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
+
+    async def publish_monitoring_async(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> None:
+        callback = getattr(self.inner, "publish_monitoring_async", None)
+        if callable(callback):
+            result = callback(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
+            if inspect.isawaitable(result):
+                await result
+            return
+        self.publish_monitoring(event=event, trace_id=trace_id, attributes=dict(attributes or {}))
 
     def on_ingress(
         self,
@@ -941,3 +1193,11 @@ def coerce_pipeline_observability(candidate: object | None) -> ObservabilityPipe
     if candidate is not None:
         return _PipelineObservabilityAdapter(inner=candidate)
     return NoOpObservabilityService()
+
+
+def _coerce_optional_outputs(candidate: object) -> list[object]:
+    if candidate is None:
+        return []
+    if isinstance(candidate, list):
+        return [item for item in candidate if item is not None]
+    return [candidate]

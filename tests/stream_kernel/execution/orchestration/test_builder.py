@@ -240,6 +240,117 @@ def test_build_runtime_observability_adapter_instances_builds_from_registry_and_
     assert captured["endpoint"] == "http://collector:4318/v1/traces"
 
 
+def test_build_runtime_observability_adapter_instances_resolves_backend_from_transport_group() -> None:
+    registry = AdapterRegistry()
+    captured: dict[str, object] = {}
+
+    def _factory(settings: dict[str, object]) -> object:
+        captured.update(settings)
+        return object()
+
+    registry.register("trace_otel_otlp", "trace_otel_otlp", _factory)
+
+    instances = build_runtime_observability_adapter_instances(
+        runtime={
+            "strict": True,
+            "observability": {
+                "tracing": {
+                    "exporters": [
+                        {
+                            "kind": "otel_otlp",
+                            "settings": {
+                                "otlp": {"endpoint": "http://collector:4318/v1/traces"},
+                                "transport": {"backend": "httpx", "httpx": {"mode": "async"}},
+                            },
+                        }
+                    ]
+                }
+            },
+        },
+        registry=registry,
+    )
+
+    assert "trace_otel_otlp#0" in instances
+    assert captured["backend"] == "httpx"
+    # Grouped settings are passed through; adapter will normalize as needed.
+    assert isinstance(captured.get("transport"), dict)
+    assert isinstance(captured.get("otlp"), dict)
+
+
+def test_build_runtime_observability_adapter_instances_maps_dual_view_kinds_to_trace_adapter() -> None:
+    registry = AdapterRegistry()
+    created: list[dict[str, object]] = []
+
+    def _factory(settings: dict[str, object]) -> object:
+        created.append(dict(settings))
+        return object()
+
+    registry.register("trace_otel_otlp", "trace_otel_otlp", _factory)
+
+    instances = build_runtime_observability_adapter_instances(
+        runtime={
+            "strict": True,
+            "observability": {
+                "tracing": {
+                    "exporters": [
+                        {
+                            "kind": "otel_otlp_logical",
+                            "settings": {"endpoint": "http://collector:4318/v1/traces"},
+                        },
+                        {
+                            "kind": "otel_otlp_topology",
+                            "settings": {"endpoint": "http://collector:4318/v1/traces"},
+                        },
+                    ]
+                }
+            },
+        },
+        registry=registry,
+    )
+
+    assert "trace_otel_otlp#0" in instances
+    assert "trace_otel_otlp#1" in instances
+    assert created[0]["trace_view"] == "logical"
+    assert created[0]["service_name_by_process_group"] is False
+    assert created[0]["service_name_by_step"] is True
+    assert created[0]["logical_include_platform_spans"] is False
+    assert created[0]["service_name_suffix"] == ".logical"
+    assert created[0]["isolate_view_ids"] is True
+    assert created[1]["trace_view"] == "topology"
+    assert created[1]["service_name_by_process_group"] is True
+    assert created[1]["service_name_by_step"] is False
+    assert created[1]["topology_include_business_spans"] is False
+    assert created[1]["service_name_suffix"] == ".topology"
+    assert created[1]["isolate_view_ids"] is True
+
+
+def test_build_runtime_observability_adapter_instances_skips_disabled_tracing_exporter() -> None:
+    registry = AdapterRegistry()
+
+    def _factory(_settings: dict[str, object]) -> object:
+        return object()
+
+    registry.register("trace_otel_otlp", "trace_otel_otlp", _factory)
+    instances = build_runtime_observability_adapter_instances(
+        runtime={
+            "strict": True,
+            "observability": {
+                "tracing": {
+                    "exporters": [
+                        {
+                            "kind": "otel_otlp",
+                            "enabled": False,
+                            "settings": {"endpoint": "http://collector:4318/v1/traces"},
+                        }
+                    ]
+                }
+            },
+        },
+        registry=registry,
+    )
+    assert instances == {}
+
+
 def test_build_runtime_observability_adapter_instances_raises_in_strict_mode_when_binding_missing() -> None:
     # OBS-K-B-02: strict mode must fail when runtime exporter adapter cannot be built from registry.
     with pytest.raises(ValueError, match="failed to build adapter 'trace_otel_otlp'"):
@@ -357,6 +468,66 @@ def test_build_runtime_observability_adapter_instances_uses_indexed_keys_for_dup
     assert instances["trace_stdout#0"] is created[0]
     assert instances["trace_stdout#1"] is created[1]
     assert instances["trace_stdout"] is created[0]
+
+
+def test_build_runtime_observability_adapter_instances_supports_stdout_plain_logging_exporter() -> None:
+    # runtime.observability.logging.exporters.kind=stdout_plain should resolve via AdapterRegistry.
+    registry = AdapterRegistry()
+    created: list[object] = []
+
+    def _factory(_settings: dict[str, object]) -> object:
+        instance = object()
+        created.append(instance)
+        return instance
+
+    registry.register("log_stdout_plain", "log_stdout_plain", _factory)
+
+    instances = build_runtime_observability_adapter_instances(
+        runtime={
+            "strict": True,
+            "observability": {
+                "logging": {
+                    "exporters": [
+                        {"kind": "stdout_plain", "settings": {}},
+                    ]
+                }
+            },
+        },
+        registry=registry,
+    )
+
+    assert instances["log_stdout_plain#0"] is created[0]
+    assert instances["log_stdout_plain"] is created[0]
+
+
+def test_build_runtime_observability_adapter_instances_supports_file_plain_logging_exporter() -> None:
+    # runtime.observability.logging.exporters.kind=file_plain should resolve via AdapterRegistry.
+    registry = AdapterRegistry()
+    created: list[object] = []
+
+    def _factory(_settings: dict[str, object]) -> object:
+        instance = object()
+        created.append(instance)
+        return instance
+
+    registry.register("log_file_plain", "log_file_plain", _factory)
+
+    instances = build_runtime_observability_adapter_instances(
+        runtime={
+            "strict": True,
+            "observability": {
+                "logging": {
+                    "exporters": [
+                        {"kind": "file_plain", "settings": {}},
+                    ]
+                }
+            },
+        },
+        registry=registry,
+    )
+
+    assert instances["log_file_plain#0"] is created[0]
+    assert instances["log_file_plain"] is created[0]
 
 
 def test_build_injection_registry_from_bindings_requires_instance() -> None:
@@ -1117,6 +1288,17 @@ def test_ensure_runtime_bootstrap_binding_uses_local_for_inline_mode() -> None:
     assert isinstance(resolved, LocalBootstrapSupervisor)
 
 
+def test_ensure_runtime_bootstrap_binding_defaults_to_multiprocess_when_groups_declared() -> None:
+    registry = InjectionRegistry()
+    ensure_runtime_bootstrap_binding(
+        injection_registry=registry,
+        runtime={"platform": {"process_groups": [{"name": "execution.cpu"}]}},
+    )
+    scope = registry.instantiate_for_scenario("s1")
+    resolved = scope.resolve("service", BootstrapSupervisor)
+    assert isinstance(resolved, MultiprocessBootstrapSupervisor)
+
+
 def test_runtime_transport_secret_resolution_error_redacts_secret_value() -> None:
     # KEY-IPC-04: runtime transport errors must not leak secret material representations.
     class _SecretObject:
@@ -1403,6 +1585,32 @@ def test_ensure_runtime_observability_binding_uses_platform_fanout_service() -> 
     assert len(resolved.inner.observers) == 1
 
 
+def test_ensure_runtime_observability_binding_marks_service_async_when_observer_requires_async() -> None:
+    # OBS-ASYNC-BIND-01: async-capable observer callbacks should mark observability DI bindings as async.
+    class _AsyncObserver(_Observer):
+        async def on_trace_event_async(
+            self,
+            *,
+            event: object,
+            trace_id: str | None,
+            attributes: dict[str, object] | None,
+        ) -> None:
+            _ = (event, trace_id, attributes)
+
+    registry = InjectionRegistry()
+    registry.register_factory(
+        "service",
+        ReplyCoordinatorService,
+        lambda: legacy_reply_coordinator(reply_waiter=InMemoryReplyWaiterService(now_fn=lambda: 0)),
+    )
+    ensure_runtime_observability_binding(
+        injection_registry=registry,
+        observers=[_AsyncObserver()],
+    )
+    assert registry.is_async_binding("service", ObservabilityService)
+    assert registry.is_async_binding("service", ObservabilityPipelineService)
+
+
 def test_build_observability_system_plan_builds_enabled_nodes_and_consumers() -> None:
     class _PipelineRecorder(NoOpObservabilityService):
         def __init__(self) -> None:
@@ -1519,6 +1727,62 @@ def test_build_observability_system_plan_async_qualifier_propagates_to_pool_plan
     assert pools["system.obs.log_dispatch:obs.async"] == "async"
     assert pools["system.obs.monitor_dispatch"] == "sync"
     assert "system.obs.metric_dispatch" not in pools
+
+
+def test_build_observability_system_plan_autowires_trace_dispatch_from_exporters() -> None:
+    registry = InjectionRegistry()
+    registry.register_factory(
+        "service",
+        ObservabilityPipelineService,
+        NoOpObservabilityService,
+        is_async=False,
+    )
+    scope = registry.instantiate_for_scenario("s1")
+
+    plan = build_observability_system_plan(
+        runtime={
+            "observability": {
+                "tracing": {
+                    "exporters": [
+                        {"kind": "otel_otlp", "enabled": True},
+                    ]
+                }
+            }
+        },
+        scenario_scope=scope,
+    )
+
+    names = [step.name for step in plan.system_steps]
+    assert names == ["system.obs.trace_dispatch"]
+    assert plan.system_consumers == {TraceDispatchEvent: ["system.obs.trace_dispatch"]}
+
+
+def test_build_observability_system_plan_skips_worker_process_role_even_when_exporters_enabled() -> None:
+    registry = InjectionRegistry()
+    registry.register_factory(
+        "service",
+        ObservabilityPipelineService,
+        NoOpObservabilityService,
+        is_async=False,
+    )
+    scope = registry.instantiate_for_scenario("s1")
+
+    plan = build_observability_system_plan(
+        runtime={
+            "__process_role": "worker",
+            "observability": {
+                "tracing": {
+                    "exporters": [
+                        {"kind": "otel_otlp", "enabled": True},
+                    ]
+                }
+            }
+        },
+        scenario_scope=scope,
+    )
+
+    assert plan.system_steps == []
+    assert plan.system_consumers == {}
 
 
 def test_ensure_runtime_api_policy_bindings_registers_platform_services() -> None:

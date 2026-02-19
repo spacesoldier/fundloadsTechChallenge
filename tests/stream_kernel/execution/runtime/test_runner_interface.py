@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 # Runner interface is part of the execution model (Execution runtime + planning docs).
+import pytest
+
 from stream_kernel.application_context.application_context import apply_injection
 from stream_kernel.application_context.injection_registry import InjectionRegistry
 from stream_kernel.platform.services.state.context import ContextService, InMemoryKvContextService
@@ -15,6 +17,7 @@ from stream_kernel.routing.routing_service import RoutingService
 from stream_kernel.integration.work_queue import InMemoryQueue, QueuePort
 from stream_kernel.integration.consumer_registry import InMemoryConsumerRegistry
 from stream_kernel.routing.envelope import Envelope
+from stream_kernel.platform.services.messaging.reply_waiter import TerminalEvent
 
 
 def _build_sync_runner() -> SyncRunner:
@@ -142,3 +145,166 @@ def test_sync_runner_resolves_queue_and_routing_from_di() -> None:
 
     runner.run_inputs([11], run_id="r", scenario_id="s")
     assert seen == [11]
+
+
+def test_sync_runner_collects_terminal_outputs_in_boundary_mode() -> None:
+    # RUN-UNI-B1: boundary mode should collect terminal outputs as envelopes.
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="seed", target="n1", trace_id="t1", reply_to="http:r1"))
+    terminal_outputs: list[Envelope] = []
+
+    def n1(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = (payload, ctx)
+        return [TerminalEvent(status="success", payload={"ok": True})]
+
+    runner = SyncRunner(
+        nodes={"n1": n1},
+        work_queue=queue,
+        context_service=InMemoryKvContextService(InMemoryKvStore()),
+        router=RoutingService(registry=InMemoryConsumerRegistry({}), strict=True),
+        observability=NoOpObservabilityService(),
+        allow_external_deliveries=True,
+        terminal_outputs=terminal_outputs,
+    )
+    runner.run()
+
+    assert len(terminal_outputs) == 1
+    assert terminal_outputs[0].trace_id == "t1"
+    assert terminal_outputs[0].reply_to == "http:r1"
+    assert terminal_outputs[0].payload == TerminalEvent(status="success", payload={"ok": True})
+
+
+def test_sync_runner_collects_external_deliveries_for_unknown_local_targets() -> None:
+    # RUN-UNI-B2: boundary mode should route out-of-group targets to external deliveries instead of crashing.
+    class Event:
+        pass
+
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="seed", target="n1", trace_id="t1"))
+    external_deliveries: list[Envelope] = []
+
+    def n1(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = (payload, ctx)
+        return [Event()]
+
+    runner = SyncRunner(
+        nodes={"n1": n1},
+        work_queue=queue,
+        context_service=InMemoryKvContextService(InMemoryKvStore()),
+        router=RoutingService(registry=InMemoryConsumerRegistry({Event: ["remote.node"]}), strict=True),
+        observability=NoOpObservabilityService(),
+        allow_external_deliveries=True,
+        external_deliveries=external_deliveries,
+    )
+    runner.run()
+
+    assert len(external_deliveries) == 1
+    assert external_deliveries[0].target == "remote.node"
+    assert external_deliveries[0].trace_id == "t1"
+    assert isinstance(external_deliveries[0].payload, Event)
+
+
+def test_sync_runner_default_mode_still_fails_on_unknown_targets() -> None:
+    # RUN-UNI-B3: default strict behavior remains unchanged when boundary mode is disabled.
+    class Event:
+        pass
+
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="seed", target="n1", trace_id="t1"))
+
+    def n1(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = (payload, ctx)
+        return [Event()]
+
+    runner = SyncRunner(
+        nodes={"n1": n1},
+        work_queue=queue,
+        context_service=InMemoryKvContextService(InMemoryKvStore()),
+        router=RoutingService(registry=InMemoryConsumerRegistry({Event: ["remote.node"]}), strict=True),
+        observability=NoOpObservabilityService(),
+    )
+    with pytest.raises(ValueError, match="Unknown node"):
+        runner.run()
+
+
+def test_sync_runner_boundary_mode_collects_explicit_targeted_envelope_outputs() -> None:
+    # RUN-UNI-B6: explicit Envelope(target=...) outputs should be forwarded via boundary channel in boundary mode.
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="seed", target="n1", trace_id="t1", reply_to="http:r1"))
+    external_deliveries: list[Envelope] = []
+
+    def n1(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = (payload, ctx)
+        return [Envelope(payload={"ok": True}, target="remote.node")]
+
+    runner = SyncRunner(
+        nodes={"n1": n1},
+        work_queue=queue,
+        context_service=InMemoryKvContextService(InMemoryKvStore()),
+        router=RoutingService(registry=InMemoryConsumerRegistry({}), strict=True),
+        observability=NoOpObservabilityService(),
+        allow_external_deliveries=True,
+        external_deliveries=external_deliveries,
+    )
+    runner.run()
+
+    assert len(external_deliveries) == 1
+    assert external_deliveries[0].target == "remote.node"
+    assert external_deliveries[0].trace_id == "t1"
+    assert external_deliveries[0].reply_to == "http:r1"
+    assert external_deliveries[0].payload == {"ok": True}
+
+
+def test_sync_runner_boundary_mode_treats_no_consumer_output_as_terminal() -> None:
+    # RUN-UNI-B4: in boundary mode, unroutable plain outputs are collected as terminal outputs.
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="seed", target="n1", trace_id="t1"))
+    terminal_outputs: list[Envelope] = []
+
+    def n1(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = (payload, ctx)
+        return ["orphan-value"]
+
+    runner = SyncRunner(
+        nodes={"n1": n1},
+        work_queue=queue,
+        context_service=InMemoryKvContextService(InMemoryKvStore()),
+        router=RoutingService(registry=InMemoryConsumerRegistry({}), strict=True),
+        observability=NoOpObservabilityService(),
+        allow_external_deliveries=True,
+        terminal_outputs=terminal_outputs,
+    )
+    runner.run()
+
+    assert len(terminal_outputs) == 1
+    assert terminal_outputs[0].payload == "orphan-value"
+    assert terminal_outputs[0].trace_id == "t1"
+
+
+def test_async_runner_collects_external_deliveries_for_unknown_local_targets() -> None:
+    # RUN-UNI-B5: async runner must preserve boundary external-delivery semantics.
+    class Event:
+        pass
+
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="seed", target="n1", trace_id="t1"))
+    external_deliveries: list[Envelope] = []
+
+    async def n1(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = (payload, ctx)
+        return [Event()]
+
+    runner = AsyncRunner(
+        nodes={"n1": n1},
+        work_queue=queue,
+        context_service=InMemoryKvContextService(InMemoryKvStore()),
+        router=RoutingService(registry=InMemoryConsumerRegistry({Event: ["remote.node"]}), strict=True),
+        observability=NoOpObservabilityService(),
+        allow_external_deliveries=True,
+        external_deliveries=external_deliveries,
+    )
+    runner.run()
+
+    assert len(external_deliveries) == 1
+    assert external_deliveries[0].target == "remote.node"
+    assert external_deliveries[0].trace_id == "t1"

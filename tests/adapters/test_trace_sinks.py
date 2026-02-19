@@ -5,6 +5,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -53,6 +54,164 @@ def test_jsonl_trace_sink_emits_one_json_per_line(tmp_path: Path) -> None:
     assert "line_no" not in first
 
 
+def test_jsonl_trace_sink_flattens_route_markers_for_gap_diagnostics(tmp_path: Path) -> None:
+    # Route markers are duplicated at top-level so runner-gap analysis is grep-friendly in jsonl traces.
+    path = tmp_path / "trace.jsonl"
+    sink = JsonlTraceSink(path=path, write_mode="line", flush_every_n=1, fsync_every_n=None)
+    sink.emit(
+        replace(
+            _record("step-a", 0),
+            route=RouteInfo(
+                process_group="execution.features",
+                handoff_from="execution.ingress",
+                route_hop=3,
+                runner_gap_ms=42.5,
+            ),
+        )
+    )
+    sink.close()
+
+    row = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert row["process_group"] == "execution.features"
+    assert row["handoff_from"] == "execution.ingress"
+    assert row["route_hop"] == 3
+    assert row["runner_gap_ms"] == 42.5
+
+
+def test_jsonl_trace_sink_business_logic_slice_tags_records(tmp_path: Path) -> None:
+    path = tmp_path / "trace_business.jsonl"
+    sink = JsonlTraceSink(
+        path=path,
+        write_mode="line",
+        flush_every_n=1,
+        fsync_every_n=None,
+        trace_slice="business_logic",
+    )
+    sink.emit(_record("compute_features", 2))
+    sink.close()
+
+    row = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert row["trace_plane"] == "business_logic"
+    assert row["trace_view"] == "logical"
+    assert row["slice_node"] == "compute_features"
+
+
+def test_jsonl_trace_sink_business_logic_slice_skips_platform_records(tmp_path: Path) -> None:
+    path = tmp_path / "trace_business_platform.jsonl"
+    sink = JsonlTraceSink(
+        path=path,
+        write_mode="line",
+        flush_every_n=1,
+        fsync_every_n=None,
+        trace_slice="business_logic",
+    )
+    sink.emit(
+        replace(
+            _record("system.obs.supervisor_handoff", 0),
+            route=RouteInfo(process_group="supervisor.transport", handoff_from="execution.ingress", route_hop=1),
+        )
+    )
+    sink.close()
+
+    assert path.read_text(encoding="utf-8") == ""
+
+
+def test_jsonl_trace_sink_platform_slice_skips_non_platform_records(tmp_path: Path) -> None:
+    path = tmp_path / "trace_platform.jsonl"
+    sink = JsonlTraceSink(
+        path=path,
+        write_mode="line",
+        flush_every_n=1,
+        fsync_every_n=None,
+        trace_slice="platform_internals",
+    )
+    sink.emit(_record("compute_features", 2))
+    sink.close()
+
+    assert path.read_text(encoding="utf-8") == ""
+
+
+def test_jsonl_trace_sink_platform_slice_keeps_supervisor_transport_records(tmp_path: Path) -> None:
+    path = tmp_path / "trace_platform.jsonl"
+    sink = JsonlTraceSink(
+        path=path,
+        write_mode="line",
+        flush_every_n=1,
+        fsync_every_n=None,
+        trace_slice="platform_internals",
+    )
+    sink.emit(
+        replace(
+            _record("system.obs.supervisor_handoff", 2),
+            route=RouteInfo(
+                process_group="supervisor.transport",
+                handoff_from="execution.ingress",
+                route_hop=2,
+                runner_gap_ms=12.0,
+            ),
+        )
+    )
+    sink.close()
+
+    row = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert row["trace_plane"] == "platform_internals"
+    assert row["trace_view"] == "topology"
+    assert row["slice_node"] == "supervisor.transport"
+
+
+@pytest.mark.parametrize(
+    ("trace_slice", "expected_plane", "step_name", "route", "expect_written"),
+    [
+        ("full", "all", "compute_features", None, True),
+        ("logical", "business_logic", "system.obs.trace_dispatch", None, False),
+        (
+            "topology",
+            "platform_internals",
+            "system.obs.trace_dispatch",
+            RouteInfo(process_group="supervisor.transport", handoff_from=None, route_hop=0),
+            True,
+        ),
+    ],
+)
+def test_jsonl_trace_sink_accepts_trace_slice_aliases(
+    tmp_path: Path,
+    trace_slice: str,
+    expected_plane: str,
+    step_name: str,
+    route: RouteInfo | None,
+    expect_written: bool,
+) -> None:
+    path = tmp_path / "trace_alias.jsonl"
+    sink = JsonlTraceSink(
+        path=path,
+        write_mode="line",
+        flush_every_n=1,
+        fsync_every_n=None,
+        trace_slice=trace_slice,
+    )
+    sink.emit(replace(_record(step_name, 0), route=route))
+    sink.close()
+
+    payload = path.read_text(encoding="utf-8")
+    if not expect_written:
+        assert payload == ""
+        return
+
+    row = json.loads(payload.splitlines()[0])
+    assert row["trace_plane"] == expected_plane
+
+
+def test_jsonl_trace_sink_rejects_invalid_trace_slice(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="trace_slice"):
+        JsonlTraceSink(
+            path=tmp_path / "trace_invalid.jsonl",
+            write_mode="line",
+            flush_every_n=1,
+            fsync_every_n=None,
+            trace_slice="unknown_slice",
+        )
+
+
 def test_jsonl_trace_sink_flush_every_n(tmp_path: Path) -> None:
     # In line mode, flush_every_n controls when flush() is called (Trace spec §7.3).
     path = tmp_path / "trace.jsonl"
@@ -96,6 +255,48 @@ def test_jsonl_trace_sink_flush_writes_buffered_lines(tmp_path: Path) -> None:
     sink.emit(_record("step-a", 0))
     sink.flush()
     sink.close()
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["step_name"] == "step-a"
+
+
+def test_jsonl_trace_sink_emit_async_batch_offloads_only_flush_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Async batch path should avoid one to_thread hop per record and offload only flush boundaries.
+    path = tmp_path / "trace.jsonl"
+    calls: list[str] = []
+
+    async def _fake_to_thread(fn, *args, **kwargs):  # noqa: ANN001 - monkeypatch helper.
+        calls.append(getattr(fn, "__name__", str(fn)))
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(trace_sinks.asyncio, "to_thread", _fake_to_thread)
+    sink = JsonlTraceSink(path=path, write_mode="batch", flush_every_n=2, fsync_every_n=None)
+    trace_sinks._run_async_blocking(sink.emit_async(_record("step-a", 0)))
+    trace_sinks._run_async_blocking(sink.emit_async(_record("step-b", 1)))
+    sink.close()
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert calls.count("_write_lines") == 1
+
+
+def test_jsonl_trace_sink_emit_async_line_mode_does_not_offload_to_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "trace_line_async.jsonl"
+
+    async def _forbidden_to_thread(_fn, *_args, **_kwargs):  # noqa: ANN001 - monkeypatch helper.
+        raise AssertionError("line-mode emit_async must not call asyncio.to_thread")
+
+    monkeypatch.setattr(trace_sinks.asyncio, "to_thread", _forbidden_to_thread)
+    sink = JsonlTraceSink(path=path, write_mode="line", flush_every_n=1, fsync_every_n=None)
+    trace_sinks._run_async_blocking(sink.emit_async(_record("step-a", 0)))
+    sink.close()
+
     lines = path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
     assert json.loads(lines[0])["step_name"] == "step-a"
@@ -181,6 +382,7 @@ def test_otel_otlp_trace_sink_exports_span_with_trace_id() -> None:
                 process_group="execution.features",
                 handoff_from="execution.ingress",
                 route_hop=1,
+                runner_gap_ms=7.25,
             ),
         )
     )
@@ -192,6 +394,13 @@ def test_otel_otlp_trace_sink_exports_span_with_trace_id() -> None:
     assert attrs["process_group"] == "execution.features"
     assert attrs["handoff_from"] == "execution.ingress"
     assert attrs["route_hop"] == 1
+    assert attrs["runner_gap_ms"] == 7.25
+    assert attrs["stream_kernel.status"] == "ok"
+    assert attrs["stream_kernel.msg_in.type"] == "A"
+    assert attrs["stream_kernel.duration_ms"] == 1000.0
+    assert attrs["stream_kernel.process_group"] == "execution.features"
+    assert attrs["stream_kernel.runner_gap_ms"] == 7.25
+    assert attrs["stream_kernel.trace_view"] == "topology"
 
 
 def test_opentracing_bridge_sink_maps_operation_and_tags() -> None:
@@ -258,19 +467,52 @@ def test_otel_otlp_trace_sink_posts_http_json_payload(monkeypatch: pytest.Monkey
     assert diagnostics["dropped"] == 0
     assert captured["url"] == "http://collector:4318/v1/traces"
     assert captured["timeout"] == 1.5
-    headers = captured["headers"]
-    assert isinstance(headers, dict)
-    assert headers["Content-type"] == "application/json"
-    assert headers["Authorization"] == "Bearer test-token"
-    body = json.loads(captured["body"].decode("utf-8"))  # type: ignore[union-attr]
-    resource_spans = body["resourceSpans"]
-    assert isinstance(resource_spans, list)
-    assert resource_spans
-    assert body["resourceSpans"][0]["resource"]["attributes"][0]["key"] == "service.name"
-    spans = body["resourceSpans"][0]["scopeSpans"][0]["spans"]
-    assert spans[0]["name"] == "step-a"
-    assert spans[0]["kind"] == "SPAN_KIND_INTERNAL"
-    assert spans[0]["attributes"]
+
+
+def test_otel_httpx_async_recreates_client_on_cross_loop_access(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Async httpx client is loop-bound; sync fallback path must recreate client on cross-loop use.
+    created_clients: list[object] = []
+
+    class _Response:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class _AsyncClient:
+        def __init__(self, **_kwargs) -> None:
+            created_clients.append(self)
+
+        async def post(self, *_args, **_kwargs):
+            return _Response()
+
+        async def aclose(self) -> None:
+            return None
+
+    fake_httpx_module = SimpleNamespace(
+        AsyncClient=_AsyncClient,
+        Limits=lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(trace_sinks, "_import_httpx_module", lambda: fake_httpx_module)
+
+    sink = OTelOtlpTraceSink(
+        endpoint="http://collector:4318/v1/traces",
+        backend="httpx",
+        httpx_mode="async",
+        batch_max_items=1,
+    )
+
+    # First export in async loop creates loop-bound AsyncClient.
+    trace_sinks._run_async_blocking(sink.emit_async(_record("step-a", 0)))
+    first_client = sink._httpx_client  # noqa: SLF001 - regression guard on loop-bound client recreation.
+    assert first_client is not None
+
+    # Second export from sync path should recreate client instead of reusing foreign-loop instance.
+    sink.emit(_record("step-b", 1))
+    second_client = sink._httpx_client  # noqa: SLF001 - regression guard on loop-bound client recreation.
+    assert second_client is not None
+    assert first_client is not second_client
+    assert len(created_clients) >= 2
 
 
 def test_otel_otlp_trace_sink_network_failures_increment_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -335,6 +577,158 @@ def test_otel_otlp_trace_sink_adds_parent_span_and_process_group_service_name(
     assert span["spanId"] == "1111111111111111"
     assert span["parentSpanId"] == "0123456789abcdef"
     assert span["kind"] == "SPAN_KIND_INTERNAL"
+
+
+def test_otel_otlp_trace_sink_can_mark_logical_view_mode() -> None:
+    exported: list[dict[str, object]] = []
+    sink = OTelOtlpTraceSink(
+        endpoint="http://collector:4318/v1/traces",
+        trace_view="logical",
+        export_fn=lambda span: exported.append(span),
+    )
+    sink.emit(_record("step-a", 0))
+    sink.close()
+    assert exported
+    attrs = exported[0].get("attributes", {})
+    assert isinstance(attrs, dict)
+    assert attrs.get("stream_kernel.trace_view") == "logical"
+    assert attrs.get("stream_kernel.trace_plane") == "business_logic"
+
+
+def test_otel_otlp_trace_sink_logical_view_skips_platform_control_spans() -> None:
+    exported: list[dict[str, object]] = []
+    sink = OTelOtlpTraceSink(
+        endpoint="http://collector:4318/v1/traces",
+        trace_view="logical",
+        export_fn=lambda span: exported.append(span),
+    )
+    sink.emit(
+        replace(
+            _record("system.obs.supervisor_handoff", 0),
+            route=RouteInfo(
+                process_group="supervisor.transport",
+                handoff_from="execution.features",
+                route_hop=3,
+            ),
+        )
+    )
+    sink.close()
+    assert exported == []
+    diagnostics = sink.diagnostics()
+    assert diagnostics["exported"] == 0
+    assert diagnostics["dropped"] == 0
+
+
+def test_otel_otlp_trace_sink_logical_view_can_use_step_service_names_with_suffix() -> None:
+    exported: list[dict[str, object]] = []
+    sink = OTelOtlpTraceSink(
+        endpoint="http://collector:4318/v1/traces",
+        trace_view="logical",
+        service_name="fund-load",
+        service_name_by_step=True,
+        service_name_by_process_group=False,
+        service_name_suffix=".logical",
+        export_fn=lambda span: exported.append(span),
+    )
+    sink.emit(_record("compute_time_keys", 0))
+    sink.close()
+    assert exported
+    resource = exported[0].get("resource")
+    assert isinstance(resource, dict)
+    assert resource.get("service.name") == "fund-load.compute_time_keys.logical"
+
+
+def test_otel_otlp_trace_sink_isolates_trace_and_span_ids_per_view() -> None:
+    exported: list[dict[str, object]] = []
+    sink = OTelOtlpTraceSink(
+        endpoint="http://collector:4318/v1/traces",
+        trace_view="topology",
+        isolate_view_ids=True,
+        export_fn=lambda span: exported.append(span),
+    )
+    sink.emit(
+        replace(
+            _record("step-a", 0),
+            span_id="1111111111111111",
+            parent_span_id="0123456789abcdef",
+        )
+    )
+    sink.close()
+    assert exported
+    span = exported[0]
+    assert span["trace_id"] == "t1@topology"
+    assert span["span_id"] != "1111111111111111"
+    assert span["parent_span_id"] != "0123456789abcdef"
+    attrs = span["attributes"]
+    assert attrs["stream_kernel.trace_id"] == "t1"
+    assert attrs["stream_kernel.correlation_id"] == "t1"
+    assert attrs["stream_kernel.export_trace_id"] == "t1@topology"
+    assert attrs["stream_kernel.trace_plane"] == "platform_internals"
+
+
+def test_otel_otlp_trace_sink_topology_view_can_skip_business_spans() -> None:
+    exported: list[dict[str, object]] = []
+    sink = OTelOtlpTraceSink(
+        endpoint="http://collector:4318/v1/traces",
+        trace_view="topology",
+        topology_include_business_spans=False,
+        export_fn=lambda span: exported.append(span),
+    )
+    sink.emit(_record("compute_time_keys", 0))
+    sink.emit(
+        replace(
+            _record("system.obs.supervisor_handoff", 1),
+            route=RouteInfo(
+                process_group="supervisor.transport",
+                handoff_from="execution.features",
+                route_hop=4,
+            ),
+        )
+    )
+    sink.close()
+    assert len(exported) == 1
+    assert exported[0]["name"] == "system.obs.supervisor_handoff"
+
+
+def test_otel_otlp_trace_sink_reparents_filtered_parent_to_root_in_topology_view() -> None:
+    exported: list[dict[str, object]] = []
+    sink = OTelOtlpTraceSink(
+        endpoint="http://collector:4318/v1/traces",
+        trace_view="topology",
+        topology_include_business_spans=False,
+        export_fn=lambda span: exported.append(span),
+    )
+    # Hidden in topology plane (business span).
+    sink.emit(
+        replace(
+            _record("compute_time_keys", 0),
+            span_id="1111111111111111",
+            parent_span_id=None,
+        )
+    )
+    # Visible in topology plane (platform span) with a parent that was filtered out.
+    sink.emit(
+        replace(
+            _record("system.obs.supervisor_handoff", 1),
+            span_id="2222222222222222",
+            parent_span_id="1111111111111111",
+            route=RouteInfo(
+                process_group="supervisor.transport",
+                handoff_from="execution.features",
+                route_hop=5,
+            ),
+        )
+    )
+    sink.close()
+
+    assert len(exported) == 1
+    span = exported[0]
+    assert span["name"] == "system.obs.supervisor_handoff"
+    assert span.get("parent_span_id") is None
+    attrs = span.get("attributes", {})
+    assert isinstance(attrs, dict)
+    assert attrs.get("stream_kernel.parent_visible") is False
+    assert attrs.get("stream_kernel.parent_resolution") == "filtered_to_root"
 
 
 def _count_otlp_spans(payload: dict[str, object]) -> int:

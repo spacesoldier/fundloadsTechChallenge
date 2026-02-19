@@ -324,6 +324,12 @@ def execute_with_bootstrap_supervisor(
         if not isinstance(routing_cache, dict):
             routing_cache = {}
         configure_routing_cache(dict(routing_cache))
+    configure_dispatch_policy = getattr(supervisor, "configure_dispatch_policy", None)
+    if callable(configure_dispatch_policy):
+        boundary_dispatch = platform.get("boundary_dispatch", {})
+        if not isinstance(boundary_dispatch, dict):
+            boundary_dispatch = {}
+        configure_dispatch_policy(dict(boundary_dispatch))
     configure_lifecycle_logging = getattr(supervisor, "configure_lifecycle_logging", None)
     if callable(configure_lifecycle_logging):
         observability = runtime.get("observability", {})
@@ -333,6 +339,15 @@ def execute_with_bootstrap_supervisor(
         if not isinstance(logging_cfg, dict):
             logging_cfg = {}
         configure_lifecycle_logging(dict(logging_cfg))
+    configure_tracing = getattr(supervisor, "configure_tracing", None)
+    if callable(configure_tracing):
+        observability = runtime.get("observability", {})
+        if not isinstance(observability, dict):
+            observability = {}
+        tracing_cfg = observability.get("tracing", {})
+        if not isinstance(tracing_cfg, dict):
+            tracing_cfg = {}
+        configure_tracing(dict(tracing_cfg), strict=bool(runtime.get("strict", True)))
     boundary_inputs, dispatch_group, trace_aliases = _build_boundary_dispatch_inputs(
         runtime=runtime,
         inputs=inputs,
@@ -394,6 +409,11 @@ def execute_with_bootstrap_supervisor(
                     group_names=group_names,
                     policy=policy,
                 )
+                if _stop_mode == "graceful" and policy.drain_inflight:
+                    _wait_output_closed_if_available(
+                        supervisor=supervisor,
+                        policy=policy,
+                    )
                 _emit_stop_events(supervisor=supervisor, group_names=group_names, mode=_stop_mode)
             except RuntimeExecutionError as exc:
                 stop_error = exc
@@ -624,6 +644,24 @@ def _wait_boundary_drain_if_available(
         raise RuntimeBootstrapStopError("bootstrap supervisor boundary drain wait failed") from exc
     if isinstance(ready, bool) and not ready:
         raise RuntimeBootstrapStopTimeoutError("bootstrap supervisor boundary drain wait timed out")
+
+
+def _wait_output_closed_if_available(
+    *,
+    supervisor: BootstrapSupervisor,
+    policy: RuntimeLifecyclePolicy,
+) -> None:
+    # Phase D: wait for child on_run_end() completion signal before stopping.
+    # Allows file sinks and trace sinks to flush before the process is joined/killed.
+    waiter = getattr(supervisor, "wait_output_closed", None)
+    if not callable(waiter):
+        return
+    try:
+        closed = waiter(policy.graceful_timeout_seconds)
+    except Exception as exc:
+        raise RuntimeBootstrapStopError("bootstrap supervisor output-close wait failed") from exc
+    if isinstance(closed, bool) and not closed:
+        raise RuntimeBootstrapStopTimeoutError("bootstrap supervisor output-close wait timed out")
 
 
 def _map_worker_failure(

@@ -7,7 +7,9 @@ from stream_kernel.execution.observers.observer import (
     ObserverFactory,
     ObserverFactoryContext,
 )
-from stream_kernel.execution.observers.observer_discovery import discover_execution_observer_factories
+from stream_kernel.execution.observers.observer_discovery import (
+    discover_execution_observer_factories,
+)
 
 
 def build_execution_observers(

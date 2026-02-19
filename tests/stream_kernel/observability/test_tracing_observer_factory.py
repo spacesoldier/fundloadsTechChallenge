@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from stream_kernel.execution.observers.observer import ObserverFactoryContext
+from stream_kernel.execution.orchestration.observability_system_nodes import TraceDispatchEvent
 from stream_kernel.observability.observers.tracing import build_tracing_observer
 
 
@@ -86,13 +87,18 @@ def test_build_tracing_observer_observability_exporter_failure_is_isolated() -> 
 
     observer = build_tracing_observer(
         ObserverFactoryContext(
-            runtime={
-                "observability": {
-                    "tracing": {
-                        "exporters": [
-                            {"kind": "otel_otlp"},
-                            {"kind": "opentracing_bridge"},
-                        ]
+                runtime={
+                    "observability": {
+                        "pipeline": {
+                            "system_nodes": [
+                                {"kind": "system.obs.trace_dispatch", "enabled": False},
+                            ]
+                        },
+                        "tracing": {
+                            "exporters": [
+                                {"kind": "otel_otlp"},
+                                {"kind": "opentracing_bridge"},
+                            ]
                     }
                 }
             },
@@ -162,3 +168,103 @@ def test_build_tracing_observer_skips_missing_exporter_binding_in_non_strict_mod
         )
     )
     assert observer is None
+
+
+def test_build_tracing_observer_enables_runner_dispatch_when_trace_dispatch_node_configured() -> None:
+    observer = build_tracing_observer(
+        ObserverFactoryContext(
+            runtime={
+                "observability": {
+                    "pipeline": {
+                        "system_nodes": [
+                            {"kind": "system.obs.trace_dispatch", "enabled": True},
+                        ]
+                    },
+                    "tracing": {
+                        "exporters": [
+                            {"kind": "otel_otlp"},
+                        ]
+                    },
+                }
+            },
+            adapter_instances={"trace_otel_otlp#0": _Sink()},
+            run_id="r1",
+            scenario_id="s1",
+            node_order=["worker"],
+        )
+    )
+    assert observer is not None
+
+    state = observer.before_node(node_name="worker", payload={"v": 1}, ctx={}, trace_id="t1")
+    dispatched = observer.after_node(
+        node_name="worker",
+        payload={"v": 1},
+        ctx={},
+        trace_id="t1",
+        outputs=[],
+        state=state,
+    )
+    assert isinstance(dispatched, TraceDispatchEvent)
+
+
+def test_build_tracing_observer_enables_runner_dispatch_when_exporters_are_configured() -> None:
+    observer = build_tracing_observer(
+        ObserverFactoryContext(
+            runtime={
+                "observability": {
+                    "tracing": {
+                        "exporters": [
+                            {"kind": "otel_otlp", "enabled": True},
+                        ]
+                    }
+                }
+            },
+            adapter_instances={"trace_otel_otlp#0": _Sink()},
+            run_id="r1",
+            scenario_id="s1",
+            node_order=["worker"],
+        )
+    )
+    assert observer is not None
+
+    state = observer.before_node(node_name="worker", payload={"v": 1}, ctx={}, trace_id="t1")
+    dispatched = observer.after_node(
+        node_name="worker",
+        payload={"v": 1},
+        ctx={},
+        trace_id="t1",
+        outputs=[],
+        state=state,
+    )
+    assert isinstance(dispatched, TraceDispatchEvent)
+
+
+def test_build_tracing_observer_worker_role_skips_local_sinks_but_dispatches() -> None:
+    observer = build_tracing_observer(
+        ObserverFactoryContext(
+            runtime={
+                "__process_role": "worker",
+                "tracing": {"enabled": False},
+                "observability": {
+                    "tracing": {
+                        "exporters": [{"kind": "jsonl", "enabled": True}],
+                    },
+                },
+            },
+            adapter_instances={"trace_jsonl#0": _Sink()},
+            run_id="r1",
+            scenario_id="s1",
+            node_order=["worker"],
+        )
+    )
+    assert observer is not None
+    state = observer.before_node(node_name="worker", payload={"v": 1}, ctx={}, trace_id="t1")
+    dispatched = observer.after_node(
+        node_name="worker",
+        payload={"v": 1},
+        ctx={},
+        trace_id="t1",
+        outputs=[],
+        state=state,
+    )
+    assert isinstance(dispatched, TraceDispatchEvent)

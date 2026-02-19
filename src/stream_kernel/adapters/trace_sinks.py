@@ -7,12 +7,13 @@ import platform
 import socket
 import sys
 import threading
-from importlib import import_module
+from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from hashlib import sha256
+from importlib import import_module
 from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING, Literal
@@ -32,23 +33,22 @@ class JsonlTraceSink:
         flush_every_n: int = 1,
         flush_every_ms: int | None = None,
         fsync_every_n: int | None = None,
+        trace_slice: str = "all",
     ) -> None:
         self._path = path
         self._write_mode = write_mode
         self._flush_every_n = max(1, flush_every_n)
         self._flush_every_ms = flush_every_ms  # reserved, not used in sync runtime
         self._fsync_every_n = fsync_every_n
+        self._trace_slice = _normalize_trace_slice(trace_slice)
         self._emit_count = 0
         self._buffer: list[str] = []
         self._handle = self._path.open("a", encoding="utf-8")
 
     def emit(self, record: "TraceRecord") -> None:
-        line = json.dumps(
-            _trace_to_dict(record),
-            separators=(",", ":"),
-            ensure_ascii=False,
-            default=_json_default,
-        )
+        line = self._serialize_line(record)
+        if line is None:
+            return
         if self._write_mode == "batch":
             self._buffer.append(line)
             if len(self._buffer) >= self._flush_every_n:
@@ -61,6 +61,33 @@ class JsonlTraceSink:
         self._emit_count += 1
         if self._fsync_every_n and self._emit_count % self._fsync_every_n == 0:
             os.fsync(self._handle.fileno())
+
+    async def emit_async(self, record: "TraceRecord") -> None:
+        # Keep event loop non-blocking: in batch mode offload only flush/fsync boundaries.
+        # This avoids one thread-hop per record while preserving deterministic write order.
+        line = self._serialize_line(record)
+        if line is None:
+            return
+        if self._write_mode == "batch":
+            self._buffer.append(line)
+            should_flush_buffer = len(self._buffer) >= self._flush_every_n
+            next_emit_count = self._emit_count + 1
+            should_fsync = bool(
+                self._fsync_every_n
+                and next_emit_count % self._fsync_every_n == 0
+            )
+            self._emit_count = next_emit_count
+            if should_flush_buffer:
+                lines = list(self._buffer)
+                self._buffer.clear()
+                await asyncio.to_thread(self._write_lines, lines)
+            if should_fsync:
+                await asyncio.to_thread(self._fsync_now)
+            return
+
+        # Python 3.13 TextIOWrapper can deadlock when file writes are offloaded from the owner thread.
+        # Keep line mode on the current loop thread; batch mode still offloads flush boundaries.
+        self.emit(record)
 
     def flush(self) -> None:
         if self._buffer:
@@ -75,6 +102,21 @@ class JsonlTraceSink:
     def _write_lines(self, lines: Iterable[str]) -> None:
         for line in lines:
             self._handle.write(line + "\n")
+
+    def _serialize_line(self, record: "TraceRecord") -> str | None:
+        payload = _trace_to_dict(record, trace_slice=self._trace_slice)
+        if payload is None:
+            return None
+        return json.dumps(
+            payload,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=_json_default,
+        )
+
+    def _fsync_now(self) -> None:
+        self._handle.flush()
+        os.fsync(self._handle.fileno())
 
 
 class StdoutTraceSink:
@@ -132,7 +174,13 @@ class OTelOtlpTraceSink:
         service_instance_id: str | None = None,
         deployment_environment: str | None = None,
         service_name_by_process_group: bool = True,
+        service_name_by_step: bool = False,
+        service_name_suffix: str | None = None,
         include_runtime_resource: bool = True,
+        trace_view: str = "topology",
+        logical_include_platform_spans: bool = False,
+        topology_include_business_spans: bool = True,
+        isolate_view_ids: bool = False,
         span_kind: str = "SPAN_KIND_INTERNAL",
         export_fn: Callable[[dict[str, object]], None] | None = None,
         timeout_seconds: float = 2.0,
@@ -168,7 +216,13 @@ class OTelOtlpTraceSink:
         self._service_instance_id = service_instance_id
         self._deployment_environment = deployment_environment
         self._service_name_by_process_group = service_name_by_process_group
+        self._service_name_by_step = bool(service_name_by_step)
+        self._service_name_suffix = service_name_suffix
         self._include_runtime_resource = include_runtime_resource
+        self._trace_view = trace_view
+        self._logical_include_platform_spans = bool(logical_include_platform_spans)
+        self._topology_include_business_spans = bool(topology_include_business_spans)
+        self._isolate_view_ids = bool(isolate_view_ids)
         self._span_kind = span_kind
         self._export_fn = export_fn
         self._timeout_seconds = float(timeout_seconds)
@@ -199,24 +253,44 @@ class OTelOtlpTraceSink:
         self._batch_started_at: float | None = None
         self._requests_session: object | None = None
         self._httpx_client: object | None = None
+        self._httpx_client_loop: asyncio.AbstractEventLoop | None = None
         self._grpc_channel: object | None = None
         self._grpc_stub: object | None = None
         self._urllib3_pool_manager: object | None = None
         self._aiohttp_session: object | None = None
+        self._aiohttp_session_loop: asyncio.AbstractEventLoop | None = None
         self._otel_sdk_module: object | None = None
         self._otel_sdk_provider: object | None = None
         self._otel_sdk_tracer: object | None = None
+        self._span_visibility: dict[str, bool] = {}
+        self._span_visibility_order: deque[str] = deque()
+        self._span_visibility_limit = max(1024, self._queue_max_items * 32)
         self._exported = 0
         self._dropped = 0
 
     def emit(self, record: "TraceRecord") -> None:
+        span_id_text = record.span_id if isinstance(record.span_id, str) and record.span_id else None
+        parent_span_id_text = record.parent_span_id if isinstance(record.parent_span_id, str) and record.parent_span_id else None
         span = _trace_to_otel_span(
             record,
             endpoint=self._endpoint,
             headers=self._headers,
             service_name=self._service_name,
             service_name_by_process_group=self._service_name_by_process_group,
+            service_name_by_step=self._service_name_by_step,
+            service_name_suffix=self._service_name_suffix,
+            trace_view=self._trace_view,
+            logical_include_platform_spans=self._logical_include_platform_spans,
+            topology_include_business_spans=self._topology_include_business_spans,
+            isolate_view_ids=self._isolate_view_ids,
             span_kind=self._span_kind,
+        )
+        self._remember_span_visibility(span_id_text, visible=span is not None)
+        if span is None:
+            return
+        self._apply_parent_visibility_policy(
+            span=span,
+            parent_span_id=parent_span_id_text,
         )
         if len(self._span_buffer) >= self._queue_max_items:
             if self._queue_drop_policy == "drop_newest":
@@ -245,6 +319,52 @@ class OTelOtlpTraceSink:
         if flush_by_count or flush_by_timer:
             self._flush_batch()
 
+    async def emit_async(self, record: TraceRecord) -> None:
+        # Hot-path async emit for async backends (httpx-async, aiohttp).
+        # Awaited directly by AsyncRunner — _run_async_blocking is NOT called here.
+        span_id_text = record.span_id if isinstance(record.span_id, str) and record.span_id else None
+        parent_span_id_text = record.parent_span_id if isinstance(record.parent_span_id, str) and record.parent_span_id else None
+        span = _trace_to_otel_span(
+            record,
+            endpoint=self._endpoint,
+            headers=self._headers,
+            service_name=self._service_name,
+            service_name_by_process_group=self._service_name_by_process_group,
+            service_name_by_step=self._service_name_by_step,
+            service_name_suffix=self._service_name_suffix,
+            trace_view=self._trace_view,
+            logical_include_platform_spans=self._logical_include_platform_spans,
+            topology_include_business_spans=self._topology_include_business_spans,
+            isolate_view_ids=self._isolate_view_ids,
+            span_kind=self._span_kind,
+        )
+        self._remember_span_visibility(span_id_text, visible=span is not None)
+        if span is None:
+            return
+        self._apply_parent_visibility_policy(
+            span=span,
+            parent_span_id=parent_span_id_text,
+        )
+        if len(self._span_buffer) >= self._queue_max_items:
+            if self._queue_drop_policy == "drop_oldest":
+                self._span_buffer.pop(0)
+                self._dropped += 1
+            else:
+                self._dropped += 1
+                return
+        self._span_buffer.append(span)
+        now = self._time_fn()
+        if self._batch_started_at is None:
+            self._batch_started_at = now
+        flush_by_count = len(self._span_buffer) >= self._batch_max_items
+        flush_by_timer = (
+            self._batch_flush_interval_ms > 0
+            and self._batch_started_at is not None
+            and (now - self._batch_started_at) * 1000 >= self._batch_flush_interval_ms
+        )
+        if flush_by_count or flush_by_timer:
+            await self._flush_batch_async()
+
     def flush(self) -> None:
         self._flush_batch()
 
@@ -267,6 +387,47 @@ class OTelOtlpTraceSink:
     def diagnostics(self) -> dict[str, int]:
         return {"exported": self._exported, "dropped": self._dropped}
 
+    def _remember_span_visibility(self, span_id: str | None, *, visible: bool) -> None:
+        if not isinstance(span_id, str) or not span_id:
+            return
+        if span_id not in self._span_visibility:
+            self._span_visibility_order.append(span_id)
+        self._span_visibility[span_id] = visible
+        while len(self._span_visibility_order) > self._span_visibility_limit:
+            evicted = self._span_visibility_order.popleft()
+            self._span_visibility.pop(evicted, None)
+
+    def _apply_parent_visibility_policy(
+        self,
+        *,
+        span: dict[str, object],
+        parent_span_id: str | None,
+    ) -> None:
+        if not isinstance(parent_span_id, str) or not parent_span_id:
+            return
+        attrs = span.get("attributes")
+        if not isinstance(attrs, dict):
+            return
+        parent_visible = self._span_visibility.get(parent_span_id)
+        if parent_visible is False:
+            span["parent_span_id"] = None
+            attrs["stream_kernel.parent_visible"] = False
+            attrs["stream_kernel.parent_resolution"] = "filtered_to_root"
+            return
+        if parent_visible is None and self._is_partial_trace_view():
+            # In filtered plane views we prefer a complete local tree over dangling
+            # parents that likely belong to excluded records.
+            span["parent_span_id"] = None
+            attrs["stream_kernel.parent_visible"] = False
+            attrs["stream_kernel.parent_resolution"] = "unknown_to_root"
+
+    def _is_partial_trace_view(self) -> bool:
+        if self._trace_view == "logical":
+            return not self._logical_include_platform_spans
+        if self._trace_view == "topology":
+            return not self._topology_include_business_spans
+        return False
+
     def _flush_batch(self) -> None:
         if not self._span_buffer:
             return
@@ -286,6 +447,50 @@ class OTelOtlpTraceSink:
 
         try:
             self._post_http(batch)
+        except Exception:
+            self._dropped += len(batch)
+            return
+        self._exported += len(batch)
+
+    async def _flush_batch_async(self) -> None:
+        # Async flush — called from emit_async hot path.
+        # httpx-async and aiohttp are awaited natively; sync backends are offloaded to a thread.
+        if not self._span_buffer:
+            return
+        batch = list(self._span_buffer)
+        self._span_buffer.clear()
+        self._batch_started_at = None
+
+        if callable(self._export_fn):
+            for span in batch:
+                try:
+                    self._export_fn(span)
+                except Exception:
+                    self._dropped += 1
+                    continue
+                self._exported += 1
+            return
+
+        payload = _spans_to_otlp_http_payload(
+            batch,
+            service_name=self._service_name,
+            service_namespace=self._service_namespace,
+            service_version=self._service_version,
+            service_instance_id=self._service_instance_id,
+            deployment_environment=self._deployment_environment,
+            include_runtime_resource=self._include_runtime_resource,
+        )
+        body = json.dumps(
+            payload, separators=(",", ":"), ensure_ascii=False, default=_json_default
+        ).encode("utf-8")
+        try:
+            if self._backend == "httpx":
+                await self._post_http_httpx_async_native(body)
+            elif self._backend == "aiohttp":
+                await self._post_http_aiohttp_native(body)
+            else:
+                # Sync backends: run in thread pool to avoid blocking the event loop.
+                await asyncio.to_thread(self._post_http, batch)
         except Exception:
             self._dropped += len(batch)
             return
@@ -494,7 +699,22 @@ class OTelOtlpTraceSink:
             )
             self._validate_http_response(response)
 
-        _run_async_blocking(_send())
+        _run_async_blocking(_send(), timeout_seconds=self._timeout_seconds)
+
+    async def _post_http_httpx_async_native(self, body: bytes) -> None:
+        # Native async version — awaited directly; _run_async_blocking not called.
+        headers = {"Content-Type": "application/json", **self._headers}
+        client = self._get_httpx_async_client()
+        post = getattr(client, "post", None)
+        if not callable(post):
+            raise RuntimeError("httpx.AsyncClient.post is not callable")
+        response = await post(  # type: ignore[operator]
+            self._endpoint,
+            content=body,
+            headers=headers,
+            timeout=self._timeout_seconds,
+        )
+        self._validate_http_response(response)
 
     def _get_httpx_sync_client(self) -> object:
         if self._httpx_client is not None:
@@ -514,8 +734,23 @@ class OTelOtlpTraceSink:
         return self._httpx_client
 
     def _get_httpx_async_client(self) -> object:
+        current_loop: asyncio.AbstractEventLoop | None
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
         if self._httpx_client is not None:
-            return self._httpx_client
+            if (
+                self._httpx_mode == "async"
+                and self._httpx_client_loop is not None
+                and self._httpx_client_loop is not current_loop
+            ):
+                # Async client is loop-bound; recreate on cross-loop access.
+                self._httpx_client = None
+                self._httpx_client_loop = None
+            else:
+                return self._httpx_client
         httpx_module = _import_httpx_module()
         client_cls = getattr(httpx_module, "AsyncClient", None)
         if not callable(client_cls):
@@ -528,6 +763,7 @@ class OTelOtlpTraceSink:
         if limits is not None:
             kwargs["limits"] = limits
         self._httpx_client = client_cls(**kwargs)
+        self._httpx_client_loop = current_loop
         return self._httpx_client
 
     def _build_httpx_limits(self, httpx_module: object) -> object | None:
@@ -551,6 +787,7 @@ class OTelOtlpTraceSink:
     def _close_httpx_client(self) -> None:
         client = self._httpx_client
         self._httpx_client = None
+        self._httpx_client_loop = None
         if client is None:
             return
         if self._httpx_mode == "async":
@@ -560,7 +797,7 @@ class OTelOtlpTraceSink:
                     await close_async()
 
             try:
-                _run_async_blocking(_close_async())
+                _run_async_blocking(_close_async(), timeout_seconds=self._timeout_seconds)
             except Exception:
                 return
             return
@@ -692,9 +929,40 @@ class OTelOtlpTraceSink:
 
         _run_async_blocking(_send())
 
+    async def _post_http_aiohttp_native(self, body: bytes) -> None:
+        # Native async version — awaited directly; _run_async_blocking not called.
+        headers = {"Content-Type": "application/json", **self._headers}
+        session = self._get_aiohttp_session()
+        post = getattr(session, "post", None)
+        if not callable(post):
+            raise RuntimeError("aiohttp.ClientSession.post is not callable")
+        async with post(  # type: ignore[attr-defined]
+            self._endpoint,
+            data=body,
+            headers=headers,
+            timeout=self._timeout_seconds,
+        ) as response:
+            status = getattr(response, "status", None)
+            if isinstance(status, int) and status >= 400:
+                raise OSError(f"otlp_http_export_failed:{status}")
+            raise_for_status = getattr(response, "raise_for_status", None)
+            if callable(raise_for_status):
+                raise_for_status()
+
     def _get_aiohttp_session(self) -> object:
+        current_loop: asyncio.AbstractEventLoop | None
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
         if self._aiohttp_session is not None:
-            return self._aiohttp_session
+            if self._aiohttp_session_loop is not None and self._aiohttp_session_loop is not current_loop:
+                # aiohttp session is loop-bound; recreate on cross-loop access.
+                self._aiohttp_session = None
+                self._aiohttp_session_loop = None
+            else:
+                return self._aiohttp_session
         aiohttp_module = _import_aiohttp_module()
         session_cls = getattr(aiohttp_module, "ClientSession", None)
         if not callable(session_cls):
@@ -704,6 +972,7 @@ class OTelOtlpTraceSink:
         if connector is not None:
             kwargs["connector"] = connector
         self._aiohttp_session = session_cls(**kwargs)
+        self._aiohttp_session_loop = current_loop
         return self._aiohttp_session
 
     def _build_aiohttp_connector(self, aiohttp_module: object) -> object | None:
@@ -727,6 +996,7 @@ class OTelOtlpTraceSink:
     def _close_aiohttp_session(self) -> None:
         session = self._aiohttp_session
         self._aiohttp_session = None
+        self._aiohttp_session_loop = None
         if session is None:
             return
 
@@ -886,8 +1156,142 @@ class OpenTracingBridgeTraceSink:
         return {"exported": self._exported, "dropped": self._dropped}
 
 
-def _trace_to_dict(record: "TraceRecord") -> dict[str, object]:
+from stream_kernel.adapters.contracts import TraceSinkPort, adapter  # noqa: E402
+
+
+def _otlp_kwargs(settings: dict[str, object]) -> dict[str, object]:
+    # Extract OTelOtlpTraceSink constructor kwargs from an adapter settings dict.
+    kwargs: dict[str, object] = {"endpoint": str(settings["endpoint"])}
+    for key in (
+        "backend", "service_name", "service_namespace", "service_version",
+        "service_instance_id", "deployment_environment", "span_kind", "trace_view",
+        "service_name_suffix",
+        "queue_drop_policy", "httpx_mode",
+    ):
+        if key in settings:
+            kwargs[key] = str(settings[key])
+    for key in (
+        "service_name_by_process_group", "service_name_by_step",
+        "include_runtime_resource", "isolate_view_ids",
+        "logical_include_platform_spans", "topology_include_business_spans",
+        "httpx_http2", "grpc_insecure",
+    ):
+        if key in settings:
+            kwargs[key] = bool(settings[key])
+    for key in (
+        "batch_max_items", "batch_flush_interval_ms", "queue_max_items",
+        "retry_max_attempts", "retry_backoff_ms",
+    ):
+        if key in settings:
+            kwargs[key] = int(settings[key])  # type: ignore[arg-type]
+    for key in ("timeout_seconds", "grpc_timeout_seconds", "aiohttp_shutdown_timeout_seconds",
+                "urllib3_timeout_seconds"):
+        if key in settings:
+            kwargs[key] = float(settings[key])  # type: ignore[arg-type]
+    for key in ("urllib3_num_pools", "urllib3_maxsize", "httpx_max_connections",
+                "httpx_max_keepalive_connections", "aiohttp_connector_limit",
+                "aiohttp_connector_limit_per_host"):
+        if key in settings:
+            kwargs[key] = int(settings[key])  # type: ignore[arg-type]
+    if "urllib3_block" in settings:
+        kwargs["urllib3_block"] = bool(settings["urllib3_block"])
+    if "headers" in settings and isinstance(settings["headers"], dict):
+        kwargs["headers"] = {str(k): str(v) for k, v in settings["headers"].items()}
+    return kwargs
+
+
+@adapter(
+    name="trace_jsonl",
+    kind="trace_sink",
+    consumes=[],
+    emits=[],
+    binds=[("stream", TraceSinkPort)],
+    execution_mode="sync",
+)
+def trace_jsonl_adapter(settings: dict[str, object]) -> TraceSinkPort:
+    # Platform trace sink adapter: writes one TraceRecord per JSONL line.
+    flush_every_ms = settings.get("flush_every_ms")
+    fsync_every_n = settings.get("fsync_every_n")
+    return JsonlTraceSink(
+        path=Path(str(settings["path"])),
+        write_mode=str(settings.get("write_mode", "line")),
+        flush_every_n=int(settings.get("flush_every_n", 1)),
+        flush_every_ms=int(flush_every_ms) if flush_every_ms is not None else None,
+        fsync_every_n=int(fsync_every_n) if fsync_every_n is not None else None,
+    )
+
+
+@adapter(
+    name="trace_stdout",
+    kind="trace_sink",
+    consumes=[],
+    emits=[],
+    binds=[("stream", TraceSinkPort)],
+    execution_mode="sync",
+)
+def trace_stdout_adapter(settings: dict[str, object]) -> TraceSinkPort:
+    # Platform trace sink adapter: writes TraceRecord JSON lines to stdout.
+    return StdoutTraceSink()
+
+
+@adapter(
+    name="trace_otel_otlp",
+    kind="trace_sink",
+    consumes=[],
+    emits=[],
+    binds=[("stream", TraceSinkPort)],
+    execution_mode="sync",
+)
+def trace_otel_otlp_adapter(settings: dict[str, object]) -> TraceSinkPort:
+    # Platform trace sink adapter: OTLP export via sync backends
+    # (urllib, requests, httpx-sync, urllib3, grpcio, otel_sdk).
+    return OTelOtlpTraceSink(**_otlp_kwargs(settings))
+
+
+@adapter(
+    name="trace_otel_otlp_async",
+    kind="trace_sink",
+    consumes=[],
+    emits=[],
+    binds=[("stream", TraceSinkPort)],
+    execution_mode="async",
+)
+def trace_otel_otlp_async_adapter(settings: dict[str, object]) -> TraceSinkPort:
+    # Platform trace sink adapter: OTLP export via async backends (httpx-async, aiohttp).
+    return OTelOtlpTraceSink(**_otlp_kwargs(settings))
+
+
+@adapter(
+    name="trace_opentracing_bridge",
+    kind="trace_sink",
+    consumes=[],
+    emits=[],
+    binds=[("stream", TraceSinkPort)],
+    execution_mode="sync",
+)
+def trace_opentracing_bridge_adapter(settings: dict[str, object]) -> TraceSinkPort:
+    # Platform trace sink adapter: legacy OpenTracing bridge.
+    emit_fn = settings.get("emit_fn")
+    return OpenTracingBridgeTraceSink(
+        bridge_name=str(settings.get("bridge_name", "opentracing")),
+        emit_fn=emit_fn if callable(emit_fn) else None,
+    )
+
+
+def _trace_to_dict(
+    record: "TraceRecord",
+    *,
+    trace_slice: str = "all",
+) -> dict[str, object] | None:
     # Keep key order stable so diffs stay deterministic in tests and diagnostics.
+    process_group = record.route.process_group if record.route is not None else None
+    handoff_from = record.route.handoff_from if record.route is not None else None
+    route_hop = record.route.route_hop if record.route is not None else None
+    runner_gap_ms = record.route.runner_gap_ms if record.route is not None else None
+    if trace_slice == "business_logic" and _is_platform_record(record):
+        return None
+    if trace_slice == "platform_internals" and not _is_platform_record(record):
+        return None
     return {
         "trace_id": record.trace_id,
         "scenario": record.scenario,
@@ -908,7 +1312,59 @@ def _trace_to_dict(record: "TraceRecord") -> dict[str, object]:
         "parent_span_id": record.parent_span_id,
         "error": _as_dict(record.error) if record.error is not None else None,
         "route": _as_dict(record.route) if record.route is not None else None,
+        # Flattened route markers simplify profiling/grep over jsonl traces.
+        "process_group": process_group,
+        "handoff_from": handoff_from,
+        "route_hop": route_hop,
+        "runner_gap_ms": runner_gap_ms,
+        "trace_view": _trace_view_for_slice(trace_slice),
+        "trace_plane": trace_slice,
+        "slice_node": _slice_node_for_record(record=record, trace_slice=trace_slice),
     }
+
+
+def _normalize_trace_slice(value: str) -> str:
+    token = value.strip().lower()
+    aliases = {
+        "all": "all",
+        "full": "all",
+        "combined": "all",
+        "business_logic": "business_logic",
+        "logical": "business_logic",
+        "platform_internals": "platform_internals",
+        "topology": "platform_internals",
+    }
+    resolved = aliases.get(token)
+    if isinstance(resolved, str):
+        return resolved
+    supported = sorted(set(aliases.values()))
+    raise ValueError(f"trace_jsonl.settings.trace_slice must be one of: {supported}")
+
+
+def _trace_view_for_slice(trace_slice: str) -> str:
+    if trace_slice == "business_logic":
+        return "logical"
+    if trace_slice == "platform_internals":
+        return "topology"
+    return "all"
+
+
+def _slice_node_for_record(*, record: "TraceRecord", trace_slice: str) -> str:
+    if trace_slice == "platform_internals":
+        process_group = record.route.process_group if record.route is not None else None
+        if isinstance(process_group, str) and process_group:
+            return process_group
+    return record.step_name
+
+
+def _is_platform_record(record: "TraceRecord") -> bool:
+    if record.step_name.startswith("system.obs."):
+        return True
+    route = record.route
+    if route is None:
+        return False
+    process_group = route.process_group
+    return isinstance(process_group, str) and process_group == "supervisor.transport"
 
 
 def _trace_to_otel_span(
@@ -918,22 +1374,57 @@ def _trace_to_otel_span(
     headers: dict[str, str],
     service_name: str,
     service_name_by_process_group: bool,
+    service_name_by_step: bool,
+    service_name_suffix: str | None,
+    trace_view: str,
+    logical_include_platform_spans: bool,
+    topology_include_business_spans: bool,
+    isolate_view_ids: bool,
     span_kind: str,
-) -> dict[str, object]:
+) -> dict[str, object] | None:
+    if not _record_visible_for_trace_view(
+        record=record,
+        trace_view=trace_view,
+        logical_include_platform_spans=logical_include_platform_spans,
+        topology_include_business_spans=topology_include_business_spans,
+    ):
+        return None
+    trace_plane = _trace_plane_for_view(trace_view)
     process_group = record.route.process_group if record.route is not None else None
-    resolved_service_name = (
-        f"{service_name}.{process_group}"
-        if service_name_by_process_group and isinstance(process_group, str) and process_group
-        else service_name
-    )
+    handoff_from = record.route.handoff_from if record.route is not None else None
+    route_hop = record.route.route_hop if record.route is not None else None
+    runner_gap_ms = record.route.runner_gap_ms if record.route is not None else None
+    start_ns = int(record.t_enter.timestamp() * 1_000_000_000)
+    end_ns = int(record.t_exit.timestamp() * 1_000_000_000)
+    if service_name_by_step:
+        resolved_service_name = f"{service_name}.{_service_name_part(record.step_name)}"
+    elif service_name_by_process_group and isinstance(process_group, str) and process_group:
+        resolved_service_name = f"{service_name}.{_service_name_part(process_group)}"
+    else:
+        resolved_service_name = service_name
+    if isinstance(service_name_suffix, str) and service_name_suffix:
+        resolved_service_name = f"{resolved_service_name}{service_name_suffix}"
+
+    exported_trace_id = record.trace_id
+    exported_span_id = record.span_id
+    exported_parent_span_id = record.parent_span_id
+    if isolate_view_ids:
+        exported_trace_id = f"{record.trace_id}@{trace_view}"
+        if isinstance(record.span_id, str) and record.span_id:
+            exported_span_id = _stable_hex_id(f"{record.span_id}:{trace_view}", size_bytes=8)
+        if isinstance(record.parent_span_id, str) and record.parent_span_id:
+            exported_parent_span_id = _stable_hex_id(
+                f"{record.parent_span_id}:{trace_view}",
+                size_bytes=8,
+            )
     return {
-        "trace_id": record.trace_id,
-        "span_id": record.span_id,
-        "parent_span_id": record.parent_span_id,
+        "trace_id": exported_trace_id,
+        "span_id": exported_span_id,
+        "parent_span_id": exported_parent_span_id,
         "name": record.step_name,
         "kind": span_kind,
-        "start_time_unix_nano": int(record.t_enter.timestamp() * 1_000_000_000),
-        "end_time_unix_nano": int(record.t_exit.timestamp() * 1_000_000_000),
+        "start_time_unix_nano": start_ns,
+        "end_time_unix_nano": end_ns,
         "status": record.status,
         "resource": {"service.name": resolved_service_name},
         "attributes": {
@@ -942,17 +1433,63 @@ def _trace_to_otel_span(
             "work_index": record.work_index,
             "msg_out_count": record.msg_out_count,
             "process_group": process_group,
-            "handoff_from": record.route.handoff_from if record.route is not None else None,
-            "route_hop": record.route.route_hop if record.route is not None else None,
+            "handoff_from": handoff_from,
+            "route_hop": route_hop,
+            "runner_gap_ms": runner_gap_ms,
+            "stream_kernel.status": record.status,
+            "stream_kernel.step_name": record.step_name,
+            "stream_kernel.step_index": record.step_index,
+            "stream_kernel.work_index": record.work_index,
+            "stream_kernel.scenario": record.scenario,
+            "stream_kernel.msg_in.type": record.msg_in.type_name,
+            "stream_kernel.msg_out_count": record.msg_out_count,
+            "stream_kernel.duration_ms": record.duration_ms,
+            "stream_kernel.start_time_unix_nano": start_ns,
+            "stream_kernel.end_time_unix_nano": end_ns,
+            "stream_kernel.process_group": process_group,
+            "stream_kernel.handoff_from": handoff_from,
+            "stream_kernel.route_hop": route_hop,
+            "stream_kernel.runner_gap_ms": runner_gap_ms,
             "stream_kernel.trace_id": record.trace_id,
+            "stream_kernel.correlation_id": record.trace_id,
             "stream_kernel.span_id": record.span_id,
             "stream_kernel.parent_span_id": record.parent_span_id,
+            "stream_kernel.export_trace_id": exported_trace_id,
+            "stream_kernel.export_span_id": exported_span_id,
+            "stream_kernel.export_parent_span_id": exported_parent_span_id,
+            "stream_kernel.trace_view": trace_view,
+            "stream_kernel.trace_plane": trace_plane,
         },
         "transport": {
             "endpoint": endpoint,
             "headers": dict(headers),
         },
     }
+
+
+def _record_visible_for_trace_view(
+    *,
+    record: "TraceRecord",
+    trace_view: str,
+    logical_include_platform_spans: bool,
+    topology_include_business_spans: bool,
+) -> bool:
+    platform_record = _is_platform_control_record(record)
+    if trace_view == "logical":
+        return logical_include_platform_spans or not platform_record
+    if trace_view == "topology":
+        return topology_include_business_spans or platform_record
+    return True
+
+
+def _is_platform_control_record(record: "TraceRecord") -> bool:
+    if record.step_name.startswith("system.obs."):
+        return True
+    route = record.route
+    if route is None:
+        return False
+    process_group = route.process_group
+    return isinstance(process_group, str) and process_group == "supervisor.transport"
 
 
 def _span_to_otlp_http_payload(
@@ -986,7 +1523,7 @@ def _spans_to_otlp_http_payload(
     deployment_environment: str | None = None,
     include_runtime_resource: bool = True,
 ) -> dict[str, object]:
-    resource_spans: list[dict[str, object]] = []
+    grouped_spans: dict[str, list[dict[str, object]]] = {}
     for span in spans:
         trace_id_text = str(span.get("trace_id", ""))
         span_id_text = span.get("span_id")
@@ -1000,6 +1537,7 @@ def _spans_to_otlp_http_payload(
         attrs = raw_attrs if isinstance(raw_attrs, dict) else {}
         raw_resource = span.get("resource", {})
         resource = raw_resource if isinstance(raw_resource, dict) else {}
+        resolved_service_name = str(resource.get("service.name", service_name))
 
         trace_hex = _stable_hex_id(trace_id_text, size_bytes=16)
         span_hex = _normalize_span_id(span_id_text) or _stable_hex_id(
@@ -1018,18 +1556,6 @@ def _spans_to_otlp_http_payload(
             else "STATUS_CODE_ERROR" if status == "error" else "STATUS_CODE_UNSET"
         )
 
-        resource_attributes = [_otlp_attr("service.name", str(resource.get("service.name", service_name)))]
-        if isinstance(service_namespace, str) and service_namespace:
-            resource_attributes.append(_otlp_attr("service.namespace", service_namespace))
-        if isinstance(service_version, str) and service_version:
-            resource_attributes.append(_otlp_attr("service.version", service_version))
-        if isinstance(service_instance_id, str) and service_instance_id:
-            resource_attributes.append(_otlp_attr("service.instance.id", service_instance_id))
-        if isinstance(deployment_environment, str) and deployment_environment:
-            resource_attributes.append(_otlp_attr("deployment.environment.name", deployment_environment))
-        if include_runtime_resource:
-            resource_attributes.extend(_runtime_resource_attributes())
-
         otlp_span: dict[str, object] = {
             "traceId": trace_hex,
             "spanId": span_hex,
@@ -1043,13 +1569,28 @@ def _spans_to_otlp_http_payload(
         if isinstance(parent_hex, str):
             otlp_span["parentSpanId"] = parent_hex
 
+        grouped_spans.setdefault(resolved_service_name, []).append(otlp_span)
+
+    resource_spans: list[dict[str, object]] = []
+    for resolved_service_name, grouped in grouped_spans.items():
+        resource_attributes = [_otlp_attr("service.name", resolved_service_name)]
+        if isinstance(service_namespace, str) and service_namespace:
+            resource_attributes.append(_otlp_attr("service.namespace", service_namespace))
+        if isinstance(service_version, str) and service_version:
+            resource_attributes.append(_otlp_attr("service.version", service_version))
+        if isinstance(service_instance_id, str) and service_instance_id:
+            resource_attributes.append(_otlp_attr("service.instance.id", service_instance_id))
+        if isinstance(deployment_environment, str) and deployment_environment:
+            resource_attributes.append(_otlp_attr("deployment.environment.name", deployment_environment))
+        if include_runtime_resource:
+            resource_attributes.extend(_runtime_resource_attributes())
         resource_spans.append(
             {
                 "resource": {"attributes": resource_attributes},
                 "scopeSpans": [
                     {
                         "scope": {"name": "stream-kernel"},
-                        "spans": [otlp_span],
+                        "spans": grouped,
                     }
                 ],
             }
@@ -1162,6 +1703,21 @@ def _stable_hex_id(value: str, *, size_bytes: int) -> str:
     return digest[:size_bytes].hex()
 
 
+def _service_name_part(value: str) -> str:
+    token = value.strip()
+    if not token:
+        return "unknown"
+    return "".join(ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in token)
+
+
+def _trace_plane_for_view(trace_view: str) -> str:
+    if trace_view == "logical":
+        return "business_logic"
+    if trace_view == "topology":
+        return "platform_internals"
+    return "unknown"
+
+
 def _normalize_span_id(value: object) -> str | None:
     if not isinstance(value, str):
         return None
@@ -1233,6 +1789,7 @@ def _trace_to_opentracing_span(record: "TraceRecord", *, bridge_name: str) -> di
             "process_group": record.route.process_group if record.route is not None else None,
             "handoff_from": record.route.handoff_from if record.route is not None else None,
             "route_hop": record.route.route_hop if record.route is not None else None,
+            "runner_gap_ms": record.route.runner_gap_ms if record.route is not None else None,
         },
         "logs": logs,
     }

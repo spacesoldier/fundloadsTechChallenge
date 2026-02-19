@@ -16,6 +16,7 @@ _SUPPORTED_EXECUTION_IPC_AUTH_MODES = {"hmac"}
 _SUPPORTED_BOOTSTRAP_MODES = {"inline", "process_supervisor"}
 _SUPPORTED_EXECUTION_IPC_SECRET_MODES = {"static", "generated"}
 _SUPPORTED_EXECUTION_IPC_KDFS = {"none", "hkdf_sha256"}
+_SUPPORTED_BOUNDARY_DISPATCH_MODES = {"stream", "batch"}
 _SUPPORTED_WEB_INTERFACE_KINDS = {"http", "http_stream", "websocket", "graphql"}
 _SUPPORTED_WEB_BIND_PORT_TYPES = {"request", "response", "stream", "kv_stream"}
 _PROCESS_GROUP_SELECTOR_KEYS = {"stages", "tags", "runners", "nodes"}
@@ -29,9 +30,19 @@ _PROCESS_GROUP_RUNTIME_KEYS = {
 }
 _SUPPORTED_PROCESS_GROUP_RUNNER_PROFILES = {"sync", "async"}
 _SUPPORTED_PROCESS_GROUP_SERVICE_KEYS = {"api_service_profile", "rate_limiter_profile"}
-_SUPPORTED_OBSERVABILITY_TRACE_EXPORTER_KINDS = {"jsonl", "stdout", "otel_otlp", "opentracing_bridge"}
-_SUPPORTED_OBSERVABILITY_LOG_EXPORTER_KINDS = {"stdout", "jsonl", "otel_logs_otlp"}
-_SUPPORTED_OBSERVABILITY_LOG_LEVELS = {"info", "debug"}
+_SUPPORTED_OBSERVABILITY_TRACE_EXPORTER_KINDS = {
+    "jsonl",
+    "stdout",
+    "otel_otlp",
+    "otel_otlp_logical",
+    "otel_otlp_topology",
+    "opentracing_bridge",
+}
+_SUPPORTED_OBSERVABILITY_OTEL_TRACE_VIEWS = {"logical", "topology"}
+_SUPPORTED_OBSERVABILITY_TRACE_JSONL_SLICES = {"all", "business_logic", "platform_internals"}
+_SUPPORTED_OBSERVABILITY_LOG_EXPORTER_KINDS = {"stdout", "stdout_plain", "jsonl", "file_plain", "otel_logs_otlp"}
+_SUPPORTED_OBSERVABILITY_LOG_EXPORTER_MODES = {"lifecycle", "all"}
+_SUPPORTED_OBSERVABILITY_LOG_LEVELS = {"off", "none", "info", "debug", "full"}
 _SUPPORTED_OBSERVABILITY_OTEL_BACKENDS = {"urllib", "requests", "httpx", "aiohttp", "urllib3", "grpcio", "otel_sdk"}
 _OBSERVABILITY_ASYNC_ONLY_BACKENDS = {"aiohttp"}
 _OBSERVABILITY_SYNC_ONLY_BACKENDS = {"urllib", "requests", "urllib3", "grpcio", "otel_sdk"}
@@ -78,6 +89,104 @@ _SUPPORTED_RUNTIME_KEYS = {
     "tracing",
     "cli",
 }
+
+
+def _flatten_observability_otel_exporter_grouped_settings(
+    settings: dict[str, object],
+    *,
+    prefix: str,
+) -> None:
+    # Support grouped settings while keeping flat keys backward compatible.
+    otlp = settings.get("otlp")
+    if otlp is not None and not isinstance(otlp, dict):
+        raise ConfigError(f"{prefix}.otlp must be a mapping when provided")
+    transport = settings.get("transport")
+    if transport is not None and not isinstance(transport, dict):
+        raise ConfigError(f"{prefix}.transport must be a mapping when provided")
+    service = settings.get("service")
+    if service is not None and not isinstance(service, dict):
+        raise ConfigError(f"{prefix}.service must be a mapping when provided")
+    view = settings.get("view")
+    if view is not None and not isinstance(view, dict):
+        raise ConfigError(f"{prefix}.view must be a mapping when provided")
+
+    if isinstance(otlp, dict):
+        if "endpoint" in otlp:
+            settings["endpoint"] = otlp["endpoint"]
+        if "headers" in otlp:
+            settings["headers"] = otlp["headers"]
+
+    if isinstance(transport, dict):
+        for key in (
+            "backend",
+            "timeout_seconds",
+            "dependency_missing",
+            "bridge",
+            "batch",
+            "queue",
+            "retry",
+            "httpx",
+            "grpc",
+            "urllib3",
+            "aiohttp",
+        ):
+            if key in transport:
+                settings[key] = transport[key]
+
+    if isinstance(service, dict):
+        for key in (
+            "service_name",
+            "service_namespace",
+            "service_version",
+            "service_instance_id",
+            "deployment_environment",
+        ):
+            if key in service:
+                settings[key] = service[key]
+
+    if isinstance(view, dict):
+        for key in (
+            "trace_view",
+            "service_name_by_step",
+            "service_name_by_process_group",
+            "service_name_suffix",
+            "isolate_view_ids",
+            "include_runtime_resource",
+            "span_kind",
+        ):
+            if key in view:
+                settings[key] = view[key]
+
+
+def _resolve_observability_otel_exporter_backend(
+    exporter: dict[str, object],
+    settings: dict[str, object],
+    *,
+    prefix: str,
+) -> str:
+    backend: object | None = exporter.get("backend")
+    if backend is None:
+        transport = settings.get("transport")
+        if isinstance(transport, dict):
+            backend = transport.get("backend")
+    if backend is None:
+        backend = settings.get("backend")
+    if backend is None:
+        backend = "urllib"
+    if not isinstance(backend, str) or not backend:
+        raise ConfigError(f"{prefix}.backend must be a non-empty string")
+    if backend not in _SUPPORTED_OBSERVABILITY_OTEL_BACKENDS:
+        raise ConfigError(
+            f"{prefix}.backend must be one of: {sorted(_SUPPORTED_OBSERVABILITY_OTEL_BACKENDS)}"
+        )
+    return backend
+
+
+def _default_bootstrap_mode(platform: dict[str, object]) -> str:
+    process_groups = platform.get("process_groups")
+    if isinstance(process_groups, list) and len(process_groups) > 0:
+        return "process_supervisor"
+    return "inline"
 
 
 def validate_newgen_config(raw: object) -> dict[str, object]:
@@ -211,7 +320,7 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
     if not isinstance(bootstrap, dict):
         raise ConfigError("runtime.platform.bootstrap must be a mapping when provided")
     platform["bootstrap"] = bootstrap
-    bootstrap_mode = bootstrap.get("mode", "inline")
+    bootstrap_mode = bootstrap.get("mode", _default_bootstrap_mode(platform))
     if not isinstance(bootstrap_mode, str) or not bootstrap_mode:
         raise ConfigError("runtime.platform.bootstrap.mode must be a non-empty string when provided")
     if bootstrap_mode not in _SUPPORTED_BOOTSTRAP_MODES:
@@ -416,6 +525,48 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
             raise ConfigError("runtime.platform.routing_cache.max_entries must be > 0")
         routing_cache["max_entries"] = max_entries
 
+    boundary_dispatch = platform.get("boundary_dispatch")
+    if boundary_dispatch is not None:
+        if not isinstance(boundary_dispatch, dict):
+            raise ConfigError("runtime.platform.boundary_dispatch must be a mapping when provided")
+        unknown_keys = [
+            key
+            for key in boundary_dispatch
+            if key not in {"mode", "batch_max_items", "control_poll_ms", "timeout_seconds"}
+        ]
+        if unknown_keys:
+            raise ConfigError(
+                "runtime.platform.boundary_dispatch has unsupported keys: "
+                f"{sorted(unknown_keys)}"
+            )
+        mode = boundary_dispatch.get("mode", "stream")
+        if not isinstance(mode, str) or not mode:
+            raise ConfigError("runtime.platform.boundary_dispatch.mode must be a non-empty string when provided")
+        if mode not in _SUPPORTED_BOUNDARY_DISPATCH_MODES:
+            raise ConfigError(
+                "runtime.platform.boundary_dispatch.mode must be one of: "
+                f"{sorted(_SUPPORTED_BOUNDARY_DISPATCH_MODES)}"
+            )
+        boundary_dispatch["mode"] = mode
+        batch_max_items = boundary_dispatch.get("batch_max_items", 1000)
+        if not isinstance(batch_max_items, int):
+            raise ConfigError("runtime.platform.boundary_dispatch.batch_max_items must be an integer when provided")
+        if batch_max_items <= 0:
+            raise ConfigError("runtime.platform.boundary_dispatch.batch_max_items must be > 0")
+        boundary_dispatch["batch_max_items"] = batch_max_items
+        control_poll_ms = boundary_dispatch.get("control_poll_ms", 1.0)
+        if not isinstance(control_poll_ms, (int, float)):
+            raise ConfigError("runtime.platform.boundary_dispatch.control_poll_ms must be a number when provided")
+        if control_poll_ms <= 0:
+            raise ConfigError("runtime.platform.boundary_dispatch.control_poll_ms must be > 0")
+        boundary_dispatch["control_poll_ms"] = float(control_poll_ms)
+        timeout_seconds = boundary_dispatch.get("timeout_seconds", 10.0)
+        if not isinstance(timeout_seconds, (int, float)):
+            raise ConfigError("runtime.platform.boundary_dispatch.timeout_seconds must be a number when provided")
+        if timeout_seconds <= 0:
+            raise ConfigError("runtime.platform.boundary_dispatch.timeout_seconds must be > 0")
+        boundary_dispatch["timeout_seconds"] = float(timeout_seconds)
+
 
 def _normalize_execution_ipc_mapping(mapping: dict[str, object], *, prefix: str) -> None:
     transport = mapping.get("transport", "tcp_local")
@@ -579,6 +730,12 @@ def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
     for index, exporter in enumerate(tracing_exporters):
         if not isinstance(exporter, dict):
             raise ConfigError(f"runtime.observability.tracing.exporters[{index}] must be a mapping")
+        enabled = exporter.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ConfigError(
+                f"runtime.observability.tracing.exporters[{index}].enabled must be a boolean when provided"
+            )
+        exporter["enabled"] = enabled
         kind = exporter.get("kind")
         if not isinstance(kind, str) or not kind:
             raise ConfigError(f"runtime.observability.tracing.exporters[{index}].kind must be a non-empty string")
@@ -592,25 +749,70 @@ def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
             raise ConfigError(
                 f"runtime.observability.tracing.exporters[{index}].settings must be a mapping when provided"
             )
-        if kind == "otel_otlp":
-            backend = exporter.get("backend", "urllib")
-            if not isinstance(backend, str) or not backend:
-                raise ConfigError(
-                    f"runtime.observability.tracing.exporters[{index}].backend must be a non-empty string"
-                )
-            if backend not in _SUPPORTED_OBSERVABILITY_OTEL_BACKENDS:
-                raise ConfigError(
-                    "runtime.observability.tracing.exporters["
-                    f"{index}].backend must be one of: {sorted(_SUPPORTED_OBSERVABILITY_OTEL_BACKENDS)}"
-                )
+        if kind in {"otel_otlp", "otel_otlp_logical", "otel_otlp_topology"}:
+            _flatten_observability_otel_exporter_grouped_settings(
+                settings,
+                prefix=f"runtime.observability.tracing.exporters[{index}].settings",
+            )
+            backend = _resolve_observability_otel_exporter_backend(
+                exporter,
+                settings,
+                prefix=f"runtime.observability.tracing.exporters[{index}]",
+            )
             exporter["backend"] = backend
             _normalize_observability_otel_exporter_settings(
                 settings,
                 prefix=f"runtime.observability.tracing.exporters[{index}].settings",
             )
+        elif kind == "jsonl":
+            path = settings.get("path")
+            if not isinstance(path, str) or not path:
+                raise ConfigError(
+                    f"runtime.observability.tracing.exporters[{index}].settings.path "
+                    "must be a non-empty string for kind 'jsonl'"
+                )
+            view = settings.get("view")
+            if view is not None and not isinstance(view, dict):
+                raise ConfigError(
+                    f"runtime.observability.tracing.exporters[{index}].settings.view "
+                    "must be a mapping when provided"
+                )
+            trace_slice = settings.get("trace_slice")
+            if trace_slice is not None:
+                if not isinstance(trace_slice, str) or not trace_slice:
+                    raise ConfigError(
+                        f"runtime.observability.tracing.exporters[{index}].settings.trace_slice "
+                        "must be a non-empty string when provided"
+                    )
+                normalized = _normalize_trace_jsonl_slice(trace_slice)
+                if normalized is None:
+                    raise ConfigError(
+                        "runtime.observability.tracing.exporters["
+                        f"{index}].settings.trace_slice must be one of: "
+                        f"{sorted(_SUPPORTED_OBSERVABILITY_TRACE_JSONL_SLICES)} "
+                        "(aliases: logical|topology|full)"
+                    )
+                settings["trace_slice"] = normalized
+            if isinstance(view, dict) and "trace_view" in view:
+                trace_view = view.get("trace_view")
+                if not isinstance(trace_view, str) or not trace_view:
+                    raise ConfigError(
+                        f"runtime.observability.tracing.exporters[{index}].settings.view.trace_view "
+                        "must be a non-empty string when provided"
+                    )
+                normalized = _normalize_trace_jsonl_slice(trace_view)
+                if normalized is None:
+                    raise ConfigError(
+                        "runtime.observability.tracing.exporters["
+                        f"{index}].settings.view.trace_view must be one of: "
+                        f"{sorted(_SUPPORTED_OBSERVABILITY_TRACE_JSONL_SLICES)} "
+                        "(aliases: logical|topology|full)"
+                    )
+                settings["trace_slice"] = normalized
         elif "backend" in exporter:
             raise ConfigError(
-                f"runtime.observability.tracing.exporters[{index}].backend is supported only for kind 'otel_otlp'"
+                "runtime.observability.tracing.exporters["
+                f"{index}].backend is supported only for kind 'otel_otlp*'"
             )
         exporter["settings"] = settings
 
@@ -634,23 +836,52 @@ def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
                 "runtime.observability.logging.exporters["
                 f"{index}].kind must be one of: {sorted(_SUPPORTED_OBSERVABILITY_LOG_EXPORTER_KINDS)}"
             )
+        mode = exporter.get("mode", "lifecycle")
+        if not isinstance(mode, str) or not mode:
+            raise ConfigError(
+                f"runtime.observability.logging.exporters[{index}].mode must be a non-empty string when provided"
+            )
+        mode = mode.lower()
+        if mode not in _SUPPORTED_OBSERVABILITY_LOG_EXPORTER_MODES:
+            raise ConfigError(
+                "runtime.observability.logging.exporters["
+                f"{index}].mode must be one of: {sorted(_SUPPORTED_OBSERVABILITY_LOG_EXPORTER_MODES)}"
+            )
+        exporter["mode"] = mode
         settings = exporter.get("settings", {})
         if not isinstance(settings, dict):
             raise ConfigError(
                 f"runtime.observability.logging.exporters[{index}].settings must be a mapping when provided"
             )
-        if kind == "jsonl":
+        if kind in {"jsonl", "file_plain"}:
             path = settings.get("path")
-            if not isinstance(path, str) or not path:
+            if path is not None and (not isinstance(path, str) or not path):
                 raise ConfigError(
                     f"runtime.observability.logging.exporters[{index}].settings.path "
-                    "must be a non-empty string for kind 'jsonl'"
+                    f"must be a non-empty string when provided for kind '{kind}'"
                 )
-            workers_dir = settings.get("workers_dir")
-            if workers_dir is not None and (not isinstance(workers_dir, str) or not workers_dir):
+            file_prefix = settings.get("file_prefix")
+            if file_prefix is not None and (not isinstance(file_prefix, str) or not file_prefix):
+                raise ConfigError(
+                    f"runtime.observability.logging.exporters[{index}].settings.file_prefix "
+                    "must be a non-empty string when provided"
+                )
+            flush_every_n = settings.get("flush_every_n")
+            if flush_every_n is not None and (not isinstance(flush_every_n, int) or flush_every_n <= 0):
+                raise ConfigError(
+                    f"runtime.observability.logging.exporters[{index}].settings.flush_every_n "
+                    "must be an integer > 0 when provided"
+                )
+            fsync_every_n = settings.get("fsync_every_n")
+            if fsync_every_n is not None and (not isinstance(fsync_every_n, int) or fsync_every_n <= 0):
+                raise ConfigError(
+                    f"runtime.observability.logging.exporters[{index}].settings.fsync_every_n "
+                    "must be an integer > 0 when provided"
+                )
+            if "workers_dir" in settings:
                 raise ConfigError(
                     f"runtime.observability.logging.exporters[{index}].settings.workers_dir "
-                    "must be a non-empty string when provided"
+                    "is not supported; worker-local lifecycle log sinks are disabled"
                 )
         exporter["settings"] = settings
 
@@ -665,6 +896,7 @@ def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
     level = lifecycle_events.get("level", "info")
     if not isinstance(level, str) or not level:
         raise ConfigError("runtime.observability.logging.lifecycle_events.level must be a non-empty string")
+    level = level.lower()
     if level not in _SUPPORTED_OBSERVABILITY_LOG_LEVELS:
         raise ConfigError(
             "runtime.observability.logging.lifecycle_events.level must be one of: "
@@ -820,6 +1052,32 @@ def _normalize_observability_otel_exporter_settings(
         )
     settings["dependency_missing"] = dependency_missing
 
+    trace_view = settings.get("trace_view")
+    if trace_view is not None:
+        if not isinstance(trace_view, str) or trace_view not in _SUPPORTED_OBSERVABILITY_OTEL_TRACE_VIEWS:
+            raise ConfigError(
+                f"{prefix}.trace_view must be one of: {sorted(_SUPPORTED_OBSERVABILITY_OTEL_TRACE_VIEWS)}"
+            )
+        settings["trace_view"] = trace_view
+
+    service_name_suffix = settings.get("service_name_suffix")
+    if service_name_suffix is not None:
+        if not isinstance(service_name_suffix, str) or not service_name_suffix:
+            raise ConfigError(f"{prefix}.service_name_suffix must be a non-empty string when provided")
+        settings["service_name_suffix"] = service_name_suffix
+
+    service_name_by_step = settings.get("service_name_by_step")
+    if service_name_by_step is not None:
+        if not isinstance(service_name_by_step, bool):
+            raise ConfigError(f"{prefix}.service_name_by_step must be a boolean when provided")
+        settings["service_name_by_step"] = service_name_by_step
+
+    isolate_view_ids = settings.get("isolate_view_ids")
+    if isolate_view_ids is not None:
+        if not isinstance(isolate_view_ids, bool):
+            raise ConfigError(f"{prefix}.isolate_view_ids must be a boolean when provided")
+        settings["isolate_view_ids"] = isolate_view_ids
+
     batch = settings.get("batch", {})
     if not isinstance(batch, dict):
         raise ConfigError(f"{prefix}.batch must be a mapping when provided")
@@ -828,8 +1086,8 @@ def _normalize_observability_otel_exporter_settings(
         raise ConfigError(f"{prefix}.batch.max_items must be an integer > 0 when provided")
     batch["max_items"] = max_items
     flush_interval_ms = batch.get("flush_interval_ms", 1000)
-    if not isinstance(flush_interval_ms, int) or flush_interval_ms <= 0:
-        raise ConfigError(f"{prefix}.batch.flush_interval_ms must be an integer > 0 when provided")
+    if not isinstance(flush_interval_ms, int) or flush_interval_ms < 0:
+        raise ConfigError(f"{prefix}.batch.flush_interval_ms must be an integer >= 0 when provided")
     batch["flush_interval_ms"] = flush_interval_ms
     settings["batch"] = batch
 
@@ -981,7 +1239,9 @@ def _validate_observability_exporter_runner_compatibility(
     for index, exporter in enumerate(exporters):
         if not isinstance(exporter, dict):
             continue
-        if exporter.get("kind") != "otel_otlp":
+        if exporter.get("enabled") is False:
+            continue
+        if exporter.get("kind") not in {"otel_otlp", "otel_otlp_logical", "otel_otlp_topology"}:
             continue
         backend = exporter.get("backend", "urllib")
         if not isinstance(backend, str):
@@ -1014,6 +1274,23 @@ def _normalize_runtime_tracing(runtime: dict[str, object]) -> None:
     if not isinstance(tracing, dict):
         raise ConfigError("runtime.tracing must be a mapping when provided")
     runtime["tracing"] = tracing
+
+
+def _normalize_trace_jsonl_slice(value: str) -> str | None:
+    token = value.strip().lower()
+    aliases = {
+        "all": "all",
+        "full": "all",
+        "combined": "all",
+        "logical": "business_logic",
+        "business_logic": "business_logic",
+        "topology": "platform_internals",
+        "platform_internals": "platform_internals",
+    }
+    normalized = aliases.get(token)
+    if normalized in _SUPPORTED_OBSERVABILITY_TRACE_JSONL_SLICES:
+        return normalized
+    return None
 
 
 def _normalize_runtime_cli(runtime: dict[str, object]) -> None:

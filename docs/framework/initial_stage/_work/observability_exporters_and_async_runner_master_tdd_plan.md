@@ -39,6 +39,15 @@ Target outcome:
   dependency groups, docs migration closure),
   tracked in
   [observability_platform_rails_no_hardcode_tdd_plan](observability_platform_rails_no_hardcode_tdd_plan.md).
+- [ ] Phase L in progress:
+  runner-level observability service dispatch and strict `system.obs.*` recursion guard,
+  tracked in
+  [observability_phaseL_runner_dispatch_and_recursion_guard_tdd_plan](observability_phaseL_runner_dispatch_and_recursion_guard_tdd_plan.md).
+- [x] Patch M complete:
+  grouped OTLP exporter config (`settings.otlp/transport/service/view`) + deterministic backend
+  selection contract (`exporter.backend -> settings.transport.backend -> settings.backend -> urllib`),
+  tracked in
+  [observability_exporter_grouped_config_backend_selection_tdd_plan](observability_exporter_grouped_config_backend_selection_tdd_plan.md).
 
 ---
 
@@ -155,6 +164,18 @@ Detailed subplan:
 Detailed subplan:
 
 - [observability_platform_rails_no_hardcode_tdd_plan](observability_platform_rails_no_hardcode_tdd_plan.md)
+
+### Phase L — runner dispatch + recursion guard closure
+
+Detailed subplan:
+
+- [observability_phaseL_runner_dispatch_and_recursion_guard_tdd_plan](observability_phaseL_runner_dispatch_and_recursion_guard_tdd_plan.md)
+
+### Patch M — grouped exporter config + backend resolver fix
+
+Detailed subplan:
+
+- [observability_exporter_grouped_config_backend_selection_tdd_plan](observability_exporter_grouped_config_backend_selection_tdd_plan.md)
 
 ---
 

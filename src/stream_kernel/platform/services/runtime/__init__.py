@@ -12,6 +12,13 @@ from stream_kernel.platform.services.runtime.transport import (
     RuntimeTransportService,
     TcpLocalRuntimeTransportService,
 )
+from stream_kernel.platform.services.runtime.process_group_router import (
+    InMemoryProcessGroupRouterService,
+    ProcessGroupRouterService,
+)
+from stream_kernel.platform.services.runtime.async_dispatch_loop import (
+    AsyncDispatchLoop,
+)
 
 __all__ = [
     "BootstrapSupervisor",
@@ -19,7 +26,10 @@ __all__ = [
     "MultiprocessBootstrapSupervisor",
     "LocalRuntimeLifecycleManager",
     "MemoryRuntimeTransportService",
+    "InMemoryProcessGroupRouterService",
+    "ProcessGroupRouterService",
     "RuntimeLifecycleManager",
     "RuntimeTransportService",
     "TcpLocalRuntimeTransportService",
+    "AsyncDispatchLoop",
 ]

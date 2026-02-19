@@ -6,6 +6,10 @@ Four problems were identified in the runtime execution path. This plan closes ea
 using only platform-native mechanisms: @node, @service, ports/adapters, router, work queue.
 No ad-hoc background threads or queues are introduced outside these rails.
 
+Follow-up execution track (2026-02-18):
+
+- [runtime IPC bytes + non-blocking observability plan](runtime_ipc_bytes_and_nonblocking_observability_tdd_plan.md)
+
 ---
 
 ## Problem 1 — Observability execution bypasses platform graph
@@ -99,6 +103,18 @@ incomplete. No explicit "output closed" signal is sent from child to supervisor.
 2. Wire stop signal from lifecycle manager to runner (currently only wired for async).
 3. In multiprocess mode: supervisor waits for child `on_run_end` completion signal before
    considering the child stopped, not just for the IPC boundary to drain.
+4. Tighten stop-command semantics in supervisor/worker control-plane:
+   - `stop_ack` is considered successful only when explicitly received (timeout is not success).
+   - Worker must send `stop_ack` only after child runtime close (`on_run_end` + scope close) completes.
+   - `stop_ack` must carry explicit `output_closed=true` confirmation.
+   - `drain_inflight=True` stop-command timeout should use remaining graceful budget, not a fixed tiny timeout.
+   - Lifecycle order must be `wait_boundary_drain -> stop_groups -> wait_output_closed`.
+   - Supervisor lifecycle logs must emit `worker_output_closed` when stop handshake confirms output close.
+
+TDD cases for item 4:
+- `test_p5pre_sup_08b_worker_sends_stop_ack_only_after_runtime_close`
+- `test_p5pre_sup_12b_drain_inflight_stop_command_uses_graceful_budget`
+- `test_p5pre_sup_12c_stop_timeout_is_not_treated_as_stop_ack`
 
 ---
 
@@ -168,11 +184,38 @@ Tests:
 
 - Decorate `ObservabilityDispatchNode` (or a refactored successor) with `@node`.
 - Create `TraceSinkNode` (`@node(name="system.obs.trace_sink")`) with
-  `inject.port(TraceSinkPort)`.
+  `inject.stream(TraceSinkPort)`.
 - Decorate `FanoutObservabilityService` and `ReplyAwareObservabilityService` with
   `@service`.
 - Remove manual `StepSpec` insertion in `builder.py`; system nodes discovered through
   standard registry path.
+
+**Step B3 — Recursion guard: TracingObserver excludes system nodes**
+
+System nodes must not generate trace events for their own execution. Otherwise
+`trace_sink_node` processing a `TraceRecord` would generate another `TraceRecord`,
+causing infinite recursion.
+
+Fix:
+- Add `excluded_node_names: frozenset[str]` field to `TracingObserver`.
+- `before_node()` returns `None` immediately if `node_name in excluded_node_names`.
+- Since `state is None`, `after_node()` / `on_node_error()` are already no-ops (existing check).
+- Builder collects all system node names from `ObservabilitySystemPlan.system_node_names`
+  and passes them when constructing `TracingObserver`.
+
+Tests to add:
+- `test_tracing_observer_skips_excluded_nodes`: call `before_node()` / `after_node()` for
+  an excluded node name — `sink.emit()` must not be called.
+- `test_builder_passes_system_node_names_to_tracing_observer`: builder constructs
+  TracingObserver with `excluded_node_names` containing all system.obs.* node names.
+
+Note: `execution_mode` on trace adapters is intentionally accurate:
+- `sync` adapters (urllib, requests, urllib3, grpcio, otel_sdk): genuinely blocking I/O;
+  marking them `"async"` would be false and would block an event loop if placed in AsyncRunner.
+  After Phase C they are non-blocking for the business process: they run in a separate
+  process group or in a separate runner turn. Phase E adds `asyncio.to_thread()` wrapping
+  so they can safely live in AsyncRunner without stalling the loop.
+- `async` adapters (httpx-async, aiohttp): correctly marked; Phase E will `await emit_async()` directly on the runner loop.
 
 ### Phase C — Routing-native trace emission (remove inline sink.emit)
 
@@ -262,12 +305,12 @@ Tests:
 
 ## Execution status
 
-- [ ] Phase A — TraceSinkPort as platform port
-- [ ] Phase B — @node/@service rails for observability
-- [ ] Phase C — routing-native trace emission
-- [ ] Phase D — SyncRunner stop signal + multiprocess output ack
-- [ ] Phase E — retire _run_async_blocking from hot path
-- [ ] Phase F — docs sync
+- [x] Phase A — TraceSinkPort as platform port
+- [x] Phase B — @node/@service rails for observability
+- [x] Phase C — routing-native trace emission
+- [x] Phase D — SyncRunner stop signal + multiprocess output ack
+- [x] Phase E — retire _run_async_blocking from hot path
+- [x] Phase F — docs sync
 
 ---
 

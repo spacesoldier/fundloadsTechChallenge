@@ -13,7 +13,7 @@
         "PYTHONPATH": "${workspaceFolder}/src"
       },
       "args": [
-        "${workspaceFolder}/docs/analysis/data/assets/input.txt"
+        "--config", "src/fund_load/experiment_config_newgen_multiprocess_jaeger.yml"
       ]
     }
   ]

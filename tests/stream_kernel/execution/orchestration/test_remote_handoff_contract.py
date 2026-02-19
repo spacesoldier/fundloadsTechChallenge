@@ -233,6 +233,49 @@ def test_remote_handoff_contract_waits_for_boundary_drain_before_stop() -> None:
     assert events.index("wait_boundary_drain") < events.index("stop")
 
 
+def test_remote_handoff_contract_waits_for_output_close_after_stop() -> None:
+    # HANDOFF-05B: output-close wait should run after stop_groups handshake, not before.
+    events: list[str] = []
+
+    class _Supervisor:
+        def start_groups(self, group_names: list[str]) -> None:
+            _ = group_names
+            events.append("start")
+
+        def wait_ready(self, timeout_seconds: int) -> bool:
+            _ = timeout_seconds
+            events.append("ready")
+            return True
+
+        def execute_boundary(self, *, run, run_id: str, scenario_id: str, inputs: list[object]) -> RoutingResult:
+            _ = (run, run_id, scenario_id, inputs)
+            events.append("boundary")
+            return RoutingResult(local_deliveries=[], boundary_deliveries=[], terminal_outputs=[])
+
+        def wait_boundary_drain(self, timeout_seconds: int) -> bool:
+            _ = timeout_seconds
+            events.append("wait_boundary_drain")
+            return True
+
+        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
+            _ = (graceful_timeout_seconds, drain_inflight)
+            events.append("stop")
+
+        def wait_output_closed(self, timeout_seconds: int) -> bool:
+            _ = timeout_seconds
+            events.append("wait_output_closed")
+            return True
+
+    artifacts = _runtime_artifacts_for_process_supervisor(
+        runtime=_process_supervisor_runtime(),
+        supervisor=_Supervisor(),
+        inputs=[Envelope(payload={"v": 1}, target="n1", trace_id="t1")],
+    )
+    execute_runtime_artifacts(artifacts)
+
+    assert events.index("stop") < events.index("wait_output_closed")
+
+
 def test_remote_handoff_contract_rejects_local_deliveries_in_boundary_result() -> None:
     # BOUNDARY-CONTRACT-01: execute_boundary must not return local_deliveries on parent boundary path.
     class _Supervisor:

@@ -7,7 +7,8 @@ import pytest
 
 from stream_kernel.platform.services.state.context import InMemoryKvContextService
 from stream_kernel.platform.services.observability import NoOpObservabilityService
-from stream_kernel.execution.runtime.runner import SyncRunner
+from stream_kernel.execution.orchestration.observability_system_nodes import TraceDispatchEvent
+from stream_kernel.execution.runtime.runner import AsyncRunner, SyncRunner
 from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.routing.routing_service import RoutingService
 from stream_kernel.integration.work_queue import InMemoryQueue
@@ -219,3 +220,270 @@ def test_runner_propagates_parent_and_current_span_ids_across_messages() -> None
     assert seen == ["x"]
     assert observer._seen_parent_by_node["n1"] == "upstream-parent"
     assert observer._seen_parent_by_node["n2"] == "span-n1"
+
+
+def test_runner_routes_observability_service_outputs_via_router_queue() -> None:
+    # OBS-L-01: service outputs returned by observability callbacks must be routed by runner rails.
+    routed: list[object] = []
+
+    class _DispatchingObserver:
+        def before_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+        ) -> object | None:
+            _ = (node_name, payload, ctx, trace_id)
+            return None
+
+        def after_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            outputs: list[object],
+            state: object | None,
+        ) -> list[object] | None:
+            _ = (payload, ctx, outputs, state)
+            if node_name != "worker":
+                return None
+            return [
+                TraceDispatchEvent(
+                    payload={"kind": "trace", "node": node_name},
+                    trace_id=trace_id,
+                )
+            ]
+
+        def on_node_error(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            error: Exception,
+            state: object | None,
+        ) -> None:
+            _ = (node_name, payload, ctx, trace_id, error, state)
+            return None
+
+        def on_run_end(self) -> None:
+            return None
+
+    def worker(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = (payload, ctx)
+        return []
+
+    def trace_dispatch(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = ctx
+        routed.append(payload)
+        return []
+
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="seed", target="worker", trace_id="t1"))
+    registry = InMemoryConsumerRegistry({TraceDispatchEvent: ["system.obs.trace_dispatch"]})
+
+    runner = SyncRunner(
+        nodes={
+            "worker": worker,
+            "system.obs.trace_dispatch": trace_dispatch,
+        },
+        work_queue=queue,
+        context_service=InMemoryKvContextService(InMemoryKvStore()),
+        router=RoutingService(registry=registry, strict=True),
+        observability=_DispatchingObserver(),
+    )
+    runner.run()
+
+    assert len(routed) == 1
+    dispatched = routed[0]
+    assert isinstance(dispatched, TraceDispatchEvent)
+    assert dispatched.trace_id == "t1"
+
+
+def test_runner_guard_prevents_observability_self_dispatch_recursion_on_system_nodes() -> None:
+    # RUN-UNI-D1: system.obs.* execution must not re-enter observability callbacks.
+    system_exec_calls = 0
+
+    class _RecursiveObserver:
+        def __init__(self) -> None:
+            self.before: list[str] = []
+            self.after: list[str] = []
+            self.calls = 0
+
+        def before_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+        ) -> object | None:
+            _ = (payload, ctx, trace_id)
+            self.before.append(node_name)
+            return None
+
+        def after_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            outputs: list[object],
+            state: object | None,
+        ) -> list[object] | None:
+            _ = (payload, ctx, outputs, state)
+            self.calls += 1
+            self.after.append(node_name)
+            if self.calls > 3:
+                raise RuntimeError("observability recursion detected")
+            return [TraceDispatchEvent(payload={"from": node_name}, trace_id=trace_id)]
+
+        def on_node_error(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            error: Exception,
+            state: object | None,
+        ) -> None:
+            _ = (node_name, payload, ctx, trace_id, error, state)
+            return None
+
+        def on_run_end(self) -> None:
+            return None
+
+    def worker(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = (payload, ctx)
+        return []
+
+    def trace_dispatch(payload: object, ctx: dict[str, object]) -> list[object]:
+        nonlocal system_exec_calls
+        _ = (payload, ctx)
+        system_exec_calls += 1
+        return []
+
+    observer = _RecursiveObserver()
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="seed", target="worker", trace_id="t1"))
+    registry = InMemoryConsumerRegistry({TraceDispatchEvent: ["system.obs.trace_dispatch"]})
+    runner = SyncRunner(
+        nodes={
+            "worker": worker,
+            "system.obs.trace_dispatch": trace_dispatch,
+        },
+        work_queue=queue,
+        context_service=InMemoryKvContextService(InMemoryKvStore()),
+        router=RoutingService(registry=registry, strict=True),
+        observability=observer,
+    )
+    runner.run()
+
+    assert observer.before == ["worker"]
+    assert observer.after == ["worker"]
+    assert system_exec_calls == 1
+
+
+@pytest.mark.parametrize("runner_kind", ["sync", "async"])
+def test_system_observability_node_exclusion_is_deterministic_for_sync_and_async(
+    runner_kind: str,
+) -> None:
+    # RUN-UNI-D2: `system.obs.*` exclusion must behave the same in sync and async runners.
+    observed_before: list[str] = []
+    observed_after: list[str] = []
+
+    class _DispatchingObserver:
+        def before_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+        ) -> object | None:
+            _ = (payload, ctx, trace_id)
+            observed_before.append(node_name)
+            return None
+
+        def after_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            outputs: list[object],
+            state: object | None,
+        ) -> list[object] | None:
+            _ = (payload, ctx, outputs, state)
+            observed_after.append(node_name)
+            if node_name == "worker":
+                return [TraceDispatchEvent(payload={"node": node_name}, trace_id=trace_id)]
+            return None
+
+        def on_node_error(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            error: Exception,
+            state: object | None,
+        ) -> None:
+            _ = (node_name, payload, ctx, trace_id, error, state)
+            return None
+
+        def on_run_end(self) -> None:
+            return None
+
+    if runner_kind == "async":
+        async def worker(payload: object, ctx: dict[str, object]) -> list[object]:
+            _ = (payload, ctx)
+            return []
+
+        async def trace_dispatch(payload: object, ctx: dict[str, object]) -> list[object]:
+            _ = (payload, ctx)
+            return []
+
+        runner = AsyncRunner(
+            nodes={"worker": worker, "system.obs.trace_dispatch": trace_dispatch},
+            work_queue=InMemoryQueue(),
+            context_service=InMemoryKvContextService(InMemoryKvStore()),
+            router=RoutingService(
+                registry=InMemoryConsumerRegistry({TraceDispatchEvent: ["system.obs.trace_dispatch"]}),
+                strict=True,
+            ),
+            observability=_DispatchingObserver(),
+        )
+    else:
+        def worker(payload: object, ctx: dict[str, object]) -> list[object]:
+            _ = (payload, ctx)
+            return []
+
+        def trace_dispatch(payload: object, ctx: dict[str, object]) -> list[object]:
+            _ = (payload, ctx)
+            return []
+
+        runner = SyncRunner(
+            nodes={"worker": worker, "system.obs.trace_dispatch": trace_dispatch},
+            work_queue=InMemoryQueue(),
+            context_service=InMemoryKvContextService(InMemoryKvStore()),
+            router=RoutingService(
+                registry=InMemoryConsumerRegistry({TraceDispatchEvent: ["system.obs.trace_dispatch"]}),
+                strict=True,
+            ),
+            observability=_DispatchingObserver(),
+        )
+
+    runner.work_queue.push(Envelope(payload="seed", target="worker", trace_id="t1"))
+    runner.run()
+    assert observed_before == ["worker"]
+    assert observed_after == ["worker"]

@@ -14,6 +14,86 @@ from stream_kernel.adapters.trace_sinks import (
 from stream_kernel.observability.domain.tracing import TraceMessage
 
 
+def _flatten_trace_otel_grouped_settings(settings: dict[str, object]) -> dict[str, object]:
+    # Grouped config syntax is supported in parallel with flat keys.
+    normalized = dict(settings)
+    otlp = normalized.get("otlp")
+    if otlp is not None and not isinstance(otlp, dict):
+        raise ValueError("trace_otel_otlp.settings.otlp must be a mapping when provided")
+    transport = normalized.get("transport")
+    if transport is not None and not isinstance(transport, dict):
+        raise ValueError("trace_otel_otlp.settings.transport must be a mapping when provided")
+    service = normalized.get("service")
+    if service is not None and not isinstance(service, dict):
+        raise ValueError("trace_otel_otlp.settings.service must be a mapping when provided")
+    view = normalized.get("view")
+    if view is not None and not isinstance(view, dict):
+        raise ValueError("trace_otel_otlp.settings.view must be a mapping when provided")
+
+    if isinstance(otlp, dict):
+        if "endpoint" in otlp:
+            normalized["endpoint"] = otlp["endpoint"]
+        if "headers" in otlp:
+            normalized["headers"] = otlp["headers"]
+
+    if isinstance(transport, dict):
+        for key in (
+            "backend",
+            "timeout_seconds",
+            "dependency_missing",
+            "bridge",
+            "batch",
+            "queue",
+            "retry",
+            "httpx",
+            "grpc",
+            "urllib3",
+            "aiohttp",
+        ):
+            if key in transport:
+                normalized[key] = transport[key]
+
+    if isinstance(service, dict):
+        for key in (
+            "service_name",
+            "service_namespace",
+            "service_version",
+            "service_instance_id",
+            "deployment_environment",
+        ):
+            if key in service:
+                normalized[key] = service[key]
+
+    if isinstance(view, dict):
+        for key in (
+            "trace_view",
+            "service_name_by_step",
+            "service_name_by_process_group",
+            "logical_include_platform_spans",
+            "topology_include_business_spans",
+            "service_name_suffix",
+            "isolate_view_ids",
+            "include_runtime_resource",
+            "span_kind",
+        ):
+            if key in view:
+                normalized[key] = view[key]
+
+    return normalized
+
+
+def _resolve_trace_otel_backend(settings: dict[str, object]) -> str:
+    transport = settings.get("transport")
+    if isinstance(transport, dict):
+        backend = transport.get("backend")
+        if isinstance(backend, str) and backend:
+            return backend
+    backend = settings.get("backend", "urllib")
+    if not isinstance(backend, str) or not backend:
+        raise ValueError("trace_otel_otlp.settings.backend must be a non-empty string when provided")
+    return backend
+
+
 @adapter(
     name="trace_stdout",
     consumes=[TraceMessage],
@@ -39,12 +119,21 @@ def trace_jsonl(settings: dict[str, object]) -> JsonlTraceSink:
     path = settings.get("path")
     if not isinstance(path, str) or not path:
         raise ValueError("trace_jsonl.settings.path must be a non-empty string")
+    trace_slice = settings.get("trace_slice", "all")
+    view = settings.get("view")
+    if isinstance(view, dict) and "trace_view" in view:
+        trace_slice = view["trace_view"]
+    elif "trace_view" in settings:
+        trace_slice = settings.get("trace_view")
+    if not isinstance(trace_slice, str) or not trace_slice:
+        raise ValueError("trace_jsonl.settings.trace_slice must be a non-empty string when provided")
     return JsonlTraceSink(
         path=Path(path),
         write_mode=str(settings.get("write_mode", "line")),
         flush_every_n=int(settings.get("flush_every_n", 1)),
         flush_every_ms=settings.get("flush_every_ms") if isinstance(settings.get("flush_every_ms"), int) else None,
         fsync_every_n=settings.get("fsync_every_n") if isinstance(settings.get("fsync_every_n"), int) else None,
+        trace_slice=trace_slice,
     )
 
 
@@ -57,9 +146,8 @@ def trace_jsonl(settings: dict[str, object]) -> JsonlTraceSink:
 )
 def trace_otel_otlp(settings: dict[str, object]) -> OTelOtlpTraceSink | NoOpTraceSink:
     # Framework-owned OpenTelemetry OTLP trace exporter sink.
-    backend = settings.get("backend", "urllib")
-    if not isinstance(backend, str) or not backend:
-        raise ValueError("trace_otel_otlp.settings.backend must be a non-empty string when provided")
+    settings = _flatten_trace_otel_grouped_settings(settings)
+    backend = _resolve_trace_otel_backend(settings)
     dependency_missing = settings.get("dependency_missing", "error")
     if not isinstance(dependency_missing, str) or dependency_missing not in {"error", "degrade_noop"}:
         raise ValueError(
@@ -108,6 +196,28 @@ def trace_otel_otlp(settings: dict[str, object]) -> OTelOtlpTraceSink | NoOpTrac
     service_name_by_process_group = settings.get("service_name_by_process_group", True)
     if not isinstance(service_name_by_process_group, bool):
         raise ValueError("trace_otel_otlp.settings.service_name_by_process_group must be a boolean when provided")
+    service_name_by_step = settings.get("service_name_by_step", False)
+    if not isinstance(service_name_by_step, bool):
+        raise ValueError("trace_otel_otlp.settings.service_name_by_step must be a boolean when provided")
+    service_name_suffix = settings.get("service_name_suffix")
+    if service_name_suffix is not None and (not isinstance(service_name_suffix, str) or not service_name_suffix):
+        raise ValueError("trace_otel_otlp.settings.service_name_suffix must be a non-empty string when provided")
+    logical_include_platform_spans = settings.get("logical_include_platform_spans", False)
+    if not isinstance(logical_include_platform_spans, bool):
+        raise ValueError(
+            "trace_otel_otlp.settings.logical_include_platform_spans must be a boolean when provided"
+        )
+    topology_include_business_spans = settings.get("topology_include_business_spans", True)
+    if not isinstance(topology_include_business_spans, bool):
+        raise ValueError(
+            "trace_otel_otlp.settings.topology_include_business_spans must be a boolean when provided"
+        )
+    trace_view = settings.get("trace_view", "topology")
+    if not isinstance(trace_view, str) or trace_view not in {"logical", "topology"}:
+        raise ValueError("trace_otel_otlp.settings.trace_view must be one of: ['logical', 'topology']")
+    isolate_view_ids = settings.get("isolate_view_ids", False)
+    if not isinstance(isolate_view_ids, bool):
+        raise ValueError("trace_otel_otlp.settings.isolate_view_ids must be a boolean when provided")
     include_runtime_resource = settings.get("include_runtime_resource", True)
     if not isinstance(include_runtime_resource, bool):
         raise ValueError("trace_otel_otlp.settings.include_runtime_resource must be a boolean when provided")
@@ -238,7 +348,13 @@ def trace_otel_otlp(settings: dict[str, object]) -> OTelOtlpTraceSink | NoOpTrac
         service_instance_id=service_instance_id if isinstance(service_instance_id, str) else None,
         deployment_environment=deployment_environment if isinstance(deployment_environment, str) else None,
         service_name_by_process_group=service_name_by_process_group,
+        service_name_by_step=service_name_by_step,
+        service_name_suffix=service_name_suffix if isinstance(service_name_suffix, str) else None,
+        logical_include_platform_spans=logical_include_platform_spans,
+        topology_include_business_spans=topology_include_business_spans,
         include_runtime_resource=include_runtime_resource,
+        trace_view=trace_view,
+        isolate_view_ids=isolate_view_ids,
         span_kind=span_kind,
         timeout_seconds=float(timeout_seconds),
         batch_max_items=batch_max_items,

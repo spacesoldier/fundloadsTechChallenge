@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -207,3 +208,78 @@ def test_p5pre_exec_03_child_execution_error_details_are_propagated(tmp_path: Pa
             supervisor.stop_groups(graceful_timeout_seconds=1, drain_inflight=True)
         except Exception:  # noqa: BLE001 - keep cleanup resilient in constrained environments.
             supervisor.force_terminate_groups(["execution.cpu"])
+
+
+def test_boundary_dispatch_defaults_to_stream_mode_single_item_commands() -> None:
+    supervisor = MultiprocessBootstrapSupervisor()
+    supervisor.configure_process_groups([{"name": "execution.cpu", "workers": 1, "nodes": ["child.echo"]}])
+    sent_sizes: list[int] = []
+    handle = SimpleNamespace(group_name="execution.cpu")
+
+    setattr(supervisor, "_select_worker_for_group", lambda _group_name: handle)
+
+    def _send(_handle, *, command, timeout_seconds, raise_on_timeout=True):  # noqa: ANN001
+        _ = (_handle, timeout_seconds, raise_on_timeout)
+        sent_sizes.append(len(command["inputs"]))
+        return {"kind": "execute_boundary_result", "terminal_outputs": []}
+
+    setattr(supervisor, "_send_boundary_command", _send)
+
+    result = supervisor.execute_boundary(
+        run=lambda: None,
+        run_id="run",
+        scenario_id="scenario",
+        inputs=[
+            BoundaryDispatchInput(payload={"i": 1}, dispatch_group="execution.cpu", target="child.echo", trace_id="t1"),
+            BoundaryDispatchInput(payload={"i": 2}, dispatch_group="execution.cpu", target="child.echo", trace_id="t2"),
+            BoundaryDispatchInput(payload={"i": 3}, dispatch_group="execution.cpu", target="child.echo", trace_id="t3"),
+        ],
+    )
+
+    assert result.terminal_outputs == []
+    assert sent_sizes == [1, 1, 1]
+
+
+def test_boundary_dispatch_batch_mode_uses_configured_chunk_size() -> None:
+    supervisor = MultiprocessBootstrapSupervisor()
+    supervisor.configure_process_groups([{"name": "execution.cpu", "workers": 1, "nodes": ["child.echo"]}])
+    supervisor.configure_dispatch_policy({"mode": "batch", "batch_max_items": 2})
+    sent_sizes: list[int] = []
+    handle = SimpleNamespace(group_name="execution.cpu")
+
+    setattr(supervisor, "_select_worker_for_group", lambda _group_name: handle)
+
+    def _send(_handle, *, command, timeout_seconds, raise_on_timeout=True):  # noqa: ANN001
+        _ = (_handle, timeout_seconds, raise_on_timeout)
+        sent_sizes.append(len(command["inputs"]))
+        return {"kind": "execute_boundary_result", "terminal_outputs": []}
+
+    setattr(supervisor, "_send_boundary_command", _send)
+
+    result = supervisor.execute_boundary(
+        run=lambda: None,
+        run_id="run",
+        scenario_id="scenario",
+        inputs=[
+            BoundaryDispatchInput(payload={"i": 1}, dispatch_group="execution.cpu", target="child.echo", trace_id="t1"),
+            BoundaryDispatchInput(payload={"i": 2}, dispatch_group="execution.cpu", target="child.echo", trace_id="t2"),
+            BoundaryDispatchInput(payload={"i": 3}, dispatch_group="execution.cpu", target="child.echo", trace_id="t3"),
+        ],
+    )
+
+    assert result.terminal_outputs == []
+    assert sent_sizes == [2, 1]
+
+
+def test_boundary_dispatch_config_accepts_control_poll_ms() -> None:
+    supervisor = MultiprocessBootstrapSupervisor()
+    supervisor.configure_dispatch_policy({"mode": "stream", "control_poll_ms": 3.5})
+
+    assert getattr(supervisor, "_boundary_control_poll_seconds") == 0.0035  # noqa: SLF001
+
+
+def test_boundary_dispatch_config_accepts_timeout_seconds() -> None:
+    supervisor = MultiprocessBootstrapSupervisor()
+    supervisor.configure_dispatch_policy({"mode": "stream", "timeout_seconds": 42.0})
+
+    assert getattr(supervisor, "_boundary_timeout_seconds") == 42.0  # noqa: SLF001

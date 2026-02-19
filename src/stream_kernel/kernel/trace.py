@@ -37,6 +37,7 @@ class RouteInfo:
     handoff_from: str | None = None
     route_hop: int | None = None
     parent_span_id: str | None = None
+    runner_gap_ms: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

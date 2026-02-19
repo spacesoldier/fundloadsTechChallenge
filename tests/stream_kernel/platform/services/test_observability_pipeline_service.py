@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 
 from stream_kernel.platform.services.messaging.reply_waiter import TerminalEvent
@@ -326,6 +327,48 @@ def test_obs_k_f_01_fanout_isolates_optional_callback_failures() -> None:
 
     assert failing.trace_calls == 1
     assert recorder.events[0][0] == "trace_event"
+
+
+def test_obs_k_f_02_fanout_publish_trace_async_awaits_async_observer_callback() -> None:
+    @dataclass
+    class _AsyncObserver:
+        calls: int = 0
+
+        def before_node(self, **kwargs: object) -> object | None:
+            _ = kwargs
+            return None
+
+        def after_node(self, **kwargs: object) -> None:
+            _ = kwargs
+            return None
+
+        def on_node_error(self, **kwargs: object) -> None:
+            _ = kwargs
+            return None
+
+        def on_run_end(self) -> None:
+            return None
+
+        async def on_trace_event_async(
+            self,
+            *,
+            event: object,
+            trace_id: str | None,
+            attributes: dict[str, object] | None,
+        ) -> None:
+            _ = (event, trace_id, attributes)
+            self.calls += 1
+
+    observer = _AsyncObserver()
+    service = FanoutObservabilityService(observers=[observer])
+    asyncio.run(
+        service.publish_trace_async(
+            event={"span": "n1"},
+            trace_id="t1",
+            attributes={"k": "v"},
+        )
+    )
+    assert observer.calls == 1
 
 
 def test_obs_k_c_03_reply_aware_forwards_pipeline_callbacks() -> None:

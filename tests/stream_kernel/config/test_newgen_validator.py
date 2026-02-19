@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+from stream_kernel.config.loader import load_yaml_config
 from stream_kernel.config.validator import ConfigError, validate_newgen_config
 
 
@@ -549,7 +552,7 @@ def test_validate_newgen_config_accepts_valid_execution_ipc_config() -> None:
 
 
 def test_validate_newgen_config_defaults_runtime_platform_bootstrap_mode_to_inline() -> None:
-    # BOOT-CFG-04: bootstrap mode defaults to inline when omitted.
+    # BOOT-CFG-04: bootstrap mode defaults to inline when omitted and no process groups are declared.
     raw = _phase0_base_config()
     validated = validate_newgen_config(raw)
     validated_runtime = validated["runtime"]
@@ -559,6 +562,31 @@ def test_validate_newgen_config_defaults_runtime_platform_bootstrap_mode_to_inli
     bootstrap = platform.get("bootstrap")
     assert isinstance(bootstrap, dict)
     assert bootstrap.get("mode") == "inline"
+
+
+def test_validate_newgen_config_defaults_bootstrap_mode_to_process_supervisor_when_groups_declared() -> None:
+    # BOOT-CFG-11: declared process groups imply process-supervisor mode unless mode is explicitly overridden.
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "process_groups": [{"name": "execution.cpu"}],
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "bind_host": "127.0.0.1",
+            "bind_port": 0,
+            "auth": {"mode": "hmac", "ttl_seconds": 30, "nonce_cache_size": 1000},
+            "max_payload_bytes": 1024,
+        },
+    }
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    bootstrap = platform.get("bootstrap")
+    assert isinstance(bootstrap, dict)
+    assert bootstrap.get("mode") == "process_supervisor"
 
 
 def test_validate_newgen_config_rejects_unknown_bootstrap_mode() -> None:
@@ -816,7 +844,122 @@ def test_validate_newgen_config_rejects_unknown_observability_logging_lifecycle_
         validate_newgen_config(raw)
 
 
-def test_validate_newgen_config_rejects_logging_jsonl_exporter_without_path() -> None:
+def test_validate_newgen_config_accepts_observability_logging_lifecycle_level_off_none_full() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "logging": {
+            "lifecycle_events": {"enabled": True, "level": "off"},
+        }
+    }
+    validated = validate_newgen_config(raw)
+    vruntime = validated.get("runtime")
+    assert isinstance(vruntime, dict)
+    observability = vruntime.get("observability")
+    assert isinstance(observability, dict)
+    logging = observability.get("logging")
+    assert isinstance(logging, dict)
+    lifecycle = logging.get("lifecycle_events")
+    assert isinstance(lifecycle, dict)
+    assert lifecycle.get("level") == "off"
+
+    runtime["observability"] = {
+        "logging": {
+            "lifecycle_events": {"enabled": True, "level": "none"},
+        }
+    }
+    validated = validate_newgen_config(raw)
+    vruntime = validated.get("runtime")
+    assert isinstance(vruntime, dict)
+    observability = vruntime.get("observability")
+    assert isinstance(observability, dict)
+    logging = observability.get("logging")
+    assert isinstance(logging, dict)
+    lifecycle = logging.get("lifecycle_events")
+    assert isinstance(lifecycle, dict)
+    assert lifecycle.get("level") == "none"
+
+    runtime["observability"] = {
+        "logging": {
+            "lifecycle_events": {"enabled": True, "level": "full"},
+        }
+    }
+    validated = validate_newgen_config(raw)
+    vruntime = validated.get("runtime")
+    assert isinstance(vruntime, dict)
+    observability = vruntime.get("observability")
+    assert isinstance(observability, dict)
+    logging = observability.get("logging")
+    assert isinstance(logging, dict)
+    lifecycle = logging.get("lifecycle_events")
+    assert isinstance(lifecycle, dict)
+    assert lifecycle.get("level") == "full"
+
+
+def test_validate_newgen_config_accepts_observability_logging_stdout_plain_exporter_kind() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "logging": {
+            "exporters": [
+                {"kind": "stdout_plain", "settings": {}},
+            ],
+            "lifecycle_events": {"enabled": True, "level": "info"},
+        }
+    }
+    validated = validate_newgen_config(raw)
+    vruntime = validated.get("runtime")
+    assert isinstance(vruntime, dict)
+    observability = vruntime.get("observability")
+    assert isinstance(observability, dict)
+    logging = observability.get("logging")
+    assert isinstance(logging, dict)
+    exporters = logging.get("exporters")
+    assert isinstance(exporters, list)
+    assert exporters and exporters[0].get("kind") == "stdout_plain"
+
+
+def test_validate_newgen_config_accepts_observability_logging_exporter_mode_all() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "logging": {
+            "exporters": [
+                {"kind": "jsonl", "mode": "all", "settings": {"path": "logs/all.jsonl"}},
+            ],
+        }
+    }
+    validated = validate_newgen_config(raw)
+    vruntime = validated.get("runtime")
+    assert isinstance(vruntime, dict)
+    observability = vruntime.get("observability")
+    assert isinstance(observability, dict)
+    logging = observability.get("logging")
+    assert isinstance(logging, dict)
+    exporters = logging.get("exporters")
+    assert isinstance(exporters, list)
+    assert exporters and exporters[0].get("mode") == "all"
+
+
+def test_validate_newgen_config_rejects_observability_logging_exporter_unknown_mode() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "logging": {
+            "exporters": [
+                {"kind": "jsonl", "mode": "everything", "settings": {"path": "logs/all.jsonl"}},
+            ],
+        }
+    }
+    with pytest.raises(ConfigError, match="exporters\\[0\\]\\.mode must be one of"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_accepts_logging_jsonl_exporter_without_path() -> None:
     raw = _phase0_base_config()
     runtime = raw["runtime"]
     assert isinstance(runtime, dict)
@@ -827,8 +970,39 @@ def test_validate_newgen_config_rejects_logging_jsonl_exporter_without_path() ->
             ]
         }
     }
-    with pytest.raises(ConfigError):
-        validate_newgen_config(raw)
+    validated = validate_newgen_config(raw)
+    vruntime = validated.get("runtime")
+    assert isinstance(vruntime, dict)
+    observability = vruntime.get("observability")
+    assert isinstance(observability, dict)
+    logging = observability.get("logging")
+    assert isinstance(logging, dict)
+    exporters = logging.get("exporters")
+    assert isinstance(exporters, list)
+    assert exporters and exporters[0].get("kind") == "jsonl"
+
+
+def test_validate_newgen_config_accepts_logging_file_plain_exporter_without_path() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "logging": {
+            "exporters": [
+                {"kind": "file_plain", "settings": {}},
+            ]
+        }
+    }
+    validated = validate_newgen_config(raw)
+    vruntime = validated.get("runtime")
+    assert isinstance(vruntime, dict)
+    observability = vruntime.get("observability")
+    assert isinstance(observability, dict)
+    logging = observability.get("logging")
+    assert isinstance(logging, dict)
+    exporters = logging.get("exporters")
+    assert isinstance(exporters, list)
+    assert exporters and exporters[0].get("kind") == "file_plain"
 
 
 def test_validate_newgen_config_rejects_logging_jsonl_exporter_invalid_workers_dir() -> None:
@@ -843,6 +1017,140 @@ def test_validate_newgen_config_rejects_logging_jsonl_exporter_invalid_workers_d
         }
     }
     with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+@pytest.mark.parametrize("slice_name", ["all", "business_logic", "platform_internals"])
+def test_validate_newgen_config_accepts_tracing_jsonl_trace_slice(slice_name: str) -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {"kind": "jsonl", "settings": {"path": "logs/trace.jsonl", "trace_slice": slice_name}},
+            ]
+        }
+    }
+    validated = validate_newgen_config(raw)
+    vruntime = validated.get("runtime")
+    assert isinstance(vruntime, dict)
+    observability = vruntime.get("observability")
+    assert isinstance(observability, dict)
+    tracing = observability.get("tracing")
+    assert isinstance(tracing, dict)
+    exporters = tracing.get("exporters")
+    assert isinstance(exporters, list)
+    settings = exporters[0].get("settings")
+    assert isinstance(settings, dict)
+    assert settings.get("trace_slice") == slice_name
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "normalized"),
+    [("logical", "business_logic"), ("topology", "platform_internals"), ("full", "all")],
+)
+def test_validate_newgen_config_normalizes_tracing_jsonl_trace_slice_aliases(
+    raw_value: str,
+    normalized: str,
+) -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {"kind": "jsonl", "settings": {"path": "logs/trace.jsonl", "trace_slice": raw_value}},
+            ]
+        }
+    }
+    validated = validate_newgen_config(raw)
+    vruntime = validated.get("runtime")
+    assert isinstance(vruntime, dict)
+    observability = vruntime.get("observability")
+    assert isinstance(observability, dict)
+    tracing = observability.get("tracing")
+    assert isinstance(tracing, dict)
+    exporters = tracing.get("exporters")
+    assert isinstance(exporters, list)
+    settings = exporters[0].get("settings")
+    assert isinstance(settings, dict)
+    assert settings.get("trace_slice") == normalized
+
+
+def test_validate_newgen_config_normalizes_tracing_jsonl_view_trace_view_alias() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "jsonl",
+                    "settings": {"path": "logs/trace.jsonl", "view": {"trace_view": "topology"}},
+                },
+            ]
+        }
+    }
+    validated = validate_newgen_config(raw)
+    vruntime = validated.get("runtime")
+    assert isinstance(vruntime, dict)
+    observability = vruntime.get("observability")
+    assert isinstance(observability, dict)
+    tracing = observability.get("tracing")
+    assert isinstance(tracing, dict)
+    exporters = tracing.get("exporters")
+    assert isinstance(exporters, list)
+    settings = exporters[0].get("settings")
+    assert isinstance(settings, dict)
+    assert settings.get("trace_slice") == "platform_internals"
+
+
+def test_validate_newgen_config_rejects_tracing_jsonl_invalid_trace_slice() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {"kind": "jsonl", "settings": {"path": "logs/trace.jsonl", "trace_slice": "unknown"}},
+            ]
+        }
+    }
+    with pytest.raises(ConfigError, match="trace_slice must be one of"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_tracing_jsonl_non_mapping_view() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {"kind": "jsonl", "settings": {"path": "logs/trace.jsonl", "view": "logical"}},
+            ]
+        }
+    }
+    with pytest.raises(ConfigError, match="settings.view must be a mapping"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_tracing_jsonl_invalid_view_trace_view() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "jsonl",
+                    "settings": {"path": "logs/trace.jsonl", "view": {"trace_view": "both"}},
+                },
+            ]
+        }
+    }
+    with pytest.raises(ConfigError, match="settings.view.trace_view must be one of"):
         validate_newgen_config(raw)
 
 
@@ -1046,6 +1354,213 @@ def test_validate_newgen_config_obs_cfg_a_04_backward_compat_defaults_backend_to
     exporters = tracing.get("exporters")
     assert isinstance(exporters, list)
     assert exporters[0].get("backend") == "urllib"
+
+
+def test_validate_newgen_config_obs_cfg_a_04b_allows_zero_batch_flush_interval() -> None:
+    # OBS-CFG-A-04B: flush_interval_ms=0 disables timer flush and must be accepted.
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "settings": {
+                        "endpoint": "http://collector:4318/v1/traces",
+                        "batch": {"max_items": 1024, "flush_interval_ms": 0},
+                    },
+                }
+            ]
+        }
+    }
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    observability = validated_runtime.get("observability")
+    assert isinstance(observability, dict)
+    tracing = observability.get("tracing")
+    assert isinstance(tracing, dict)
+    exporters = tracing.get("exporters")
+    assert isinstance(exporters, list)
+    settings = exporters[0].get("settings")
+    assert isinstance(settings, dict)
+    batch = settings.get("batch")
+    assert isinstance(batch, dict)
+    assert batch.get("flush_interval_ms") == 0
+
+
+def test_validate_newgen_config_obs_cfg_a_04c_accepts_transport_group_backend() -> None:
+    # OBS-CFG-A-04C: backend may be declared in settings.transport.backend and must normalize to exporter.backend.
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "settings": {
+                        "otlp": {"endpoint": "http://collector:4318/v1/traces"},
+                        "transport": {"backend": "httpx", "httpx": {"mode": "async"}},
+                    },
+                }
+            ]
+        }
+    }
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    observability = validated_runtime.get("observability")
+    assert isinstance(observability, dict)
+    tracing = observability.get("tracing")
+    assert isinstance(tracing, dict)
+    exporters = tracing.get("exporters")
+    assert isinstance(exporters, list)
+    assert exporters[0].get("backend") == "httpx"
+    settings = exporters[0].get("settings")
+    assert isinstance(settings, dict)
+    assert settings.get("endpoint") == "http://collector:4318/v1/traces"
+    assert settings.get("httpx", {}).get("mode") == "async"
+
+
+def test_validate_newgen_config_obs_cfg_a_04d_accepts_settings_backend_for_compat() -> None:
+    # OBS-CFG-A-04D: settings.backend remains accepted and normalized to exporter.backend for compatibility.
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "settings": {
+                        "endpoint": "http://collector:4318/v1/traces",
+                        "backend": "aiohttp",
+                    },
+                }
+            ]
+        }
+    }
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    observability = validated_runtime.get("observability")
+    assert isinstance(observability, dict)
+    tracing = observability.get("tracing")
+    assert isinstance(tracing, dict)
+    exporters = tracing.get("exporters")
+    assert isinstance(exporters, list)
+    assert exporters[0].get("backend") == "aiohttp"
+
+
+def test_validate_newgen_config_obs_cfg_a_04a_accepts_otel_dual_view_kinds() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {"kind": "otel_otlp_logical", "settings": {"endpoint": "http://collector:4318/v1/traces"}},
+                {"kind": "otel_otlp_topology", "settings": {"endpoint": "http://collector:4318/v1/traces"}},
+            ]
+        }
+    }
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    observability = validated_runtime.get("observability")
+    assert isinstance(observability, dict)
+    tracing = observability.get("tracing")
+    assert isinstance(tracing, dict)
+    exporters = tracing.get("exporters")
+    assert isinstance(exporters, list)
+    assert exporters[0].get("kind") == "otel_otlp_logical"
+    assert exporters[1].get("kind") == "otel_otlp_topology"
+    assert exporters[0].get("backend") == "urllib"
+    assert exporters[1].get("backend") == "urllib"
+
+
+def test_validate_newgen_config_obs_cfg_a_04b_rejects_invalid_exporter_enabled_type() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "enabled": "yes",
+                    "settings": {"endpoint": "http://collector:4318/v1/traces"},
+                }
+            ]
+        }
+    }
+    with pytest.raises(ConfigError, match="enabled must be a boolean"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_obs_cfg_a_04c_rejects_invalid_otel_trace_view() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "settings": {
+                        "endpoint": "http://collector:4318/v1/traces",
+                        "trace_view": "both",
+                    },
+                }
+            ]
+        }
+    }
+    with pytest.raises(ConfigError, match="trace_view must be one of"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_obs_cfg_a_04d_rejects_invalid_service_name_by_step_type() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "settings": {
+                        "endpoint": "http://collector:4318/v1/traces",
+                        "service_name_by_step": "yes",
+                    },
+                }
+            ]
+        }
+    }
+    with pytest.raises(ConfigError, match="service_name_by_step must be a boolean"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_obs_cfg_a_04e_rejects_invalid_isolate_view_ids_type() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "settings": {
+                        "endpoint": "http://collector:4318/v1/traces",
+                        "isolate_view_ids": 1,
+                    },
+                }
+            ]
+        }
+    }
+    with pytest.raises(ConfigError, match="isolate_view_ids must be a boolean"):
+        validate_newgen_config(raw)
 
 
 def test_validate_newgen_config_obs_cfg_e_01_rejects_invalid_dependency_missing_mode() -> None:
@@ -1646,6 +2161,138 @@ def test_validate_newgen_config_rejects_runtime_platform_routing_cache_bad_max_e
     }
     with pytest.raises(ConfigError):
         validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_accepts_runtime_platform_boundary_dispatch_contract() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "boundary_dispatch": {
+            "mode": "batch",
+            "batch_max_items": 16,
+            "control_poll_ms": 2.5,
+        }
+    }
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    boundary_dispatch = platform.get("boundary_dispatch")
+    assert isinstance(boundary_dispatch, dict)
+    assert boundary_dispatch.get("mode") == "batch"
+    assert boundary_dispatch.get("batch_max_items") == 16
+    assert boundary_dispatch.get("control_poll_ms") == 2.5
+    assert boundary_dispatch.get("timeout_seconds") == 10.0
+
+
+def test_validate_newgen_config_rejects_runtime_platform_boundary_dispatch_unknown_mode() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "boundary_dispatch": {
+            "mode": "burst",
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_runtime_platform_boundary_dispatch_bad_control_poll_ms() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "boundary_dispatch": {
+            "mode": "stream",
+            "control_poll_ms": 0,
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_accepts_runtime_platform_boundary_dispatch_timeout_seconds() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "boundary_dispatch": {
+            "mode": "stream",
+            "timeout_seconds": 45.0,
+        }
+    }
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    boundary_dispatch = platform.get("boundary_dispatch")
+    assert isinstance(boundary_dispatch, dict)
+    assert boundary_dispatch.get("timeout_seconds") == 45.0
+
+
+def test_validate_multiprocess_jaeger_config_uses_async_otel_backend_experiment() -> None:
+    root = Path(__file__).resolve().parents[3]
+    raw = load_yaml_config(root / "src" / "fund_load" / "experiment_config_newgen_multiprocess_jaeger.yml")
+    validated = validate_newgen_config(raw)
+    runtime = validated["runtime"]
+    assert isinstance(runtime, dict)
+    observability = runtime.get("observability")
+    assert isinstance(observability, dict)
+    tracing = observability.get("tracing")
+    assert isinstance(tracing, dict)
+    exporters = tracing.get("exporters")
+    assert isinstance(exporters, list)
+    enabled_otel = [
+        exporter
+        for exporter in exporters
+        if isinstance(exporter, dict)
+        and exporter.get("enabled", True) is True
+        and isinstance(exporter.get("kind"), str)
+        and str(exporter.get("kind")).startswith("otel_otlp")
+    ]
+    assert enabled_otel
+    for exporter in enabled_otel:
+        settings = exporter.get("settings")
+        assert isinstance(settings, dict)
+        assert settings.get("backend") == "httpx"
+        httpx_settings = settings.get("httpx")
+        assert isinstance(httpx_settings, dict)
+        assert httpx_settings.get("mode") == "async"
+
+
+def test_validate_multiprocess_jaeger_config_uses_async_otel_backend_baseline() -> None:
+    root = Path(__file__).resolve().parents[3]
+    raw = load_yaml_config(root / "src" / "fund_load" / "baseline_config_newgen_multiprocess_jaeger.yml")
+    validated = validate_newgen_config(raw)
+    runtime = validated["runtime"]
+    assert isinstance(runtime, dict)
+    observability = runtime.get("observability")
+    assert isinstance(observability, dict)
+    tracing = observability.get("tracing")
+    assert isinstance(tracing, dict)
+    exporters = tracing.get("exporters")
+    assert isinstance(exporters, list)
+    otel = [
+        exporter
+        for exporter in exporters
+        if isinstance(exporter, dict)
+        and isinstance(exporter.get("kind"), str)
+        and str(exporter.get("kind")).startswith("otel_otlp")
+    ]
+    assert otel
+    for exporter in otel:
+        settings = exporter.get("settings")
+        assert isinstance(settings, dict)
+        assert settings.get("backend") == "httpx"
+        httpx_settings = settings.get("httpx")
+        assert isinstance(httpx_settings, dict)
+        assert httpx_settings.get("mode") == "async"
 
 
 def test_validate_newgen_config_accepts_runtime_platform_api_policies_and_web_interface_policies() -> None:

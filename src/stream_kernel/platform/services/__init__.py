@@ -49,6 +49,11 @@ from stream_kernel.platform.services.runtime.transport import (
     RuntimeTransportService,
     TcpLocalRuntimeTransportService,
 )
+from stream_kernel.platform.services.runtime.async_dispatch_loop import AsyncDispatchLoop
+from stream_kernel.platform.services.runtime.process_group_router import (
+    InMemoryProcessGroupRouterService,
+    ProcessGroupRouterService,
+)
 
 __all__ = [
     "ConsumerRegistry",
@@ -84,6 +89,9 @@ __all__ = [
     "resolve_pipeline_observability",
     "legacy_reply_coordinator",
     "MemoryRuntimeTransportService",
+    "InMemoryProcessGroupRouterService",
+    "ProcessGroupRouterService",
     "TcpLocalRuntimeTransportService",
+    "AsyncDispatchLoop",
     "kv_store_memory",
 ]

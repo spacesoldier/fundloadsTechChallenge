@@ -499,6 +499,7 @@ def ensure_runtime_observability_binding(
     replace: bool = True,
 ) -> None:
     # Bind platform observability service to runtime fan-out implementation for this run.
+    requires_async = _observers_require_async_dispatch(observers)
     factory = lambda _observers=list(observers): ReplyAwareObservabilityService(
         inner=FanoutObservabilityService(observers=list(_observers))
     )
@@ -507,8 +508,25 @@ def ensure_runtime_observability_binding(
             "service",
             contract,
             factory,
+            is_async=requires_async,
             replace=replace,
         )
+
+
+def _observers_require_async_dispatch(observers: list[object]) -> bool:
+    for observer in observers:
+        if callable(getattr(observer, "on_trace_event_async", None)):
+            return True
+        if callable(getattr(observer, "on_log_event_async", None)):
+            return True
+        if callable(getattr(observer, "on_metric_event_async", None)):
+            return True
+        if callable(getattr(observer, "on_monitoring_event_async", None)):
+            return True
+        sink = getattr(observer, "_sink", None)
+        if callable(getattr(sink, "emit_async", None)):
+            return True
+    return False
 
 
 @dataclass(slots=True)
@@ -516,6 +534,7 @@ class AdapterSinkNode:
     # Sink adapter wrapper executed inside runner graph.
     role: str
     adapter: object
+    adapter_binding_marker: object | None = None
 
     def __call__(self, msg: object, _ctx: object | None) -> list[object]:
         consume = getattr(self.adapter, "consume", None)
@@ -551,10 +570,31 @@ def build_sink_runtime_nodes(
         if not missing_tokens:
             continue
         node_name = f"sink:{role}"
-        sink_nodes[node_name] = AdapterSinkNode(role=role, adapter=adapter_instances[role])
+        sink_nodes[node_name] = AdapterSinkNode(
+            role=role,
+            adapter=adapter_instances[role],
+            adapter_binding_marker=_build_stream_binding_marker_from_meta(meta),
+        )
         for token in missing_tokens:
             sink_consumers.setdefault(token, []).append(node_name)
     return sink_nodes, sink_consumers
+
+
+def _build_stream_binding_marker_from_meta(meta: object | None) -> object | None:
+    if meta is None:
+        return None
+    binds = getattr(meta, "binds", ())
+    if not isinstance(binds, tuple):
+        return None
+    for binding in binds:
+        if (
+            isinstance(binding, tuple)
+            and len(binding) == 2
+            and binding[0] == "stream"
+            and isinstance(binding[1], type)
+        ):
+            return inject.stream(binding[1])
+    return None
 
 
 def resolve_step_names(dag: object | None) -> list[str]:
@@ -1263,6 +1303,24 @@ def resolve_runtime_adapters(
     return registry, bindings
 
 
+def _resolve_otel_backend_for_build(
+    exporter: dict[str, object],
+    settings_for_build: dict[str, object],
+) -> str | None:
+    backend = exporter.get("backend")
+    if isinstance(backend, str) and backend:
+        return backend
+    transport = settings_for_build.get("transport")
+    if isinstance(transport, dict):
+        transport_backend = transport.get("backend")
+        if isinstance(transport_backend, str) and transport_backend:
+            return transport_backend
+    settings_backend = settings_for_build.get("backend")
+    if isinstance(settings_backend, str) and settings_backend:
+        return settings_backend
+    return None
+
+
 def build_runtime_observability_adapter_instances(
     *,
     runtime: dict[str, object],
@@ -1279,11 +1337,15 @@ def build_runtime_observability_adapter_instances(
             "jsonl": "trace_jsonl",
             "stdout": "trace_stdout",
             "otel_otlp": "trace_otel_otlp",
+            "otel_otlp_logical": "trace_otel_otlp",
+            "otel_otlp_topology": "trace_otel_otlp",
             "opentracing_bridge": "trace_opentracing_bridge",
         },
         "logging": {
             "stdout": "log_stdout",
+            "stdout_plain": "log_stdout_plain",
             "jsonl": "log_jsonl",
+            "file_plain": "log_file_plain",
             "otel_logs_otlp": "log_otel_otlp",
         },
     }
@@ -1302,6 +1364,8 @@ def build_runtime_observability_adapter_instances(
         for index, exporter in enumerate(exporters):
             if not isinstance(exporter, dict):
                 continue
+            if exporter.get("enabled") is False:
+                continue
             kind = exporter.get("kind")
             if not isinstance(kind, str) or not kind:
                 continue
@@ -1314,10 +1378,24 @@ def build_runtime_observability_adapter_instances(
                 continue
             settings = exporter.get("settings", {})
             settings_for_build = dict(settings) if isinstance(settings, dict) else {}
-            if channel == "tracing" and kind == "otel_otlp":
-                backend = exporter.get("backend")
+            if channel == "tracing" and kind in {"otel_otlp", "otel_otlp_logical", "otel_otlp_topology"}:
+                backend = _resolve_otel_backend_for_build(exporter, settings_for_build)
                 if isinstance(backend, str) and backend:
                     settings_for_build["backend"] = backend
+                if kind == "otel_otlp_logical":
+                    settings_for_build.setdefault("trace_view", "logical")
+                    settings_for_build.setdefault("service_name_by_step", True)
+                    settings_for_build.setdefault("service_name_by_process_group", False)
+                    settings_for_build.setdefault("logical_include_platform_spans", False)
+                    settings_for_build.setdefault("service_name_suffix", ".logical")
+                    settings_for_build.setdefault("isolate_view_ids", True)
+                elif kind == "otel_otlp_topology":
+                    settings_for_build.setdefault("trace_view", "topology")
+                    settings_for_build.setdefault("service_name_by_step", False)
+                    settings_for_build.setdefault("service_name_by_process_group", True)
+                    settings_for_build.setdefault("topology_include_business_spans", False)
+                    settings_for_build.setdefault("service_name_suffix", ".topology")
+                    settings_for_build.setdefault("isolate_view_ids", True)
 
             try:
                 instance = registry.build(alias, {"kind": alias, "settings": settings_for_build})

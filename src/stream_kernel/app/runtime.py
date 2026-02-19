@@ -10,6 +10,13 @@ from stream_kernel.config.validator import validate_newgen_config
 from stream_kernel.execution.orchestration import builder as execution_builder
 
 
+def _default_bootstrap_mode(platform: dict[str, object]) -> str:
+    process_groups = platform.get("process_groups")
+    if isinstance(process_groups, list) and len(process_groups) > 0:
+        return "process_supervisor"
+    return "inline"
+
+
 def runtime_contract_summary(config: dict[str, object]) -> dict[str, object]:
     # Build a normalized runtime contract snapshot used by preflight diagnostics.
     runtime = config.get("runtime", {})
@@ -39,7 +46,7 @@ def runtime_contract_summary(config: dict[str, object]) -> dict[str, object]:
     bootstrap_raw = platform.get("bootstrap", {})
     if not isinstance(bootstrap_raw, dict):
         raise ValueError("runtime.platform.bootstrap must be a mapping")
-    bootstrap_mode = bootstrap_raw.get("mode", "inline")
+    bootstrap_mode = bootstrap_raw.get("mode", _default_bootstrap_mode(platform))
     if not isinstance(bootstrap_mode, str) or not bootstrap_mode:
         raise ValueError("runtime.platform.bootstrap.mode must be a non-empty string")
     execution_ipc: dict[str, object]

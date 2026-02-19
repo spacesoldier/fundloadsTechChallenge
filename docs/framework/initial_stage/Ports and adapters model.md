@@ -115,6 +115,36 @@ Framework observability model contracts are defined in:
 Default platform observability adapters are defined in:
 - `src/stream_kernel/observability/adapters/`
 
+#### 2.3.1 TraceSinkPort (trace platform port)
+
+`TraceSinkPort` is a named `@runtime_checkable` Protocol declared in
+`src/stream_kernel/adapters/contracts.py`:
+
+```python
+class TraceSinkPort(Protocol):
+    def emit(self, record: object) -> None: ...
+    def flush(self) -> None: ...
+    def close(self) -> None: ...
+```
+
+All trace sink adapter factories in `src/stream_kernel/adapters/trace_sinks.py`
+are annotated with `@adapter(execution_mode=..., binds=[("stream", TraceSinkPort)])`.
+
+`execution_mode` values:
+
+- `"sync"` — blocking I/O (JSONL file write, stdout flush, sync OTLP HTTP, grpcio).
+  These are non-blocking for the business process after Phase C: they run in a
+  separate runner turn. They are wrapped in `asyncio.to_thread()` when processed by
+  `AsyncRunner` so they do not stall the event loop.
+- `"async"` — native async I/O (httpx async mode, aiohttp).
+  `execution_mode="async"` causes `plan_pools()` to assign the `system.obs.trace_sink`
+  node to `AsyncRunner`. `TraceSinkNode.__call__()` returns a coroutine when the sink
+  exposes `emit_async()`; `AsyncRunner` awaits it directly on the running loop — no
+  new thread or event loop is created.
+
+This is the only platform port for trace record emission. All trace adapters must
+implement `TraceSinkPort` and declare their `execution_mode` via `@adapter` metadata.
+
 ### 2.1 Adapter identities come from framework discovery
 
 Adapter instances are selected by YAML key name (`adapters.<name>`) and resolved

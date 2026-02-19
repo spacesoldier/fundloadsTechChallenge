@@ -105,6 +105,22 @@ def test_runtime_contract_summary_reports_phase0_sections() -> None:
     assert summary["ordering_sink_mode"] == "source_seq"
 
 
+def test_runtime_contract_summary_defaults_bootstrap_mode_to_process_supervisor_when_groups_declared() -> None:
+    summary = runtime_module.runtime_contract_summary(
+        {
+            "scenario": {"name": "baseline"},
+            "runtime": {
+                "platform": {
+                    "process_groups": [{"name": "execution.cpu"}],
+                }
+            },
+            "nodes": {},
+            "adapters": {},
+        }
+    )
+    assert summary["bootstrap_mode"] == "process_supervisor"
+
+
 def test_runtime_contract_summary_reports_execution_transport_profile() -> None:
     # IPC-INT-03: runtime summary should expose resolved execution transport profile.
     memory_summary = runtime_module.runtime_contract_summary(
@@ -824,7 +840,7 @@ def test_run_with_config_uses_discovery_order_when_pipeline_missing(monkeypatch:
     )
     monkeypatch.setattr(
         "stream_kernel.execution.orchestration.builder.build_injection_registry_from_bindings",
-        lambda _instances, _bindings: InjectionRegistry(),
+        lambda _instances, _bindings, **_kw: InjectionRegistry(),
     )
     monkeypatch.setattr("stream_kernel.execution.orchestration.builder.build_execution_observers", lambda *_a, **_k: [])
     monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_sync_runner", lambda **_kw: None)
@@ -886,7 +902,7 @@ def test_run_with_config_invokes_preflight(monkeypatch: pytest.MonkeyPatch) -> N
     )
     monkeypatch.setattr(
         "stream_kernel.execution.orchestration.builder.build_injection_registry_from_bindings",
-        lambda _instances, _bindings: InjectionRegistry(),
+        lambda _instances, _bindings, **_kw: InjectionRegistry(),
     )
     monkeypatch.setattr("stream_kernel.execution.orchestration.builder.build_execution_observers", lambda *_a, **_k: [])
     monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_sync_runner", lambda **_kw: None)
@@ -973,7 +989,7 @@ def test_run_with_config_ignores_runtime_pipeline_without_special_case(monkeypat
     )
     monkeypatch.setattr(
         "stream_kernel.execution.orchestration.builder.build_injection_registry_from_bindings",
-        lambda _instances, _bindings: InjectionRegistry(),
+        lambda _instances, _bindings, **_kw: InjectionRegistry(),
     )
     monkeypatch.setattr("stream_kernel.execution.orchestration.builder.build_execution_observers", lambda *_a, **_k: [])
     monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_sync_runner", lambda **_kw: None)
@@ -1115,7 +1131,7 @@ def test_run_uses_discovery_order_when_pipeline_missing(monkeypatch: pytest.Monk
     )
     monkeypatch.setattr(
         "stream_kernel.execution.orchestration.builder.build_injection_registry_from_bindings",
-        lambda _instances, _bindings: InjectionRegistry(),
+        lambda _instances, _bindings, **_kw: InjectionRegistry(),
     )
     monkeypatch.setattr("stream_kernel.execution.orchestration.builder.build_execution_observers", lambda *_a, **_k: [])
     monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_sync_runner", lambda **_kw: None)
@@ -1235,7 +1251,7 @@ def test_run_accepts_non_default_source_role_with_read(monkeypatch: pytest.Monke
     )
     monkeypatch.setattr(
         "stream_kernel.execution.orchestration.builder.build_injection_registry_from_bindings",
-        lambda _instances, _bindings: InjectionRegistry(),
+        lambda _instances, _bindings, **_kw: InjectionRegistry(),
     )
     monkeypatch.setattr("stream_kernel.execution.orchestration.builder.build_execution_observers", lambda *_a, **_k: [])
     monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_sync_runner", lambda **_kw: None)

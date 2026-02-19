@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from stream_kernel.adapters.registry import AdapterRegistry
+from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.injection_registry import InjectionRegistryError
 from stream_kernel.application_context.injection_registry import ScenarioScope
 from stream_kernel.kernel.scenario import StepSpec
@@ -39,6 +40,7 @@ class SourceBootstrapNode:
     ingress_limiter: object | None = None
     observability: object | None = None
     ingress_limiter_qualifier: str | None = None
+    adapter_binding_marker: object | None = None
     _sequence: int = 0
     _iterator: object | None = None
     _next_payload: object = _NO_PAYLOAD
@@ -247,6 +249,7 @@ def build_source_ingress_plan(
             ingress_limiter=ingress_limiter,
             observability=observability,
             ingress_limiter_qualifier=limiter_qualifier,
+            adapter_binding_marker=_build_stream_binding_marker(meta),
         )
         source_consumers.setdefault(BootstrapControl, []).append(node_name)
     if adapters and not source_nodes:
@@ -270,6 +273,25 @@ def _resolve_adapter_meta(role: str, *, adapter_registry: AdapterRegistry | None
         meta = adapter_registry.get_meta(role, role)
         if meta is not None:
             return meta
+    return None
+
+
+def _build_stream_binding_marker(meta: object | None) -> object | None:
+    # Keep an explicit inject marker on source wrapper so execution pool planning
+    # can infer async capability from adapter DI bindings.
+    if meta is None:
+        return None
+    binds = getattr(meta, "binds", ())
+    if not isinstance(binds, tuple):
+        return None
+    for binding in binds:
+        if (
+            isinstance(binding, tuple)
+            and len(binding) == 2
+            and binding[0] == "stream"
+            and isinstance(binding[1], type)
+        ):
+            return inject.stream(binding[1])
     return None
 
 

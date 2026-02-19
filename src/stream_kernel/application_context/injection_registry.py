@@ -102,6 +102,14 @@ class InjectionRegistry:
             _apply_scope_injection(instance, scope)
         return scope
 
+    def list_async_bindings(self) -> list[tuple[str, type[Any], str | None]]:
+        # Introspection hook for runtime diagnostics (runner auto-selection visibility).
+        return [
+            key
+            for key, binding in self._bindings.items()
+            if binding.is_async
+        ]
+
 
 def _is_injected_marker(value: object) -> bool:
     return (

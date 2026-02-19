@@ -129,6 +129,18 @@ def test_registry_tracks_async_capability_with_qualifier() -> None:
     assert reg.is_async_binding("stream", EventA) is False
 
 
+def test_registry_can_list_async_bindings_for_runtime_diagnostics() -> None:
+    reg = InjectionRegistry()
+    reg.register_factory("stream", EventA, lambda: _StreamPort("A"), is_async=True)
+    reg.register_factory("stream", EventB, lambda: _StreamPort("B"), is_async=False)
+    reg.register_factory("service", _StorePort, lambda: _StorePort("svc"), is_async=True, qualifier="execution.async")
+
+    async_bindings = reg.list_async_bindings()
+    assert ("stream", EventA, None) in async_bindings
+    assert ("service", _StorePort, "execution.async") in async_bindings
+    assert ("stream", EventB, None) not in async_bindings
+
+
 def test_registry_rejects_extended_kv_contract() -> None:
     # KV bindings must use base or marker contracts without extra public methods.
     reg = InjectionRegistry()

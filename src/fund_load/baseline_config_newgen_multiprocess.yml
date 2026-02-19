@@ -24,6 +24,10 @@ runtime:
       max_payload_bytes: 1048576
     bootstrap:
       mode: process_supervisor
+    boundary_dispatch:
+      mode: stream
+      control_poll_ms: 1.0
+      batch_max_items: 1000
     process_groups:
       - name: execution.ingress
         workers: 1

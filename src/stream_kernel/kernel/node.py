@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from typing import TypeVar
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,5 +33,24 @@ class NodeDef:
     container_attr: str | None = None
 
 
-# Re-export decorator for backward compatibility; implementation lives in node_annotation.py.
-from stream_kernel.kernel.node_annotation import node
+T = TypeVar("T")
+
+
+def node(
+    *,
+    name: str,
+    stage: str = "",
+    consumes: Iterable[type[object]] | None = None,
+    emits: Iterable[type[object]] | None = None,
+    service: bool = False,
+) -> Callable[[T], T]:
+    # Backward-compatible re-export without module-load import cycle.
+    from stream_kernel.kernel.node_annotation import node as _node
+
+    return _node(
+        name=name,
+        stage=stage,
+        consumes=consumes,
+        emits=emits,
+        service=service,
+    )

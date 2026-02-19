@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 from stream_kernel.application_context.inject import inject
 from stream_kernel.integration.work_queue import QueuePort
-from stream_kernel.platform.services.state.context import ContextService
+from stream_kernel.platform.services.messaging.reply_waiter import TerminalEvent
 from stream_kernel.platform.services.observability import (
     ObservabilityPipelineService,
     ObservabilityService,
     resolve_pipeline_observability,
 )
-from stream_kernel.platform.services.messaging.reply_waiter import TerminalEvent
+from stream_kernel.platform.services.state.context import ContextService
 from stream_kernel.routing.envelope import Envelope
 from stream_kernel.routing.router import RoutingResult
 from stream_kernel.routing.routing_service import RoutingService
@@ -43,6 +45,24 @@ class SyncRunner:
     full_context_nodes: set[str] = field(default_factory=set)
     # Sink delivery ordering mode: `completion` (default) or `source_seq`.
     ordered_sink_mode: str = "completion"
+    # Boundary mode: collect cross-group / terminal envelopes instead of failing on unknown local targets.
+    allow_external_deliveries: bool = False
+    # Optional sink for envelopes targeted outside this runner node set.
+    external_deliveries: list[Envelope] | None = None
+    # Optional sink for terminal envelopes collected during run().
+    terminal_outputs: list[Envelope] | None = None
+    # Optional sink preserving boundary output order (terminal + external deliveries).
+    boundary_outputs: list[Envelope] | None = None
+    # Optional hook to enrich per-envelope observability context.
+    observability_context_enricher: Callable[[Envelope, dict[str, object]], dict[str, object] | None] | None = None
+    # Graceful stop: when True, runner empties the queue before honouring the stop request.
+    drain_on_stop: bool = True
+    _stop_requested: bool = field(default=False, init=False)
+    _last_seen_by_trace: dict[str, float] = field(default_factory=dict, init=False)
+
+    def request_stop(self) -> None:
+        # Graceful stop signal: runner finishes inflight queue when drain_on_stop=True.
+        self._stop_requested = True
 
     def run(self) -> None:
         # Drain current queue until empty.
@@ -52,6 +72,11 @@ class SyncRunner:
         router = self._router()
         observability = self._observability()
         while True:
+            if self._stop_requested:
+                size_fn = getattr(work_queue, "size", None)
+                size = size_fn() if callable(size_fn) else 0
+                if not self.drain_on_stop or size == 0:
+                    break
             item = work_queue.pop()
             if item is None:
                 break
@@ -65,6 +90,9 @@ class SyncRunner:
             else:
                 raise ValueError("Envelope.target must resolve to a single node")
             if node_name not in self.nodes:
+                if self.allow_external_deliveries:
+                    self._collect_external_delivery(envelope)
+                    continue
                 raise ValueError(f"Unknown node '{node_name}'")
 
             is_sink_node = node_name.startswith("sink:")
@@ -82,40 +110,70 @@ class SyncRunner:
             observability_ctx = dict(raw_ctx)
             if isinstance(envelope.span_id, str) and envelope.span_id:
                 observability_ctx["__parent_span_id"] = envelope.span_id
+            self._stamp_runner_gap(
+                envelope=envelope,
+                observability_ctx=observability_ctx,
+            )
+            self._enrich_observability_ctx(envelope, observability_ctx)
             # Pass a copy to the node so it cannot mutate persisted context in-place by accident.
             node_ctx = dict(raw_ctx)
             node = self.nodes[node_name]
+            observability_enabled = not self._is_observability_system_node(node_name)
             # Observability hooks can keep per-node temporary state (timers, snapshots, counters).
-            observer_state = observability.before_node(
-                node_name=node_name,
-                payload=envelope.payload,
-                ctx=observability_ctx,
-                trace_id=envelope.trace_id,
+            observer_state = (
+                observability.before_node(
+                    node_name=node_name,
+                    payload=envelope.payload,
+                    ctx=observability_ctx,
+                    trace_id=envelope.trace_id,
+                )
+                if observability_enabled
+                else None
             )
             try:
                 # Node contract is `(payload, ctx) -> iterable[output]`.
                 outputs = list(node(envelope.payload, node_ctx))
             except Exception as exc:
                 # Error path is explicitly observable for diagnostics and metrics.
-                observability.on_node_error(
+                if observability_enabled:
+                    error_service_outputs = observability.on_node_error(
+                        node_name=node_name,
+                        payload=envelope.payload,
+                        ctx=observability_ctx,
+                        trace_id=envelope.trace_id,
+                        error=exc,
+                        state=observer_state,
+                    )
+                    self._route_observability_service_outputs(
+                        service_outputs=error_service_outputs,
+                        source_node=node_name,
+                        trace_id=envelope.trace_id,
+                        reply_to=envelope.reply_to,
+                        span_id=self._span_id_from_observer_state(observer_state),
+                        work_queue=work_queue,
+                        router=router,
+                    )
+                raise
+            # Success path callback after node output materialization.
+            produced_span_id = self._span_id_from_observer_state(observer_state)
+            if observability_enabled:
+                after_service_outputs = observability.after_node(
                     node_name=node_name,
                     payload=envelope.payload,
                     ctx=observability_ctx,
                     trace_id=envelope.trace_id,
-                    error=exc,
+                    outputs=outputs,
                     state=observer_state,
                 )
-                raise
-            # Success path callback after node output materialization.
-            observability.after_node(
-                node_name=node_name,
-                payload=envelope.payload,
-                ctx=observability_ctx,
-                trace_id=envelope.trace_id,
-                outputs=outputs,
-                state=observer_state,
-            )
-            produced_span_id = self._span_id_from_observer_state(observer_state)
+                self._route_observability_service_outputs(
+                    service_outputs=after_service_outputs,
+                    source_node=node_name,
+                    trace_id=envelope.trace_id,
+                    reply_to=envelope.reply_to,
+                    span_id=produced_span_id,
+                    work_queue=work_queue,
+                    router=router,
+                )
 
             # Router translates outputs to concrete `(target_node, payload)` deliveries.
             # Envelope trace_id emitted by node output overrides current trace_id if present.
@@ -124,29 +182,80 @@ class SyncRunner:
                 if terminal is not None:
                     terminal_trace_id = output.trace_id if isinstance(output, Envelope) else None
                     resolved_trace_id = terminal_trace_id or envelope.trace_id
-                    self._emit_terminal_event(
+                    terminal_service_outputs = self._emit_terminal_event(
                         trace_id=resolved_trace_id,
                         terminal=terminal,
+                    )
+                    self._collect_terminal_output(
+                        Envelope(
+                            payload=terminal,
+                            trace_id=resolved_trace_id,
+                            reply_to=envelope.reply_to,
+                            span_id=produced_span_id,
+                        )
+                    )
+                    self._route_observability_service_outputs(
+                        service_outputs=terminal_service_outputs,
+                        source_node=node_name,
+                        trace_id=resolved_trace_id,
+                        reply_to=envelope.reply_to,
+                        span_id=produced_span_id,
+                        work_queue=work_queue,
+                        router=router,
                     )
                     continue
 
                 explicit_trace_id = output.trace_id if isinstance(output, Envelope) else None
                 explicit_reply_to = output.reply_to if isinstance(output, Envelope) else None
                 explicit_span_id = output.span_id if isinstance(output, Envelope) else None
-                routing_result = router.route([output], source=node_name)
+                if self.allow_external_deliveries and isinstance(output, Envelope) and output.target is not None:
+                    target_names = (
+                        [output.target]
+                        if isinstance(output.target, str)
+                        else list(output.target)
+                    )
+                    for target_name in target_names:
+                        envelope_out = Envelope(
+                            payload=output.payload,
+                            target=target_name,
+                            trace_id=explicit_trace_id or envelope.trace_id,
+                            reply_to=explicit_reply_to or envelope.reply_to,
+                            span_id=explicit_span_id or produced_span_id,
+                        )
+                        if self.allow_external_deliveries and target_name not in self.nodes:
+                            self._collect_external_delivery(envelope_out)
+                            continue
+                        work_queue.push(envelope_out)
+                    continue
+                try:
+                    routing_result = router.route([output], source=node_name)
+                except ValueError as exc:
+                    if self.allow_external_deliveries and "No consumers registered" in str(exc):
+                        self._collect_terminal_output(
+                            Envelope(
+                                payload=output.payload if isinstance(output, Envelope) else output,
+                                trace_id=explicit_trace_id or envelope.trace_id,
+                                reply_to=explicit_reply_to or envelope.reply_to,
+                                span_id=explicit_span_id or produced_span_id,
+                            )
+                        )
+                        continue
+                    raise
                 downstream_trace_id = explicit_trace_id or envelope.trace_id
                 downstream_reply_to = explicit_reply_to or envelope.reply_to
                 downstream_span_id = explicit_span_id or produced_span_id
                 for target_name, payload in self._local_deliveries(routing_result):
-                    work_queue.push(
-                        Envelope(
-                            payload=payload,
-                            target=target_name,
-                            trace_id=downstream_trace_id,
-                            reply_to=downstream_reply_to,
-                            span_id=downstream_span_id,
-                        )
+                    envelope_out = Envelope(
+                        payload=payload,
+                        target=target_name,
+                        trace_id=downstream_trace_id,
+                        reply_to=downstream_reply_to,
+                        span_id=downstream_span_id,
                     )
+                    if self.allow_external_deliveries and target_name not in self.nodes:
+                        self._collect_external_delivery(envelope_out)
+                        continue
+                    work_queue.push(envelope_out)
 
     def run_inputs(
         self,
@@ -177,9 +286,18 @@ class SyncRunner:
                     scenario_id=scenario_id,
                     reply_to=payload.reply_to,
                 )
-                self._emit_ingress(
+                ingress_service_outputs = self._emit_ingress(
                     trace_id=trace_id,
                     reply_to=payload.reply_to,
+                )
+                self._route_observability_service_outputs(
+                    service_outputs=ingress_service_outputs,
+                    source_node="__ingress__",
+                    trace_id=trace_id,
+                    reply_to=payload.reply_to,
+                    span_id=payload.span_id,
+                    work_queue=work_queue,
+                    router=router,
                 )
                 if payload.target is not None:
                     work_queue.push(
@@ -214,7 +332,16 @@ class SyncRunner:
                 run_id=run_id,
                 scenario_id=scenario_id,
             )
-            self._emit_ingress(trace_id=trace_id, reply_to=None)
+            ingress_service_outputs = self._emit_ingress(trace_id=trace_id, reply_to=None)
+            self._route_observability_service_outputs(
+                service_outputs=ingress_service_outputs,
+                source_node="__ingress__",
+                trace_id=trace_id,
+                reply_to=None,
+                span_id=None,
+                work_queue=work_queue,
+                router=router,
+            )
             routing_result = router.route([payload])
             for target_name, routed_payload in self._local_deliveries(routing_result):
                 work_queue.push(
@@ -324,16 +451,16 @@ class SyncRunner:
         *,
         trace_id: str | None,
         reply_to: str | None,
-    ) -> None:
-        self._observability().on_ingress(trace_id=trace_id, reply_to=reply_to)
+    ) -> object | None:
+        return self._observability().on_ingress(trace_id=trace_id, reply_to=reply_to)
 
     def _emit_terminal_event(
         self,
         *,
         trace_id: str | None,
         terminal: TerminalEvent | None,
-    ) -> None:
-        self._observability().on_terminal_event(trace_id=trace_id, terminal_event=terminal)
+    ) -> object | None:
+        return self._observability().on_terminal_event(trace_id=trace_id, terminal_event=terminal)
 
     @staticmethod
     def _span_id_from_observer_state(state: object) -> str | None:
@@ -348,12 +475,122 @@ class SyncRunner:
                 return candidate
         return None
 
+    @staticmethod
+    def _is_observability_system_node(node_name: str) -> bool:
+        return node_name.startswith("system.obs.")
+
     def __post_init__(self) -> None:
         if self.ordered_sink_mode not in _ORDERED_SINK_MODES:
             raise ValueError(
                 "SyncRunner ordered_sink_mode must be one of: "
                 f"{sorted(_ORDERED_SINK_MODES)}"
             )
+
+    @staticmethod
+    def _coerce_observability_service_outputs(candidate: object) -> list[object]:
+        if candidate is None:
+            return []
+        if isinstance(candidate, list):
+            return [item for item in candidate if item is not None]
+        return [candidate]
+
+    def _route_observability_service_outputs(
+        self,
+        *,
+        service_outputs: object,
+        source_node: str,
+        trace_id: str | None,
+        reply_to: str | None,
+        span_id: str | None,
+        work_queue: QueuePort,
+        router: RoutingService,
+    ) -> None:
+        for output in self._coerce_observability_service_outputs(service_outputs):
+            explicit_trace_id = output.trace_id if isinstance(output, Envelope) else None
+            explicit_reply_to = output.reply_to if isinstance(output, Envelope) else None
+            explicit_span_id = output.span_id if isinstance(output, Envelope) else None
+            if self.allow_external_deliveries and isinstance(output, Envelope) and output.target is not None:
+                target_names = (
+                    [output.target]
+                    if isinstance(output.target, str)
+                    else list(output.target)
+                )
+                downstream_trace_id = explicit_trace_id or trace_id
+                downstream_reply_to = explicit_reply_to or reply_to
+                downstream_span_id = explicit_span_id or span_id
+                for target_name in target_names:
+                    envelope_out = Envelope(
+                        payload=output.payload,
+                        target=target_name,
+                        trace_id=downstream_trace_id,
+                        reply_to=downstream_reply_to,
+                        span_id=downstream_span_id,
+                    )
+                    if self.allow_external_deliveries and target_name not in self.nodes:
+                        self._collect_external_delivery(envelope_out)
+                        continue
+                    work_queue.push(envelope_out)
+                continue
+            try:
+                routing_result = router.route([output], source=source_node)
+            except ValueError as exc:
+                if self.allow_external_deliveries and "No consumers registered" in str(exc):
+                    self._collect_terminal_output(
+                        Envelope(
+                            payload=output.payload if isinstance(output, Envelope) else output,
+                            trace_id=explicit_trace_id or trace_id,
+                            reply_to=explicit_reply_to or reply_to,
+                            span_id=explicit_span_id or span_id,
+                        )
+                    )
+                    continue
+                raise
+            downstream_trace_id = explicit_trace_id or trace_id
+            downstream_reply_to = explicit_reply_to or reply_to
+            downstream_span_id = explicit_span_id or span_id
+            for target_name, payload in SyncRunner._local_deliveries(routing_result):
+                envelope_out = Envelope(
+                    payload=payload,
+                    target=target_name,
+                    trace_id=downstream_trace_id,
+                    reply_to=downstream_reply_to,
+                    span_id=downstream_span_id,
+                )
+                if self.allow_external_deliveries and target_name not in self.nodes:
+                    self._collect_external_delivery(envelope_out)
+                    continue
+                work_queue.push(envelope_out)
+
+    def _collect_external_delivery(self, envelope: Envelope) -> None:
+        if isinstance(self.external_deliveries, list):
+            self.external_deliveries.append(envelope)
+        if isinstance(self.boundary_outputs, list):
+            self.boundary_outputs.append(envelope)
+
+    def _collect_terminal_output(self, envelope: Envelope) -> None:
+        if isinstance(self.terminal_outputs, list):
+            self.terminal_outputs.append(envelope)
+        if isinstance(self.boundary_outputs, list):
+            self.boundary_outputs.append(envelope)
+
+    def _enrich_observability_ctx(self, envelope: Envelope, observability_ctx: dict[str, object]) -> None:
+        enrich = self.observability_context_enricher
+        if not callable(enrich):
+            return
+        extra = enrich(envelope, dict(observability_ctx))
+        if isinstance(extra, dict):
+            observability_ctx.update(extra)
+
+    def _stamp_runner_gap(self, *, envelope: Envelope, observability_ctx: dict[str, object]) -> None:
+        trace_id = envelope.trace_id
+        if not isinstance(trace_id, str) or not trace_id:
+            return
+        now = time.monotonic()
+        prev = self._last_seen_by_trace.get(trace_id)
+        self._last_seen_by_trace[trace_id] = now
+        if prev is None:
+            return
+        observability_ctx["__runner_gap_ms"] = (now - prev) * 1000.0
 
 
 @dataclass(slots=True)
@@ -367,8 +604,14 @@ class AsyncRunner:
     observability: object = inject.service(ObservabilityService)
     full_context_nodes: set[str] = field(default_factory=set)
     ordered_sink_mode: str = "completion"
+    allow_external_deliveries: bool = False
+    external_deliveries: list[Envelope] | None = None
+    terminal_outputs: list[Envelope] | None = None
+    boundary_outputs: list[Envelope] | None = None
+    observability_context_enricher: Callable[[Envelope, dict[str, object]], dict[str, object] | None] | None = None
     drain_on_stop: bool = True
     _stop_requested: bool = field(default=False, init=False)
+    _last_seen_by_trace: dict[str, float] = field(default_factory=dict, init=False)
 
     def run(self) -> None:
         _run_async_blocking(self.run_async())
@@ -393,6 +636,9 @@ class AsyncRunner:
             else:
                 raise ValueError("Envelope.target must resolve to a single node")
             if node_name not in self.nodes:
+                if self.allow_external_deliveries:
+                    self._collect_external_delivery(envelope)
+                    continue
                 raise ValueError(f"Unknown node '{node_name}'")
 
             is_sink_node = node_name.startswith("sink:")
@@ -409,70 +655,151 @@ class AsyncRunner:
             observability_ctx = dict(raw_ctx)
             if isinstance(envelope.span_id, str) and envelope.span_id:
                 observability_ctx["__parent_span_id"] = envelope.span_id
+            self._stamp_runner_gap(
+                envelope=envelope,
+                observability_ctx=observability_ctx,
+            )
+            self._enrich_observability_ctx(envelope, observability_ctx)
             node_ctx = dict(raw_ctx)
             node = self.nodes[node_name]
-            observer_state = await _maybe_await(
-                observability.before_node(
-                    node_name=node_name,
-                    payload=envelope.payload,
-                    ctx=observability_ctx,
-                    trace_id=envelope.trace_id,
-                )
-            )
-            try:
-                outputs = await _coerce_node_outputs(node(envelope.payload, node_ctx))
-            except Exception as exc:
+            observability_enabled = not SyncRunner._is_observability_system_node(node_name)
+            observer_state = (
                 await _maybe_await(
-                    observability.on_node_error(
+                    observability.before_node(
                         node_name=node_name,
                         payload=envelope.payload,
                         ctx=observability_ctx,
                         trace_id=envelope.trace_id,
-                        error=exc,
+                    )
+                )
+                if observability_enabled
+                else None
+            )
+            try:
+                outputs = await _coerce_node_outputs(node(envelope.payload, node_ctx))
+            except Exception as exc:
+                if observability_enabled:
+                    error_service_outputs = await _maybe_await(
+                        observability.on_node_error(
+                            node_name=node_name,
+                            payload=envelope.payload,
+                            ctx=observability_ctx,
+                            trace_id=envelope.trace_id,
+                            error=exc,
+                            state=observer_state,
+                        )
+                    )
+                    self._route_observability_service_outputs(
+                        service_outputs=error_service_outputs,
+                        source_node=node_name,
+                        trace_id=envelope.trace_id,
+                        reply_to=envelope.reply_to,
+                        span_id=SyncRunner._span_id_from_observer_state(observer_state),
+                        work_queue=work_queue,
+                        router=router,
+                    )
+                raise
+            produced_span_id = SyncRunner._span_id_from_observer_state(observer_state)
+            if observability_enabled:
+                after_service_outputs = await _maybe_await(
+                    observability.after_node(
+                        node_name=node_name,
+                        payload=envelope.payload,
+                        ctx=observability_ctx,
+                        trace_id=envelope.trace_id,
+                        outputs=outputs,
                         state=observer_state,
                     )
                 )
-                raise
-            await _maybe_await(
-                observability.after_node(
-                    node_name=node_name,
-                    payload=envelope.payload,
-                    ctx=observability_ctx,
+                self._route_observability_service_outputs(
+                    service_outputs=after_service_outputs,
+                    source_node=node_name,
                     trace_id=envelope.trace_id,
-                    outputs=outputs,
-                    state=observer_state,
+                    reply_to=envelope.reply_to,
+                    span_id=produced_span_id,
+                    work_queue=work_queue,
+                    router=router,
                 )
-            )
-            produced_span_id = SyncRunner._span_id_from_observer_state(observer_state)
 
             for output in outputs:
                 terminal = SyncRunner._terminal_event_from_output(output)
                 if terminal is not None:
                     terminal_trace_id = output.trace_id if isinstance(output, Envelope) else None
                     resolved_trace_id = terminal_trace_id or envelope.trace_id
-                    self._emit_terminal_event(
+                    terminal_service_outputs = self._emit_terminal_event(
                         trace_id=resolved_trace_id,
                         terminal=terminal,
+                    )
+                    self._collect_terminal_output(
+                        Envelope(
+                            payload=terminal,
+                            trace_id=resolved_trace_id,
+                            reply_to=envelope.reply_to,
+                            span_id=produced_span_id,
+                        )
+                    )
+                    self._route_observability_service_outputs(
+                        service_outputs=terminal_service_outputs,
+                        source_node=node_name,
+                        trace_id=resolved_trace_id,
+                        reply_to=envelope.reply_to,
+                        span_id=produced_span_id,
+                        work_queue=work_queue,
+                        router=router,
                     )
                     continue
 
                 explicit_trace_id = output.trace_id if isinstance(output, Envelope) else None
                 explicit_reply_to = output.reply_to if isinstance(output, Envelope) else None
                 explicit_span_id = output.span_id if isinstance(output, Envelope) else None
-                routing_result = router.route([output], source=node_name)
+                if self.allow_external_deliveries and isinstance(output, Envelope) and output.target is not None:
+                    target_names = (
+                        [output.target]
+                        if isinstance(output.target, str)
+                        else list(output.target)
+                    )
+                    for target_name in target_names:
+                        envelope_out = Envelope(
+                            payload=output.payload,
+                            target=target_name,
+                            trace_id=explicit_trace_id or envelope.trace_id,
+                            reply_to=explicit_reply_to or envelope.reply_to,
+                            span_id=explicit_span_id or produced_span_id,
+                        )
+                        if self.allow_external_deliveries and target_name not in self.nodes:
+                            self._collect_external_delivery(envelope_out)
+                            continue
+                        work_queue.push(envelope_out)
+                    continue
+                try:
+                    routing_result = router.route([output], source=node_name)
+                except ValueError as exc:
+                    if self.allow_external_deliveries and "No consumers registered" in str(exc):
+                        self._collect_terminal_output(
+                            Envelope(
+                                payload=output.payload if isinstance(output, Envelope) else output,
+                                trace_id=explicit_trace_id or envelope.trace_id,
+                                reply_to=explicit_reply_to or envelope.reply_to,
+                                span_id=explicit_span_id or produced_span_id,
+                            )
+                        )
+                        continue
+                    raise
                 downstream_trace_id = explicit_trace_id or envelope.trace_id
                 downstream_reply_to = explicit_reply_to or envelope.reply_to
                 downstream_span_id = explicit_span_id or produced_span_id
                 for target_name, payload in SyncRunner._local_deliveries(routing_result):
-                    work_queue.push(
-                        Envelope(
-                            payload=payload,
-                            target=target_name,
-                            trace_id=downstream_trace_id,
-                            reply_to=downstream_reply_to,
-                            span_id=downstream_span_id,
-                        )
+                    envelope_out = Envelope(
+                        payload=payload,
+                        target=target_name,
+                        trace_id=downstream_trace_id,
+                        reply_to=downstream_reply_to,
+                        span_id=downstream_span_id,
                     )
+                    if self.allow_external_deliveries and target_name not in self.nodes:
+                        self._collect_external_delivery(envelope_out)
+                        continue
+                    work_queue.push(envelope_out)
 
     def run_inputs(
         self,
@@ -504,7 +831,16 @@ class AsyncRunner:
                     scenario_id=scenario_id,
                     reply_to=payload.reply_to,
                 )
-                self._emit_ingress(trace_id=trace_id, reply_to=payload.reply_to)
+                ingress_service_outputs = self._emit_ingress(trace_id=trace_id, reply_to=payload.reply_to)
+                self._route_observability_service_outputs(
+                    service_outputs=ingress_service_outputs,
+                    source_node="__ingress__",
+                    trace_id=trace_id,
+                    reply_to=payload.reply_to,
+                    span_id=payload.span_id,
+                    work_queue=work_queue,
+                    router=router,
+                )
                 if payload.target is not None:
                     work_queue.push(
                         Envelope(
@@ -538,7 +874,16 @@ class AsyncRunner:
                 run_id=run_id,
                 scenario_id=scenario_id,
             )
-            self._emit_ingress(trace_id=trace_id, reply_to=None)
+            ingress_service_outputs = self._emit_ingress(trace_id=trace_id, reply_to=None)
+            self._route_observability_service_outputs(
+                service_outputs=ingress_service_outputs,
+                source_node="__ingress__",
+                trace_id=trace_id,
+                reply_to=None,
+                span_id=None,
+                work_queue=work_queue,
+                router=router,
+            )
             routing_result = router.route([payload])
             for target_name, routed_payload in SyncRunner._local_deliveries(routing_result):
                 work_queue.push(
@@ -576,16 +921,16 @@ class AsyncRunner:
         *,
         trace_id: str | None,
         reply_to: str | None,
-    ) -> None:
-        self._observability().on_ingress(trace_id=trace_id, reply_to=reply_to)
+    ) -> object | None:
+        return self._observability().on_ingress(trace_id=trace_id, reply_to=reply_to)
 
     def _emit_terminal_event(
         self,
         *,
         trace_id: str | None,
         terminal: TerminalEvent | None,
-    ) -> None:
-        self._observability().on_terminal_event(trace_id=trace_id, terminal_event=terminal)
+    ) -> object | None:
+        return self._observability().on_terminal_event(trace_id=trace_id, terminal_event=terminal)
 
     def __post_init__(self) -> None:
         if self.ordered_sink_mode not in _ORDERED_SINK_MODES:
@@ -593,6 +938,63 @@ class AsyncRunner:
                 "AsyncRunner ordered_sink_mode must be one of: "
                 f"{sorted(_ORDERED_SINK_MODES)}"
             )
+
+    @staticmethod
+    def _coerce_observability_service_outputs(candidate: object) -> list[object]:
+        return SyncRunner._coerce_observability_service_outputs(candidate)
+
+    def _route_observability_service_outputs(
+        self,
+        *,
+        service_outputs: object,
+        source_node: str,
+        trace_id: str | None,
+        reply_to: str | None,
+        span_id: str | None,
+        work_queue: QueuePort,
+        router: RoutingService,
+    ) -> None:
+        SyncRunner._route_observability_service_outputs(
+            self,
+            service_outputs=service_outputs,
+            source_node=source_node,
+            trace_id=trace_id,
+            reply_to=reply_to,
+            span_id=span_id,
+            work_queue=work_queue,
+            router=router,
+        )
+
+    def _collect_external_delivery(self, envelope: Envelope) -> None:
+        if isinstance(self.external_deliveries, list):
+            self.external_deliveries.append(envelope)
+        if isinstance(self.boundary_outputs, list):
+            self.boundary_outputs.append(envelope)
+
+    def _collect_terminal_output(self, envelope: Envelope) -> None:
+        if isinstance(self.terminal_outputs, list):
+            self.terminal_outputs.append(envelope)
+        if isinstance(self.boundary_outputs, list):
+            self.boundary_outputs.append(envelope)
+
+    def _enrich_observability_ctx(self, envelope: Envelope, observability_ctx: dict[str, object]) -> None:
+        enrich = self.observability_context_enricher
+        if not callable(enrich):
+            return
+        extra = enrich(envelope, dict(observability_ctx))
+        if isinstance(extra, dict):
+            observability_ctx.update(extra)
+
+    def _stamp_runner_gap(self, *, envelope: Envelope, observability_ctx: dict[str, object]) -> None:
+        trace_id = envelope.trace_id
+        if not isinstance(trace_id, str) or not trace_id:
+            return
+        now = time.monotonic()
+        prev = self._last_seen_by_trace.get(trace_id)
+        self._last_seen_by_trace[trace_id] = now
+        if prev is None:
+            return
+        observability_ctx["__runner_gap_ms"] = (now - prev) * 1000.0
 
 
 async def _coerce_node_outputs(raw: object) -> list[object]:

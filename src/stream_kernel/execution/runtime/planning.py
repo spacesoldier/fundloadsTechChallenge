@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 
 from stream_kernel.application_context.inject import Injected
 from stream_kernel.application_context.injection_registry import InjectionRegistry, InjectionRegistryError
@@ -28,6 +28,14 @@ def _iter_injected(obj: object) -> list[Injected]:
     injected: list[Injected] = []
 
     def _collect(target: object) -> None:
+        if is_dataclass(target):
+            for dataclass_field in fields(target):
+                try:
+                    value = getattr(target, dataclass_field.name)
+                except AttributeError:
+                    continue
+                if isinstance(value, Injected):
+                    injected.append(value)
         for value in getattr(target, "__dict__", {}).values():
             if isinstance(value, Injected):
                 injected.append(value)
