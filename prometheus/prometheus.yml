@@ -7,7 +7,7 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets:
-          - host.docker.internal:9465
+          - host.docker.internal:9466
         labels:
           app: stream-kernel
 
@@ -15,3 +15,11 @@ scrape_configs:
     static_configs:
       - targets:
           - localhost:9090
+
+  - job_name: stream_kernel_textfile
+    static_configs:
+      - targets:
+          - node-exporter:9100
+        labels:
+          app: stream-kernel
+          source: textfile

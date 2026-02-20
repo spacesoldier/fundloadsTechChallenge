@@ -9,7 +9,20 @@ runtime:
   tracing:
     enabled: false
   observability:
+    service_worker:
+      enabled: true
+      queue_max_items: 131072
+      drop_policy: block_with_timeout
+      block_timeout_ms: 5000
+      drain_timeout_seconds: 120
     tracing:
+      dispatch_queue:
+        max_items: 131072
+        drop_policy: block_with_timeout
+        block_timeout_ms: 5000
+        forward_batch_max_items: 100
+        forward_flush_interval_ms: 20
+        drain_timeout_seconds: 120
       exporters:
         - kind: jsonl
           enabled: true
@@ -26,8 +39,12 @@ runtime:
               backend: httpx
               timeout_seconds: 2.0
               batch:
-                max_items: 256
+                max_items: 100
                 flush_interval_ms: 100
+              queue:
+                max_items: 131072
+                drop_policy: block_with_timeout
+                block_timeout_ms: 5000
               httpx:
                 mode: async
             service:
@@ -52,8 +69,12 @@ runtime:
               backend: httpx
               timeout_seconds: 2.0
               batch:
-                max_items: 256
+                max_items: 100
                 flush_interval_ms: 100
+              queue:
+                max_items: 131072
+                drop_policy: block_with_timeout
+                block_timeout_ms: 5000
               httpx:
                 mode: async
             service:
@@ -84,6 +105,9 @@ runtime:
   discovery_modules:
     - fund_load
   platform:
+    lifecycle:
+      graceful_timeout_seconds: 120
+      drain_inflight: true
     execution_ipc:
       transport: tcp_local
       bind_host: 127.0.0.1

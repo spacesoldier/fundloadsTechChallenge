@@ -282,19 +282,17 @@ def test_jsonl_trace_sink_creates_parent_directory(tmp_path: Path) -> None:
     assert path.exists()
 
 
-def test_jsonl_trace_sink_emit_async_batch_offloads_only_flush_boundaries(
+def test_jsonl_trace_sink_emit_async_batch_mode_does_not_offload_to_thread(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Async batch path should avoid one to_thread hop per record and offload only flush boundaries.
+    # Async batch path must not depend on asyncio.to_thread; I/O runs on dispatch worker rails.
     path = tmp_path / "trace.jsonl"
-    calls: list[str] = []
 
-    async def _fake_to_thread(fn, *args, **kwargs):  # noqa: ANN001 - monkeypatch helper.
-        calls.append(getattr(fn, "__name__", str(fn)))
-        return fn(*args, **kwargs)
+    async def _forbidden_to_thread(_fn, *_args, **_kwargs):  # noqa: ANN001 - monkeypatch helper.
+        raise AssertionError("batch-mode emit_async must not call asyncio.to_thread")
 
-    monkeypatch.setattr(trace_sinks.asyncio, "to_thread", _fake_to_thread)
+    monkeypatch.setattr(trace_sinks.asyncio, "to_thread", _forbidden_to_thread)
     sink = JsonlTraceSink(path=path, write_mode="batch", flush_every_n=2, fsync_every_n=None)
     trace_sinks._run_async_blocking(sink.emit_async(_record("step-a", 0)))
     trace_sinks._run_async_blocking(sink.emit_async(_record("step-b", 1)))
@@ -302,7 +300,6 @@ def test_jsonl_trace_sink_emit_async_batch_offloads_only_flush_boundaries(
 
     lines = path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 2
-    assert calls.count("_write_lines") == 1
 
 
 def test_jsonl_trace_sink_emit_async_line_mode_does_not_offload_to_thread(

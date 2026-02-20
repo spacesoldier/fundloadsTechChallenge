@@ -22,6 +22,7 @@ from stream_kernel.platform.services.state.consumer_registry import DiscoveryCon
 from stream_kernel.platform.services.state.context import ContextService, InMemoryKvContextService, kv_store_memory
 from stream_kernel.platform.services.observability import (
     coerce_pipeline_observability,
+    DefaultWorkerQueueTelemetryService,
     InMemoryObservabilityMetricsService,
     NoOpObservabilityService,
     ObservabilityMetricsService,
@@ -29,6 +30,7 @@ from stream_kernel.platform.services.observability import (
     ObservabilityService,
     ReplyAwareObservabilityService,
     legacy_reply_aware_observability,
+    WorkerQueueTelemetryService,
     resolve_pipeline_observability,
 )
 from stream_kernel.platform.services.messaging.reply_waiter import (
@@ -72,10 +74,12 @@ __all__ = [
     "LocalRuntimeLifecycleManager",
     "NoOpObservabilityService",
     "InMemoryObservabilityMetricsService",
+    "DefaultWorkerQueueTelemetryService",
     "coerce_pipeline_observability",
     "ObservabilityMetricsService",
     "ObservabilityPipelineService",
     "ObservabilityService",
+    "WorkerQueueTelemetryService",
     "ReplyAwareObservabilityService",
     "InMemoryReplyWaiterService",
     "InMemoryReplyCoordinatorService",

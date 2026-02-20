@@ -898,8 +898,11 @@ def test_validate_newgen_config_normalizes_observability_tracing_dispatch_queue_
     dispatch_queue = tracing.get("dispatch_queue")
     assert isinstance(dispatch_queue, dict)
     assert dispatch_queue.get("drop_policy") == "block_with_timeout"
-    assert dispatch_queue.get("max_items") == 8192
+    assert dispatch_queue.get("max_items") == 131072
     assert dispatch_queue.get("block_timeout_ms") == 100
+    assert dispatch_queue.get("forward_batch_max_items") == 100
+    assert dispatch_queue.get("forward_flush_interval_ms") == 20
+    assert dispatch_queue.get("drain_timeout_seconds") == 30.0
 
 
 def test_validate_newgen_config_rejects_unknown_observability_monitoring_exporter_kind() -> None:
@@ -959,6 +962,45 @@ def test_validate_newgen_config_accepts_observability_monitoring_prometheus_http
     assert http.get("host") == "127.0.0.1"
     assert http.get("port") == 9464
     assert http.get("path") == "/metrics"
+
+
+def test_validate_newgen_config_accepts_observability_service_worker_defaults() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "service_worker": {
+            "enabled": True,
+        }
+    }
+
+    validated = validate_newgen_config(raw)
+    vruntime = validated.get("runtime")
+    assert isinstance(vruntime, dict)
+    observability = vruntime.get("observability")
+    assert isinstance(observability, dict)
+    service_worker = observability.get("service_worker")
+    assert isinstance(service_worker, dict)
+    assert service_worker.get("enabled") is True
+    assert service_worker.get("queue_max_items") == 131072
+    assert service_worker.get("drop_policy") == "drop_newest"
+    assert service_worker.get("block_timeout_ms") == 100
+    assert service_worker.get("drain_timeout_seconds") == 30.0
+
+
+def test_validate_newgen_config_rejects_observability_service_worker_invalid_drop_policy() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "service_worker": {
+            "enabled": True,
+            "drop_policy": "block_forever",
+        }
+    }
+
+    with pytest.raises(ConfigError, match="service_worker\\.drop_policy must be one of"):
+        validate_newgen_config(raw)
 
 
 def test_validate_newgen_config_rejects_invalid_otel_exporter_queue_block_timeout() -> None:
@@ -1561,6 +1603,44 @@ def test_validate_newgen_config_obs_cfg_a_04b_allows_zero_batch_flush_interval()
     batch = settings.get("batch")
     assert isinstance(batch, dict)
     assert batch.get("flush_interval_ms") == 0
+
+
+def test_validate_newgen_config_obs_cfg_a_04d_applies_near_realtime_otlp_defaults() -> None:
+    # OBS-CFG-E-01: OTLP exporter defaults should favor near-realtime small-batch flush.
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "settings": {"endpoint": "http://collector:4318/v1/traces"},
+                }
+            ]
+        }
+    }
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    observability = validated_runtime.get("observability")
+    assert isinstance(observability, dict)
+    tracing = observability.get("tracing")
+    assert isinstance(tracing, dict)
+    exporters = tracing.get("exporters")
+    assert isinstance(exporters, list)
+    settings = exporters[0].get("settings")
+    assert isinstance(settings, dict)
+    batch = settings.get("batch")
+    assert isinstance(batch, dict)
+    assert batch.get("max_items") == 64
+    assert batch.get("flush_interval_ms") == 200
+    queue = settings.get("queue")
+    assert isinstance(queue, dict)
+    assert queue.get("max_items") == 10000
+    assert queue.get("drop_policy") == "block_with_timeout"
+    assert queue.get("block_timeout_ms") == 100
 
 
 def test_validate_newgen_config_obs_cfg_a_04c_accepts_transport_group_backend() -> None:
@@ -2733,6 +2813,217 @@ def test_validate_newgen_config_rejects_unknown_process_group_services_key() -> 
     }
     with pytest.raises(ConfigError):
         validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_obs_service_process_materializes_default_owner_group() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "bootstrap": {"mode": "process_supervisor"},
+        "execution_ipc": {"transport": "tcp_local", "auth": {"mode": "hmac"}},
+        "process_groups": [{"name": "execution.cpu", "nodes": ["compute_features"]}],
+    }
+    runtime["observability"] = {
+        "service_process": {"enabled": True},
+        "tracing": {"exporters": [{"kind": "jsonl", "settings": {"path": "traces/trace.jsonl"}}]},
+    }
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    groups = platform.get("process_groups")
+    assert isinstance(groups, list)
+    system_groups = [group for group in groups if isinstance(group, dict) and group.get("name") == "system.observability"]
+    assert len(system_groups) == 1
+    system_group = system_groups[0]
+    assert system_group.get("runner_profile") == "async"
+    assert system_group.get("workers") == 1
+    nodes = system_group.get("nodes")
+    assert isinstance(nodes, list)
+    assert "system.obs.trace_dispatch" in nodes
+    assert "system.obs.log_dispatch" in nodes
+    assert "system.obs.metric_dispatch" in nodes
+    assert "system.obs.monitor_dispatch" in nodes
+
+
+def test_validate_newgen_config_worker_queue_telemetry_adds_system_dispatch_node_to_owner_group() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "bootstrap": {"mode": "process_supervisor"},
+        "execution_ipc": {"transport": "tcp_local", "auth": {"mode": "hmac"}},
+        "process_groups": [{"name": "execution.cpu", "nodes": ["compute_features"]}],
+    }
+    runtime["observability"] = {
+        "service_process": {"enabled": True},
+        "worker_queue_telemetry": {"enabled": True, "sample_hz": 20},
+        "tracing": {"exporters": [{"kind": "jsonl", "settings": {"path": "traces/trace.jsonl"}}]},
+    }
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    observability = validated_runtime.get("observability")
+    assert isinstance(observability, dict)
+    service_process = observability.get("service_process")
+    assert isinstance(service_process, dict)
+    nodes = service_process.get("nodes")
+    assert isinstance(nodes, list)
+    assert "system.obs.worker_queue_dispatch" in nodes
+
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    groups = platform.get("process_groups")
+    assert isinstance(groups, list)
+    owner = next(
+        group
+        for group in groups
+        if isinstance(group, dict) and group.get("name") == "system.observability"
+    )
+    owner_nodes = owner.get("nodes")
+    assert isinstance(owner_nodes, list)
+    assert "system.obs.worker_queue_dispatch" in owner_nodes
+
+
+def test_validate_newgen_config_obs_service_process_defaults_to_enabled_for_process_supervisor_with_exporters() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "bootstrap": {"mode": "process_supervisor"},
+        "execution_ipc": {"transport": "tcp_local", "auth": {"mode": "hmac"}},
+        "process_groups": [{"name": "execution.cpu", "nodes": ["compute_features"]}],
+    }
+    runtime["observability"] = {
+        "tracing": {"exporters": [{"kind": "jsonl", "settings": {"path": "traces/trace.jsonl"}}]},
+    }
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    observability = validated_runtime.get("observability")
+    assert isinstance(observability, dict)
+    service_process = observability.get("service_process")
+    assert isinstance(service_process, dict)
+    assert service_process.get("enabled") is True
+    assert service_process.get("group_name") == "system.observability"
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    groups = platform.get("process_groups")
+    assert isinstance(groups, list)
+    assert any(
+        isinstance(group, dict) and group.get("name") == "system.observability"
+        for group in groups
+    )
+
+
+def test_validate_newgen_config_obs_service_process_can_be_explicitly_disabled() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "bootstrap": {"mode": "process_supervisor"},
+        "execution_ipc": {"transport": "tcp_local", "auth": {"mode": "hmac"}},
+        "process_groups": [{"name": "execution.cpu", "nodes": ["compute_features"]}],
+    }
+    runtime["observability"] = {
+        "service_process": {"enabled": False},
+        "tracing": {"exporters": [{"kind": "jsonl", "settings": {"path": "traces/trace.jsonl"}}]},
+    }
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    observability = validated_runtime.get("observability")
+    assert isinstance(observability, dict)
+    service_process = observability.get("service_process")
+    assert isinstance(service_process, dict)
+    assert service_process.get("enabled") is False
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    groups = platform.get("process_groups")
+    assert isinstance(groups, list)
+    assert not any(
+        isinstance(group, dict) and group.get("name") == "system.observability"
+        for group in groups
+    )
+
+
+def test_validate_newgen_config_obs_service_process_rejects_ambiguous_system_node_ownership() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "bootstrap": {"mode": "process_supervisor"},
+        "execution_ipc": {"transport": "tcp_local", "auth": {"mode": "hmac"}},
+        "process_groups": [
+            {"name": "execution.cpu", "nodes": ["compute_features", "system.obs.trace_dispatch"]},
+            {"name": "system.observability", "nodes": ["system.obs.trace_dispatch"]},
+        ],
+    }
+    runtime["observability"] = {
+        "service_process": {"enabled": True},
+        "tracing": {"exporters": [{"kind": "jsonl", "settings": {"path": "traces/trace.jsonl"}}]},
+    }
+
+    with pytest.raises(ConfigError, match="owned by multiple groups"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_obs_service_process_rejects_missing_owner_when_auto_create_disabled() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "bootstrap": {"mode": "process_supervisor"},
+        "execution_ipc": {"transport": "tcp_local", "auth": {"mode": "hmac"}},
+        "process_groups": [{"name": "execution.cpu", "nodes": ["compute_features"]}],
+    }
+    runtime["observability"] = {
+        "service_process": {"enabled": True, "auto_create_group": False},
+        "tracing": {"exporters": [{"kind": "jsonl", "settings": {"path": "traces/trace.jsonl"}}]},
+    }
+
+    with pytest.raises(ConfigError, match="owner group is not resolvable"):
+        validate_newgen_config(raw)
+
+
+@pytest.mark.parametrize(
+    "config_path,expect_enabled",
+    [
+        ("src/fund_load/baseline_config_newgen_multiprocess.yml", False),
+        ("src/fund_load/experiment_config_newgen_multiprocess.yml", False),
+        ("src/fund_load/baseline_config_newgen_multiprocess_jaeger.yml", True),
+        ("src/fund_load/experiment_config_newgen_multiprocess_jaeger.yml", True),
+    ],
+)
+def test_validate_newgen_config_fund_load_multiprocess_regression_service_process_defaults(
+    config_path: str,
+    expect_enabled: bool,
+) -> None:
+    validated = validate_newgen_config(load_yaml_config(Path(config_path)))
+    runtime = validated.get("runtime")
+    assert isinstance(runtime, dict)
+    observability = runtime.get("observability")
+    if not isinstance(observability, dict):
+        assert expect_enabled is False
+        return
+    service_process = observability.get("service_process")
+    assert isinstance(service_process, dict)
+    assert service_process.get("enabled") is expect_enabled
+    platform = runtime.get("platform")
+    assert isinstance(platform, dict)
+    groups = platform.get("process_groups")
+    assert isinstance(groups, list)
+    has_observability_group = any(
+        isinstance(group, dict) and group.get("name") == "system.observability"
+        for group in groups
+    )
+    assert has_observability_group is expect_enabled
 
 
 def test_validate_newgen_config_rejects_unknown_api_policy_execution_mode() -> None:

@@ -64,8 +64,8 @@ class JsonlTraceSink:
             os.fsync(self._handle.fileno())
 
     async def emit_async(self, record: "TraceRecord") -> None:
-        # Keep event loop non-blocking: in batch mode offload only flush/fsync boundaries.
-        # This avoids one thread-hop per record while preserving deterministic write order.
+        # Batch-mode async path keeps deterministic ordering on the dedicated dispatch loop.
+        # No thread-pool offload: sink I/O is isolated by runtime dispatch workers.
         line = self._serialize_line(record)
         if line is None:
             return
@@ -81,9 +81,9 @@ class JsonlTraceSink:
             if should_flush_buffer:
                 lines = list(self._buffer)
                 self._buffer.clear()
-                await asyncio.to_thread(self._write_lines, lines)
+                self._write_lines(lines)
             if should_fsync:
-                await asyncio.to_thread(self._fsync_now)
+                self._fsync_now()
             return
 
         # Python 3.13 TextIOWrapper can deadlock when file writes are offloaded from the owner thread.
@@ -537,7 +537,7 @@ class OTelOtlpTraceSink:
 
     async def _flush_batch_async(self) -> None:
         # Async flush — called from emit_async hot path.
-        # httpx-async and aiohttp are awaited natively; sync backends are offloaded to a thread.
+        # httpx-async and aiohttp are awaited natively; sync backends run on dispatch worker thread.
         if not self._span_buffer:
             return
         batch = list(self._span_buffer)
@@ -572,8 +572,7 @@ class OTelOtlpTraceSink:
             elif self._backend == "aiohttp":
                 await self._post_http_aiohttp_native(body)
             else:
-                # Sync backends: run in thread pool to avoid blocking the event loop.
-                await asyncio.to_thread(self._post_http, batch)
+                self._post_http(batch)
         except Exception:
             self._dropped += len(batch)
             return

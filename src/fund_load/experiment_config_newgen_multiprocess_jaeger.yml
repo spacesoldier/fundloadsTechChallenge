@@ -9,7 +9,20 @@ runtime:
   tracing:
     enabled: false
   observability:
+    service_worker:
+      enabled: true
+      queue_max_items: 131072
+      drop_policy: block_with_timeout
+      block_timeout_ms: 5000
+      drain_timeout_seconds: 120
     tracing:
+      dispatch_queue:
+        max_items: 131072
+        drop_policy: block_with_timeout
+        block_timeout_ms: 5000
+        forward_batch_max_items: 100
+        forward_flush_interval_ms: 20
+        drain_timeout_seconds: 120
       exporters:
         - kind: jsonl
           enabled: true
@@ -23,14 +36,14 @@ runtime:
           settings:
             path: traces/trace_experiment_multiprocess_jaeger_business_logic.jsonl
             write_mode: line
-            flush_every_n: 1
+            flush_every_n: 100
             trace_slice: business_logic
         - kind: jsonl
           enabled: true
           settings:
             path: traces/trace_experiment_multiprocess_jaeger_platform_internals.jsonl
             write_mode: line
-            flush_every_n: 1
+            flush_every_n: 100
             trace_slice: platform_internals
         - kind: otel_otlp_topology
           enabled: true
@@ -41,8 +54,12 @@ runtime:
               backend: httpx
               timeout_seconds: 2.0
               batch:
-                max_items: 64
+                max_items: 100
                 flush_interval_ms: 100
+              queue:
+                max_items: 131072
+                drop_policy: block_with_timeout
+                block_timeout_ms: 5000
               httpx:
                 mode: async
             service:
@@ -67,8 +84,12 @@ runtime:
               backend: httpx
               timeout_seconds: 2.0
               batch:
-                max_items: 64
+                max_items: 100
                 flush_interval_ms: 100
+              queue:
+                max_items: 131072
+                drop_policy: block_with_timeout
+                block_timeout_ms: 5000
               httpx:
                 mode: async
             service:
@@ -105,19 +126,38 @@ runtime:
         level: info
     monitoring:
       exporters:
-        - kind: prometheus
+        - kind: jsonl
           enabled: true
+          settings:
+            path: metrics/worker_queue_timeseries_experiment_multiprocess_jaeger.jsonl
+            flush_every_n: 100
+        - kind: prometheus
+          enabled: false
           settings:
             mode: http_pull
             namespace: stream_kernel
             subsystem: observability
             http:
               host: 0.0.0.0
-              port: 9465
+              port: 9466
               path: /metrics
+        - kind: prometheus
+          enabled: true
+          settings:
+            mode: textfile
+            namespace: stream_kernel
+            subsystem: observability
+            textfile:
+              path: metrics/stream_kernel_observability_experiment.prom
+    worker_queue_telemetry:
+      enabled: false
+      sample_hz: 10
   discovery_modules:
     - fund_load
   platform:
+    lifecycle:
+      graceful_timeout_seconds: 120
+      drain_inflight: true
     execution_ipc:
       transport: tcp_local
       bind_host: 127.0.0.1

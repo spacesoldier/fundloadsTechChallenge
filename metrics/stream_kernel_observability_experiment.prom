@@ -1,0 +1,6 @@
+# TYPE stream_kernel_observability_worker_inflight gauge
+stream_kernel_observability_worker_inflight{group_name="execution.ingress",pid="601250",runner_profile="async",worker_id="execution.ingress#1"} 0
+# TYPE stream_kernel_observability_worker_queue_depth gauge
+stream_kernel_observability_worker_queue_depth{group_name="execution.ingress",pid="601250",runner_profile="async",worker_id="execution.ingress#1"} 0
+# TYPE stream_kernel_observability_worker_queue_samples_total counter
+stream_kernel_observability_worker_queue_samples_total{group_name="execution.ingress",pid="601250",runner_profile="async",worker_id="execution.ingress#1"} 2

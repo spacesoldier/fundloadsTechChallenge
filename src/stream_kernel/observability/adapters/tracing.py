@@ -227,10 +227,10 @@ def trace_otel_otlp(settings: dict[str, object]) -> OTelOtlpTraceSink | NoOpTrac
     batch = settings.get("batch", {})
     if not isinstance(batch, dict):
         raise ValueError("trace_otel_otlp.settings.batch must be a mapping when provided")
-    batch_max_items = batch.get("max_items", 1)
+    batch_max_items = batch.get("max_items", 64)
     if not isinstance(batch_max_items, int) or batch_max_items <= 0:
         raise ValueError("trace_otel_otlp.settings.batch.max_items must be an integer > 0 when provided")
-    batch_flush_interval_ms = batch.get("flush_interval_ms", 0)
+    batch_flush_interval_ms = batch.get("flush_interval_ms", 200)
     if not isinstance(batch_flush_interval_ms, int) or batch_flush_interval_ms < 0:
         raise ValueError(
             "trace_otel_otlp.settings.batch.flush_interval_ms must be an integer >= 0 when provided"
@@ -241,7 +241,7 @@ def trace_otel_otlp(settings: dict[str, object]) -> OTelOtlpTraceSink | NoOpTrac
     queue_max_items = queue.get("max_items", 10000)
     if not isinstance(queue_max_items, int) or queue_max_items <= 0:
         raise ValueError("trace_otel_otlp.settings.queue.max_items must be an integer > 0 when provided")
-    queue_drop_policy = queue.get("drop_policy", "drop_newest")
+    queue_drop_policy = queue.get("drop_policy", "block_with_timeout")
     if not isinstance(queue_drop_policy, str) or queue_drop_policy not in {
         "drop_newest",
         "drop_oldest",

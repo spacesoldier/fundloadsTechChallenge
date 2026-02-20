@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import os
+import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -18,6 +21,86 @@ class StdoutMonitoringSink:
     # Minimal monitoring sink for runtime health/status events.
     def emit(self, message: MonitoringMessage) -> None:
         print(f"{message.name}:{message.status}")
+
+
+class JsonlMonitoringSink:
+    # JSONL monitoring sink for time-series style offline analysis/import.
+    def __init__(
+        self,
+        *,
+        path: str,
+        flush_every_n: int = 1,
+        fsync_every_n: int | None = None,
+    ) -> None:
+        self._path = Path(path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self._path.open("a", encoding="utf-8")
+        self._lock = Lock()
+        self._emit_count = 0
+        self._flush_every_n = max(1, int(flush_every_n))
+        self._fsync_every_n = fsync_every_n if isinstance(fsync_every_n, int) and fsync_every_n > 0 else None
+        self._failed = 0
+
+    def emit(self, message: MonitoringMessage) -> None:
+        payload = {
+            "kind": "monitoring_message",
+            "name": message.name,
+            "status": message.status,
+            "timestamp": message.timestamp.isoformat(),
+            "details": dict(message.details),
+        }
+        self._write_json_line(payload)
+
+    async def emit_async(self, message: MonitoringMessage) -> None:
+        self.emit(message)
+
+    def publish_metrics(
+        self,
+        *,
+        records: list[dict[str, object]],
+        snapshot: dict[str, object] | None = None,
+        stage: str | None = None,
+    ) -> None:
+        payload = {
+            "kind": "monitoring_metrics_snapshot",
+            "stage": stage or "runtime",
+            "ts_epoch_ms": int(time.time() * 1000),
+            "snapshot": dict(snapshot) if isinstance(snapshot, dict) else {},
+            "records": [dict(record) for record in records if isinstance(record, dict)],
+        }
+        self._write_json_line(payload)
+
+    def diagnostics(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "path": str(self._path),
+                "exported": self._emit_count,
+                "failed": self._failed,
+            }
+
+    def flush(self) -> None:
+        with self._lock:
+            self._handle.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            self._handle.flush()
+            self._handle.close()
+
+    def _write_json_line(self, payload: dict[str, object]) -> None:
+        line = json.dumps(payload, separators=(",", ":"), ensure_ascii=False, default=_json_default)
+        with self._lock:
+            try:
+                self._handle.write(line + "\n")
+                next_emit = self._emit_count + 1
+                if next_emit % self._flush_every_n == 0:
+                    self._handle.flush()
+                if self._fsync_every_n and next_emit % self._fsync_every_n == 0:
+                    self._handle.flush()
+                    os.fsync(self._handle.fileno())
+                self._emit_count = next_emit
+            except Exception:
+                self._failed += 1
 
 
 @dataclass(slots=True)
@@ -52,6 +135,9 @@ class PrometheusMonitoringSink:
         self._textfile_path = Path(textfile_path)
         self._render_lock = Lock()
         self._rendered = _PrometheusRendered(payload="", metric_count=0)
+        self._snapshot_records: dict[str, dict[str, object]] = {}
+        self._message_records: dict[str, dict[str, object]] = {}
+        self._worker_sample_counters: dict[tuple[str, str, str, str], int] = {}
         self._exported = 0
         self._failed = 0
         self._http_server: ThreadingHTTPServer | None = None
@@ -61,8 +147,17 @@ class PrometheusMonitoringSink:
             self._start_http_server()
 
     def emit(self, message: MonitoringMessage) -> None:
-        _ = message
-        return None
+        try:
+            message_records = self._records_from_message(message)
+            with self._render_lock:
+                for record in message_records:
+                    self._message_records[self._record_key(record)] = dict(record)
+                self._refresh_rendered_locked()
+                self._exported += 1
+        except Exception:
+            with self._render_lock:
+                self._failed += 1
+            return None
 
     def publish_metrics(
         self,
@@ -73,12 +168,12 @@ class PrometheusMonitoringSink:
     ) -> None:
         _ = (snapshot, stage)
         try:
-            rendered = self._render(records)
-            if self._mode == "textfile":
-                self._textfile_path.parent.mkdir(parents=True, exist_ok=True)
-                self._textfile_path.write_text(rendered.payload, encoding="utf-8")
             with self._render_lock:
-                self._rendered = rendered
+                for record in records:
+                    if not isinstance(record, dict):
+                        continue
+                    self._snapshot_records[self._record_key(record)] = dict(record)
+                self._refresh_rendered_locked()
                 self._exported += 1
         except Exception:
             with self._render_lock:
@@ -162,6 +257,89 @@ class PrometheusMonitoringSink:
         with self._render_lock:
             return self._rendered.payload
 
+    def _refresh_rendered_locked(self) -> None:
+        merged_records = [
+            *self._snapshot_records.values(),
+            *self._message_records.values(),
+        ]
+        rendered = self._render(merged_records)
+        if self._mode == "textfile":
+            self._textfile_path.parent.mkdir(parents=True, exist_ok=True)
+            self._textfile_path.write_text(rendered.payload, encoding="utf-8")
+        self._rendered = rendered
+
+    def _record_key(self, record: dict[str, object]) -> str:
+        name = str(record.get("name", ""))
+        metric_type = str(record.get("type", ""))
+        labels = record.get("labels", {})
+        if isinstance(labels, dict):
+            labels_key = tuple(
+                (str(key), str(value))
+                for key, value in sorted(labels.items(), key=lambda item: str(item[0]))
+                if isinstance(key, str)
+            )
+        else:
+            labels_key = ()
+        return f"{name}|{metric_type}|{labels_key}"
+
+    def _records_from_message(self, message: MonitoringMessage) -> list[dict[str, object]]:
+        details = dict(message.details)
+        if message.name != "worker_queue_depth":
+            labels = {"message_name": message.name, "status": message.status}
+            return [
+                {
+                    "name": "monitoring_events_total",
+                    "type": "counter",
+                    "value": 1,
+                    "labels": labels,
+                }
+            ]
+
+        group_name = details.get("group_name")
+        worker_id = details.get("worker_id")
+        pid = details.get("pid")
+        runner_profile = details.get("runner_profile")
+        queue_depth = details.get("queue_depth")
+        inflight = details.get("inflight")
+
+        labels = {
+            "group_name": str(group_name) if isinstance(group_name, str) else "unknown",
+            "worker_id": str(worker_id) if isinstance(worker_id, str) else "unknown",
+            "pid": str(pid) if isinstance(pid, int) else "0",
+            "runner_profile": str(runner_profile) if isinstance(runner_profile, str) else "unknown",
+        }
+        key = (
+            labels["group_name"],
+            labels["worker_id"],
+            labels["pid"],
+            labels["runner_profile"],
+        )
+        next_samples = int(self._worker_sample_counters.get(key, 0)) + 1
+        self._worker_sample_counters[key] = next_samples
+        queue_depth_value = int(queue_depth) if isinstance(queue_depth, (int, float)) else 0
+        inflight_value = int(inflight) if isinstance(inflight, (int, float)) else 0
+
+        return [
+            {
+                "name": "worker_queue_depth",
+                "type": "gauge",
+                "value": max(0, queue_depth_value),
+                "labels": dict(labels),
+            },
+            {
+                "name": "worker_inflight",
+                "type": "gauge",
+                "value": max(0, inflight_value),
+                "labels": dict(labels),
+            },
+            {
+                "name": "worker_queue_samples_total",
+                "type": "counter",
+                "value": next_samples,
+                "labels": dict(labels),
+            },
+        ]
+
     def _render(self, records: list[dict[str, object]]) -> _PrometheusRendered:
         type_by_metric: dict[str, str] = {}
         lines: list[str] = []
@@ -235,6 +413,36 @@ def _metric_token(value: str) -> str:
 def _escape_label_value(value: object) -> str:
     text = str(value)
     return text.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+def _json_default(value: object) -> object:
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        try:
+            return isoformat()
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+@adapter(
+    name="monitoring_jsonl",
+    consumes=[MonitoringMessage],
+    emits=[],
+    binds=[("stream", MonitoringMessage)],
+    execution_mode="async",
+)
+def monitoring_jsonl(settings: dict[str, object]) -> JsonlMonitoringSink:
+    path = settings.get("path", "metrics/monitoring_timeseries.jsonl")
+    if not isinstance(path, str) or not path:
+        raise ValueError("monitoring_jsonl.settings.path must be a non-empty string")
+    flush_every_n = settings.get("flush_every_n", 1)
+    if not isinstance(flush_every_n, int) or flush_every_n <= 0:
+        raise ValueError("monitoring_jsonl.settings.flush_every_n must be an integer > 0")
+    fsync_every_n = settings.get("fsync_every_n")
+    if fsync_every_n is not None and (not isinstance(fsync_every_n, int) or fsync_every_n <= 0):
+        raise ValueError("monitoring_jsonl.settings.fsync_every_n must be an integer > 0 when provided")
+    return JsonlMonitoringSink(path=path, flush_every_n=flush_every_n, fsync_every_n=fsync_every_n)
 
 
 @adapter(

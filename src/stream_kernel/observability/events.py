@@ -42,3 +42,14 @@ class MonitoringMetricsSnapshotResult:
     stage: str
     snapshot: dict[str, object]
     metric_records: list[dict[str, object]] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerQueueTelemetryEvent:
+    group_name: str
+    worker_id: str
+    pid: int
+    queue_depth: int
+    inflight: int
+    runner_profile: str
+    ts_epoch_ms: int

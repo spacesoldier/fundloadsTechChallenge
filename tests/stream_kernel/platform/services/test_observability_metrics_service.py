@@ -1,7 +1,11 @@
 from __future__ import annotations
 
-from stream_kernel.observability.events import MonitoringMetricsSnapshotEvent
+import asyncio
+
+from stream_kernel.observability.domain.monitoring import MonitoringMessage
+from stream_kernel.observability.events import MonitoringMetricsSnapshotEvent, WorkerQueueTelemetryEvent
 from stream_kernel.platform.services.observability import (
+    DefaultWorkerQueueTelemetryService,
     DefaultObservabilityMetricsDispatchService,
     InMemoryObservabilityMetricsService,
 )
@@ -20,6 +24,10 @@ def _snapshot_fixture() -> dict[str, object]:
         "dispatch_submit_timeout_count": 1,
         "dispatch_submit_block_wait_ms_total": 125,
         "dispatch_submit_dropped_total": 5,
+        "dispatch_wait_count": 8,
+        "dispatch_wait_ms_total": 240,
+        "dispatch_wait_ms_max": 61,
+        "dispatch_wait_ms_avg": 30,
         "sink_count": 2,
         "sink_pending_total": 4,
         "pending_total_estimate": 7,
@@ -47,15 +55,19 @@ def test_observability_metrics_service_aggregates_dispatch_and_sink_metrics() ->
     assert counters["dispatch_submit_dropped_total"] == 5
     assert counters["dispatch_submit_timeout_total"] == 1
     assert counters["dispatch_submit_block_wait_ms_total"] == 125
+    assert counters["dispatch_wait_count_total"] == 8
+    assert counters["dispatch_wait_ms_total"] == 240
     assert counters["sink_exported_total"] == 17
     assert counters["sink_dropped_total"] == 3
-    assert counters["loss_estimate_total"] == 10  # dispatch_dropped + dispatch_submit_dropped_total + sink_dropped_total
+    assert counters["loss_estimate_total"] == 5  # dispatch_dropped + sink_dropped_total
 
     assert gauges["dispatch_queue_depth"] == 3
     assert gauges["dispatch_pending"] == 3
     assert gauges["pending_total_estimate"] == 7
     assert gauges["sink_count"] == 2
     assert gauges["sink_pending_total"] == 4
+    assert gauges["dispatch_wait_ms_avg"] == 30
+    assert gauges["dispatch_wait_ms_max"] == 61
     assert gauges["tracing_enabled"] == 1
 
 
@@ -114,3 +126,129 @@ def test_observability_metrics_dispatch_service_uses_metrics_service_snapshot_co
     names = {str(item.get("name")) for item in result.metric_records}
     assert "stream_kernel_observability_dispatch_submitted_total" in names
     assert "stream_kernel_observability_pending_total_estimate" in names
+
+
+def test_worker_queue_telemetry_service_emits_monitoring_message() -> None:
+    class _Pipeline:
+        def __init__(self) -> None:
+            self.calls: list[tuple[MonitoringMessage, dict[str, object] | None]] = []
+
+        def publish_monitoring(
+            self,
+            *,
+            event: object,
+            trace_id: str | None = None,
+            attributes: dict[str, object] | None = None,
+        ) -> None:
+            _ = trace_id
+            if isinstance(event, MonitoringMessage):
+                self.calls.append((event, attributes))
+
+    pipeline = _Pipeline()
+    service = DefaultWorkerQueueTelemetryService(pipeline=pipeline)  # type: ignore[arg-type]
+    service.publish_sample(
+        sample=WorkerQueueTelemetryEvent(
+            group_name="execution.features",
+            worker_id="execution.features#1",
+            pid=123,
+            queue_depth=5,
+            inflight=1,
+            runner_profile="sync",
+            ts_epoch_ms=123456789,
+        )
+    )
+
+    assert pipeline.calls
+    message, attrs = pipeline.calls[-1]
+    assert message.name == "worker_queue_depth"
+    assert message.status == "sample"
+    assert message.details.get("group_name") == "execution.features"
+    assert message.details.get("queue_depth") == 5
+    assert isinstance(attrs, dict)
+    assert attrs.get("channel") == "worker_queue_telemetry"
+
+
+def test_worker_queue_telemetry_service_emits_monitoring_message_async() -> None:
+    class _Pipeline:
+        def __init__(self) -> None:
+            self.calls: list[tuple[MonitoringMessage, dict[str, object] | None]] = []
+
+        async def publish_monitoring_async(
+            self,
+            *,
+            event: object,
+            trace_id: str | None = None,
+            attributes: dict[str, object] | None = None,
+        ) -> None:
+            _ = trace_id
+            if isinstance(event, MonitoringMessage):
+                self.calls.append((event, attributes))
+
+    pipeline = _Pipeline()
+    service = DefaultWorkerQueueTelemetryService(pipeline=pipeline)  # type: ignore[arg-type]
+
+    asyncio.run(
+        service.publish_sample_async(
+            sample=WorkerQueueTelemetryEvent(
+                group_name="execution.features",
+                worker_id="execution.features#1",
+                pid=123,
+                queue_depth=5,
+                inflight=1,
+                runner_profile="sync",
+                ts_epoch_ms=123456789,
+            )
+        )
+    )
+
+    assert pipeline.calls
+    message, attrs = pipeline.calls[-1]
+    assert message.name == "worker_queue_depth"
+    assert message.status == "sample"
+    assert message.details.get("group_name") == "execution.features"
+    assert message.details.get("queue_depth") == 5
+    assert isinstance(attrs, dict)
+    assert attrs.get("channel") == "worker_queue_telemetry"
+
+
+def test_worker_queue_telemetry_service_async_fallback_does_not_require_to_thread() -> None:
+    class _Pipeline:
+        def __init__(self) -> None:
+            self.calls: list[tuple[MonitoringMessage, dict[str, object] | None]] = []
+
+        def publish_monitoring(
+            self,
+            *,
+            event: object,
+            trace_id: str | None = None,
+            attributes: dict[str, object] | None = None,
+        ) -> None:
+            _ = trace_id
+            if isinstance(event, MonitoringMessage):
+                self.calls.append((event, attributes))
+
+    import stream_kernel.platform.services.observability as observability_module
+    assert not hasattr(observability_module, "asyncio")
+
+    pipeline = _Pipeline()
+    service = DefaultWorkerQueueTelemetryService(pipeline=pipeline)  # type: ignore[arg-type]
+
+    asyncio.run(
+        service.publish_sample_async(
+            sample=WorkerQueueTelemetryEvent(
+                group_name="execution.features",
+                worker_id="execution.features#1",
+                pid=123,
+                queue_depth=5,
+                inflight=1,
+                runner_profile="sync",
+                ts_epoch_ms=123456789,
+            )
+        )
+    )
+
+    assert pipeline.calls
+    message, attrs = pipeline.calls[-1]
+    assert message.name == "worker_queue_depth"
+    assert isinstance(attrs, dict)
+    assert attrs.get("channel") == "worker_queue_telemetry"

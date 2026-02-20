@@ -17,12 +17,28 @@ services:
     networks:
       - sk_observability
 
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: sk-node-exporter
+    restart: unless-stopped
+    command:
+      - --collector.disable-defaults
+      - --collector.textfile
+      - --collector.textfile.directory=/var/lib/node_exporter/textfile_collector
+    ports:
+      - "9100:9100"
+    volumes:
+      - ./metrics:/var/lib/node_exporter/textfile_collector:ro
+    networks:
+      - sk_observability
+
   grafana:
     image: grafana/grafana:11.1.5
     container_name: sk-grafana
     restart: unless-stopped
     depends_on:
       - prometheus
+      - node-exporter
     ports:
       - "3000:3000"
     environment:

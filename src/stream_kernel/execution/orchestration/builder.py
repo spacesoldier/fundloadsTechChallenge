@@ -1329,11 +1329,33 @@ def build_runtime_observability_adapter_instances(
 ) -> dict[str, object]:
     # Build observability adapter instances from runtime config via AdapterRegistry only.
     strict = bool(runtime.get("strict", True))
-    is_worker_process = runtime.get("__process_role") == "worker"
+    process_role = runtime.get("__process_role")
+    allowed_roles = {"worker", "observability_worker", "supervisor"}
+    normalized_role = "supervisor"
+    if process_role is None:
+        normalized_role = "supervisor"
+    elif isinstance(process_role, str):
+        if process_role in allowed_roles:
+            normalized_role = process_role
+        elif strict:
+            raise ValueError(
+                "runtime.__process_role must be one of: "
+                "['worker', 'observability_worker', 'supervisor'] when provided"
+            )
+    elif strict:
+        raise ValueError(
+            "runtime.__process_role must be one of: "
+            "['worker', 'observability_worker', 'supervisor'] when provided"
+        )
+    is_worker_process = normalized_role == "worker"
+    is_observability_worker = normalized_role == "observability_worker"
     supervisor_owns_monitoring = False
+    bootstrap_mode = ""
     try:
-        supervisor_owns_monitoring = runtime_bootstrap_mode(runtime) == "process_supervisor"
+        bootstrap_mode = runtime_bootstrap_mode(runtime)
+        supervisor_owns_monitoring = bootstrap_mode == "process_supervisor"
     except Exception:
+        bootstrap_mode = ""
         supervisor_owns_monitoring = False
     existing = existing_instances or {}
     built: dict[str, object] = {}
@@ -1356,6 +1378,7 @@ def build_runtime_observability_adapter_instances(
         },
         "monitoring": {
             "stdout": "monitoring_stdout",
+            "jsonl": "monitoring_jsonl",
             "prometheus": "monitoring_prometheus",
         },
     }
@@ -1363,9 +1386,31 @@ def build_runtime_observability_adapter_instances(
     observability = runtime.get("observability", {})
     if not isinstance(observability, dict):
         return built
+    service_process_cfg = observability.get("service_process", {})
+    service_process_enabled = False
+    if isinstance(service_process_cfg, dict):
+        enabled_raw = service_process_cfg.get("enabled", False)
+        if isinstance(enabled_raw, bool):
+            service_process_enabled = enabled_raw
+        elif strict:
+            raise ValueError(
+                "runtime.observability.service_process.enabled must be a boolean when provided"
+            )
+    elif service_process_cfg is not None and strict:
+        raise ValueError("runtime.observability.service_process must be a mapping when provided")
+
+    if bootstrap_mode == "process_supervisor" and service_process_enabled and not is_observability_worker:
+        # Dedicated observability process owns all exporter adapters.
+        # Supervisor (and non-owner roles) must stay transport-only at adapter materialization stage.
+        return built
 
     for channel, alias_map in kind_to_alias.items():
-        if channel == "monitoring" and (is_worker_process or supervisor_owns_monitoring):
+        if is_worker_process:
+            # Business workers must not instantiate observability exporters.
+            continue
+        if channel == "monitoring" and (
+            supervisor_owns_monitoring and not is_observability_worker
+        ):
             # Monitoring sinks are supervisor-owned in process-supervisor runtime.
             # Worker/runtime adapter materialization must skip monitoring exporters
             # to avoid duplicate HTTP bind in build phase vs supervisor configure_monitoring().

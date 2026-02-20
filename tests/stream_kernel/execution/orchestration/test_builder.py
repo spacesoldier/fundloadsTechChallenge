@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -42,6 +44,7 @@ from stream_kernel.execution.orchestration.source_ingress import build_source_in
 from stream_kernel.execution.orchestration.observability_system_nodes import (
     MetricDispatchEvent,
     TraceDispatchEvent,
+    WorkerQueueTelemetryEvent,
     build_observability_system_plan,
 )
 from stream_kernel.execution.transport.bootstrap_keys import BootstrapChannelStateError
@@ -72,6 +75,7 @@ from stream_kernel.platform.services.observability import (
     ObservabilityPipelineService,
     ObservabilityService,
     ReplyAwareObservabilityService,
+    WorkerQueueTelemetryService,
 )
 from stream_kernel.platform.services.api.policy import (
     ApiPolicyService,
@@ -566,6 +570,36 @@ def test_build_runtime_observability_adapter_instances_skips_monitoring_exporter
     assert created == []
 
 
+def test_build_runtime_observability_adapter_instances_skips_tracing_exporters_for_worker_role() -> None:
+    # Business workers must not instantiate tracing exporters directly.
+    registry = AdapterRegistry()
+    created: list[dict[str, object]] = []
+
+    def _factory(settings: dict[str, object]) -> object:
+        created.append(dict(settings))
+        return object()
+
+    registry.register("trace_jsonl", "trace_jsonl", _factory)
+
+    instances = build_runtime_observability_adapter_instances(
+        runtime={
+            "__process_role": "worker",
+            "strict": True,
+            "observability": {
+                "tracing": {
+                    "exporters": [
+                        {"kind": "jsonl", "settings": {"path": "traces/worker_trace.jsonl"}},
+                    ]
+                }
+            },
+        },
+        registry=registry,
+    )
+
+    assert instances == {}
+    assert created == []
+
+
 def test_build_runtime_observability_adapter_instances_skips_monitoring_exporters_for_process_supervisor_mode() -> None:
     # In process_supervisor mode monitoring sinks are created only via supervisor.configure_monitoring().
     registry = AdapterRegistry()
@@ -600,6 +634,132 @@ def test_build_runtime_observability_adapter_instances_skips_monitoring_exporter
 
     assert instances == {}
     assert created == []
+
+
+def test_build_runtime_observability_adapter_instances_allows_observability_worker_exports() -> None:
+    # Dedicated observability worker owns tracing+monitoring adapters in process_supervisor topology.
+    registry = AdapterRegistry()
+    created_trace: list[dict[str, object]] = []
+    created_monitoring: list[dict[str, object]] = []
+
+    def _trace_factory(settings: dict[str, object]) -> object:
+        created_trace.append(dict(settings))
+        return object()
+
+    def _monitoring_factory(settings: dict[str, object]) -> object:
+        created_monitoring.append(dict(settings))
+        return object()
+
+    registry.register("trace_jsonl", "trace_jsonl", _trace_factory)
+    registry.register("monitoring_prometheus", "monitoring_prometheus", _monitoring_factory)
+
+    instances = build_runtime_observability_adapter_instances(
+        runtime={
+            "__process_role": "observability_worker",
+            "strict": True,
+            "platform": {"bootstrap": {"mode": "process_supervisor"}},
+            "observability": {
+                "tracing": {
+                    "exporters": [
+                        {"kind": "jsonl", "settings": {"path": "traces/obs_worker_trace.jsonl"}},
+                    ]
+                },
+                "monitoring": {
+                    "exporters": [
+                        {
+                            "kind": "prometheus",
+                            "settings": {
+                                "mode": "textfile",
+                                "textfile": {"path": "metrics/obs_worker.prom"},
+                            },
+                        }
+                    ]
+                },
+            },
+        },
+        registry=registry,
+    )
+
+    assert "trace_jsonl#0" in instances
+    assert "monitoring_prometheus#0" in instances
+    assert created_trace and created_monitoring
+
+
+def test_build_runtime_observability_adapter_instances_skips_all_exporters_for_supervisor_when_service_process_enabled(
+) -> None:
+    # In dedicated service-process mode supervisor must stay transport-only
+    # and should not instantiate tracing/logging/monitoring adapters.
+    registry = AdapterRegistry()
+    created_trace: list[dict[str, object]] = []
+    created_log: list[dict[str, object]] = []
+    created_monitoring: list[dict[str, object]] = []
+
+    def _trace_factory(settings: dict[str, object]) -> object:
+        created_trace.append(dict(settings))
+        return object()
+
+    def _log_factory(settings: dict[str, object]) -> object:
+        created_log.append(dict(settings))
+        return object()
+
+    def _monitoring_factory(settings: dict[str, object]) -> object:
+        created_monitoring.append(dict(settings))
+        return object()
+
+    registry.register("trace_jsonl", "trace_jsonl", _trace_factory)
+    registry.register("log_jsonl", "log_jsonl", _log_factory)
+    registry.register("monitoring_prometheus", "monitoring_prometheus", _monitoring_factory)
+
+    instances = build_runtime_observability_adapter_instances(
+        runtime={
+            "strict": True,
+            "platform": {"bootstrap": {"mode": "process_supervisor"}},
+            "observability": {
+                "service_process": {"enabled": True, "group_name": "system.observability"},
+                "tracing": {
+                    "exporters": [
+                        {"kind": "jsonl", "settings": {"path": "traces/supervisor_trace.jsonl"}},
+                    ]
+                },
+                "logging": {
+                    "exporters": [
+                        {"kind": "jsonl", "settings": {"path": "logs/supervisor_runtime.jsonl"}},
+                    ]
+                },
+                "monitoring": {
+                    "exporters": [
+                        {"kind": "prometheus", "settings": {"mode": "textfile"}},
+                    ]
+                },
+            },
+        },
+        registry=registry,
+    )
+
+    assert instances == {}
+    assert created_trace == []
+    assert created_log == []
+    assert created_monitoring == []
+
+
+def test_build_runtime_observability_adapter_instances_rejects_unknown_process_role_in_strict_mode() -> None:
+    registry = AdapterRegistry()
+
+    with pytest.raises(ValueError, match="runtime.__process_role"):
+        build_runtime_observability_adapter_instances(
+            runtime={
+                "__process_role": "orchestrator",
+                "strict": True,
+                "observability": {
+                    "tracing": {
+                        "exporters": [
+                            {"kind": "jsonl", "settings": {"path": "traces/invalid_role.jsonl"}},
+                        ]
+                    }
+                },
+            },
+            registry=registry,
+        )
 
 
 def test_build_injection_registry_from_bindings_requires_instance() -> None:
@@ -1829,6 +1989,104 @@ def test_build_observability_system_plan_autowires_trace_dispatch_from_exporters
     assert plan.system_consumers == {TraceDispatchEvent: ["system.obs.trace_dispatch"]}
 
 
+def test_build_observability_system_plan_autowires_worker_queue_dispatch_without_tracing_exporters() -> None:
+    class _QueueTelemetryRecorder:
+        def __init__(self) -> None:
+            self.samples: list[object] = []
+
+        def publish_sample(self, *, sample: object) -> None:
+            self.samples.append(sample)
+
+    registry = InjectionRegistry()
+    recorder = _QueueTelemetryRecorder()
+    registry.register_factory(
+        "service",
+        WorkerQueueTelemetryService,
+        lambda _svc=recorder: _svc,
+        is_async=False,
+    )
+    scope = registry.instantiate_for_scenario("s1")
+
+    plan = build_observability_system_plan(
+        runtime={
+            "observability": {
+                "worker_queue_telemetry": {"enabled": True, "sample_hz": 20},
+            }
+        },
+        scenario_scope=scope,
+    )
+
+    names = [step.name for step in plan.system_steps]
+    assert names == ["system.obs.worker_queue_dispatch"]
+    assert plan.system_consumers == {WorkerQueueTelemetryEvent: ["system.obs.worker_queue_dispatch"]}
+
+    steps = {step.name: step.step for step in plan.system_steps}
+    event = WorkerQueueTelemetryEvent(
+        group_name="execution.features",
+        worker_id="execution.features#1",
+        pid=12345,
+        queue_depth=3,
+        inflight=1,
+        runner_profile="sync",
+        ts_epoch_ms=123456789,
+    )
+    assert steps["system.obs.worker_queue_dispatch"](event, {}) == []
+    assert recorder.samples and recorder.samples[-1] == event
+
+
+def test_build_observability_system_plan_worker_queue_dispatch_prefers_async_service_in_event_loop() -> None:
+    class _QueueTelemetryRecorder:
+        def __init__(self) -> None:
+            self.sync_samples: list[object] = []
+            self.async_samples: list[object] = []
+
+        def publish_sample(self, *, sample: object) -> None:
+            self.sync_samples.append(sample)
+
+        async def publish_sample_async(self, *, sample: object) -> None:
+            self.async_samples.append(sample)
+
+    registry = InjectionRegistry()
+    recorder = _QueueTelemetryRecorder()
+    registry.register_factory(
+        "service",
+        WorkerQueueTelemetryService,
+        lambda _svc=recorder: _svc,
+        is_async=True,
+    )
+    scope = registry.instantiate_for_scenario("s1")
+
+    plan = build_observability_system_plan(
+        runtime={
+            "observability": {
+                "worker_queue_telemetry": {"enabled": True, "sample_hz": 20},
+            }
+        },
+        scenario_scope=scope,
+    )
+
+    steps = {step.name: step.step for step in plan.system_steps}
+    event = WorkerQueueTelemetryEvent(
+        group_name="execution.features",
+        worker_id="execution.features#1",
+        pid=12345,
+        queue_depth=3,
+        inflight=1,
+        runner_profile="sync",
+        ts_epoch_ms=123456789,
+    )
+
+    async def _invoke() -> None:
+        produced = steps["system.obs.worker_queue_dispatch"](event, {})
+        assert inspect.isawaitable(produced)
+        await produced
+
+    asyncio.run(_invoke())
+
+    assert recorder.async_samples and recorder.async_samples[-1] == event
+    assert recorder.sync_samples == []
+
+
 def test_build_observability_system_plan_skips_worker_process_role_even_when_exporters_enabled() -> None:
     registry = InjectionRegistry()
     registry.register_factory(
@@ -2916,6 +3174,102 @@ def test_execute_runtime_artifacts_process_supervisor_passes_lifecycle_logging_s
     assert settings == {
         "exporters": [{"kind": "stdout"}],
         "lifecycle_events": {"enabled": True, "level": "debug"},
+    }
+
+
+def test_execute_runtime_artifacts_process_supervisor_skips_supervisor_monitoring_when_service_process_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _Supervisor:
+        def configure_monitoring(self, settings: dict[str, object], *, strict: bool = True) -> None:
+            captured["settings"] = dict(settings)
+            captured["strict"] = strict
+
+        def start_groups(self, group_names: list[str]) -> None:
+            _ = group_names
+            return None
+
+        def wait_ready(self, timeout_seconds: int) -> bool:
+            _ = timeout_seconds
+            return True
+
+        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
+            _ = (graceful_timeout_seconds, drain_inflight)
+            return None
+
+    monkeypatch.setattr(builder_module, "run_with_sync_runner", lambda **_kwargs: None)
+    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
+        runtime={
+            "strict": True,
+            "platform": {
+                "execution_ipc": {"transport": "tcp_local"},
+                "bootstrap": {"mode": "process_supervisor"},
+                "process_groups": [{"name": "execution.cpu"}, {"name": "system.observability"}],
+            },
+            "observability": {
+                "service_process": {"enabled": True, "group_name": "system.observability"},
+                "monitoring": {
+                    "exporters": [
+                        {"kind": "prometheus", "settings": {"mode": "http_pull"}},
+                    ]
+                },
+            },
+        },
+        supervisor=_Supervisor(),
+    )
+    execute_runtime_artifacts(artifacts)
+
+    assert captured == {}
+
+
+def test_execute_runtime_artifacts_process_supervisor_passes_lifecycle_logging_when_service_process_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _Supervisor:
+        def configure_lifecycle_logging(self, settings: dict[str, object]) -> None:
+            captured["settings"] = dict(settings)
+
+        def start_groups(self, group_names: list[str]) -> None:
+            _ = group_names
+            return None
+
+        def wait_ready(self, timeout_seconds: int) -> bool:
+            _ = timeout_seconds
+            return True
+
+        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
+            _ = (graceful_timeout_seconds, drain_inflight)
+            return None
+
+    monkeypatch.setattr(builder_module, "run_with_sync_runner", lambda **_kwargs: None)
+    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
+        runtime={
+            "platform": {
+                "execution_ipc": {"transport": "tcp_local"},
+                "bootstrap": {"mode": "process_supervisor"},
+                "process_groups": [{"name": "execution.cpu"}, {"name": "system.observability"}],
+            },
+            "observability": {
+                "service_process": {"enabled": True, "group_name": "system.observability"},
+                "logging": {
+                    "exporters": [{"kind": "stdout"}],
+                    "lifecycle_events": {"enabled": True, "level": "debug"},
+                },
+            },
+        },
+        supervisor=_Supervisor(),
+    )
+    execute_runtime_artifacts(artifacts)
+
+    assert captured == {
+        "settings": {
+            "exporters": [{"kind": "stdout"}],
+            "lifecycle_events": {"enabled": True, "level": "debug"},
+        }
     }
 
 

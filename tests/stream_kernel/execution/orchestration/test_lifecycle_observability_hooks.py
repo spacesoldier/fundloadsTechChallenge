@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from stream_kernel.application_context.injection_registry import InjectionRegistry
 from stream_kernel.execution.orchestration.lifecycle_orchestration import (
     execute_with_runtime_lifecycle,
+    runtime_lifecycle_policy,
 )
 from stream_kernel.platform.services.observability import NoOpObservabilityService, ObservabilityService
 from stream_kernel.platform.services.runtime.lifecycle import RuntimeLifecycleManager
@@ -75,3 +76,31 @@ def test_obs_k_c_06_runtime_lifecycle_emits_observability_events() -> None:
         "runtime_lifecycle_stopped",
     ]
 
+
+def test_runtime_lifecycle_policy_uses_readiness_timeout_when_lifecycle_timeout_missing() -> None:
+    policy = runtime_lifecycle_policy(
+        {
+            "platform": {
+                "readiness": {
+                    "readiness_timeout_seconds": 30,
+                }
+            }
+        }
+    )
+    assert policy.ready_timeout_seconds == 30
+
+
+def test_runtime_lifecycle_policy_prefers_lifecycle_timeout_over_readiness_timeout() -> None:
+    policy = runtime_lifecycle_policy(
+        {
+            "platform": {
+                "readiness": {
+                    "readiness_timeout_seconds": 30,
+                },
+                "lifecycle": {
+                    "ready_timeout_seconds": 7,
+                },
+            }
+        }
+    )
+    assert policy.ready_timeout_seconds == 7

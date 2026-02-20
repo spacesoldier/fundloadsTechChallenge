@@ -8,9 +8,11 @@ from typing import Protocol, runtime_checkable
 from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.service import service
 from stream_kernel.execution.observers.observer import ExecutionObserver
+from stream_kernel.observability.domain.monitoring import MonitoringMessage
 from stream_kernel.observability.events import (
     MonitoringMetricsSnapshotEvent,
     MonitoringMetricsSnapshotResult,
+    WorkerQueueTelemetryEvent,
 )
 from stream_kernel.platform.services.messaging.reply_coordinator import (
     ReplyCoordinatorService,
@@ -182,6 +184,65 @@ class ObservabilityMetricsDispatchService(Protocol):
         raise NotImplementedError("ObservabilityMetricsDispatchService.dispatch_snapshot must be implemented")
 
 
+@runtime_checkable
+class WorkerQueueTelemetryService(Protocol):
+    # Publishes per-worker queue telemetry samples to monitoring adapters.
+    def publish_sample(self, *, sample: WorkerQueueTelemetryEvent) -> None:
+        raise NotImplementedError("WorkerQueueTelemetryService.publish_sample must be implemented")
+
+    async def publish_sample_async(self, *, sample: WorkerQueueTelemetryEvent) -> None:
+        raise NotImplementedError("WorkerQueueTelemetryService.publish_sample_async must be implemented")
+
+
+@service(name="worker_queue_telemetry_service")
+@dataclass(slots=True)
+class DefaultWorkerQueueTelemetryService(WorkerQueueTelemetryService):
+    pipeline: ObservabilityPipelineService = inject.service(ObservabilityPipelineService)
+
+    def publish_sample(self, *, sample: WorkerQueueTelemetryEvent) -> None:
+        message = self._build_message(sample)
+        self.pipeline.publish_monitoring(
+            event=message,
+            trace_id=None,
+            attributes={"channel": "worker_queue_telemetry"},
+        )
+
+    async def publish_sample_async(self, *, sample: WorkerQueueTelemetryEvent) -> None:
+        message = self._build_message(sample)
+        publish_async = getattr(self.pipeline, "publish_monitoring_async", None)
+        if callable(publish_async):
+            result = publish_async(
+                event=message,
+                trace_id=None,
+                attributes={"channel": "worker_queue_telemetry"},
+            )
+            if inspect.isawaitable(result):
+                await result
+            return None
+        self.pipeline.publish_monitoring(
+            event=message,
+            trace_id=None,
+            attributes={"channel": "worker_queue_telemetry"},
+        )
+        return None
+
+    def _build_message(self, sample: WorkerQueueTelemetryEvent) -> MonitoringMessage:
+        message = MonitoringMessage(
+            name="worker_queue_depth",
+            status="sample",
+            details={
+                "group_name": sample.group_name,
+                "worker_id": sample.worker_id,
+                "pid": sample.pid,
+                "queue_depth": sample.queue_depth,
+                "inflight": sample.inflight,
+                "runner_profile": sample.runner_profile,
+                "ts_epoch_ms": sample.ts_epoch_ms,
+            },
+        )
+        return message
+
+
 @service(name="observability_metrics_service")
 @dataclass(slots=True)
 class InMemoryObservabilityMetricsService(ObservabilityMetricsService):
@@ -215,6 +276,8 @@ class InMemoryObservabilityMetricsService(ObservabilityMetricsService):
             "dispatch_submit_block_count": "dispatch_submit_block_total",
             "dispatch_submit_timeout_count": "dispatch_submit_timeout_total",
             "dispatch_submit_block_wait_ms_total": "dispatch_submit_block_wait_ms_total",
+            "dispatch_wait_count": "dispatch_wait_count_total",
+            "dispatch_wait_ms_total": "dispatch_wait_ms_total",
         }
         for source, target in dispatch_counter_map.items():
             value = data.get(source)
@@ -252,11 +315,18 @@ class InMemoryObservabilityMetricsService(ObservabilityMetricsService):
             "dispatch_pending": "dispatch_pending",
             "sink_count": "sink_count",
             "pending_total_estimate": "pending_total_estimate",
+            "dispatch_wait_ms_avg": "dispatch_wait_ms_avg",
+            "dispatch_wait_ms_max": "dispatch_wait_ms_max",
+            "worker_queue_telemetry_sample_hz": "worker_queue_telemetry_sample_hz",
         }
         for source, target in gauge_keys.items():
             value = data.get(source)
             if isinstance(value, int) and value >= 0:
                 self._gauges[target] = value
+
+        queue_telemetry_enabled = data.get("worker_queue_telemetry_enabled")
+        if isinstance(queue_telemetry_enabled, bool):
+            self._gauges["worker_queue_telemetry_enabled"] = 1 if queue_telemetry_enabled else 0
 
         sink_pending_total_value = data.get("sink_pending_total")
         sink_pending_total = (
@@ -267,8 +337,7 @@ class InMemoryObservabilityMetricsService(ObservabilityMetricsService):
         self._gauges["sink_pending_total"] = sink_pending_total
 
         dispatch_dropped = int(data.get("dispatch_dropped", 0) or 0)
-        submit_dropped = int(data.get("dispatch_submit_dropped_total", 0) or 0)
-        loss_estimate = max(0, dispatch_dropped) + max(0, submit_dropped) + max(0, sink_dropped_total)
+        loss_estimate = max(0, dispatch_dropped) + max(0, sink_dropped_total)
         self._set_counter_max("loss_estimate_total", loss_estimate)
 
     def snapshot(self) -> dict[str, object]:

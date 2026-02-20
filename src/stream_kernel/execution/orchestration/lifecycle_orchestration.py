@@ -114,7 +114,14 @@ def runtime_lifecycle_policy(runtime: dict[str, object]) -> RuntimeLifecyclePoli
     if not isinstance(lifecycle, dict):
         raise ValueError("runtime.platform.lifecycle must be a mapping")
 
-    ready_timeout_seconds = lifecycle.get("ready_timeout_seconds", 5)
+    ready_timeout_default = 5
+    readiness = platform.get("readiness", {})
+    if isinstance(readiness, dict):
+        readiness_timeout = readiness.get("readiness_timeout_seconds")
+        if isinstance(readiness_timeout, int) and readiness_timeout > 0:
+            ready_timeout_default = readiness_timeout
+
+    ready_timeout_seconds = lifecycle.get("ready_timeout_seconds", ready_timeout_default)
     if not isinstance(ready_timeout_seconds, int) or ready_timeout_seconds <= 0:
         raise ValueError("runtime.platform.lifecycle.ready_timeout_seconds must be > 0")
 
@@ -331,6 +338,13 @@ def execute_with_bootstrap_supervisor(
             boundary_dispatch = {}
         configure_dispatch_policy(dict(boundary_dispatch))
     configure_lifecycle_logging = getattr(supervisor, "configure_lifecycle_logging", None)
+    configure_observability_worker = getattr(supervisor, "configure_observability_worker", None)
+    dedicated_observability_owner = _is_dedicated_observability_service_process_enabled(runtime)
+    if callable(configure_observability_worker):
+        observability = runtime.get("observability", {})
+        if not isinstance(observability, dict):
+            observability = {}
+        configure_observability_worker(dict(observability))
     if callable(configure_lifecycle_logging):
         observability = runtime.get("observability", {})
         if not isinstance(observability, dict):
@@ -349,7 +363,7 @@ def execute_with_bootstrap_supervisor(
             tracing_cfg = {}
         configure_tracing(dict(tracing_cfg), strict=bool(runtime.get("strict", True)))
     configure_monitoring = getattr(supervisor, "configure_monitoring", None)
-    if callable(configure_monitoring):
+    if callable(configure_monitoring) and not dedicated_observability_owner:
         observability = runtime.get("observability", {})
         if not isinstance(observability, dict):
             observability = {}
@@ -637,6 +651,17 @@ def _emit_runtime_lifecycle_event(
     except Exception:
         # Observability callbacks must never break runtime lifecycle orchestration.
         return
+
+
+def _is_dedicated_observability_service_process_enabled(runtime: dict[str, object]) -> bool:
+    observability = runtime.get("observability", {})
+    if not isinstance(observability, dict):
+        return False
+    service_process = observability.get("service_process", {})
+    if not isinstance(service_process, dict):
+        return False
+    enabled = service_process.get("enabled", False)
+    return isinstance(enabled, bool) and enabled
 
 
 def _wait_boundary_drain_if_available(

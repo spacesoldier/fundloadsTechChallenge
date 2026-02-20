@@ -90,3 +90,28 @@ def test_process_group_router_invalidates_cache_on_placement_update() -> None:
     assert after["positive_entries"] == 0
     assert router.resolve_group_for_target(target="compute_features", source_group=None) == "execution.gpu"
 
+
+def test_process_group_router_routes_system_observability_nodes_to_dedicated_group() -> None:
+    router = InMemoryProcessGroupRouterService()
+    router.configure_process_groups(
+        [
+            {
+                "name": "execution.cpu",
+                "workers": 1,
+                "nodes": ["compute_features"],
+            },
+            {
+                "name": "system.observability",
+                "workers": 1,
+                "nodes": ["system.obs.trace_dispatch"],
+            },
+        ]
+    )
+
+    assert (
+        router.resolve_group_for_target(
+            target="system.obs.trace_dispatch",
+            source_group="execution.cpu",
+        )
+        == "system.observability"
+    )

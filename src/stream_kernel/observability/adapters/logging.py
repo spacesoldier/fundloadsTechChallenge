@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 from datetime import UTC, datetime
@@ -16,7 +15,7 @@ class StdoutLogSink:
         print(json.dumps(_log_to_dict(message), separators=(",", ":"), ensure_ascii=False))
 
     async def emit_async(self, message: LogMessage) -> None:
-        await asyncio.to_thread(self.emit, message)
+        self.emit(message)
 
 
 class StdoutPlainLogSink:
@@ -31,7 +30,7 @@ class StdoutPlainLogSink:
         print(line)
 
     async def emit_async(self, message: LogMessage) -> None:
-        await asyncio.to_thread(self.emit, message)
+        self.emit(message)
 
 
 class PlainFileLogSink:
@@ -65,7 +64,7 @@ class PlainFileLogSink:
             os.fsync(self._file.fileno())
 
     async def emit_async(self, message: LogMessage) -> None:
-        await asyncio.to_thread(self.emit, message)
+        self.emit(message)
 
     def close(self) -> None:
         self._file.flush()
@@ -115,7 +114,7 @@ class JsonlLogSink:
             os.fsync(self._file.fileno())
 
     async def emit_async(self, message: LogMessage) -> None:
-        await asyncio.to_thread(self.emit, message)
+        self.emit(message)
 
     def close(self) -> None:
         self._file.flush()

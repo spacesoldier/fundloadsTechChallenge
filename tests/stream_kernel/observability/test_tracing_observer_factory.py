@@ -268,3 +268,35 @@ def test_build_tracing_observer_worker_role_skips_local_sinks_but_dispatches() -
         state=state,
     )
     assert isinstance(dispatched, TraceDispatchEvent)
+
+
+def test_build_tracing_observer_supervisor_transport_only_mode_skips_local_sinks_but_dispatches() -> None:
+    observer = build_tracing_observer(
+        ObserverFactoryContext(
+            runtime={
+                "strict": True,
+                "platform": {"bootstrap": {"mode": "process_supervisor"}},
+                "observability": {
+                    "service_process": {"enabled": True, "group_name": "system.observability"},
+                    "tracing": {
+                        "exporters": [{"kind": "otel_otlp_logical", "enabled": True}],
+                    },
+                },
+            },
+            adapter_instances={},
+            run_id="r1",
+            scenario_id="s1",
+            node_order=["worker"],
+        )
+    )
+    assert observer is not None
+    state = observer.before_node(node_name="worker", payload={"v": 1}, ctx={}, trace_id="t1")
+    dispatched = observer.after_node(
+        node_name="worker",
+        payload={"v": 1},
+        ctx={},
+        trace_id="t1",
+        outputs=[],
+        state=state,
+    )
+    assert isinstance(dispatched, TraceDispatchEvent)

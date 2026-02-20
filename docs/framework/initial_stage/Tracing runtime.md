@@ -80,6 +80,12 @@ Exporter entry fields:
 - `settings.include_runtime_resource: true|false` — include host/process/runtime
   resource attributes (for example `host.name`, `process.pid`,
   `process.runtime.*`) in OTLP resource section.
+- OTLP transport defaults (when not provided explicitly):
+  - `settings.transport.batch.max_items=64`
+  - `settings.transport.batch.flush_interval_ms=200`
+  - `settings.transport.queue.max_items=10000`
+  - `settings.transport.queue.drop_policy=block_with_timeout`
+  - `settings.transport.queue.block_timeout_ms=100`
 - `settings.trace_slice: all|business_logic|platform_internals` (JSONL only) —
   writes selected trace plane to file. `business_logic` excludes platform
   control spans (`system.obs.*`, supervisor transport hops);
@@ -101,12 +107,106 @@ Logging exporters also support:
   - `lifecycle` — controlled by `runtime.observability.logging.lifecycle_events`.
   - `all` — exports all supervisor runtime events regardless of lifecycle level gate.
 
+Supervisor observability worker (multiprocess mode):
+
+- `runtime.observability.service_worker.enabled` (optional, default `false`) enables
+  dedicated async dispatch worker for supervisor-owned logging and monitoring sinks.
+- `runtime.observability.service_worker.queue_max_items` (optional, default `8192`) sets
+  bounded command queue capacity.
+- `runtime.observability.service_worker.drop_policy` (optional, default `drop_newest`) supports:
+  `drop_newest | drop_oldest | block_with_timeout`.
+- `runtime.observability.service_worker.block_timeout_ms` (optional, default `100`) controls
+  submit blocking budget for `block_with_timeout`.
+
+When enabled, supervisor lifecycle logging and monitoring snapshots are emitted via this
+platform worker queue instead of direct synchronous sink calls on routing path.
+Tracing uses dedicated dispatch queues, and in dedicated-service-process mode exporter
+ownership belongs to `system.observability` (not supervisor).
+
+Dedicated observability service process contract (Phase F):
+
+- `runtime.observability.service_process.enabled` (optional):
+  - defaults to `true` when `runtime.platform.bootstrap.mode=process_supervisor`
+    and at least one observability exporter is enabled;
+  - defaults to `false` otherwise;
+  - explicit `false` keeps legacy supervisor-owned path as override.
+- `runtime.observability.service_process.group_name` (optional, default
+  `system.observability`) sets owner process group name.
+- `runtime.observability.service_process.auto_create_group` (optional, default `true`)
+  materializes owner group in `runtime.platform.process_groups` when missing.
+- `runtime.observability.service_process.runner_profile` (optional, default `async`)
+  and `workers` (optional, default `1`) define generated owner group runtime profile.
+- `runtime.observability.service_process.nodes` (optional) defaults to:
+  `system.obs.trace_dispatch`, `system.obs.log_dispatch`,
+  `system.obs.metric_dispatch`, `system.obs.monitor_dispatch`.
+
+Validator enforces unambiguous ownership: the same `system.obs.*` node kind
+cannot be declared by both observability owner group and business groups.
+
+Child process role split for service-process mode:
+
+- business groups run with `runtime.__process_role=worker`;
+- observability owner group runs with `runtime.__process_role=observability_worker`.
+
+Ownership implications:
+
+- business workers do not instantiate observability exporters from runtime config;
+- observability owner worker is allowed to instantiate observability exporters;
+- in `process_supervisor` mode with dedicated observability service process enabled,
+  monitoring exporter setup is not executed on supervisor (`configure_monitoring` is skipped there).
+
+Known limitation (as of February 20, 2026):
+
+- trace-forwarding path still has blocking `multiprocessing.Connection.send()` call sites
+  on worker/supervisor control channels under burst load;
+- this can stall multiprocess startup/execution in logical-only OTLP scenarios even when
+  exporter I/O itself is async.
+- migration/fix plan is tracked in:
+  `docs/framework/initial_stage/_work/supervisor_transport_only_system_control_plane_tdd_plan.md`.
+
+Migration notes (`service_worker` -> dedicated service process):
+
+- `runtime.observability.service_worker.*` remains compatibility-only for
+  supervisor-local async fanout and should not be treated as primary ownership model.
+- Default multiprocess path is now dedicated observability process ownership.
+- To force old behavior during migration/debug:
+  - set `runtime.observability.service_process.enabled: false`;
+  - keep explicit `runtime.observability.service_worker.enabled: true` if needed.
+
+Default/override examples:
+
+```yaml
+runtime:
+  platform:
+    bootstrap:
+      mode: process_supervisor
+  observability:
+    tracing:
+      exporters:
+        - kind: otel_otlp
+          settings:
+            endpoint: http://127.0.0.1:4318/v1/traces
+```
+
+Above enables dedicated `system.observability` ownership automatically.
+
+```yaml
+runtime:
+  observability:
+    service_process:
+      enabled: false
+```
+
+Above explicitly disables dedicated process ownership.
+
 If `path` is omitted, runtime generates a sortable UTC filename:
 `logs/<prefix>_<YYYYMMDDTHHMMSSZ>_pid<PID>.(jsonl|log)`.
 
 Lifecycle logging is single-writer in multiprocess mode:
 
-- all lifecycle exporters are owned by supervisor process;
+- dedicated service-process mode: file/jsonl lifecycle exporters are owned by
+  `system.observability`, while supervisor keeps console lifecycle output (`stdout_plain`);
+- supervisor-owned mode (`service_process.enabled: false`): lifecycle exporters are owned by supervisor;
 - workers forward lifecycle events over control channel only;
 - worker-local file sinks are disabled (`settings.workers_dir` is not supported).
 
@@ -125,8 +225,8 @@ Message lifecycle platform spans (multiprocess mode):
 - `system.obs.supervisor_boundary_receive` — supervisor received worker boundary output.
 - `system.obs.supervisor_boundary_dispatch` — supervisor dispatched message to target worker group.
 
-These spans are emitted by supervisor-owned tracing exporters. Workers forward
-message-lifecycle records over control channel; workers do not own trace/log sinks.
+These spans are exported by the active observability owner process. Workers and supervisor
+forward message-lifecycle records over control channels; workers do not own trace/log sinks.
 
 `otel_otlp` backends currently supported by validator/runtime:
 
@@ -521,6 +621,13 @@ Recommended baseline tuning order:
 2. increase batch size moderately (`64 -> 128`) before increasing queue capacity;
 3. then increase queue capacity as burst absorber;
 4. only then reduce flush interval for lower latency.
+
+Safe starting ranges for production-like profiling:
+
+- `batch.max_items`: `32..256`
+- `batch.flush_interval_ms`: `50..500`
+- `queue.max_items`: `10000..50000`
+- `queue.block_timeout_ms`: `50..500`
 
 ### 10.5 Prometheus mapping (target metric names)
 

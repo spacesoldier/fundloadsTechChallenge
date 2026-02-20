@@ -71,3 +71,34 @@ class TraceSinkPort(Protocol):
     def emit(self, record: object) -> None: ...
     def flush(self) -> None: ...
     def close(self) -> None: ...
+
+
+@runtime_checkable
+class BusinessDispatchPort(Protocol):
+    # Transport-agnostic business dispatch port used by supervisor boundary execution path.
+    def send(
+        self,
+        *,
+        handle: object,
+        command: dict[str, object],
+        timeout_seconds: float,
+        raise_on_timeout: bool = True,
+    ) -> dict[str, object]: ...
+
+    def send_no_wait(
+        self,
+        *,
+        handle: object,
+        command: dict[str, object],
+    ) -> None: ...
+
+
+@runtime_checkable
+class ControlPlaneDispatchPort(Protocol):
+    # Transport-agnostic control-plane port for system/service commands.
+    def send_no_wait(
+        self,
+        *,
+        handle: object,
+        command: dict[str, object],
+    ) -> None: ...

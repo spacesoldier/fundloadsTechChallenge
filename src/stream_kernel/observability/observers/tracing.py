@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import inspect
@@ -49,7 +48,7 @@ class _FanoutTraceSink:
             emit = getattr(sink, "emit", None)
             if callable(emit):
                 try:
-                    await asyncio.to_thread(emit, record)
+                    emit(record)
                 except Exception:
                     continue
 
@@ -253,7 +252,7 @@ class TracingObserver(ExecutionObserver):
         if callable(emit_async):
             await emit_async(record)
             return
-        await asyncio.to_thread(self._sink.emit, record)
+        self._sink.emit(record)
 
 
 @observer_factory(name="tracing")
@@ -293,6 +292,24 @@ def build_tracing_observer(ctx: ObserverFactoryContext) -> ExecutionObserver | N
     # Supervisor-owned tracing in worker runtimes: no local sinks, but records must still be
     # produced and dispatched back through runner/system-node rails.
     if _is_worker_process_role(runtime=ctx.runtime) and emit_via_runner:
+        recorder = TraceRecorder(
+            signature_mode="type_only",
+            context_diff_mode="none",
+            context_diff_whitelist=(),
+        )
+        step_indices = {name: idx for idx, name in enumerate(ctx.node_order)}
+        return TracingObserver(
+            recorder=recorder,
+            sink=_FanoutTraceSink([]),
+            run_id=ctx.run_id,
+            scenario_id=ctx.scenario_id,
+            step_indices=step_indices,
+            emit_via_runner=True,
+        )
+
+    # Dedicated service-process mode: supervisor remains transport-only and dispatches
+    # trace records via runner/system-node rails without local sink ownership.
+    if _is_supervisor_transport_only_role(runtime=ctx.runtime) and emit_via_runner:
         recorder = TraceRecorder(
             signature_mode="type_only",
             context_diff_mode="none",
@@ -398,7 +415,7 @@ def _build_sinks_from_observability_exporters(ctx: ObserverFactoryContext) -> li
             continue
 
         if candidate is None:
-            if strict:
+            if strict and not _is_supervisor_transport_only_role(runtime=ctx.runtime):
                 raise ValueError(
                     "runtime.observability.tracing."
                     f"exporters[{index}] sink binding is missing for adapter '{alias}'"
@@ -541,3 +558,26 @@ def _has_enabled_tracing_exporters(*, runtime: dict[str, object]) -> bool:
 def _is_worker_process_role(*, runtime: dict[str, object]) -> bool:
     role = runtime.get("__process_role")
     return isinstance(role, str) and role == "worker"
+
+
+def _is_supervisor_transport_only_role(*, runtime: dict[str, object]) -> bool:
+    role = runtime.get("__process_role")
+    if isinstance(role, str) and role in {"worker", "observability_worker"}:
+        return False
+
+    platform = runtime.get("platform", {})
+    if not isinstance(platform, dict):
+        return False
+    bootstrap = platform.get("bootstrap", {})
+    if not isinstance(bootstrap, dict):
+        return False
+    if bootstrap.get("mode") != "process_supervisor":
+        return False
+
+    observability = runtime.get("observability", {})
+    if not isinstance(observability, dict):
+        return False
+    service_process = observability.get("service_process", {})
+    if not isinstance(service_process, dict):
+        return False
+    return service_process.get("enabled") is True

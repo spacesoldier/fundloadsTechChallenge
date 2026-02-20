@@ -14,6 +14,7 @@ from stream_kernel.observability.adapters import (
     log_jsonl,
     log_stdout_plain,
     log_stdout,
+    monitoring_jsonl,
     monitoring_prometheus,
     monitoring_stdout,
     telemetry_stdout,
@@ -60,6 +61,7 @@ def test_log_and_telemetry_adapters_declare_standard_stream_contract() -> None:
     log_meta = get_adapter_meta(log_stdout)
     telemetry_meta = get_adapter_meta(telemetry_stdout)
     monitoring_meta = get_adapter_meta(monitoring_stdout)
+    monitoring_jsonl_meta = get_adapter_meta(monitoring_jsonl)
     monitoring_prometheus_meta = get_adapter_meta(monitoring_prometheus)
     assert log_jsonl_meta is not None
     assert log_plain_file_meta is not None
@@ -67,6 +69,7 @@ def test_log_and_telemetry_adapters_declare_standard_stream_contract() -> None:
     assert log_meta is not None
     assert telemetry_meta is not None
     assert monitoring_meta is not None
+    assert monitoring_jsonl_meta is not None
     assert monitoring_prometheus_meta is not None
     assert list(log_jsonl_meta.consumes) == [LogMessage]
     assert list(log_plain_file_meta.consumes) == [LogMessage]
@@ -80,6 +83,8 @@ def test_log_and_telemetry_adapters_declare_standard_stream_contract() -> None:
     assert list(telemetry_meta.binds) == [("stream", TelemetryMessage)]
     assert list(monitoring_meta.consumes) == [MonitoringMessage]
     assert list(monitoring_meta.binds) == [("stream", MonitoringMessage)]
+    assert list(monitoring_jsonl_meta.consumes) == [MonitoringMessage]
+    assert list(monitoring_jsonl_meta.binds) == [("stream", MonitoringMessage)]
     assert list(monitoring_prometheus_meta.consumes) == [MonitoringMessage]
     assert list(monitoring_prometheus_meta.binds) == [("stream", MonitoringMessage)]
     assert log_jsonl_meta.execution_mode == "async"
@@ -88,6 +93,7 @@ def test_log_and_telemetry_adapters_declare_standard_stream_contract() -> None:
     assert log_meta.execution_mode == "async"
     assert telemetry_meta.execution_mode == "async"
     assert monitoring_meta.execution_mode == "async"
+    assert monitoring_jsonl_meta.execution_mode == "async"
     assert monitoring_prometheus_meta.execution_mode == "async"
 
 
@@ -135,6 +141,7 @@ def test_observability_adapters_are_discoverable() -> None:
     module.log_stdout = log_stdout
     module.telemetry_stdout = telemetry_stdout
     module.monitoring_stdout = monitoring_stdout
+    module.monitoring_jsonl = monitoring_jsonl
     module.monitoring_prometheus = monitoring_prometheus
     discovered = discover_adapters([module])
     assert set(discovered) == {
@@ -148,6 +155,7 @@ def test_observability_adapters_are_discoverable() -> None:
         "log_stdout",
         "telemetry_stdout",
         "monitoring_stdout",
+        "monitoring_jsonl",
         "monitoring_prometheus",
     }
     # Smoke build for jsonl adapter to ensure factory signature remains valid.
@@ -347,6 +355,20 @@ def test_trace_otel_otlp_passes_queue_block_timeout_to_sink() -> None:
     assert isinstance(sink, OTelOtlpTraceSink)
     assert sink._queue_drop_policy == "block_with_timeout"
     assert sink._queue_block_timeout_ms == 250
+
+
+def test_trace_otel_otlp_applies_near_realtime_batch_defaults() -> None:
+    sink = trace_otel_otlp(
+        {
+            "backend": "urllib",
+            "endpoint": "http://collector:4318/v1/traces",
+        }
+    )
+    assert isinstance(sink, OTelOtlpTraceSink)
+    assert sink._batch_max_items == 64
+    assert sink._batch_flush_interval_ms == 200
+    assert sink._queue_drop_policy == "block_with_timeout"
+    assert sink._queue_block_timeout_ms == 100
 
 
 def test_trace_otel_otlp_rejects_invalid_queue_block_timeout() -> None:

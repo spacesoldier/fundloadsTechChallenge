@@ -43,7 +43,7 @@ _SUPPORTED_OBSERVABILITY_TRACE_JSONL_SLICES = {"all", "business_logic", "platfor
 _SUPPORTED_OBSERVABILITY_LOG_EXPORTER_KINDS = {"stdout", "stdout_plain", "jsonl", "file_plain", "otel_logs_otlp"}
 _SUPPORTED_OBSERVABILITY_LOG_EXPORTER_MODES = {"lifecycle", "all"}
 _SUPPORTED_OBSERVABILITY_LOG_LEVELS = {"off", "none", "info", "debug", "full"}
-_SUPPORTED_OBSERVABILITY_MONITORING_EXPORTER_KINDS = {"prometheus"}
+_SUPPORTED_OBSERVABILITY_MONITORING_EXPORTER_KINDS = {"prometheus", "jsonl"}
 _SUPPORTED_OBSERVABILITY_PROMETHEUS_MODES = {"http_pull", "textfile"}
 _SUPPORTED_OBSERVABILITY_OTEL_BACKENDS = {"urllib", "requests", "httpx", "aiohttp", "urllib3", "grpcio", "otel_sdk"}
 _OBSERVABILITY_ASYNC_ONLY_BACKENDS = {"aiohttp"}
@@ -56,7 +56,16 @@ _SUPPORTED_OBSERVABILITY_PIPELINE_SYSTEM_NODE_KINDS = {
     "system.obs.log_dispatch",
     "system.obs.metric_dispatch",
     "system.obs.monitor_dispatch",
+    "system.obs.monitoring_metrics_dispatch",
+    "system.obs.worker_queue_dispatch",
 }
+_DEFAULT_OBSERVABILITY_SERVICE_PROCESS_GROUP_NAME = "system.observability"
+_DEFAULT_OBSERVABILITY_SERVICE_PROCESS_NODES = [
+    "system.obs.trace_dispatch",
+    "system.obs.log_dispatch",
+    "system.obs.metric_dispatch",
+    "system.obs.monitor_dispatch",
+]
 _SUPPORTED_API_POLICY_KEYS = {"defaults", "profiles"}
 _SUPPORTED_API_POLICY_DEFAULT_KEYS = {
     "timeout_ms",
@@ -737,7 +746,7 @@ def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
     dispatch_queue = tracing.get("dispatch_queue", {})
     if not isinstance(dispatch_queue, dict):
         raise ConfigError("runtime.observability.tracing.dispatch_queue must be a mapping when provided")
-    max_items = dispatch_queue.get("max_items", 8192)
+    max_items = dispatch_queue.get("max_items", 131072)
     if not isinstance(max_items, int) or max_items <= 0:
         raise ConfigError("runtime.observability.tracing.dispatch_queue.max_items must be an integer > 0")
     dispatch_queue["max_items"] = max_items
@@ -759,6 +768,24 @@ def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
         block_timeout_ms = dispatch_queue.get("block_timeout_ms")
         if not isinstance(block_timeout_ms, int) or block_timeout_ms <= 0:
             raise ConfigError("runtime.observability.tracing.dispatch_queue.block_timeout_ms must be an integer > 0")
+    forward_batch_max_items = dispatch_queue.get("forward_batch_max_items", 100)
+    if not isinstance(forward_batch_max_items, int) or forward_batch_max_items <= 0:
+        raise ConfigError(
+            "runtime.observability.tracing.dispatch_queue.forward_batch_max_items must be an integer > 0"
+        )
+    dispatch_queue["forward_batch_max_items"] = forward_batch_max_items
+    forward_flush_interval_ms = dispatch_queue.get("forward_flush_interval_ms", 20)
+    if not isinstance(forward_flush_interval_ms, int) or forward_flush_interval_ms <= 0:
+        raise ConfigError(
+            "runtime.observability.tracing.dispatch_queue.forward_flush_interval_ms must be an integer > 0"
+        )
+    dispatch_queue["forward_flush_interval_ms"] = forward_flush_interval_ms
+    drain_timeout_seconds = dispatch_queue.get("drain_timeout_seconds", 30)
+    if not isinstance(drain_timeout_seconds, (int, float)) or float(drain_timeout_seconds) <= 0:
+        raise ConfigError(
+            "runtime.observability.tracing.dispatch_queue.drain_timeout_seconds must be > 0"
+        )
+    dispatch_queue["drain_timeout_seconds"] = float(drain_timeout_seconds)
     tracing["dispatch_queue"] = dispatch_queue
 
     tracing_exporters = tracing.get("exporters", [])
@@ -1043,7 +1070,81 @@ def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
                     )
                 textfile["path"] = path
                 settings["textfile"] = textfile
+        if kind == "jsonl":
+            path = settings.get("path", "metrics/monitoring_timeseries.jsonl")
+            if not isinstance(path, str) or not path:
+                raise ConfigError(
+                    "runtime.observability.monitoring.exporters["
+                    f"{index}].settings.path must be a non-empty string"
+                )
+            flush_every_n = settings.get("flush_every_n", 1)
+            if not isinstance(flush_every_n, int) or flush_every_n <= 0:
+                raise ConfigError(
+                    "runtime.observability.monitoring.exporters["
+                    f"{index}].settings.flush_every_n must be an integer > 0"
+                )
+            fsync_every_n = settings.get("fsync_every_n")
+            if fsync_every_n is not None and (not isinstance(fsync_every_n, int) or fsync_every_n <= 0):
+                raise ConfigError(
+                    "runtime.observability.monitoring.exporters["
+                    f"{index}].settings.fsync_every_n must be an integer > 0 when provided"
+                )
+            settings["path"] = path
+            settings["flush_every_n"] = flush_every_n
+            if fsync_every_n is not None:
+                settings["fsync_every_n"] = fsync_every_n
         exporter["settings"] = settings
+
+    worker_queue_telemetry = observability.get("worker_queue_telemetry", {})
+    if worker_queue_telemetry is None:
+        worker_queue_telemetry = {}
+    if not isinstance(worker_queue_telemetry, dict):
+        raise ConfigError("runtime.observability.worker_queue_telemetry must be a mapping when provided")
+    observability["worker_queue_telemetry"] = worker_queue_telemetry
+    wqt_enabled = worker_queue_telemetry.get("enabled", False)
+    if not isinstance(wqt_enabled, bool):
+        raise ConfigError("runtime.observability.worker_queue_telemetry.enabled must be a boolean when provided")
+    worker_queue_telemetry["enabled"] = wqt_enabled
+    sample_hz = worker_queue_telemetry.get("sample_hz", 20)
+    if not isinstance(sample_hz, int) or sample_hz <= 0:
+        raise ConfigError("runtime.observability.worker_queue_telemetry.sample_hz must be an integer > 0")
+    worker_queue_telemetry["sample_hz"] = sample_hz
+
+    service_worker = observability.get("service_worker", {})
+    if service_worker is None:
+        service_worker = {}
+    if not isinstance(service_worker, dict):
+        raise ConfigError("runtime.observability.service_worker must be a mapping when provided")
+    observability["service_worker"] = service_worker
+
+    enabled = service_worker.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError("runtime.observability.service_worker.enabled must be a boolean when provided")
+    service_worker["enabled"] = enabled
+
+    queue_max_items = service_worker.get("queue_max_items", 131072)
+    if not isinstance(queue_max_items, int) or queue_max_items <= 0:
+        raise ConfigError("runtime.observability.service_worker.queue_max_items must be an integer > 0")
+    service_worker["queue_max_items"] = queue_max_items
+
+    drop_policy = service_worker.get("drop_policy", "drop_newest")
+    if not isinstance(drop_policy, str) or not drop_policy:
+        raise ConfigError("runtime.observability.service_worker.drop_policy must be a non-empty string")
+    if drop_policy not in _SUPPORTED_OBSERVABILITY_QUEUE_DROP_POLICIES:
+        raise ConfigError(
+            "runtime.observability.service_worker.drop_policy must be one of: "
+            f"{sorted(_SUPPORTED_OBSERVABILITY_QUEUE_DROP_POLICIES)}"
+        )
+    service_worker["drop_policy"] = drop_policy
+
+    block_timeout_ms = service_worker.get("block_timeout_ms", 100)
+    if not isinstance(block_timeout_ms, int) or block_timeout_ms <= 0:
+        raise ConfigError("runtime.observability.service_worker.block_timeout_ms must be an integer > 0")
+    service_worker["block_timeout_ms"] = block_timeout_ms
+    drain_timeout_seconds = service_worker.get("drain_timeout_seconds", 30)
+    if not isinstance(drain_timeout_seconds, (int, float)) or float(drain_timeout_seconds) <= 0:
+        raise ConfigError("runtime.observability.service_worker.drain_timeout_seconds must be > 0")
+    service_worker["drain_timeout_seconds"] = float(drain_timeout_seconds)
 
     pipeline = observability.get("pipeline")
     if pipeline is not None and (tracing_exporters or log_exporters or monitoring_exporters):
@@ -1052,6 +1153,196 @@ def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
             "runtime.observability.tracing.exporters or runtime.observability.logging.exporters "
             "or runtime.observability.monitoring.exporters"
         )
+
+    _normalize_observability_service_process(
+        runtime=runtime,
+        observability=observability,
+    )
+
+
+def _normalize_observability_service_process(
+    *,
+    runtime: dict[str, object],
+    observability: dict[str, object],
+) -> None:
+    service_process = observability.get("service_process", {})
+    if service_process is None:
+        service_process = {}
+    if not isinstance(service_process, dict):
+        raise ConfigError("runtime.observability.service_process must be a mapping when provided")
+    observability["service_process"] = service_process
+
+    enabled_value = service_process.get("enabled")
+    if enabled_value is None:
+        enabled = _should_enable_observability_service_process_by_default(
+            runtime=runtime,
+            observability=observability,
+        )
+    else:
+        if not isinstance(enabled_value, bool):
+            raise ConfigError("runtime.observability.service_process.enabled must be a boolean when provided")
+        enabled = enabled_value
+    service_process["enabled"] = enabled
+    if not enabled:
+        return
+
+    platform = runtime.get("platform")
+    if not isinstance(platform, dict):
+        raise ConfigError("runtime.platform must be a mapping when provided")
+    bootstrap = platform.get("bootstrap", {})
+    if not isinstance(bootstrap, dict):
+        raise ConfigError("runtime.platform.bootstrap must be a mapping when provided")
+    bootstrap_mode = bootstrap.get("mode", _default_bootstrap_mode(platform))
+    if bootstrap_mode != "process_supervisor":
+        raise ConfigError(
+            "runtime.observability.service_process.enabled=true requires "
+            "runtime.platform.bootstrap.mode=process_supervisor"
+        )
+
+    group_name = service_process.get("group_name", _DEFAULT_OBSERVABILITY_SERVICE_PROCESS_GROUP_NAME)
+    if not isinstance(group_name, str) or not group_name:
+        raise ConfigError("runtime.observability.service_process.group_name must be a non-empty string")
+    service_process["group_name"] = group_name
+
+    auto_create_group = service_process.get("auto_create_group", True)
+    if not isinstance(auto_create_group, bool):
+        raise ConfigError("runtime.observability.service_process.auto_create_group must be a boolean when provided")
+    service_process["auto_create_group"] = auto_create_group
+
+    workers = service_process.get("workers", 1)
+    if not isinstance(workers, int) or workers <= 0:
+        raise ConfigError("runtime.observability.service_process.workers must be an integer > 0")
+    service_process["workers"] = workers
+
+    runner_profile = service_process.get("runner_profile", "async")
+    if not isinstance(runner_profile, str) or not runner_profile:
+        raise ConfigError("runtime.observability.service_process.runner_profile must be a non-empty string")
+    if runner_profile not in _SUPPORTED_PROCESS_GROUP_RUNNER_PROFILES:
+        raise ConfigError(
+            "runtime.observability.service_process.runner_profile must be one of: "
+            f"{sorted(_SUPPORTED_PROCESS_GROUP_RUNNER_PROFILES)}"
+        )
+    service_process["runner_profile"] = runner_profile
+
+    nodes = service_process.get("nodes", list(_DEFAULT_OBSERVABILITY_SERVICE_PROCESS_NODES))
+    if not isinstance(nodes, list) or not nodes:
+        raise ConfigError("runtime.observability.service_process.nodes must be a non-empty list")
+    if not all(isinstance(node, str) and node for node in nodes):
+        raise ConfigError("runtime.observability.service_process.nodes entries must be non-empty strings")
+    unknown_nodes = sorted({node for node in nodes if node not in _SUPPORTED_OBSERVABILITY_PIPELINE_SYSTEM_NODE_KINDS})
+    if unknown_nodes:
+        raise ConfigError(
+            "runtime.observability.service_process.nodes entries must be one of: "
+            f"{sorted(_SUPPORTED_OBSERVABILITY_PIPELINE_SYSTEM_NODE_KINDS)}"
+        )
+    nodes = list(dict.fromkeys(nodes))
+    worker_queue_telemetry = observability.get("worker_queue_telemetry", {})
+    if isinstance(worker_queue_telemetry, dict) and worker_queue_telemetry.get("enabled") is True:
+        if "system.obs.worker_queue_dispatch" not in nodes:
+            nodes.append("system.obs.worker_queue_dispatch")
+    service_process["nodes"] = nodes
+
+    process_groups = platform.get("process_groups")
+    if process_groups is None:
+        process_groups = []
+        platform["process_groups"] = process_groups
+    if not isinstance(process_groups, list):
+        raise ConfigError("runtime.platform.process_groups must be a list when provided")
+
+    owner_group: dict[str, object] | None = None
+    for group in process_groups:
+        if not isinstance(group, dict):
+            continue
+        if group.get("name") == group_name:
+            owner_group = group
+            break
+
+    if owner_group is None:
+        if not auto_create_group:
+            raise ConfigError(
+                "runtime.observability.service_process owner group is not resolvable "
+                f"(expected group '{group_name}')"
+            )
+        owner_group = {
+            "name": group_name,
+            "workers": workers,
+            "runner_profile": runner_profile,
+            "nodes": list(nodes),
+            "heartbeat_seconds": 5,
+            "start_timeout_seconds": 30,
+            "stop_timeout_seconds": 30,
+        }
+        process_groups.append(owner_group)
+    else:
+        owner_nodes = owner_group.get("nodes")
+        if owner_nodes is None:
+            owner_nodes = []
+        if not isinstance(owner_nodes, list):
+            raise ConfigError("runtime.platform.process_groups owner nodes must be a list when provided")
+        if not all(isinstance(item, str) and item for item in owner_nodes):
+            raise ConfigError("runtime.platform.process_groups owner nodes entries must be non-empty strings")
+
+        if auto_create_group:
+            for node in nodes:
+                if node not in owner_nodes:
+                    owner_nodes.append(node)
+            owner_group["nodes"] = owner_nodes
+        else:
+            missing_nodes = [node for node in nodes if node not in owner_nodes]
+            if missing_nodes:
+                raise ConfigError(
+                    "runtime.observability.service_process owner group is not resolvable "
+                    f"(group '{group_name}' is missing nodes {missing_nodes})"
+                )
+
+    node_set = set(nodes)
+    for group in process_groups:
+        if not isinstance(group, dict) or group is owner_group:
+            continue
+        group_nodes = group.get("nodes")
+        if not isinstance(group_nodes, list):
+            continue
+        overlaps = sorted({node for node in group_nodes if isinstance(node, str) and node in node_set})
+        if overlaps:
+            other_name = group.get("name")
+            raise ConfigError(
+                "runtime.observability.service_process system nodes are owned by multiple groups: "
+                f"group '{other_name}' also declares {overlaps}"
+            )
+
+
+def _should_enable_observability_service_process_by_default(
+    *,
+    runtime: dict[str, object],
+    observability: dict[str, object],
+) -> bool:
+    platform = runtime.get("platform")
+    if not isinstance(platform, dict):
+        return False
+    bootstrap = platform.get("bootstrap", {})
+    if not isinstance(bootstrap, dict):
+        return False
+    bootstrap_mode = bootstrap.get("mode", _default_bootstrap_mode(platform))
+    if bootstrap_mode != "process_supervisor":
+        return False
+    return _has_enabled_observability_exporters(observability)
+
+
+def _has_enabled_observability_exporters(observability: dict[str, object]) -> bool:
+    for key in ("tracing", "logging", "monitoring"):
+        section = observability.get(key, {})
+        if not isinstance(section, dict):
+            continue
+        exporters = section.get("exporters", [])
+        if not isinstance(exporters, list):
+            continue
+        for exporter in exporters:
+            if not isinstance(exporter, dict):
+                continue
+            enabled = exporter.get("enabled", True)
+            if isinstance(enabled, bool) and enabled:
+                return True
+    return False
 
 
 def _normalize_observability_pipeline(observability: dict[str, object]) -> None:
@@ -1223,11 +1514,11 @@ def _normalize_observability_otel_exporter_settings(
     batch = settings.get("batch", {})
     if not isinstance(batch, dict):
         raise ConfigError(f"{prefix}.batch must be a mapping when provided")
-    max_items = batch.get("max_items", 100)
+    max_items = batch.get("max_items", 64)
     if not isinstance(max_items, int) or max_items <= 0:
         raise ConfigError(f"{prefix}.batch.max_items must be an integer > 0 when provided")
     batch["max_items"] = max_items
-    flush_interval_ms = batch.get("flush_interval_ms", 1000)
+    flush_interval_ms = batch.get("flush_interval_ms", 200)
     if not isinstance(flush_interval_ms, int) or flush_interval_ms < 0:
         raise ConfigError(f"{prefix}.batch.flush_interval_ms must be an integer >= 0 when provided")
     batch["flush_interval_ms"] = flush_interval_ms
@@ -1240,7 +1531,7 @@ def _normalize_observability_otel_exporter_settings(
     if not isinstance(queue_max_items, int) or queue_max_items <= 0:
         raise ConfigError(f"{prefix}.queue.max_items must be an integer > 0 when provided")
     queue["max_items"] = queue_max_items
-    drop_policy = queue.get("drop_policy", "drop_newest")
+    drop_policy = queue.get("drop_policy", "block_with_timeout")
     if not isinstance(drop_policy, str) or not drop_policy:
         raise ConfigError(f"{prefix}.queue.drop_policy must be a non-empty string when provided")
     if drop_policy not in _SUPPORTED_OBSERVABILITY_QUEUE_DROP_POLICIES:
