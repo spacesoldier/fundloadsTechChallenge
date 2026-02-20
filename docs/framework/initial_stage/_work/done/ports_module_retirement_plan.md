@@ -63,8 +63,8 @@ This is a staged migration plan, not a one-shot refactor.
 
 - [x] Delete `src/fund_load/ports`.
 - [x] Replace imports in app/integration/usecase tests.
-- [ ] Remove redundant compatibility aliases.
-- [ ] Update framework and project docs to reflect the final contract map.
+- [x] Remove redundant compatibility aliases.
+- [x] Update framework and project docs to reflect the final contract map.
 
 ---
 
