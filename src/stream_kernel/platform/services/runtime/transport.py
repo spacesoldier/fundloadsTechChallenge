@@ -37,6 +37,20 @@ class MemoryRuntimeTransportService(RuntimeTransportService):
 
 
 @dataclass(slots=True)
+class IpcLocalRuntimeTransportService(RuntimeTransportService):
+    # Pipe-based multiprocess runtime profile.
+    # Queue/topic contracts remain in-process for runner-local dispatch;
+    # cross-process delivery goes through ExecutionIpc* services/adapters.
+    profile: str = "ipc_local"
+
+    def build_queue(self) -> QueuePort:
+        return InMemoryQueue()
+
+    def build_topic(self) -> TopicPort:
+        return InMemoryTopic()
+
+
+@dataclass(slots=True)
 class TcpLocalRuntimeTransportService(RuntimeTransportService):
     # Localhost secure transport profile.
     transport: SecureTcpTransport

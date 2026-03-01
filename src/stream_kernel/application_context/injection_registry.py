@@ -127,10 +127,15 @@ def _iter_injected_fields(obj: object):
                 yield f.name, value
         return
 
-    for name, value in getattr(obj, "__dict__", {}).items():
+    instance_dict = getattr(obj, "__dict__", {})
+    for name, value in instance_dict.items():
         if _is_injected_marker(value):
             yield name, value
     for name, value in getattr(obj.__class__, "__dict__", {}).items():
+        if name in instance_dict:
+            # Instance attribute shadows class marker (common for services that
+            # replace inject markers with defaults in __init__).
+            continue
         if _is_injected_marker(value):
             yield name, value
 

@@ -567,3 +567,101 @@ def test_system_observability_node_exclusion_is_deterministic_for_sync_and_async
     runner.run()
     assert observed_before == ["worker"]
     assert observed_after == ["worker"]
+
+
+@pytest.mark.parametrize("runner_kind", ["sync", "async"])
+def test_transport_handoff_observability_node_exclusion_is_deterministic_for_sync_and_async(
+    runner_kind: str,
+) -> None:
+    observed_before: list[str] = []
+    observed_after: list[str] = []
+
+    class _DispatchingObserver:
+        def before_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+        ) -> object | None:
+            _ = (payload, ctx, trace_id)
+            observed_before.append(node_name)
+            return None
+
+        def after_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            outputs: list[object],
+            state: object | None,
+        ) -> list[object] | None:
+            _ = (payload, ctx, outputs, state)
+            observed_after.append(node_name)
+            if node_name == "worker":
+                return [TraceDispatchEvent(payload={"node": node_name}, trace_id=trace_id)]
+            return None
+
+        def on_node_error(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            error: Exception,
+            state: object | None,
+        ) -> None:
+            _ = (node_name, payload, ctx, trace_id, error, state)
+            return None
+
+        def on_run_end(self) -> None:
+            return None
+
+    handoff_node = "system.transport.handoff.observability_dispatch"
+    if runner_kind == "async":
+        async def worker(payload: object, ctx: dict[str, object]) -> list[object]:
+            _ = (payload, ctx)
+            return []
+
+        async def trace_dispatch(payload: object, ctx: dict[str, object]) -> list[object]:
+            _ = (payload, ctx)
+            return []
+
+        runner = AsyncRunner(
+            nodes={"worker": worker, handoff_node: trace_dispatch},
+            work_queue=InMemoryQueue(),
+            context_service=InMemoryKvContextService(InMemoryKvStore()),
+            router=RoutingService(
+                registry=InMemoryConsumerRegistry({TraceDispatchEvent: [handoff_node]}),
+                strict=True,
+            ),
+            observability=_DispatchingObserver(),
+        )
+    else:
+        def worker(payload: object, ctx: dict[str, object]) -> list[object]:
+            _ = (payload, ctx)
+            return []
+
+        def trace_dispatch(payload: object, ctx: dict[str, object]) -> list[object]:
+            _ = (payload, ctx)
+            return []
+
+        runner = SyncRunner(
+            nodes={"worker": worker, handoff_node: trace_dispatch},
+            work_queue=InMemoryQueue(),
+            context_service=InMemoryKvContextService(InMemoryKvStore()),
+            router=RoutingService(
+                registry=InMemoryConsumerRegistry({TraceDispatchEvent: [handoff_node]}),
+                strict=True,
+            ),
+            observability=_DispatchingObserver(),
+        )
+
+    runner.work_queue.push(Envelope(payload="seed", target="worker", trace_id="t1"))
+    runner.run()
+    assert observed_before == ["worker"]
+    assert observed_after == ["worker"]

@@ -6,17 +6,22 @@ import sys
 
 import pytest
 
-from stream_kernel.execution.transport.bootstrap_keys import build_bootstrap_key_bundle
-from stream_kernel.execution.orchestration.child_bootstrap import (
+from stream_kernel.execution.orchestration.control_plane.bootstrap_keys import build_bootstrap_key_bundle
+from stream_kernel.execution.orchestration.lifecycle.leaf.startup.bootstrap_models import (
     ChildBootstrapBundle,
-    bootstrap_child_runtime_from_bundle,
+)
+from stream_kernel.execution.orchestration.lifecycle.leaf.runtime.boundary_runtime import (
     execute_child_boundary_loop,
     execute_child_boundary_loop_from_bundle,
 )
-from stream_kernel.execution.orchestration.lifecycle_orchestration import (
+from stream_kernel.execution.orchestration.lifecycle.leaf.startup.runtime_bootstrap_service import (
+    DefaultLeafRuntimeBootstrapService,
+)
+from stream_kernel.execution.orchestration.lifecycle import (
     BoundaryDispatchInput,
     _build_boundary_dispatch_inputs,
 )
+from stream_kernel.execution.runtime.runner_ingress import enqueue_runner_input_sync
 from stream_kernel.execution.runtime.runner import SyncRunner
 from stream_kernel.integration.consumer_registry import InMemoryConsumerRegistry
 from stream_kernel.integration.kv_store import InMemoryKvStore
@@ -30,6 +35,13 @@ from stream_kernel.platform.services.observability import (
 from stream_kernel.platform.services.messaging.reply_coordinator import legacy_reply_coordinator
 from stream_kernel.platform.services.messaging.reply_waiter import InMemoryReplyWaiterService, TerminalEvent
 from stream_kernel.routing.envelope import Envelope
+
+
+_leaf_runtime_bootstrap_service = DefaultLeafRuntimeBootstrapService()
+
+
+def bootstrap_child_runtime_from_bundle(bundle: object):
+    return _leaf_runtime_bootstrap_service.bootstrap_runtime(bundle=bundle)
 
 
 def _runtime_tcp_local_generated(*, discovery_modules: list[str]) -> dict[str, object]:
@@ -108,11 +120,14 @@ def test_engine_target_model_reply_to_without_target_registers_once() -> None:
         ),
     )
 
-    runner.run_inputs(
-        [Envelope(payload=7, reply_to="http:req-1")],
+    enqueue_runner_input_sync(
+        runner,
+        Envelope(payload=7, reply_to="http:req-1"),
         run_id="run",
         scenario_id="scenario",
+        index=1,
     )
+    runner.run()
 
     counters = reply_waiter.diagnostics_counters()
     assert counters["registered"] == 1

@@ -7,8 +7,8 @@ from typing import Protocol, TypeVar, runtime_checkable
 
 from stream_kernel.application_context.service import service
 from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
-from stream_kernel.platform.services.observability import coerce_pipeline_observability
 from stream_kernel.platform.services.api.policy import RateLimiterService
+from stream_kernel.platform.services.observability import coerce_pipeline_observability
 
 T = TypeVar("T")
 

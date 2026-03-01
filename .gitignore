@@ -20,6 +20,8 @@ tests/usecases/steps/__pycache__/*
 poetry.lock
 .coverage
 
+*.pyc
+
 src/fund_load/domain/__pycache__/*
 tests/domain/__pycache__/*
 src/fund_load/usecases/steps/__pycache__/*
@@ -84,3 +86,11 @@ tests/stream_kernel/platform/services/api/__pycache__/*
 tests/stream_kernel/platform/services/messaging/__pycache__/*
 tests/stream_kernel/platform/services/runtime/__pycache__/*
 tests/stream_kernel/platform/services/state/__pycache__/*
+src/stream_kernel/execution/orchestration/control_plane/__pycache__/*
+src/stream_kernel/execution/orchestration/control_plane/leaf/__pycache__/*
+src/stream_kernel/execution/orchestration/control_plane/root/__pycache__/*
+src/stream_kernel/execution/orchestration/lifecycle/__pycache__/*
+src/stream_kernel/execution/orchestration/lifecycle/leaf/__pycache__/*
+src/stream_kernel/execution/orchestration/lifecycle/leaf/command/__pycache__/*
+src/stream_kernel/execution/orchestration/lifecycle/leaf/runtime/__pycache__/*
+src/stream_kernel/execution/orchestration/lifecycle/leaf/startup/__pycache__/*

@@ -6,8 +6,8 @@ from stream_kernel.config.loader import load_yaml_config
 from stream_kernel.config.validator import validate_newgen_config
 
 
-BASELINE = Path("src/fund_load/baseline_config_newgen.yml")
-EXPERIMENT = Path("src/fund_load/experiment_config_newgen.yml")
+BASELINE = Path("src/fund_load/archive/configs/baseline_config_newgen.yml")
+EXPERIMENT = Path("src/fund_load/archive/configs/experiment_config_newgen.yml")
 
 
 def _load_validated(path: Path) -> dict[str, object]:

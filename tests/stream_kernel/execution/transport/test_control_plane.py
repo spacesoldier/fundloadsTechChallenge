@@ -4,8 +4,8 @@ import json
 
 import pytest
 
-from stream_kernel.execution.transport.bootstrap_keys import build_bootstrap_key_bundle
-from stream_kernel.execution.transport.control_plane import (
+from stream_kernel.execution.orchestration.control_plane.bootstrap_keys import build_bootstrap_key_bundle
+from stream_kernel.execution.orchestration.control_plane.control_plane import (
     CONTROL_KIND_ACK,
     CONTROL_KIND_BOOTSTRAP_BUNDLE,
     ControlMessage,

@@ -124,6 +124,8 @@ class PrometheusMonitoringSink:
         http_port: int = 9464,
         http_path: str = "/metrics",
         textfile_path: str = "metrics/stream_kernel.prom",
+        textfile_write_every_n: int = 100,
+        textfile_write_interval_ms: int = 250,
     ) -> None:
         self._mode = mode
         self._namespace = namespace.strip() if isinstance(namespace, str) else ""
@@ -133,11 +135,16 @@ class PrometheusMonitoringSink:
         self._http_port = int(http_port)
         self._http_path = http_path if isinstance(http_path, str) and http_path else "/metrics"
         self._textfile_path = Path(textfile_path)
+        self._textfile_write_every_n = max(1, int(textfile_write_every_n))
+        self._textfile_write_interval_seconds = max(0.0, float(textfile_write_interval_ms) / 1000.0)
         self._render_lock = Lock()
         self._rendered = _PrometheusRendered(payload="", metric_count=0)
         self._snapshot_records: dict[str, dict[str, object]] = {}
         self._message_records: dict[str, dict[str, object]] = {}
         self._worker_sample_counters: dict[tuple[str, str, str, str], int] = {}
+        self._textfile_dirty = False
+        self._textfile_pending_updates = 0
+        self._last_textfile_write_monotonic = time.monotonic()
         self._exported = 0
         self._failed = 0
         self._http_server: ThreadingHTTPServer | None = None
@@ -202,6 +209,9 @@ class PrometheusMonitoringSink:
         return details
 
     def close(self) -> None:
+        if self._mode == "textfile":
+            with self._render_lock:
+                self._write_textfile_locked(force=True)
         server = self._http_server
         thread = self._http_thread
         self._http_server = None
@@ -217,6 +227,12 @@ class PrometheusMonitoringSink:
                 pass
         if thread is not None and thread.is_alive():
             thread.join(timeout=1.0)
+
+    def flush(self) -> None:
+        if self._mode != "textfile":
+            return
+        with self._render_lock:
+            self._write_textfile_locked(force=True)
 
     def _start_http_server(self) -> None:
         sink = self
@@ -263,10 +279,30 @@ class PrometheusMonitoringSink:
             *self._message_records.values(),
         ]
         rendered = self._render(merged_records)
-        if self._mode == "textfile":
-            self._textfile_path.parent.mkdir(parents=True, exist_ok=True)
-            self._textfile_path.write_text(rendered.payload, encoding="utf-8")
         self._rendered = rendered
+        if self._mode == "textfile":
+            self._textfile_dirty = True
+            self._textfile_pending_updates += 1
+            self._write_textfile_locked(force=False)
+
+    def _write_textfile_locked(self, *, force: bool) -> None:
+        if self._mode != "textfile":
+            return
+        if not self._textfile_dirty and not force:
+            return
+        if not force:
+            now = time.monotonic()
+            if (
+                self._textfile_pending_updates < self._textfile_write_every_n
+                and (now - self._last_textfile_write_monotonic) < self._textfile_write_interval_seconds
+            ):
+                return
+        self._textfile_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self._rendered.payload
+        self._textfile_path.write_text(payload, encoding="utf-8")
+        self._textfile_dirty = False
+        self._textfile_pending_updates = 0
+        self._last_textfile_write_monotonic = time.monotonic()
 
     def _record_key(self, record: dict[str, object]) -> str:
         name = str(record.get("name", ""))
@@ -496,6 +532,12 @@ def monitoring_prometheus(settings: dict[str, object]) -> PrometheusMonitoringSi
     port = http_cfg.get("port", 9464)
     path = http_cfg.get("path", "/metrics")
     textfile_path = textfile_cfg.get("path", "metrics/stream_kernel.prom")
+    textfile_write_every_n = textfile_cfg.get("write_every_n", 100)
+    if not isinstance(textfile_write_every_n, int) or textfile_write_every_n <= 0:
+        raise ValueError("monitoring_prometheus.settings.textfile.write_every_n must be an integer > 0")
+    textfile_write_interval_ms = textfile_cfg.get("write_interval_ms", 250)
+    if not isinstance(textfile_write_interval_ms, int) or textfile_write_interval_ms < 0:
+        raise ValueError("monitoring_prometheus.settings.textfile.write_interval_ms must be an integer >= 0")
 
     if not isinstance(host, str) or not host:
         raise ValueError("monitoring_prometheus.settings.http.host must be a non-empty string")
@@ -515,4 +557,6 @@ def monitoring_prometheus(settings: dict[str, object]) -> PrometheusMonitoringSi
         http_port=port,
         http_path=path,
         textfile_path=textfile_path,
+        textfile_write_every_n=textfile_write_every_n,
+        textfile_write_interval_ms=textfile_write_interval_ms,
     )

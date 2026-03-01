@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import deque
+from threading import Condition
+from time import monotonic
 
 from stream_kernel.application_context.service import service
 from stream_kernel.execution.transport.secure_tcp_transport import (
@@ -22,6 +24,18 @@ class QueuePort:
     def size(self) -> int:
         raise NotImplementedError("QueuePort.size must be implemented")
 
+    def wait_for_item(self, timeout_seconds: float) -> bool:
+        # Optional efficient wait hook used by long-running runner loops.
+        _ = timeout_seconds
+        return self.size() > 0
+
+    def close(self) -> None:
+        # Optional shutdown hook; default no-op for transports without close semantics.
+        return None
+
+    def is_closed(self) -> bool:
+        return False
+
 
 class TopicPort:
     # Port for pub/sub-like message streams.
@@ -40,17 +54,54 @@ class InMemoryQueue(QueuePort):
     # In-memory FIFO queue for deterministic runs (Execution runtime and routing integration §8.1).
     def __init__(self) -> None:
         self._queue: deque[object] = deque()
+        self._cv = Condition()
+        self._closed = False
 
     def push(self, envelope: object) -> None:
-        self._queue.append(envelope)
+        with self._cv:
+            if self._closed:
+                raise RuntimeError("InMemoryQueue is closed")
+            self._queue.append(envelope)
+            self._cv.notify()
 
     def pop(self) -> object | None:
-        if not self._queue:
-            return None
-        return self._queue.popleft()
+        with self._cv:
+            if not self._queue:
+                return None
+            return self._queue.popleft()
 
     def size(self) -> int:
-        return len(self._queue)
+        with self._cv:
+            return len(self._queue)
+
+    def wait_for_item(self, timeout_seconds: float) -> bool:
+        timeout = max(0.0, float(timeout_seconds))
+        with self._cv:
+            if self._queue:
+                return True
+            if self._closed:
+                return False
+            if timeout == 0.0:
+                return False
+            deadline = monotonic() + timeout
+            remaining = timeout
+            while remaining > 0:
+                self._cv.wait(remaining)
+                if self._queue:
+                    return True
+                if self._closed:
+                    return False
+                remaining = deadline - monotonic()
+            return False
+
+    def close(self) -> None:
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+
+    def is_closed(self) -> bool:
+        with self._cv:
+            return self._closed
 
 
 @service(name="execution_queue_tcp_local")
@@ -62,20 +113,58 @@ class TcpLocalQueue(QueuePort):
         self._queue: deque[object] = deque()
         self._transport = transport
         self._transport_rejects = 0
+        self._cv = Condition()
+        self._closed = False
 
     def push(self, envelope: object) -> None:
+        with self._cv:
+            if self._closed:
+                raise RuntimeError("TcpLocalQueue is closed")
         if isinstance(envelope, (bytes, bytearray, memoryview)):
             self._push_framed(bytes(envelope))
             return
-        self._queue.append(envelope)
+        with self._cv:
+            self._queue.append(envelope)
+            self._cv.notify()
 
     def pop(self) -> object | None:
-        if not self._queue:
-            return None
-        return self._queue.popleft()
+        with self._cv:
+            if not self._queue:
+                return None
+            return self._queue.popleft()
 
     def size(self) -> int:
-        return len(self._queue)
+        with self._cv:
+            return len(self._queue)
+
+    def wait_for_item(self, timeout_seconds: float) -> bool:
+        timeout = max(0.0, float(timeout_seconds))
+        with self._cv:
+            if self._queue:
+                return True
+            if self._closed:
+                return False
+            if timeout == 0.0:
+                return False
+            deadline = monotonic() + timeout
+            remaining = timeout
+            while remaining > 0:
+                self._cv.wait(remaining)
+                if self._queue:
+                    return True
+                if self._closed:
+                    return False
+                remaining = deadline - monotonic()
+            return False
+
+    def close(self) -> None:
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+
+    def is_closed(self) -> bool:
+        with self._cv:
+            return self._closed
 
     def transport_reject_count(self) -> int:
         # Diagnostic counter for rejected tcp-local boundary frames.
@@ -83,14 +172,18 @@ class TcpLocalQueue(QueuePort):
 
     def _push_framed(self, framed: bytes) -> None:
         if self._transport is None:
-            self._queue.append(framed)
+            with self._cv:
+                self._queue.append(framed)
+                self._cv.notify()
             return
         try:
             secure = self._transport.decode_framed_message(framed)
         except SecureTcpTransportError as exc:
             self._transport_rejects += 1
             raise ValueError("tcp_local transport reject: invalid frame") from exc
-        self._queue.append(_secure_to_envelope(secure))
+        with self._cv:
+            self._queue.append(_secure_to_envelope(secure))
+            self._cv.notify()
 
 
 @service(name="execution_topic")

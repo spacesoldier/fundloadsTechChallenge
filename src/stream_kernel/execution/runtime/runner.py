@@ -263,98 +263,6 @@ class SyncRunner:
                         continue
                     work_queue.push(envelope_out)
 
-    def run_inputs(
-        self,
-        inputs: list[object],
-        *,
-        run_id: str,
-        scenario_id: str,
-    ) -> None:
-        # Bootstrap entrypoint payloads.
-        # For each input:
-        # 1) allocate deterministic trace_id;
-        # 2) seed context metadata;
-        # 3) route initial payload to first consumers;
-        # 4) drain queue end-to-end (`self.run()`).
-        #
-        # This preserves "message-by-message" deterministic processing.
-        context_service = self._context_service()
-        work_queue = self._work_queue()
-        router = self._router()
-        for index, payload in enumerate(inputs, start=1):
-            if isinstance(payload, Envelope):
-                trace_id = payload.trace_id or self._trace_id(run_id=run_id, index=index)
-                self._seed_context(
-                    context_service=context_service,
-                    trace_id=trace_id,
-                    payload=payload.payload,
-                    run_id=run_id,
-                    scenario_id=scenario_id,
-                    reply_to=payload.reply_to,
-                )
-                ingress_service_outputs = self._emit_ingress(
-                    trace_id=trace_id,
-                    reply_to=payload.reply_to,
-                )
-                self._route_observability_service_outputs(
-                    service_outputs=ingress_service_outputs,
-                    source_node="__ingress__",
-                    trace_id=trace_id,
-                    reply_to=payload.reply_to,
-                    span_id=payload.span_id,
-                    work_queue=work_queue,
-                    router=router,
-                )
-                if payload.target is not None:
-                    work_queue.push(
-                        Envelope(
-                            payload=payload.payload,
-                            target=payload.target,
-                            trace_id=trace_id,
-                            reply_to=payload.reply_to,
-                            span_id=payload.span_id,
-                        )
-                    )
-                else:
-                    routing_result = router.route([payload.payload])
-                    for target_name, routed_payload in self._local_deliveries(routing_result):
-                        work_queue.push(
-                            Envelope(
-                                payload=routed_payload,
-                                target=target_name,
-                                trace_id=trace_id,
-                                reply_to=payload.reply_to,
-                                span_id=payload.span_id,
-                            )
-                        )
-                self.run()
-                continue
-
-            trace_id = self._trace_id(run_id=run_id, index=index)
-            self._seed_context(
-                context_service=context_service,
-                trace_id=trace_id,
-                payload=payload,
-                run_id=run_id,
-                scenario_id=scenario_id,
-            )
-            ingress_service_outputs = self._emit_ingress(trace_id=trace_id, reply_to=None)
-            self._route_observability_service_outputs(
-                service_outputs=ingress_service_outputs,
-                source_node="__ingress__",
-                trace_id=trace_id,
-                reply_to=None,
-                span_id=None,
-                work_queue=work_queue,
-                router=router,
-            )
-            routing_result = router.route([payload])
-            for target_name, routed_payload in self._local_deliveries(routing_result):
-                work_queue.push(
-                    Envelope(payload=routed_payload, target=target_name, trace_id=trace_id)
-                )
-            self.run()
-
     def on_run_end(self) -> None:
         # Finalize observability lifecycle once run loop is completed.
         self._observability().on_run_end()
@@ -483,7 +391,7 @@ class SyncRunner:
 
     @staticmethod
     def _is_observability_system_node(node_name: str) -> bool:
-        return node_name.startswith("system.obs.")
+        return node_name.startswith("system.obs.") or node_name.startswith("system.transport.handoff.")
 
     def __post_init__(self) -> None:
         if self.ordered_sink_mode not in _ORDERED_SINK_MODES:
@@ -627,6 +535,41 @@ class SyncRunner:
             return
         observability_ctx["__runner_gap_ms"] = (now - prev) * 1000.0
 
+    def run_until_stopped(
+        self,
+        *,
+        poll_timeout_seconds: float = 0.01,
+        idle_timeout_seconds: float | None = None,
+    ) -> None:
+        # Long-running loop variant: drain work, then block efficiently waiting for new items.
+        # Exit on explicit stop (respecting drain_on_stop), queue close, or optional idle timeout.
+        work_queue = self._work_queue()
+        poll_timeout = max(0.0, float(poll_timeout_seconds))
+        idle_deadline = (time.monotonic() + float(idle_timeout_seconds)) if isinstance(idle_timeout_seconds, (int, float)) and float(idle_timeout_seconds) > 0 else None
+        while True:
+            self.run()
+            if self._stop_requested:
+                size_fn = getattr(work_queue, "size", None)
+                size = size_fn() if callable(size_fn) else 0
+                if not self.drain_on_stop or size == 0:
+                    return
+            if callable(getattr(work_queue, "is_closed", None)) and bool(work_queue.is_closed()):
+                if work_queue.size() == 0:
+                    return
+            now = time.monotonic()
+            if idle_deadline is not None and now >= idle_deadline and work_queue.size() == 0:
+                return
+            wait_fn = getattr(work_queue, "wait_for_item", None)
+            if not callable(wait_fn):
+                if poll_timeout > 0:
+                    time.sleep(poll_timeout)
+                continue
+            if wait_fn(poll_timeout):
+                idle_deadline = (time.monotonic() + float(idle_timeout_seconds)) if idle_deadline is not None else None
+                continue
+            if idle_deadline is not None and work_queue.size() == 0 and time.monotonic() >= idle_deadline:
+                return
+
 
 @dataclass(slots=True)
 class AsyncRunner:
@@ -650,6 +593,19 @@ class AsyncRunner:
 
     def run(self) -> None:
         _run_async_blocking(self.run_async())
+
+    def run_until_stopped(
+        self,
+        *,
+        poll_timeout_seconds: float = 0.01,
+        idle_timeout_seconds: float | None = None,
+    ) -> None:
+        _run_async_blocking(
+            self.run_until_stopped_async(
+                poll_timeout_seconds=poll_timeout_seconds,
+                idle_timeout_seconds=idle_timeout_seconds,
+            )
+        )
 
     async def run_async(self) -> None:
         context_service = self._context_service()
@@ -836,95 +792,46 @@ class AsyncRunner:
                         continue
                     work_queue.push(envelope_out)
 
-    def run_inputs(
+    async def run_until_stopped_async(
         self,
-        inputs: list[object],
         *,
-        run_id: str,
-        scenario_id: str,
+        poll_timeout_seconds: float = 0.01,
+        idle_timeout_seconds: float | None = None,
     ) -> None:
-        _run_async_blocking(self.run_inputs_async(inputs, run_id=run_id, scenario_id=scenario_id))
-
-    async def run_inputs_async(
-        self,
-        inputs: list[object],
-        *,
-        run_id: str,
-        scenario_id: str,
-    ) -> None:
-        context_service = self._context_service()
         work_queue = self._work_queue()
-        router = self._router()
-        for index, payload in enumerate(inputs, start=1):
-            if isinstance(payload, Envelope):
-                trace_id = payload.trace_id or SyncRunner._trace_id(run_id=run_id, index=index)
-                SyncRunner._seed_context(
-                    context_service=context_service,
-                    trace_id=trace_id,
-                    payload=payload.payload,
-                    run_id=run_id,
-                    scenario_id=scenario_id,
-                    reply_to=payload.reply_to,
-                )
-                ingress_service_outputs = self._emit_ingress(trace_id=trace_id, reply_to=payload.reply_to)
-                self._route_observability_service_outputs(
-                    service_outputs=ingress_service_outputs,
-                    source_node="__ingress__",
-                    trace_id=trace_id,
-                    reply_to=payload.reply_to,
-                    span_id=payload.span_id,
-                    work_queue=work_queue,
-                    router=router,
-                )
-                if payload.target is not None:
-                    work_queue.push(
-                        Envelope(
-                            payload=payload.payload,
-                            target=payload.target,
-                            trace_id=trace_id,
-                            reply_to=payload.reply_to,
-                            span_id=payload.span_id,
-                        )
-                    )
-                else:
-                    routing_result = router.route([payload.payload])
-                    for target_name, routed_payload in SyncRunner._local_deliveries(routing_result):
-                        work_queue.push(
-                            Envelope(
-                                payload=routed_payload,
-                                target=target_name,
-                                trace_id=trace_id,
-                                reply_to=payload.reply_to,
-                                span_id=payload.span_id,
-                            )
-                        )
-                await self.run_async()
-                continue
-
-            trace_id = SyncRunner._trace_id(run_id=run_id, index=index)
-            SyncRunner._seed_context(
-                context_service=context_service,
-                trace_id=trace_id,
-                payload=payload,
-                run_id=run_id,
-                scenario_id=scenario_id,
-            )
-            ingress_service_outputs = self._emit_ingress(trace_id=trace_id, reply_to=None)
-            self._route_observability_service_outputs(
-                service_outputs=ingress_service_outputs,
-                source_node="__ingress__",
-                trace_id=trace_id,
-                reply_to=None,
-                span_id=None,
-                work_queue=work_queue,
-                router=router,
-            )
-            routing_result = router.route([payload])
-            for target_name, routed_payload in SyncRunner._local_deliveries(routing_result):
-                work_queue.push(
-                    Envelope(payload=routed_payload, target=target_name, trace_id=trace_id)
-                )
+        poll_timeout = max(0.0, float(poll_timeout_seconds))
+        idle_deadline = (
+            time.monotonic() + float(idle_timeout_seconds)
+            if isinstance(idle_timeout_seconds, (int, float)) and float(idle_timeout_seconds) > 0
+            else None
+        )
+        while True:
             await self.run_async()
+            if self._stop_requested:
+                size_fn = getattr(work_queue, "size", None)
+                size = size_fn() if callable(size_fn) else 0
+                if not self.drain_on_stop or size == 0:
+                    return
+            if callable(getattr(work_queue, "is_closed", None)) and bool(work_queue.is_closed()):
+                if work_queue.size() == 0:
+                    return
+            now = time.monotonic()
+            if idle_deadline is not None and now >= idle_deadline and work_queue.size() == 0:
+                return
+            wait_fn = getattr(work_queue, "wait_for_item", None)
+            if not callable(wait_fn):
+                if poll_timeout > 0:
+                    await asyncio.sleep(poll_timeout)
+                continue
+            if wait_fn(poll_timeout):
+                idle_deadline = (
+                    time.monotonic() + float(idle_timeout_seconds)
+                    if idle_deadline is not None
+                    else None
+                )
+                continue
+            if idle_deadline is not None and work_queue.size() == 0 and time.monotonic() >= idle_deadline:
+                return
 
     def request_stop(self) -> None:
         # Graceful stop signal: runner finishes inflight queue when drain_on_stop=True.

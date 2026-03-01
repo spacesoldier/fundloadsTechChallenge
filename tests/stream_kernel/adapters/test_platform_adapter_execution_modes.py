@@ -7,6 +7,10 @@ from stream_kernel.adapters.file_io import (
     sink_file_sink,
     source_file_source,
 )
+from stream_kernel.execution.transport.carriers.ipc.ipc_adapters import (
+    execution_ipc_inmemory_adapter,
+    execution_ipc_pipe_adapter,
+)
 from stream_kernel.platform.services.state.context import kv_store_memory
 
 
@@ -31,6 +35,16 @@ def test_memory_kv_adapter_is_marked_sync_execution_mode() -> None:
     kv_meta = get_adapter_meta(kv_store_memory)
     assert kv_meta is not None
     assert kv_meta.execution_mode == "sync"
+
+
+def test_ipc_transport_adapters_are_marked_async_execution_mode() -> None:
+    # IPC transport adapters should declare async capability by default.
+    inmemory_meta = get_adapter_meta(execution_ipc_inmemory_adapter)
+    pipe_meta = get_adapter_meta(execution_ipc_pipe_adapter)
+    assert inmemory_meta is not None
+    assert pipe_meta is not None
+    assert inmemory_meta.execution_mode == "async"
+    assert pipe_meta.execution_mode == "async"
 
 
 def test_trace_sink_port_is_runtime_checkable_protocol() -> None:

@@ -27,7 +27,6 @@ from stream_kernel.execution.orchestration.builder import (
     ensure_platform_discovery_modules,
     ensure_runtime_observability_binding,
     ensure_runtime_api_policy_bindings,
-    ensure_runtime_bootstrap_binding,
     ensure_runtime_registry_bindings,
     ensure_runtime_transport_bindings,
     load_discovery_modules,
@@ -42,16 +41,16 @@ from stream_kernel.execution.orchestration.builder import (
 )
 from stream_kernel.execution.orchestration.source_ingress import build_source_ingress_plan
 from stream_kernel.execution.orchestration.observability_system_nodes import (
+    LogDispatchEvent,
     MetricDispatchEvent,
+    MonitorDispatchEvent,
+    MonitoringMetricsSnapshotEvent,
     TraceDispatchEvent,
     WorkerQueueTelemetryEvent,
     build_observability_system_plan,
 )
-from stream_kernel.execution.transport.bootstrap_keys import BootstrapChannelStateError
-from stream_kernel.execution.orchestration.lifecycle_orchestration import (
-    RuntimeBootstrapStopError,
-    RuntimeBootstrapStopTimeoutError,
-    RuntimeBootstrapStartError,
+from stream_kernel.execution.orchestration.control_plane.bootstrap_keys import BootstrapChannelStateError
+from stream_kernel.execution.orchestration.lifecycle import (
     RuntimeLifecycleReadyError,
     RuntimeLifecycleResolutionError,
     RuntimeWorkerFailedError,
@@ -60,8 +59,6 @@ from stream_kernel.application_context.service import service
 from stream_kernel.application_context.inject import inject
 from stream_kernel.platform.services.state.context import ContextService, InMemoryKvContextService
 from stream_kernel.application_context.injection_registry import InjectionRegistry, InjectionRegistryError
-from stream_kernel.execution.observers.observer_builder import build_execution_observers_from_factories
-from stream_kernel.execution.observers.observer import ExecutionObserver, ObserverFactoryContext
 from stream_kernel.execution.runtime.planning import plan_pools
 from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
 from stream_kernel.application_context.application_context import ApplicationContext
@@ -70,12 +67,22 @@ from stream_kernel.routing.routing_service import RoutingService
 from stream_kernel.integration.work_queue import InMemoryQueue, TcpLocalQueue
 from stream_kernel.execution.transport.secure_tcp_transport import SecureTcpConfig, SecureTcpTransport
 from stream_kernel.platform.services.observability import (
-    FanoutObservabilityService,
     NoOpObservabilityService,
     ObservabilityPipelineService,
     ObservabilityService,
-    ReplyAwareObservabilityService,
     WorkerQueueTelemetryService,
+)
+from stream_kernel.platform.services.observability_dispatch import DispatchingObservabilityService
+from stream_kernel.execution.transport.ipc.ipc_transport import ExecutionIpcKvStreamPort
+from stream_kernel.execution.transport.carriers.ipc.ipc_adapters import (
+    PipeExecutionIpcTransportAdapter,
+)
+from stream_kernel.execution.transport.ipc.ipc_transport_service import (
+    ExecutionIpcTransportCoordinatorService,
+)
+from stream_kernel.execution.transport.handoff import (
+    ExecutionIpcHandoffDispatchService,
+    ExecutionIpcRouteTableService,
 )
 from stream_kernel.platform.services.api.policy import (
     ApiPolicyService,
@@ -87,25 +94,27 @@ from stream_kernel.platform.services.messaging.reply_coordinator import (
     legacy_reply_coordinator,
 )
 from stream_kernel.platform.services.runtime.transport import (
+    IpcLocalRuntimeTransportService,
     MemoryRuntimeTransportService,
     RuntimeTransportService,
     TcpLocalRuntimeTransportService,
+)
+from stream_kernel.execution.transport.ipc.ipc_transport import ExecutionIpcEndpointRegistry
+from stream_kernel.platform.services.runtime.control_plane_events import (
+    ControlPlaneLeafPulse,
+    ControlPlaneRootPulse,
 )
 from stream_kernel.platform.services.messaging.reply_waiter import (
     InMemoryReplyWaiterService,
     TerminalEvent,
 )
 from stream_kernel.platform.services.runtime.lifecycle import RuntimeLifecycleManager
-from stream_kernel.platform.services.runtime.bootstrap import (
-    BootstrapSupervisor,
-    LocalBootstrapSupervisor,
-    MultiprocessBootstrapSupervisor,
-)
 from stream_kernel.kernel.scenario import StepSpec
 from stream_kernel.routing.envelope import Envelope
 from stream_kernel.routing.router import RoutingResult
 from stream_kernel.kernel.dag import NodeContract, build_dag
 import stream_kernel.execution.orchestration.builder as builder_module
+import stream_kernel.execution.orchestration.runtime.runner_execution_service as runner_execution_module
 
 
 class _Token:
@@ -155,6 +164,17 @@ def _source_factory(settings: dict[str, object]) -> object:
     return object()
 
 
+@adapter(
+    name="execution_ipc_pipe",
+    kind="ipc.transport.pipe",
+    consumes=[],
+    emits=[],
+    binds=[("kv_stream", ExecutionIpcKvStreamPort)],
+)
+def _ipc_transport_factory(settings: dict[str, object]) -> object:
+    return object()
+
+
 def test_resolve_runtime_adapters_requires_mapping_role_config() -> None:
     with pytest.raises(ValueError):
         resolve_runtime_adapters(adapters={"sink": "nope"}, discovery_modules=[])  # type: ignore[arg-type]
@@ -191,6 +211,68 @@ def test_build_adapter_bindings_resolves_typed_ports() -> None:
         registry,
     )
     assert bindings["source"] == [("stream", _StreamPort)]
+
+
+def test_build_adapter_bindings_defaults_ipc_transport_adapter() -> None:
+    registry = AdapterRegistry()
+    registry.register("execution_ipc_pipe", "execution_ipc_pipe", _ipc_transport_factory)
+    bindings = build_adapter_bindings(
+        {"execution_ipc_pipe": {"settings": {"codec": "pickle"}}},
+        registry,
+    )
+    assert bindings["execution_ipc_pipe"] == [("kv_stream", ExecutionIpcKvStreamPort)]
+
+
+def test_ensure_runtime_ipc_bindings_defaults_to_pipe_transport_for_process_supervisor() -> None:
+    registry = InjectionRegistry()
+    runtime = {
+        "platform": {
+            "bootstrap": {"mode": "process_supervisor"},
+            "process_groups": [{"name": "execution.alpha", "workers": 1, "nodes": []}],
+            "execution_ipc": {"transport": "tcp_local"},
+        }
+    }
+
+    builder_module.ensure_runtime_ipc_bindings(
+        injection_registry=registry,
+        runtime=runtime,
+    )
+
+    scope = registry.instantiate_for_scenario("s1")
+    service = scope.resolve("service", ExecutionIpcTransportCoordinatorService)
+    adapter = scope.resolve("kv_stream", ExecutionIpcKvStreamPort)
+    endpoint_registry = scope.resolve("kv", ExecutionIpcEndpointRegistry)
+
+    assert isinstance(service, ExecutionIpcTransportCoordinatorService)
+    assert isinstance(service.adapter, PipeExecutionIpcTransportAdapter)
+    assert isinstance(adapter, PipeExecutionIpcTransportAdapter)
+    assert service.adapter is adapter
+    assert service.endpoint_registry is endpoint_registry
+
+
+def test_build_runtime_artifacts_registers_ipc_handoff_services_for_root_runtime() -> None:
+    config = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {
+            "strict": True,
+            "discovery_modules": [],
+            "platform": {
+                "bootstrap": {"mode": "process_supervisor"},
+                "process_groups": [{"name": "execution.alpha", "workers": 1, "nodes": []}],
+                "execution_ipc": {"transport": "ipc_local"},
+            },
+        },
+        "nodes": {},
+        "adapters": {},
+    }
+
+    artifacts = build_runtime_artifacts(config)
+    route_table = artifacts.scenario_scope.resolve("service", ExecutionIpcRouteTableService)
+    dispatch = artifacts.scenario_scope.resolve("service", ExecutionIpcHandoffDispatchService)
+
+    assert route_table is not None
+    assert dispatch is not None
 
 
 def test_build_adapter_contracts_uses_role_name_as_contract_id() -> None:
@@ -782,7 +864,7 @@ def test_ensure_platform_discovery_modules_appends_framework_modules() -> None:
     assert "stream_kernel.integration.work_queue" in modules
     assert "stream_kernel.routing.routing_service" in modules
     assert "stream_kernel.observability.adapters" in modules
-    assert "stream_kernel.observability.observers" in modules
+    assert "stream_kernel.observability.observers" not in modules
 
 
 def test_ensure_platform_discovery_modules_does_not_duplicate_entries() -> None:
@@ -791,13 +873,12 @@ def test_ensure_platform_discovery_modules_does_not_duplicate_entries() -> None:
         "stream_kernel.integration.work_queue",
         "stream_kernel.routing.routing_service",
         "stream_kernel.observability.adapters",
-        "stream_kernel.observability.observers",
     ]
     ensure_platform_discovery_modules(modules)
     assert modules.count("stream_kernel.integration.work_queue") == 1
     assert modules.count("stream_kernel.routing.routing_service") == 1
     assert modules.count("stream_kernel.observability.adapters") == 1
-    assert modules.count("stream_kernel.observability.observers") == 1
+    assert "stream_kernel.observability.observers" not in modules
 
 
 def test_resolve_step_names_excludes_external_contract_nodes() -> None:
@@ -852,65 +933,6 @@ def test_load_discovery_modules_deduplicates_root_and_explicit_submodule(
     names = [m.__name__ for m in modules]
     assert names.count("fake_root_dupe") == 0
     assert names.count("fake_root_dupe.mod_a") == 1
-
-
-class _Observer:
-    def before_node(self, **kwargs: object) -> object | None:
-        return None
-
-    def after_node(self, **kwargs: object) -> None:
-        return None
-
-    def on_node_error(self, **kwargs: object) -> None:
-        return None
-
-    def on_run_end(self) -> None:
-        return None
-
-
-def test_build_execution_observers_collects_from_factories() -> None:
-    def _factory(_ctx: ObserverFactoryContext) -> ExecutionObserver:
-        return _Observer()
-
-    observers = build_execution_observers_from_factories(
-        factories={"x": _factory},
-        runtime={},
-        adapter_instances={},
-        run_id="r1",
-        scenario_id="s1",
-        node_order=[],
-    )
-    assert len(observers) == 1
-
-
-def test_build_execution_observers_flattens_list_result() -> None:
-    def _factory(_ctx: ObserverFactoryContext) -> list[ExecutionObserver]:
-        return [_Observer(), _Observer()]
-
-    observers = build_execution_observers_from_factories(
-        factories={"x": _factory},
-        runtime={},
-        adapter_instances={},
-        run_id="r1",
-        scenario_id="s1",
-        node_order=[],
-    )
-    assert len(observers) == 2
-
-
-def test_build_execution_observers_rejects_non_observer_result() -> None:
-    def _factory(_ctx: ObserverFactoryContext) -> object:
-        return object()
-
-    with pytest.raises(ValueError):
-        build_execution_observers_from_factories(
-            factories={"x": _factory},
-            runtime={},
-            adapter_instances={},
-            run_id="r1",
-            scenario_id="s1",
-            node_order=[],
-        )
 
 
 def test_scenario_name_falls_back_when_missing() -> None:
@@ -1465,6 +1487,28 @@ def test_runtime_transport_service_tcp_local_profile_is_bound_in_di() -> None:
     assert transport.profile == "tcp_local"
 
 
+def test_runtime_transport_service_ipc_local_profile_is_bound_in_di() -> None:
+    registry = InjectionRegistry()
+    ensure_runtime_transport_bindings(
+        injection_registry=registry,
+        runtime={
+            "platform": {
+                "execution_ipc": {
+                    "transport": "ipc_local",
+                    "bind_host": "127.0.0.1",
+                    "bind_port": 0,
+                    "auth": {"mode": "hmac", "ttl_seconds": 30, "nonce_cache_size": 1000},
+                    "max_payload_bytes": 1048576,
+                }
+            }
+        },
+    )
+    scope = registry.instantiate_for_scenario("s1")
+    transport = scope.resolve("service", RuntimeTransportService)
+    assert isinstance(transport, IpcLocalRuntimeTransportService)
+    assert transport.profile == "ipc_local"
+
+
 def test_runtime_transport_tcp_local_generated_secret_mode_builds_signing_secret() -> None:
     # KEY-IPC-01: generated secret mode should provision non-empty signing secret bytes.
     registry = InjectionRegistry()
@@ -1495,40 +1539,6 @@ def test_runtime_transport_tcp_local_generated_secret_mode_builds_signing_secret
     assert isinstance(secret, bytes)
     assert len(secret) > 0
     assert secret != b"runtime-session-secret"
-
-
-def test_ensure_runtime_bootstrap_binding_prefers_multiprocess_for_process_supervisor_mode() -> None:
-    # Bootstrap supervisor must be selected by runtime.bootstrap.mode, not by service discovery order.
-    registry = InjectionRegistry()
-    ensure_runtime_bootstrap_binding(
-        injection_registry=registry,
-        runtime={"platform": {"bootstrap": {"mode": "process_supervisor"}}},
-    )
-    scope = registry.instantiate_for_scenario("s1")
-    resolved = scope.resolve("service", BootstrapSupervisor)
-    assert isinstance(resolved, MultiprocessBootstrapSupervisor)
-
-
-def test_ensure_runtime_bootstrap_binding_uses_local_for_inline_mode() -> None:
-    registry = InjectionRegistry()
-    ensure_runtime_bootstrap_binding(
-        injection_registry=registry,
-        runtime={"platform": {"bootstrap": {"mode": "inline"}}},
-    )
-    scope = registry.instantiate_for_scenario("s1")
-    resolved = scope.resolve("service", BootstrapSupervisor)
-    assert isinstance(resolved, LocalBootstrapSupervisor)
-
-
-def test_ensure_runtime_bootstrap_binding_defaults_to_multiprocess_when_groups_declared() -> None:
-    registry = InjectionRegistry()
-    ensure_runtime_bootstrap_binding(
-        injection_registry=registry,
-        runtime={"platform": {"process_groups": [{"name": "execution.cpu"}]}},
-    )
-    scope = registry.instantiate_for_scenario("s1")
-    resolved = scope.resolve("service", BootstrapSupervisor)
-    assert isinstance(resolved, MultiprocessBootstrapSupervisor)
 
 
 def test_runtime_transport_secret_resolution_error_redacts_secret_value() -> None:
@@ -1622,6 +1632,476 @@ def test_build_runtime_artifacts_accepts_tcp_local_profile_with_framework_lifecy
 
     # No-op scenario must execute through lifecycle-managed path without monkeypatch helpers.
     execute_runtime_artifacts(artifacts)
+
+
+def test_build_runtime_artifacts_injects_root_pulse_for_process_supervisor_mode() -> None:
+    config = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {
+            "strict": True,
+            "discovery_modules": [],
+            "platform": {"process_groups": [{"name": "execution.cpu"}]},
+        },
+        "nodes": {},
+        "adapters": {},
+    }
+
+    artifacts = build_runtime_artifacts(config)
+
+    assert artifacts.inputs
+    assert isinstance(artifacts.inputs[0], ControlPlaneRootPulse)
+
+
+def test_build_runtime_artifacts_skips_root_pulse_for_worker_process() -> None:
+    config = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {
+            "__process_role": "worker",
+            "strict": True,
+            "discovery_modules": [],
+            "platform": {"process_groups": [{"name": "execution.cpu"}]},
+        },
+        "nodes": {},
+        "adapters": {},
+    }
+
+    artifacts = build_runtime_artifacts(config)
+
+    assert not any(isinstance(item, ControlPlaneRootPulse) for item in artifacts.inputs)
+
+
+def test_build_runtime_artifacts_injects_leaf_pulse_for_worker_process() -> None:
+    config = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {
+            "__process_role": "worker",
+            "strict": True,
+            "discovery_modules": [],
+            "platform": {"process_groups": [{"name": "execution.cpu"}]},
+        },
+        "nodes": {},
+        "adapters": {},
+    }
+
+    artifacts = build_runtime_artifacts(config)
+
+    assert artifacts.inputs
+    assert isinstance(artifacts.inputs[0], ControlPlaneLeafPulse)
+
+
+def test_build_runtime_artifacts_includes_control_plane_root_nodes() -> None:
+    config = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {
+            "strict": True,
+            "discovery_modules": [],
+            "platform": {"process_groups": [{"name": "execution.cpu"}]},
+        },
+        "nodes": {},
+        "adapters": {},
+    }
+
+    artifacts = build_runtime_artifacts(config)
+
+    step_names = {spec.name for spec in artifacts.scenario.steps}
+    assert "system.cp.root_bootstrap" in step_names
+    assert "system.cp.discovery_collect" in step_names
+    assert "system.cp.init_plan" in step_names
+
+    registry = artifacts.consumer_registry
+    assert registry is not None
+    assert "system.cp.root_bootstrap" in registry.get_consumers(ControlPlaneRootPulse)
+
+
+def test_build_runtime_artifacts_process_supervisor_root_omits_business_nodes(tmp_path: Path) -> None:
+    pkg = tmp_path / "root_only_cp_pkg"
+    _write_file(pkg / "__init__.py", "")
+    _write_file(
+        pkg / "nodes.py",
+        "\n".join(
+            [
+                "from stream_kernel.kernel.node_annotation import node",
+                "",
+                "@node(name='biz.source', consumes=[], emits=[int])",
+                "def biz_source(payload, ctx):",
+                "    _ = (payload, ctx)",
+                "    return [1]",
+                "",
+                "@node(name='biz.step', consumes=[int], emits=[str])",
+                "def biz_step(payload, ctx):",
+                "    _ = ctx",
+                "    return [str(payload)]",
+                "",
+            ]
+        ),
+    )
+
+    config = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {
+            "strict": True,
+            "discovery_modules": ["root_only_cp_pkg"],
+            "platform": {
+                "bootstrap": {"mode": "process_supervisor"},
+                "process_groups": [{"name": "execution.alpha", "nodes": ["biz.source", "biz.step"]}],
+            },
+        },
+        "nodes": {},
+        "adapters": {},
+    }
+
+    sys.path.insert(0, str(tmp_path))
+    try:
+        artifacts = build_runtime_artifacts(config)
+    finally:
+        sys.path.remove(str(tmp_path))
+
+    step_names = {spec.name for spec in artifacts.scenario.steps}
+    assert "biz.step" not in step_names
+    assert "system.cp.root_bootstrap" in step_names
+    assert "system.cp.discovery_collect" in step_names
+    assert "system.cp.init_plan" in step_names
+
+
+def test_build_runtime_artifacts_includes_control_plane_leaf_node_for_workers() -> None:
+    config = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {
+            "__process_role": "worker",
+            "strict": True,
+            "discovery_modules": [],
+            "platform": {"process_groups": [{"name": "execution.cpu"}]},
+        },
+        "nodes": {},
+        "adapters": {},
+    }
+
+    artifacts = build_runtime_artifacts(config)
+
+    step_names = {spec.name for spec in artifacts.scenario.steps}
+    assert "system.cp.leaf_bootstrap" in step_names
+    assert "system.cp.root_bootstrap" not in step_names
+
+    registry = artifacts.consumer_registry
+    assert registry is not None
+    assert "system.cp.leaf_bootstrap" in registry.get_consumers(ControlPlaneLeafPulse)
+
+
+def test_build_runtime_artifacts_binds_control_plane_runtime_lifecycle_manager_for_process_supervisor() -> None:
+    from stream_kernel.execution.orchestration.lifecycle.root.runtime.lifecycle_manager import (
+        ControlPlaneRootRuntimeLifecycleManager,
+    )
+
+    config = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {
+            "strict": True,
+            "discovery_modules": [],
+            "platform": {"process_groups": [{"name": "execution.cpu"}]},
+        },
+        "nodes": {},
+        "adapters": {},
+    }
+
+    artifacts = build_runtime_artifacts(config)
+    lifecycle = artifacts.scenario_scope.resolve("service", RuntimeLifecycleManager)
+
+    assert isinstance(lifecycle, ControlPlaneRootRuntimeLifecycleManager)
+
+
+def test_run_with_sync_runner_drains_external_deliveries_via_root_boundary_handoff_for_root_pulse() -> None:
+    from stream_kernel.execution.orchestration.control_plane.root.boundary_handoff_service import (
+        ControlPlaneRootBoundaryHandoffService,
+    )
+
+    class _Handoff:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def drain_external_deliveries(self, *, envelopes: list[Envelope], source_group: str | None = None) -> list[object]:
+            self.calls.append({"envelopes": list(envelopes), "source_group": source_group})
+            return []
+
+    registry = InjectionRegistry()
+    queue = InMemoryQueue()
+    registry.register_factory("queue", Envelope, lambda _q=queue: _q, qualifier="execution.cpu")
+    consumer_registry = InMemoryConsumerRegistry()
+    consumer_registry.register(ControlPlaneRootPulse, ["system.cp.root_bootstrap"])
+    consumer_registry.register(int, ["A"])
+    registry.register_factory(
+        "service",
+        RoutingService,
+        lambda _r=RoutingService(registry=consumer_registry, strict=True): _r,
+    )
+    registry.register_factory("kv", KVStore, lambda: InMemoryKvStore())
+    registry.register_factory(
+        "service",
+        ContextService,
+        lambda: InMemoryKvContextService(InMemoryKvStore()),
+    )
+    registry.register_factory("service", ObservabilityService, NoOpObservabilityService)
+    handoff = _Handoff()
+    registry.register_factory(
+        "service",
+        ControlPlaneRootBoundaryHandoffService,
+        lambda _h=handoff: _h,
+    )
+    scope = registry.instantiate_for_scenario("scenario")
+    scenario = type(
+        "S",
+        (),
+        {
+            "steps": [
+                StepSpec(name="system.cp.root_bootstrap", step=lambda _p, _c: []),
+                StepSpec(name="A", step=lambda _p, _c: [Envelope(payload={"x": 1}, target="remote.node", trace_id="t1")]),
+            ]
+        },
+    )()
+
+    run_with_sync_runner(
+        scenario=scenario,
+        inputs=[
+            ControlPlaneRootPulse(runtime={"platform": {"process_groups": [{"name": "execution.alpha"}]}}),
+            Envelope(payload=1, target="A", trace_id="t1"),
+        ],
+        strict=True,
+        run_id="run",
+        scenario_id="scenario",
+        scenario_scope=scope,
+        full_context_nodes={"system.cp.root_bootstrap"},
+    )
+
+    assert len(handoff.calls) == 1
+    call = handoff.calls[0]
+    assert call["source_group"] is None
+    envelopes = call["envelopes"]
+    assert len(envelopes) == 1
+    assert isinstance(envelopes[0], Envelope)
+    assert envelopes[0].target == "remote.node"
+
+
+def test_run_with_sync_runner_uses_single_long_running_loop_for_control_plane_pulses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    loop_args: dict[str, float | None] = {}
+
+    monkeypatch.setattr(runner_execution_module, "apply_injection", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner_execution_module, "close_scenario_scope", lambda _scope: None)
+
+    def _enqueue(*_args: object, **_kwargs: object) -> None:
+        calls.append("enqueue")
+
+    monkeypatch.setattr(runner_execution_module, "enqueue_runner_input_sync", _enqueue)
+    monkeypatch.setattr(runner_execution_module.transport_handoff_replay, "enqueue_runner_input_sync", _enqueue)
+
+    def _run(self) -> None:  # noqa: ANN001
+        calls.append("run")
+
+    def _run_until_stopped(self, *, poll_timeout_seconds: float, idle_timeout_seconds: float | None):  # noqa: ANN001
+        loop_args["poll_timeout_seconds"] = poll_timeout_seconds
+        loop_args["idle_timeout_seconds"] = idle_timeout_seconds
+        calls.append("run_until_stopped")
+
+    monkeypatch.setattr(runner_execution_module.SyncRunner, "run", _run)
+    monkeypatch.setattr(runner_execution_module.SyncRunner, "run_until_stopped", _run_until_stopped)
+
+    scenario = type("S", (), {"steps": [StepSpec(name="system.cp.root_bootstrap", step=lambda _p, _c: [])]})()
+    scope = InjectionRegistry().instantiate_for_scenario("s1")
+
+    builder_module.run_with_sync_runner(
+        scenario=scenario,
+        inputs=[ControlPlaneRootPulse(runtime={"platform": {"process_groups": [{"name": "execution.alpha"}]}})],
+        strict=True,
+        run_id="run",
+        scenario_id="scenario",
+        scenario_scope=scope,
+        full_context_nodes={"system.cp.root_bootstrap"},
+    )
+
+    assert calls == ["enqueue", "run_until_stopped"]
+    assert loop_args["poll_timeout_seconds"] == pytest.approx(0.01)
+    assert loop_args["idle_timeout_seconds"] == pytest.approx(0.1)
+
+
+def test_run_with_sync_runner_reads_runner_loop_timeouts_from_root_pulse_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop_args: dict[str, float | None] = {}
+
+    monkeypatch.setattr(runner_execution_module, "apply_injection", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner_execution_module, "close_scenario_scope", lambda _scope: None)
+    monkeypatch.setattr(runner_execution_module, "enqueue_runner_input_sync", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner_execution_module.SyncRunner, "run", lambda self: None)  # noqa: ARG005
+
+    def _run_until_stopped(self, *, poll_timeout_seconds: float, idle_timeout_seconds: float | None):  # noqa: ANN001
+        loop_args["poll_timeout_seconds"] = poll_timeout_seconds
+        loop_args["idle_timeout_seconds"] = idle_timeout_seconds
+
+    monkeypatch.setattr(runner_execution_module.SyncRunner, "run_until_stopped", _run_until_stopped)
+
+    scenario = type("S", (), {"steps": [StepSpec(name="system.cp.root_bootstrap", step=lambda _p, _c: [])]})()
+    scope = InjectionRegistry().instantiate_for_scenario("s1")
+
+    builder_module.run_with_sync_runner(
+        scenario=scenario,
+        inputs=[
+            ControlPlaneRootPulse(
+                runtime={
+                    "platform": {
+                        "process_groups": [{"name": "execution.alpha"}],
+                        "runner_loop": {"poll_timeout_ms": 7.5, "idle_timeout_ms": 250},
+                    }
+                }
+            )
+        ],
+        strict=True,
+        run_id="run",
+        scenario_id="scenario",
+        scenario_scope=scope,
+        full_context_nodes={"system.cp.root_bootstrap"},
+    )
+
+    assert loop_args["poll_timeout_seconds"] == pytest.approx(0.0075)
+    assert loop_args["idle_timeout_seconds"] == pytest.approx(0.25)
+
+
+def test_run_with_sync_runner_defers_non_root_inputs_until_after_root_startup_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    monkeypatch.setattr(runner_execution_module, "apply_injection", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner_execution_module, "close_scenario_scope", lambda _scope: None)
+
+    def _enqueue(_runner: object, payload: object, **_kwargs: object) -> None:
+        if isinstance(payload, ControlPlaneRootPulse):
+            calls.append("enqueue:root_pulse")
+            return
+        if isinstance(payload, Envelope):
+            calls.append(f"enqueue:envelope:{payload.target}")
+            return
+        calls.append(f"enqueue:{type(payload).__name__}")
+
+    monkeypatch.setattr(runner_execution_module, "enqueue_runner_input_sync", _enqueue)
+    monkeypatch.setattr(runner_execution_module.transport_handoff_replay, "enqueue_runner_input_sync", _enqueue)
+    monkeypatch.setattr(runner_execution_module.SyncRunner, "run", lambda self: calls.append("run"))  # noqa: ARG005
+
+    def _run_until_stopped(self, *, poll_timeout_seconds: float, idle_timeout_seconds: float | None):  # noqa: ANN001
+        calls.append("run_until_stopped")
+
+    monkeypatch.setattr(runner_execution_module.SyncRunner, "run_until_stopped", _run_until_stopped)
+
+    scenario = type(
+        "S",
+        (),
+        {"steps": [StepSpec(name="system.cp.root_bootstrap", step=lambda _p, _c: []), StepSpec(name="A", step=lambda _p, _c: [])]},
+    )()
+    scope = InjectionRegistry().instantiate_for_scenario("s1")
+
+    builder_module.run_with_sync_runner(
+        scenario=scenario,
+        inputs=[
+            ControlPlaneRootPulse(runtime={"platform": {"process_groups": [{"name": "execution.alpha"}]}}),
+            Envelope(payload=1, target="A", trace_id="t1"),
+            Envelope(payload=2, target="A", trace_id="t2"),
+        ],
+        strict=True,
+        run_id="run",
+        scenario_id="scenario",
+        scenario_scope=scope,
+        full_context_nodes={"system.cp.root_bootstrap"},
+    )
+
+    assert calls == [
+        "enqueue:root_pulse",
+        "run_until_stopped",
+        "enqueue:envelope:A",
+        "enqueue:envelope:A",
+        "run_until_stopped",
+    ]
+
+
+def test_run_with_sync_runner_skips_observability_requeue_from_root_boundary_handoff_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    run_count = {"value": 0}
+
+    monkeypatch.setattr(runner_execution_module, "apply_injection", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner_execution_module, "close_scenario_scope", lambda _scope: None)
+
+    def _enqueue(_runner: object, payload: object, **_kwargs: object) -> None:
+        if isinstance(payload, ControlPlaneRootPulse):
+            calls.append("enqueue:root_pulse")
+        elif isinstance(payload, Envelope):
+            calls.append(f"enqueue:envelope:{payload.target}")
+        else:
+            calls.append(f"enqueue:{type(payload).__name__}")
+
+    monkeypatch.setattr(runner_execution_module, "enqueue_runner_input_sync", _enqueue)
+    monkeypatch.setattr(runner_execution_module.transport_handoff_replay, "enqueue_runner_input_sync", _enqueue)
+
+    def _drain(*, scenario_scope: object, external_deliveries: list[Envelope]) -> list[object]:  # noqa: ARG001
+        calls.append(f"drain:{len(external_deliveries)}")
+        return [Envelope(payload={"obs": 1}, target="system.obs.log_dispatch", trace_id="t-ob")]  # replay into root
+
+    monkeypatch.setattr(runner_execution_module.transport_handoff_replay, "drain_root_boundary_handoff", _drain)
+
+    monkeypatch.setattr(runner_execution_module.SyncRunner, "run", lambda self: calls.append("run"))  # noqa: ARG005
+
+    def _run_until_stopped(self, *, poll_timeout_seconds: float, idle_timeout_seconds: float | None):  # noqa: ANN001
+        run_count["value"] += 1
+        calls.append(f"run_until_stopped:{run_count['value']}")
+        if run_count["value"] == 2:
+            self.external_deliveries = [
+                Envelope(payload={"x": 1}, target="remote.node", trace_id="t1")
+            ]
+        else:
+            self.external_deliveries = []
+
+    monkeypatch.setattr(runner_execution_module.SyncRunner, "run_until_stopped", _run_until_stopped)
+
+    scenario = type(
+        "S",
+        (),
+        {
+            "steps": [
+                StepSpec(name="system.cp.root_bootstrap", step=lambda _p, _c: []),
+                StepSpec(name="A", step=lambda _p, _c: []),
+                StepSpec(name="system.obs.log_dispatch", step=lambda _p, _c: []),
+            ]
+        },
+    )()
+    scope = InjectionRegistry().instantiate_for_scenario("s1")
+
+    builder_module.run_with_sync_runner(
+        scenario=scenario,
+        inputs=[
+            ControlPlaneRootPulse(runtime={"platform": {"process_groups": [{"name": "execution.alpha"}]}}),
+            Envelope(payload=1, target="A", trace_id="t1"),
+        ],
+        strict=True,
+        run_id="run",
+        scenario_id="scenario",
+        scenario_scope=scope,
+        full_context_nodes={"system.cp.root_bootstrap"},
+    )
+
+    assert "enqueue:root_pulse" in calls
+    assert "enqueue:envelope:A" in calls
+    assert "drain:1" in calls
+    assert "enqueue:envelope:system.obs.log_dispatch" not in calls
+    assert "run_until_stopped:1" in calls
+    assert "run_until_stopped:2" in calls
+    assert "run_until_stopped:3" in calls
 
 
 def test_runtime_tcp_local_rejects_invalid_signed_frame_before_enqueue() -> None:
@@ -1795,10 +2275,9 @@ def test_register_discovered_services_registers_routing_service() -> None:
     assert isinstance(routing.registry, ConsumerRegistry)
 
 
-def test_ensure_runtime_observability_binding_uses_platform_fanout_service() -> None:
-    # Runtime should bind reply-aware wrapper over platform observability fan-out service.
+def test_ensure_runtime_observability_binding_uses_dispatching_service() -> None:
+    # Runtime should bind platform dispatching observability service for runner callbacks.
     registry = InjectionRegistry()
-    observer = _Observer()
     registry.register_factory(
         "service",
         ReplyCoordinatorService,
@@ -1806,28 +2285,21 @@ def test_ensure_runtime_observability_binding_uses_platform_fanout_service() -> 
     )
     ensure_runtime_observability_binding(
         injection_registry=registry,
-        observers=[observer],
+        runtime={"platform": {"bootstrap": {"mode": "process_supervisor"}}, "observability": {"service_worker": {"enabled": True}}},
+        adapter_instances={},
     )
     scope = registry.instantiate_for_scenario("s1")
     resolved = scope.resolve("service", ObservabilityService)
     resolved_pipeline = scope.resolve("service", ObservabilityPipelineService)
-    assert isinstance(resolved, ReplyAwareObservabilityService)
-    assert isinstance(resolved_pipeline, ReplyAwareObservabilityService)
-    assert isinstance(resolved.inner, FanoutObservabilityService)
-    assert len(resolved.inner.observers) == 1
+    assert isinstance(resolved, DispatchingObservabilityService)
+    assert isinstance(resolved_pipeline, DispatchingObservabilityService)
 
 
-def test_ensure_runtime_observability_binding_marks_service_async_when_observer_requires_async() -> None:
-    # OBS-ASYNC-BIND-01: async-capable observer callbacks should mark observability DI bindings as async.
-    class _AsyncObserver(_Observer):
-        async def on_trace_event_async(
-            self,
-            *,
-            event: object,
-            trace_id: str | None,
-            attributes: dict[str, object] | None,
-        ) -> None:
-            _ = (event, trace_id, attributes)
+def test_ensure_runtime_observability_binding_marks_service_async_when_sink_requires_async() -> None:
+    # OBS-ASYNC-BIND-01: async-capable sink callbacks should mark observability DI bindings as async.
+    class _AsyncSink:
+        async def emit_async(self, _payload: object) -> None:
+            return None
 
     registry = InjectionRegistry()
     registry.register_factory(
@@ -1837,7 +2309,8 @@ def test_ensure_runtime_observability_binding_marks_service_async_when_observer_
     )
     ensure_runtime_observability_binding(
         injection_registry=registry,
-        observers=[_AsyncObserver()],
+        runtime={},
+        adapter_instances={"log_stdout": _AsyncSink()},
     )
     assert registry.is_async_binding("service", ObservabilityService)
     assert registry.is_async_binding("service", ObservabilityPipelineService)
@@ -1989,6 +2462,122 @@ def test_build_observability_system_plan_autowires_trace_dispatch_from_exporters
     assert plan.system_consumers == {TraceDispatchEvent: ["system.obs.trace_dispatch"]}
 
 
+def test_build_observability_system_plan_autowires_log_and_monitor_dispatch_from_exporters() -> None:
+    registry = InjectionRegistry()
+    registry.register_factory(
+        "service",
+        ObservabilityPipelineService,
+        NoOpObservabilityService,
+        is_async=False,
+    )
+    scope = registry.instantiate_for_scenario("s1")
+
+    plan = build_observability_system_plan(
+        runtime={
+            "observability": {
+                "logging": {
+                    "exporters": [
+                        {"kind": "stdout_plain", "enabled": True},
+                    ]
+                },
+                "monitoring": {
+                    "exporters": [
+                        {"kind": "jsonl", "enabled": True},
+                    ]
+                },
+            }
+        },
+        scenario_scope=scope,
+    )
+
+    names = [step.name for step in plan.system_steps]
+    assert names == [
+        "system.obs.log_dispatch",
+        "system.obs.monitor_dispatch",
+        "system.obs.monitoring_metrics_dispatch",
+    ]
+
+
+def test_build_observability_system_plan_honors_service_process_nodes_for_worker_role() -> None:
+    registry = InjectionRegistry()
+    registry.register_factory(
+        "service",
+        ObservabilityPipelineService,
+        NoOpObservabilityService,
+        is_async=False,
+    )
+    scope = registry.instantiate_for_scenario("s1")
+
+    plan = build_observability_system_plan(
+        runtime={
+            "__process_role": "observability_worker",
+            "platform": {"bootstrap": {"mode": "process_supervisor"}},
+            "observability": {
+                "service_process": {
+                    "enabled": True,
+                    "nodes": [
+                        "system.obs.trace_dispatch",
+                        "system.obs.metric_dispatch",
+                    ],
+                },
+            },
+        },
+        scenario_scope=scope,
+    )
+
+    names = [step.name for step in plan.system_steps]
+    assert names == [
+        "system.obs.trace_dispatch",
+        "system.obs.metric_dispatch",
+    ]
+    assert plan.system_consumers == {
+        TraceDispatchEvent: ["system.obs.trace_dispatch"],
+        MetricDispatchEvent: ["system.obs.metric_dispatch"],
+    }
+
+
+def test_build_observability_system_plan_augments_service_process_nodes_with_monitoring_metrics_dispatch() -> None:
+    registry = InjectionRegistry()
+    registry.register_factory(
+        "service",
+        ObservabilityPipelineService,
+        NoOpObservabilityService,
+        is_async=False,
+    )
+    scope = registry.instantiate_for_scenario("s1")
+
+    plan = build_observability_system_plan(
+        runtime={
+            "__process_role": "observability_worker",
+            "platform": {"bootstrap": {"mode": "process_supervisor"}},
+            "observability": {
+                "service_process": {
+                    "enabled": True,
+                    "nodes": [
+                        "system.obs.trace_dispatch",
+                        "system.obs.log_dispatch",
+                        "system.obs.monitor_dispatch",
+                    ],
+                },
+                "monitoring": {
+                    "exporters": [
+                        {"kind": "jsonl", "enabled": True},
+                    ]
+                },
+            },
+        },
+        scenario_scope=scope,
+    )
+
+    names = [step.name for step in plan.system_steps]
+    assert names == [
+        "system.obs.trace_dispatch",
+        "system.obs.log_dispatch",
+        "system.obs.monitor_dispatch",
+        "system.obs.monitoring_metrics_dispatch",
+    ]
+
+
 def test_build_observability_system_plan_autowires_worker_queue_dispatch_without_tracing_exporters() -> None:
     class _QueueTelemetryRecorder:
         def __init__(self) -> None:
@@ -2087,7 +2676,7 @@ def test_build_observability_system_plan_worker_queue_dispatch_prefers_async_ser
     assert recorder.sync_samples == []
 
 
-def test_build_observability_system_plan_skips_worker_process_role_even_when_exporters_enabled() -> None:
+def test_build_observability_system_plan_worker_process_role_registers_transport_only_dispatch_consumers() -> None:
     registry = InjectionRegistry()
     registry.register_factory(
         "service",
@@ -2100,19 +2689,62 @@ def test_build_observability_system_plan_skips_worker_process_role_even_when_exp
     plan = build_observability_system_plan(
         runtime={
             "__process_role": "worker",
+            "platform": {"bootstrap": {"mode": "process_supervisor"}},
             "observability": {
+                "service_process": {"enabled": True},
                 "tracing": {
                     "exporters": [
                         {"kind": "otel_otlp", "enabled": True},
                     ]
-                }
+                },
+                "logging": {"exporters": [{"kind": "stdout_plain", "enabled": True}]},
+                "monitoring": {"exporters": [{"kind": "jsonl", "enabled": True}]},
             }
         },
         scenario_scope=scope,
     )
 
     assert plan.system_steps == []
-    assert plan.system_consumers == {}
+    assert plan.system_consumers == {
+        TraceDispatchEvent: ["system.obs.trace_dispatch"],
+        LogDispatchEvent: ["system.obs.log_dispatch"],
+        MonitorDispatchEvent: ["system.obs.monitor_dispatch"],
+        MonitoringMetricsSnapshotEvent: ["system.obs.monitoring_metrics_dispatch"],
+    }
+
+
+def test_build_observability_system_plan_root_transport_only_mounts_transport_handoff_node() -> None:
+    registry = InjectionRegistry()
+    registry.register_factory(
+        "service",
+        ObservabilityPipelineService,
+        NoOpObservabilityService,
+        is_async=False,
+    )
+    scope = registry.instantiate_for_scenario("s1")
+
+    plan = build_observability_system_plan(
+        runtime={
+            "platform": {"bootstrap": {"mode": "process_supervisor"}},
+            "observability": {
+                "service_process": {"enabled": True},
+                "tracing": {
+                    "exporters": [
+                        {"kind": "otel_otlp", "enabled": True},
+                    ]
+                },
+                "worker_queue_telemetry": {"enabled": True},
+            },
+        },
+        scenario_scope=scope,
+    )
+
+    assert [step.name for step in plan.system_steps] == ["system.transport.handoff.observability_dispatch"]
+    assert plan.system_consumers == {
+        TraceDispatchEvent: ["system.transport.handoff.observability_dispatch"],
+        WorkerQueueTelemetryEvent: ["system.transport.handoff.observability_dispatch"],
+    }
+    assert plan.system_node_names == {"system.transport.handoff.observability_dispatch"}
 
 
 def test_ensure_runtime_api_policy_bindings_registers_platform_services() -> None:
@@ -2226,14 +2858,14 @@ def test_ensure_runtime_kv_binding_rejects_unknown_backend() -> None:
         ensure_runtime_kv_binding(registry, {"platform": {"kv": {"backend": "redis"}}})
 
 
-def test_execute_runtime_artifacts_delegates_to_sync_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_execute_runtime_artifacts_delegates_to_async_runner(monkeypatch: pytest.MonkeyPatch) -> None:
     # Runtime orchestration should execute via a single builder API call.
     captured: dict[str, object] = {}
 
-    def _run_with_sync_runner(**kwargs: object) -> None:
+    def _run_with_async_runner(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_sync_runner", _run_with_sync_runner)
+    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_async_runner", _run_with_async_runner)
 
     artifacts = RuntimeBuildArtifacts(
         scenario=type("S", (), {"steps": []})(),
@@ -2250,10 +2882,10 @@ def test_execute_runtime_artifacts_delegates_to_sync_runner(monkeypatch: pytest.
     assert captured["strict"] is True
 
 
-def test_execute_runtime_artifacts_selects_async_runner_from_injected_dependencies(
+def test_execute_runtime_artifacts_always_selects_async_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # RUN-AUTO-04: without explicit runner_profile, builder must infer async runner from DI contracts.
+    # RUN-ASYNC-01: root runtime execution is fixed to AsyncRunner.
     sync_calls: list[dict[str, object]] = []
     async_calls: list[dict[str, object]] = []
 
@@ -2297,10 +2929,10 @@ def test_execute_runtime_artifacts_selects_async_runner_from_injected_dependenci
     assert async_calls[0]["queue_qualifier"] == "execution.group"
 
 
-def test_execute_runtime_artifacts_selects_sync_runner_when_dependencies_are_sync_only(
+def test_execute_runtime_artifacts_ignores_sync_only_dependencies_and_uses_async_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # RUN-AUTO-05: default path must stay sync when no async DI dependencies are detected.
+    # RUN-ASYNC-02: sync-only dependency graph must not switch runtime back to SyncRunner.
     sync_calls: list[dict[str, object]] = []
     async_calls: list[dict[str, object]] = []
 
@@ -2339,15 +2971,15 @@ def test_execute_runtime_artifacts_selects_sync_runner_when_dependencies_are_syn
     )
     execute_runtime_artifacts(artifacts)
 
-    assert len(sync_calls) == 1
-    assert sync_calls[0]["queue_qualifier"] == "execution.group"
-    assert async_calls == []
+    assert sync_calls == []
+    assert len(async_calls) == 1
+    assert async_calls[0]["queue_qualifier"] == "execution.group"
 
 
-def test_execute_runtime_artifacts_explicit_runner_profile_overrides_auto_selection(
+def test_execute_runtime_artifacts_ignores_explicit_sync_runner_profile_and_uses_async(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # RUN-AUTO-06: explicit runner_profile remains a hard override for exceptional cases.
+    # RUN-ASYNC-03: group runner_profile must not override fixed AsyncRunner policy.
     sync_calls: list[dict[str, object]] = []
     async_calls: list[dict[str, object]] = []
 
@@ -2387,9 +3019,9 @@ def test_execute_runtime_artifacts_explicit_runner_profile_overrides_auto_select
 
     execute_runtime_artifacts(artifacts)
 
-    assert len(sync_calls) == 1
-    assert sync_calls[0]["queue_qualifier"] == "execution.group"
-    assert async_calls == []
+    assert sync_calls == []
+    assert len(async_calls) == 1
+    assert async_calls[0]["queue_qualifier"] == "execution.group"
 
 
 def test_run_with_sync_runner_closes_scenario_scope_after_execution() -> None:
@@ -2454,40 +3086,6 @@ def _runtime_artifacts_for_lifecycle(
     )
 
 
-def _runtime_artifacts_for_bootstrap_supervisor(
-    *,
-    runtime: dict[str, object],
-    supervisor: object | None,
-    reply_waiter: object | None = None,
-    adapters: dict[str, object] | None = None,
-) -> RuntimeBuildArtifacts:
-    injection = InjectionRegistry()
-    if supervisor is not None:
-        injection.register_factory(
-            "service",
-            BootstrapSupervisor,
-            lambda _supervisor=supervisor: _supervisor,
-        )
-    if reply_waiter is not None:
-        injection.register_factory(
-            "service",
-            ReplyCoordinatorService,
-            lambda _reply_waiter=reply_waiter: legacy_reply_coordinator(reply_waiter=_reply_waiter),
-        )
-    scope = injection.instantiate_for_scenario("scenario")
-    return RuntimeBuildArtifacts(
-        scenario=type("S", (), {"steps": []})(),
-        inputs=[],
-        strict=True,
-        run_id="run",
-        scenario_id="scenario",
-        scenario_scope=scope,
-        full_context_nodes=set(),
-        runtime=runtime,
-        adapters=dict(adapters or {}),
-    )
-
-
 def test_execute_runtime_artifacts_starts_services_before_runner_for_tcp_local(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2510,7 +3108,7 @@ def test_execute_runtime_artifacts_starts_services_before_runner_for_tcp_local(
 
     monkeypatch.setattr(
         builder_module,
-        "run_with_sync_runner",
+        "run_with_async_runner",
         lambda **_kwargs: events.append("runner"),
     )
 
@@ -2546,7 +3144,7 @@ def test_execute_runtime_artifacts_requires_ready_before_runner_for_tcp_local(
     def _runner(**_kwargs: object) -> None:
         called_runner["value"] = True
 
-    monkeypatch.setattr(builder_module, "run_with_sync_runner", _runner)
+    monkeypatch.setattr(builder_module, "run_with_async_runner", _runner)
 
     artifacts = _runtime_artifacts_for_lifecycle(
         runtime={
@@ -2576,7 +3174,7 @@ def test_execute_runtime_artifacts_stops_with_graceful_drain_contract(
         def stop(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
             stop_calls.append((graceful_timeout_seconds, drain_inflight))
 
-    monkeypatch.setattr(builder_module, "run_with_sync_runner", lambda **_kwargs: None)
+    monkeypatch.setattr(builder_module, "run_with_async_runner", lambda **_kwargs: None)
 
     artifacts = _runtime_artifacts_for_lifecycle(
         runtime={
@@ -2611,7 +3209,7 @@ def test_execute_runtime_artifacts_wraps_worker_crash_with_runtime_category(
     def _runner(**_kwargs: object) -> None:
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(builder_module, "run_with_sync_runner", _runner)
+    monkeypatch.setattr(builder_module, "run_with_async_runner", _runner)
 
     artifacts = _runtime_artifacts_for_lifecycle(
         runtime={
@@ -2635,826 +3233,83 @@ def test_execute_runtime_artifacts_requires_lifecycle_service_for_tcp_local() ->
         execute_runtime_artifacts(artifacts)
 
 
+def test_execute_runtime_artifacts_requires_lifecycle_service_for_ipc_local() -> None:
+    artifacts = _runtime_artifacts_for_lifecycle(
+        runtime={
+            "platform": {"execution_ipc": {"transport": "ipc_local"}},
+        },
+        lifecycle=None,
+    )
+    with pytest.raises(RuntimeLifecycleResolutionError, match="requires a registered RuntimeLifecycleManager"):
+        execute_runtime_artifacts(artifacts)
+
+
 def test_builder_does_not_expose_private_lifecycle_helpers_after_refactor() -> None:
     # PROC-INT-05: lifecycle orchestration should not depend on private builder helper points.
     assert not hasattr(builder_module, "_resolve_runtime_lifecycle_manager")
     assert not hasattr(builder_module, "_runtime_lifecycle_policy")
 
 
-def test_execute_runtime_artifacts_process_supervisor_uses_group_lifecycle_contract(
+def test_execute_runtime_artifacts_uses_runtime_lifecycle_for_process_supervisor_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # BOOT-API-01: process_supervisor profile should call start_groups/wait_ready/stop_groups around runner execution.
-    events: list[tuple[str, object]] = []
+    events: list[str] = []
 
-    class _Supervisor:
-        def start_groups(self, group_names: list[str]) -> None:
-            events.append(("start_groups", list(group_names)))
+    class _Lifecycle:
+        def start(self) -> None:
+            events.append("start")
 
-        def wait_ready(self, timeout_seconds: int) -> bool:
-            events.append(("wait_ready", timeout_seconds))
-            return True
-
-        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
-            events.append(("stop_groups", (graceful_timeout_seconds, drain_inflight)))
-
-    monkeypatch.setattr(
-        builder_module,
-        "run_with_sync_runner",
-        lambda **_kwargs: events.append(("runner", None)),
-    )
-    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
-        runtime={
-            "platform": {
-                "execution_ipc": {"transport": "tcp_local"},
-                "bootstrap": {"mode": "process_supervisor"},
-                "process_groups": [
-                    {"name": "web"},
-                    {"name": "execution.cpu"},
-                ],
-            },
-        },
-        supervisor=_Supervisor(),
-    )
-    execute_runtime_artifacts(artifacts)
-    assert events == [
-        ("start_groups", ["web", "execution.cpu"]),
-        ("wait_ready", 5),
-        ("runner", None),
-        ("stop_groups", (10, True)),
-    ]
-
-
-def test_execute_runtime_artifacts_process_supervisor_preserves_group_order_from_config(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # BOOT-API-02: start_groups receives process_groups in declared runtime order.
-    started: list[list[str]] = []
-
-    class _Supervisor:
-        def start_groups(self, group_names: list[str]) -> None:
-            started.append(list(group_names))
-
-        def wait_ready(self, timeout_seconds: int) -> bool:
+        def ready(self, timeout_seconds: int) -> bool:
             _ = timeout_seconds
+            events.append("ready")
             return True
 
-        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
+        def stop(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
             _ = graceful_timeout_seconds
             _ = drain_inflight
-            return None
+            events.append("stop")
 
-    monkeypatch.setattr(builder_module, "run_with_sync_runner", lambda **_kwargs: None)
-    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
-        runtime={
-            "platform": {
-                "execution_ipc": {"transport": "tcp_local"},
-                "bootstrap": {"mode": "process_supervisor"},
-                "process_groups": [
-                    {"name": "execution.asyncio"},
-                    {"name": "execution.cpu"},
-                    {"name": "execution.gpu"},
-                ],
-            },
-        },
-        supervisor=_Supervisor(),
+    class _RootBootstrap:
+        def prepare_root_runtime(self, **_kwargs: object) -> None:
+            events.append("root_bootstrap")
+
+    monkeypatch.setattr(builder_module, "run_with_async_runner", lambda **_kwargs: events.append("runner"))
+
+    injection = InjectionRegistry()
+    injection.register_factory(
+        "service",
+        RuntimeLifecycleManager,
+        lambda: _Lifecycle(),
     )
-    execute_runtime_artifacts(artifacts)
-    assert started == [["execution.asyncio", "execution.cpu", "execution.gpu"]]
+    from stream_kernel.execution.orchestration.control_plane.root.runtime_bootstrap_service import (
+        ControlPlaneRootRuntimeBootstrapService,
+    )
 
-
-def test_execute_runtime_artifacts_process_supervisor_wraps_start_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # BOOT-API-03: start_groups failure should surface deterministic runtime bootstrap error category.
-    called_runner = {"value": False}
-
-    class _Supervisor:
-        def start_groups(self, group_names: list[str]) -> None:
-            _ = group_names
-            raise RuntimeError("cannot start worker")
-
-        def wait_ready(self, timeout_seconds: int) -> bool:
-            _ = timeout_seconds
-            return True
-
-        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
-            _ = graceful_timeout_seconds
-            _ = drain_inflight
-            return None
-
-    def _runner(**_kwargs: object) -> None:
-        called_runner["value"] = True
-
-    monkeypatch.setattr(builder_module, "run_with_sync_runner", _runner)
-    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
+    injection.register_factory(
+        "service",
+        ControlPlaneRootRuntimeBootstrapService,
+        lambda: _RootBootstrap(),
+    )
+    artifacts = RuntimeBuildArtifacts(
+        scenario=type("S", (), {"steps": []})(),
+        inputs=[],
+        strict=True,
+        run_id="run",
+        scenario_id="scenario",
+        scenario_scope=injection.instantiate_for_scenario("scenario"),
+        full_context_nodes=set(),
         runtime={
             "platform": {
                 "execution_ipc": {"transport": "tcp_local"},
                 "bootstrap": {"mode": "process_supervisor"},
                 "process_groups": [{"name": "execution.cpu"}],
-            },
+            }
         },
-        supervisor=_Supervisor(),
+        config={"runtime": {"platform": {"process_groups": [{"name": "execution.cpu"}]}}},
+        adapters={},
+        modules=[],
     )
-    with pytest.raises(RuntimeBootstrapStartError, match="bootstrap supervisor failed to start process groups"):
-        execute_runtime_artifacts(artifacts)
-    assert called_runner["value"] is False
 
-
-def test_execute_runtime_artifacts_process_supervisor_prefers_boundary_executor_when_available(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # PH4-D-01: when execute_boundary exists, process_supervisor path should use it instead of local runner callback.
-    events: list[tuple[str, object]] = []
-
-    class _Supervisor:
-        def start_groups(self, group_names: list[str]) -> None:
-            events.append(("start_groups", list(group_names)))
-
-        def wait_ready(self, timeout_seconds: int) -> bool:
-            events.append(("wait_ready", timeout_seconds))
-            return True
-
-        def execute_boundary(
-            self,
-            *,
-            run,
-            run_id: str,
-            scenario_id: str,
-            inputs: list[object],
-        ) -> RoutingResult:
-            _ = run
-            events.append(("execute_boundary", (run_id, scenario_id, len(inputs))))
-            return RoutingResult(local_deliveries=[], boundary_deliveries=[], terminal_outputs=[])
-
-        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
-            events.append(("stop_groups", (graceful_timeout_seconds, drain_inflight)))
-
-    monkeypatch.setattr(
-        builder_module,
-        "run_with_sync_runner",
-        lambda **_kwargs: events.append(("runner", None)),
-    )
-    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
-        runtime={
-            "platform": {
-                "execution_ipc": {"transport": "tcp_local"},
-                "bootstrap": {"mode": "process_supervisor"},
-                "process_groups": [{"name": "web"}, {"name": "execution.cpu"}],
-            },
-        },
-        supervisor=_Supervisor(),
-    )
-    execute_runtime_artifacts(artifacts)
-    assert events == [
-        ("start_groups", ["web", "execution.cpu"]),
-        ("wait_ready", 5),
-        ("execute_boundary", ("run", "scenario", 0)),
-        ("stop_groups", (10, True)),
-    ]
-
-
-def test_execute_runtime_artifacts_process_supervisor_boundary_terminals_complete_waiters(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # PH4-D-02: boundary terminal envelopes should complete reply waiters by trace id.
-    waiter = InMemoryReplyWaiterService(now_fn=lambda: 0)
-    waiter.register(trace_id="t1", reply_to="http:req-1", timeout_seconds=30)
-    called_runner = {"value": False}
-
-    class _Supervisor:
-        def start_groups(self, group_names: list[str]) -> None:
-            _ = group_names
-            return None
-
-        def wait_ready(self, timeout_seconds: int) -> bool:
-            _ = timeout_seconds
-            return True
-
-        def execute_boundary(
-            self,
-            *,
-            run,
-            run_id: str,
-            scenario_id: str,
-            inputs: list[object],
-        ) -> RoutingResult:
-            _ = (run, run_id, scenario_id, inputs)
-            return RoutingResult(
-                local_deliveries=[],
-                boundary_deliveries=[],
-                terminal_outputs=[
-                    Envelope(
-                        payload=TerminalEvent(status="success", payload={"ok": True}),
-                        trace_id="t1",
-                        target="sink:ignored",
-                    )
-                ],
-            )
-
-        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
-            _ = graceful_timeout_seconds
-            _ = drain_inflight
-            return None
-
-    def _runner(**_kwargs: object) -> None:
-        called_runner["value"] = True
-
-    monkeypatch.setattr(builder_module, "run_with_sync_runner", _runner)
-    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
-        runtime={
-            "platform": {
-                "execution_ipc": {"transport": "tcp_local"},
-                "bootstrap": {"mode": "process_supervisor"},
-                "process_groups": [{"name": "web"}, {"name": "execution.cpu"}],
-            },
-        },
-        supervisor=_Supervisor(),
-        reply_waiter=waiter,
-    )
-    execute_runtime_artifacts(artifacts)
-    assert called_runner["value"] is False
-    assert waiter.in_flight() == 0
-    assert waiter.poll(trace_id="t1") == TerminalEvent(status="success", payload={"ok": True})
-
-
-def test_execute_runtime_artifacts_process_supervisor_delivers_bootstrap_bundle_once(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # KEY-IPC-03: process-supervisor path should deliver bootstrap key bundle through one-shot channel.
-    captured: dict[str, object] = {}
-
-    class _Supervisor:
-        _channel: object | None = None
-
-        def load_bootstrap_channel(self, channel: object) -> None:
-            self._channel = channel
-
-        def start_groups(self, group_names: list[str]) -> None:
-            _ = group_names
-            assert self._channel is not None
-            receive = getattr(self._channel, "receive_once")
-            bundle = receive()
-            captured["created_at"] = getattr(bundle, "created_at_epoch")
-            captured["secret_mode"] = bundle.execution_ipc.secret_mode
-            captured["kdf"] = bundle.execution_ipc.kdf
-            with pytest.raises(BootstrapChannelStateError):
-                receive()
-
-        def wait_ready(self, timeout_seconds: int) -> bool:
-            _ = timeout_seconds
-            return True
-
-        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
-            _ = graceful_timeout_seconds
-            _ = drain_inflight
-            return None
-
-    monkeypatch.setattr(builder_module, "run_with_sync_runner", lambda **_kwargs: None)
-    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
-        runtime={
-            "platform": {
-                "execution_ipc": {
-                    "transport": "tcp_local",
-                    "auth": {"mode": "hmac", "secret_mode": "generated", "kdf": "hkdf_sha256"},
-                },
-                "bootstrap": {"mode": "process_supervisor"},
-                "process_groups": [{"name": "execution.cpu"}],
-            },
-        },
-        supervisor=_Supervisor(),
-    )
-    execute_runtime_artifacts(artifacts)
-    assert captured["secret_mode"] == "generated"
-    assert captured["kdf"] == "hkdf_sha256"
-    assert isinstance(captured["created_at"], int)
-
-
-def test_execute_runtime_artifacts_process_supervisor_passes_child_bootstrap_metadata_bundle(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # CHILD-BOOT-01: process-supervisor path should hand over metadata-only child bootstrap bundle.
-    captured: dict[str, object] = {}
-
-    class _Supervisor:
-        def load_child_bootstrap_bundle(self, bundle: object) -> None:
-            captured["bundle"] = bundle
-
-        def start_groups(self, group_names: list[str]) -> None:
-            _ = group_names
-            return None
-
-        def wait_ready(self, timeout_seconds: int) -> bool:
-            _ = timeout_seconds
-            return True
-
-        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
-            _ = graceful_timeout_seconds
-            _ = drain_inflight
-            return None
-
-    monkeypatch.setattr(builder_module, "run_with_sync_runner", lambda **_kwargs: None)
-    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
-        runtime={
-            "discovery_modules": ["fund_load"],
-            "platform": {
-                "execution_ipc": {
-                    "transport": "tcp_local",
-                    "auth": {"mode": "hmac", "secret_mode": "generated", "kdf": "hkdf_sha256"},
-                },
-                "bootstrap": {"mode": "process_supervisor"},
-                "process_groups": [{"name": "execution.cpu"}],
-            },
-        },
-        supervisor=_Supervisor(),
-    )
     execute_runtime_artifacts(artifacts)
 
-    bundle = captured.get("bundle")
-    assert bundle is not None
-    assert getattr(bundle, "scenario_id") == "scenario"
-    assert getattr(bundle, "discovery_modules") == ["fund_load"]
-    assert isinstance(getattr(bundle, "runtime"), dict)
-    assert getattr(bundle, "key_bundle").execution_ipc.secret_mode == "generated"
-    # Metadata-only contract: no loaded module objects are passed through bundle.
-    assert not hasattr(bundle, "modules")
-
-
-def test_execute_runtime_artifacts_process_supervisor_passes_adapter_config_to_child_bundle(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # CHILD-BOOT-02: child bootstrap bundle must carry adapter config for runtime source/sink wrappers.
-    captured: dict[str, object] = {}
-
-    class _Supervisor:
-        def load_child_bootstrap_bundle(self, bundle: object) -> None:
-            captured["bundle"] = bundle
-
-        def start_groups(self, group_names: list[str]) -> None:
-            _ = group_names
-            return None
-
-        def wait_ready(self, timeout_seconds: int) -> bool:
-            _ = timeout_seconds
-            return True
-
-        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
-            _ = graceful_timeout_seconds
-            _ = drain_inflight
-            return None
-
-    monkeypatch.setattr(builder_module, "run_with_sync_runner", lambda **_kwargs: None)
-    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
-        runtime={
-            "discovery_modules": ["fund_load"],
-            "platform": {
-                "execution_ipc": {
-                    "transport": "tcp_local",
-                    "auth": {"mode": "hmac", "secret_mode": "generated", "kdf": "hkdf_sha256"},
-                },
-                "bootstrap": {"mode": "process_supervisor"},
-                "process_groups": [{"name": "execution.cpu"}],
-            },
-        },
-        supervisor=_Supervisor(),
-        adapters={
-            "source": {"settings": {"path": "input.txt"}, "binds": ["stream"]},
-            "sink": {"settings": {"path": "output.txt"}, "binds": ["stream"]},
-        },
-    )
-    execute_runtime_artifacts(artifacts)
-
-    bundle = captured.get("bundle")
-    assert bundle is not None
-    adapters = getattr(bundle, "adapters")
-    assert isinstance(adapters, dict)
-    assert "source" in adapters
-    assert "sink" in adapters
-
-
-def test_execute_runtime_artifacts_process_supervisor_passes_runtime_config_to_child_bundle(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # CHILD-BOOT-03: child bootstrap bundle must carry full config for node-level config injection in worker.
-    captured: dict[str, object] = {}
-
-    class _Supervisor:
-        def load_child_bootstrap_bundle(self, bundle: object) -> None:
-            captured["bundle"] = bundle
-
-        def start_groups(self, group_names: list[str]) -> None:
-            _ = group_names
-            return None
-
-        def wait_ready(self, timeout_seconds: int) -> bool:
-            _ = timeout_seconds
-            return True
-
-        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
-            _ = graceful_timeout_seconds
-            _ = drain_inflight
-            return None
-
-    monkeypatch.setattr(builder_module, "run_with_sync_runner", lambda **_kwargs: None)
-    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
-        runtime={
-            "discovery_modules": ["fund_load"],
-            "platform": {
-                "execution_ipc": {
-                    "transport": "tcp_local",
-                    "auth": {"mode": "hmac", "secret_mode": "generated", "kdf": "hkdf_sha256"},
-                },
-                "bootstrap": {"mode": "process_supervisor"},
-                "process_groups": [{"name": "execution.cpu"}],
-            },
-        },
-        supervisor=_Supervisor(),
-    )
-    artifacts.config = {
-        "runtime": artifacts.runtime,
-        "nodes": {"compute_time_keys": {"week_start": "SUN"}},
-    }
-
-    execute_runtime_artifacts(artifacts)
-    bundle = captured.get("bundle")
-    assert bundle is not None
-    assert getattr(bundle, "config") == artifacts.config
-
-
-def test_execute_runtime_artifacts_process_supervisor_passes_routing_cache_settings(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # ROUTE-CACHE-01: process-supervisor path should pass runtime.platform.routing_cache into supervisor.
-    captured: dict[str, object] = {}
-
-    class _Supervisor:
-        def configure_routing_cache(self, settings: dict[str, object]) -> None:
-            captured["settings"] = dict(settings)
-
-        def start_groups(self, group_names: list[str]) -> None:
-            _ = group_names
-            return None
-
-        def wait_ready(self, timeout_seconds: int) -> bool:
-            _ = timeout_seconds
-            return True
-
-        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
-            _ = graceful_timeout_seconds
-            _ = drain_inflight
-            return None
-
-    monkeypatch.setattr(builder_module, "run_with_sync_runner", lambda **_kwargs: None)
-    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
-        runtime={
-            "platform": {
-                "execution_ipc": {
-                    "transport": "tcp_local",
-                    "auth": {"mode": "hmac", "secret_mode": "generated", "kdf": "hkdf_sha256"},
-                },
-                "bootstrap": {"mode": "process_supervisor"},
-                "process_groups": [{"name": "execution.cpu"}],
-                "routing_cache": {"enabled": True, "negative_cache": True, "max_entries": 4096},
-            },
-        },
-        supervisor=_Supervisor(),
-    )
-    execute_runtime_artifacts(artifacts)
-
-    settings = captured.get("settings")
-    assert settings == {"enabled": True, "negative_cache": True, "max_entries": 4096}
-
-
-def test_execute_runtime_artifacts_process_supervisor_passes_lifecycle_logging_settings(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # BOOT-LOG-01: process-supervisor path should pass runtime.observability.logging into supervisor.
-    captured: dict[str, object] = {}
-
-    class _Supervisor:
-        def configure_lifecycle_logging(self, settings: dict[str, object]) -> None:
-            captured["settings"] = dict(settings)
-
-        def start_groups(self, group_names: list[str]) -> None:
-            _ = group_names
-            return None
-
-        def wait_ready(self, timeout_seconds: int) -> bool:
-            _ = timeout_seconds
-            return True
-
-        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
-            _ = graceful_timeout_seconds
-            _ = drain_inflight
-            return None
-
-    monkeypatch.setattr(builder_module, "run_with_sync_runner", lambda **_kwargs: None)
-    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
-        runtime={
-            "platform": {
-                "execution_ipc": {
-                    "transport": "tcp_local",
-                    "auth": {"mode": "hmac", "secret_mode": "generated", "kdf": "hkdf_sha256"},
-                },
-                "bootstrap": {"mode": "process_supervisor"},
-                "process_groups": [{"name": "execution.cpu"}],
-            },
-            "observability": {
-                "logging": {
-                    "exporters": [{"kind": "stdout"}],
-                    "lifecycle_events": {"enabled": True, "level": "debug"},
-                }
-            },
-        },
-        supervisor=_Supervisor(),
-    )
-    execute_runtime_artifacts(artifacts)
-    settings = captured.get("settings")
-    assert settings == {
-        "exporters": [{"kind": "stdout"}],
-        "lifecycle_events": {"enabled": True, "level": "debug"},
-    }
-
-
-def test_execute_runtime_artifacts_process_supervisor_skips_supervisor_monitoring_when_service_process_enabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: dict[str, object] = {}
-
-    class _Supervisor:
-        def configure_monitoring(self, settings: dict[str, object], *, strict: bool = True) -> None:
-            captured["settings"] = dict(settings)
-            captured["strict"] = strict
-
-        def start_groups(self, group_names: list[str]) -> None:
-            _ = group_names
-            return None
-
-        def wait_ready(self, timeout_seconds: int) -> bool:
-            _ = timeout_seconds
-            return True
-
-        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
-            _ = (graceful_timeout_seconds, drain_inflight)
-            return None
-
-    monkeypatch.setattr(builder_module, "run_with_sync_runner", lambda **_kwargs: None)
-    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
-        runtime={
-            "strict": True,
-            "platform": {
-                "execution_ipc": {"transport": "tcp_local"},
-                "bootstrap": {"mode": "process_supervisor"},
-                "process_groups": [{"name": "execution.cpu"}, {"name": "system.observability"}],
-            },
-            "observability": {
-                "service_process": {"enabled": True, "group_name": "system.observability"},
-                "monitoring": {
-                    "exporters": [
-                        {"kind": "prometheus", "settings": {"mode": "http_pull"}},
-                    ]
-                },
-            },
-        },
-        supervisor=_Supervisor(),
-    )
-    execute_runtime_artifacts(artifacts)
-
-    assert captured == {}
-
-
-def test_execute_runtime_artifacts_process_supervisor_passes_lifecycle_logging_when_service_process_enabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: dict[str, object] = {}
-
-    class _Supervisor:
-        def configure_lifecycle_logging(self, settings: dict[str, object]) -> None:
-            captured["settings"] = dict(settings)
-
-        def start_groups(self, group_names: list[str]) -> None:
-            _ = group_names
-            return None
-
-        def wait_ready(self, timeout_seconds: int) -> bool:
-            _ = timeout_seconds
-            return True
-
-        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
-            _ = (graceful_timeout_seconds, drain_inflight)
-            return None
-
-    monkeypatch.setattr(builder_module, "run_with_sync_runner", lambda **_kwargs: None)
-    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
-        runtime={
-            "platform": {
-                "execution_ipc": {"transport": "tcp_local"},
-                "bootstrap": {"mode": "process_supervisor"},
-                "process_groups": [{"name": "execution.cpu"}, {"name": "system.observability"}],
-            },
-            "observability": {
-                "service_process": {"enabled": True, "group_name": "system.observability"},
-                "logging": {
-                    "exporters": [{"kind": "stdout"}],
-                    "lifecycle_events": {"enabled": True, "level": "debug"},
-                },
-            },
-        },
-        supervisor=_Supervisor(),
-    )
-    execute_runtime_artifacts(artifacts)
-
-    assert captured == {
-        "settings": {
-            "exporters": [{"kind": "stdout"}],
-            "lifecycle_events": {"enabled": True, "level": "debug"},
-        }
-    }
-
-
-def test_execute_runtime_artifacts_process_supervisor_graceful_stop_drains_inflight(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # STOP-IPC-01: graceful stop path should pass timeout+drain contract and avoid forced terminate fallback.
-    stop_calls: list[tuple[int, bool]] = []
-    force_calls: list[list[str]] = []
-
-    class _Supervisor:
-        def start_groups(self, group_names: list[str]) -> None:
-            _ = group_names
-            return None
-
-        def wait_ready(self, timeout_seconds: int) -> bool:
-            _ = timeout_seconds
-            return True
-
-        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> bool:
-            stop_calls.append((graceful_timeout_seconds, drain_inflight))
-            return True
-
-        def force_terminate_groups(self, group_names: list[str]) -> None:
-            force_calls.append(list(group_names))
-
-    monkeypatch.setattr(builder_module, "run_with_sync_runner", lambda **_kwargs: None)
-    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
-        runtime={
-            "platform": {
-                "execution_ipc": {"transport": "tcp_local"},
-                "bootstrap": {"mode": "process_supervisor"},
-                "lifecycle": {"graceful_timeout_seconds": 7, "drain_inflight": True},
-                "process_groups": [{"name": "execution.cpu"}],
-            },
-        },
-        supervisor=_Supervisor(),
-    )
-    execute_runtime_artifacts(artifacts)
-    assert stop_calls == [(7, True)]
-    assert force_calls == []
-
-
-def test_execute_runtime_artifacts_process_supervisor_stop_timeout_forces_terminate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # STOP-IPC-02: stop timeout should trigger deterministic forced terminate fallback.
-    force_calls: list[list[str]] = []
-
-    class _Supervisor:
-        def start_groups(self, group_names: list[str]) -> None:
-            _ = group_names
-            return None
-
-        def wait_ready(self, timeout_seconds: int) -> bool:
-            _ = timeout_seconds
-            return True
-
-        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
-            _ = graceful_timeout_seconds
-            _ = drain_inflight
-            raise TimeoutError("did not drain in time")
-
-        def force_terminate_groups(self, group_names: list[str]) -> None:
-            force_calls.append(list(group_names))
-
-    monkeypatch.setattr(builder_module, "run_with_sync_runner", lambda **_kwargs: None)
-    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
-        runtime={
-            "platform": {
-                "execution_ipc": {"transport": "tcp_local"},
-                "bootstrap": {"mode": "process_supervisor"},
-                "process_groups": [{"name": "execution.cpu"}, {"name": "execution.asyncio"}],
-            },
-        },
-        supervisor=_Supervisor(),
-    )
-    execute_runtime_artifacts(artifacts)
-    assert force_calls == [["execution.cpu", "execution.asyncio"]]
-
-
-def test_execute_runtime_artifacts_process_supervisor_stop_timeout_without_force_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # STOP-IPC-02b: if timeout fallback is unavailable, runtime should raise deterministic timeout category.
-    class _Supervisor:
-        def start_groups(self, group_names: list[str]) -> None:
-            _ = group_names
-            return None
-
-        def wait_ready(self, timeout_seconds: int) -> bool:
-            _ = timeout_seconds
-            return True
-
-        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
-            _ = graceful_timeout_seconds
-            _ = drain_inflight
-            raise TimeoutError("timeout")
-
-    monkeypatch.setattr(builder_module, "run_with_sync_runner", lambda **_kwargs: None)
-    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
-        runtime={
-            "platform": {
-                "execution_ipc": {"transport": "tcp_local"},
-                "bootstrap": {"mode": "process_supervisor"},
-                "process_groups": [{"name": "execution.cpu"}],
-            },
-        },
-        supervisor=_Supervisor(),
-    )
-    with pytest.raises(RuntimeBootstrapStopTimeoutError, match="timed out"):
-        execute_runtime_artifacts(artifacts)
-
-
-def test_execute_runtime_artifacts_process_supervisor_emits_stop_events_once_per_group(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # STOP-IPC-03: stop lifecycle events should be emitted exactly once per group.
-    emitted: list[tuple[str, str]] = []
-
-    class _Supervisor:
-        def start_groups(self, group_names: list[str]) -> None:
-            _ = group_names
-            return None
-
-        def wait_ready(self, timeout_seconds: int) -> bool:
-            _ = timeout_seconds
-            return True
-
-        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> bool:
-            _ = graceful_timeout_seconds
-            _ = drain_inflight
-            return True
-
-        def emit_stop_event(self, *, group_name: str, mode: str) -> None:
-            emitted.append((group_name, mode))
-
-    monkeypatch.setattr(builder_module, "run_with_sync_runner", lambda **_kwargs: None)
-    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
-        runtime={
-            "platform": {
-                "execution_ipc": {"transport": "tcp_local"},
-                "bootstrap": {"mode": "process_supervisor"},
-                "process_groups": [{"name": "g1"}, {"name": "g2"}],
-            },
-        },
-        supervisor=_Supervisor(),
-    )
-    execute_runtime_artifacts(artifacts)
-    assert emitted.count(("g1", "graceful")) == 1
-    assert emitted.count(("g2", "graceful")) == 1
-
-
-def test_execute_runtime_artifacts_process_supervisor_force_terminate_failure_is_deterministic(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # STOP-IPC-02c: force terminate fallback failure should raise deterministic runtime stop error.
-    class _Supervisor:
-        def start_groups(self, group_names: list[str]) -> None:
-            _ = group_names
-            return None
-
-        def wait_ready(self, timeout_seconds: int) -> bool:
-            _ = timeout_seconds
-            return True
-
-        def stop_groups(self, *, graceful_timeout_seconds: int, drain_inflight: bool) -> None:
-            _ = graceful_timeout_seconds
-            _ = drain_inflight
-            raise TimeoutError("timeout")
-
-        def force_terminate_groups(self, group_names: list[str]) -> None:
-            _ = group_names
-            raise RuntimeError("cannot terminate")
-
-    monkeypatch.setattr(builder_module, "run_with_sync_runner", lambda **_kwargs: None)
-    artifacts = _runtime_artifacts_for_bootstrap_supervisor(
-        runtime={
-            "platform": {
-                "execution_ipc": {"transport": "tcp_local"},
-                "bootstrap": {"mode": "process_supervisor"},
-                "process_groups": [{"name": "execution.cpu"}],
-            },
-        },
-        supervisor=_Supervisor(),
-    )
-    with pytest.raises(RuntimeBootstrapStopError, match="force terminate"):
-        execute_runtime_artifacts(artifacts)
+    assert events == ["root_bootstrap", "start", "ready", "runner", "stop"]

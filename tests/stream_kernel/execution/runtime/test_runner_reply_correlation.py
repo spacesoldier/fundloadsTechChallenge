@@ -14,6 +14,7 @@ from stream_kernel.platform.services.messaging.reply_waiter import (
     InMemoryReplyWaiterService,
     TerminalEvent,
 )
+from stream_kernel.execution.runtime.runner_ingress import enqueue_runner_input_sync
 from stream_kernel.routing.envelope import Envelope
 
 
@@ -47,11 +48,14 @@ def test_runner_registers_waiter_and_persists_reply_metadata_on_ingress() -> Non
         return []
 
     runner = _runner(node_impl=node, context_service=context_service, waiter=waiter)
-    runner.run_inputs(
-        [Envelope(payload="msg", target="n1", trace_id="t1", reply_to="http:req-1")],
+    enqueue_runner_input_sync(
+        runner,
+        Envelope(payload="msg", target="n1", trace_id="t1", reply_to="http:req-1"),
         run_id="run",
         scenario_id="scenario",
+        index=1,
     )
+    runner.run()
 
     assert waiter.in_flight() == 1
     assert context_service.metadata("t1", full=True).get("__reply_to") == "http:req-1"
@@ -68,11 +72,14 @@ def test_runner_completes_waiter_on_terminal_event_output() -> None:
         return [TerminalEvent(status="success", payload={"ok": True})]
 
     runner = _runner(node_impl=node, context_service=context_service, waiter=waiter)
-    runner.run_inputs(
-        [Envelope(payload="msg", target="n1", trace_id="t1", reply_to="http:req-1")],
+    enqueue_runner_input_sync(
+        runner,
+        Envelope(payload="msg", target="n1", trace_id="t1", reply_to="http:req-1"),
         run_id="run",
         scenario_id="scenario",
+        index=1,
     )
+    runner.run()
 
     assert waiter.in_flight() == 0
     assert waiter.poll(trace_id="t1") == TerminalEvent(status="success", payload={"ok": True})
@@ -92,10 +99,13 @@ def test_runner_uses_first_terminal_event_when_node_emits_duplicates() -> None:
         ]
 
     runner = _runner(node_impl=node, context_service=context_service, waiter=waiter)
-    runner.run_inputs(
-        [Envelope(payload="msg", target="n1", trace_id="t1", reply_to="http:req-1")],
+    enqueue_runner_input_sync(
+        runner,
+        Envelope(payload="msg", target="n1", trace_id="t1", reply_to="http:req-1"),
         run_id="run",
         scenario_id="scenario",
+        index=1,
     )
+    runner.run()
 
     assert waiter.poll(trace_id="t1") == TerminalEvent(status="success", payload={"n": 1})

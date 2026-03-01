@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from stream_kernel.execution.transport.bootstrap_keys import (
+from stream_kernel.execution.orchestration.control_plane.bootstrap_keys import (
     BootstrapChannelStateError,
     OneShotBootstrapChannel,
     RuntimeIpcSecretError,

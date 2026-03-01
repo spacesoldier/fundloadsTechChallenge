@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, fields, is_dataclass
 
 from stream_kernel.application_context.inject import Injected
-from stream_kernel.application_context.injection_registry import InjectionRegistry, InjectionRegistryError
+from stream_kernel.application_context.injection_registry import (
+    InjectionRegistry,
+    InjectionRegistryError,
+)
 from stream_kernel.kernel.dag import Dag
 
 

@@ -11,12 +11,16 @@ _SUPPORTED_KV_BACKENDS = {"memory"}
 _SUPPORTED_FILE_FORMATS = {"text/jsonl", "text/plain", "application/octet-stream"}
 _SUPPORTED_DECODE_ERROR_POLICIES = {"strict", "replace"}
 _SUPPORTED_ORDERING_SINK_MODES = {"completion", "source_seq"}
-_SUPPORTED_EXECUTION_IPC_TRANSPORTS = {"tcp_local"}
+_SUPPORTED_EXECUTION_IPC_TRANSPORTS = {"tcp_local", "ipc_local", "zmq", "redis"}
+_IMPLEMENTED_EXECUTION_IPC_TRANSPORTS = {"tcp_local", "ipc_local"}
+_LOCAL_EXECUTION_IPC_TRANSPORTS = {"tcp_local", "ipc_local"}
 _SUPPORTED_EXECUTION_IPC_AUTH_MODES = {"hmac"}
 _SUPPORTED_BOOTSTRAP_MODES = {"inline", "process_supervisor"}
 _SUPPORTED_EXECUTION_IPC_SECRET_MODES = {"static", "generated"}
 _SUPPORTED_EXECUTION_IPC_KDFS = {"none", "hkdf_sha256"}
+_SUPPORTED_EXECUTION_IPC_CODECS = {"bytes", "pickle"}
 _SUPPORTED_BOUNDARY_DISPATCH_MODES = {"stream", "batch"}
+_SUPPORTED_RUNNER_LOOP_KEYS = {"poll_timeout_ms", "idle_timeout_ms"}
 _SUPPORTED_WEB_INTERFACE_KINDS = {"http", "http_stream", "websocket", "graphql"}
 _SUPPORTED_WEB_BIND_PORT_TYPES = {"request", "response", "stream", "kv_stream"}
 _PROCESS_GROUP_SELECTOR_KEYS = {"stages", "tags", "runners", "nodes"}
@@ -63,8 +67,8 @@ _DEFAULT_OBSERVABILITY_SERVICE_PROCESS_GROUP_NAME = "system.observability"
 _DEFAULT_OBSERVABILITY_SERVICE_PROCESS_NODES = [
     "system.obs.trace_dispatch",
     "system.obs.log_dispatch",
-    "system.obs.metric_dispatch",
     "system.obs.monitor_dispatch",
+    "system.obs.monitoring_metrics_dispatch",
 ]
 _SUPPORTED_API_POLICY_KEYS = {"defaults", "profiles"}
 _SUPPORTED_API_POLICY_DEFAULT_KEYS = {
@@ -372,10 +376,11 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
                 "runtime.platform.bootstrap.mode=process_supervisor requires runtime.platform.execution_ipc"
             )
         transport = execution_ipc.get("transport")
-        if transport != "tcp_local":
+        if transport not in _LOCAL_EXECUTION_IPC_TRANSPORTS:
             raise ConfigError(
                 "runtime.platform.bootstrap.mode=process_supervisor requires "
-                "runtime.platform.execution_ipc.transport=tcp_local"
+                "runtime.platform.execution_ipc.transport to be one of: "
+                f"{sorted(_LOCAL_EXECUTION_IPC_TRANSPORTS)}"
             )
 
     process_groups = platform.get("process_groups")
@@ -509,6 +514,33 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
             raise ConfigError("runtime.platform.readiness.readiness_timeout_seconds must be > 0")
         readiness["readiness_timeout_seconds"] = readiness_timeout_seconds
 
+    runner_loop = platform.get("runner_loop")
+    if runner_loop is not None:
+        if not isinstance(runner_loop, dict):
+            raise ConfigError("runtime.platform.runner_loop must be a mapping when provided")
+        unknown_keys = [key for key in runner_loop if key not in _SUPPORTED_RUNNER_LOOP_KEYS]
+        if unknown_keys:
+            raise ConfigError(
+                "runtime.platform.runner_loop has unsupported keys: "
+                f"{sorted(unknown_keys)}"
+            )
+        poll_timeout_ms = runner_loop.get("poll_timeout_ms", 10.0)
+        if not isinstance(poll_timeout_ms, (int, float)):
+            raise ConfigError("runtime.platform.runner_loop.poll_timeout_ms must be a number when provided")
+        if float(poll_timeout_ms) <= 0:
+            raise ConfigError("runtime.platform.runner_loop.poll_timeout_ms must be > 0")
+        runner_loop["poll_timeout_ms"] = float(poll_timeout_ms)
+
+        idle_timeout_ms = runner_loop.get("idle_timeout_ms", 100.0)
+        if idle_timeout_ms is not None:
+            if not isinstance(idle_timeout_ms, (int, float)):
+                raise ConfigError("runtime.platform.runner_loop.idle_timeout_ms must be a number or null when provided")
+            if float(idle_timeout_ms) <= 0:
+                raise ConfigError("runtime.platform.runner_loop.idle_timeout_ms must be > 0 when provided")
+            runner_loop["idle_timeout_ms"] = float(idle_timeout_ms)
+        else:
+            runner_loop["idle_timeout_ms"] = None
+
     routing_cache = platform.get("routing_cache")
     if routing_cache is not None:
         if not isinstance(routing_cache, dict):
@@ -595,13 +627,27 @@ def _normalize_execution_ipc_mapping(mapping: dict[str, object], *, prefix: str)
         raise ConfigError(
             f"{prefix}.transport must be one of: {sorted(_SUPPORTED_EXECUTION_IPC_TRANSPORTS)}"
         )
+    if transport not in _IMPLEMENTED_EXECUTION_IPC_TRANSPORTS:
+        raise ConfigError(
+            f"{prefix}.transport='{transport}' is reserved for future implementation"
+        )
     mapping["transport"] = transport
+
+    codec = mapping.get("codec", "pickle")
+    if not isinstance(codec, str) or not codec:
+        raise ConfigError(f"{prefix}.codec must be a non-empty string when provided")
+    if codec not in _SUPPORTED_EXECUTION_IPC_CODECS:
+        raise ConfigError(f"{prefix}.codec must be one of: {sorted(_SUPPORTED_EXECUTION_IPC_CODECS)}")
+    mapping["codec"] = codec
 
     bind_host = mapping.get("bind_host", "127.0.0.1")
     if not isinstance(bind_host, str) or not bind_host:
         raise ConfigError(f"{prefix}.bind_host must be a non-empty string when provided")
-    if transport == "tcp_local" and bind_host != "127.0.0.1":
-        raise ConfigError(f"{prefix}.bind_host must be 127.0.0.1 for tcp_local transport")
+    if transport in _LOCAL_EXECUTION_IPC_TRANSPORTS and bind_host != "127.0.0.1":
+        raise ConfigError(
+            f"{prefix}.bind_host must be 127.0.0.1 for local ipc transports: "
+            f"{sorted(_LOCAL_EXECUTION_IPC_TRANSPORTS)}"
+        )
     mapping["bind_host"] = bind_host
 
     bind_port = mapping.get("bind_port", 0)
@@ -660,6 +706,134 @@ def _normalize_execution_ipc_mapping(mapping: dict[str, object], *, prefix: str)
     if max_payload_bytes <= 0:
         raise ConfigError(f"{prefix}.max_payload_bytes must be > 0")
     mapping["max_payload_bytes"] = max_payload_bytes
+
+    buffer_cfg = mapping.get("buffer")
+    if buffer_cfg is not None:
+        if not isinstance(buffer_cfg, dict):
+            raise ConfigError(f"{prefix}.buffer must be a mapping when provided")
+        _normalize_execution_ipc_buffer_mapping(buffer_cfg, prefix=f"{prefix}.buffer", allow_per_group=True)
+        mapping["buffer"] = buffer_cfg
+
+    flow_control = mapping.get("flow_control")
+    if flow_control is not None:
+        if not isinstance(flow_control, dict):
+            raise ConfigError(f"{prefix}.flow_control must be a mapping when provided")
+        _normalize_execution_ipc_flow_control_mapping(flow_control, prefix=f"{prefix}.flow_control")
+        mapping["flow_control"] = flow_control
+
+    poll_mode = mapping.get("poll_mode", "timer")
+    if not isinstance(poll_mode, str) or not poll_mode:
+        raise ConfigError(f"{prefix}.poll_mode must be a non-empty string when provided")
+    poll_mode = poll_mode.strip().lower()
+    if poll_mode not in {"timer", "reader", "auto"}:
+        raise ConfigError(f"{prefix}.poll_mode must be one of: ['auto', 'reader', 'timer']")
+    mapping["poll_mode"] = poll_mode
+
+    poll_interval_ms = mapping.get("poll_interval_ms", 5)
+    if not isinstance(poll_interval_ms, (int, float)):
+        raise ConfigError(f"{prefix}.poll_interval_ms must be a number when provided")
+    if poll_interval_ms <= 0:
+        raise ConfigError(f"{prefix}.poll_interval_ms must be > 0")
+    mapping["poll_interval_ms"] = poll_interval_ms
+
+
+def _normalize_execution_ipc_buffer_mapping(
+    mapping: dict[str, object],
+    *,
+    prefix: str,
+    allow_per_group: bool,
+) -> None:
+    enabled = mapping.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ConfigError(f"{prefix}.enabled must be a boolean when provided")
+    mapping["enabled"] = enabled
+
+    batch_max_items = mapping.get("batch_max_items", 64)
+    if not isinstance(batch_max_items, int):
+        raise ConfigError(f"{prefix}.batch_max_items must be an integer when provided")
+    if batch_max_items <= 0:
+        raise ConfigError(f"{prefix}.batch_max_items must be > 0")
+    mapping["batch_max_items"] = batch_max_items
+
+    flush_interval_ms = mapping.get("flush_interval_ms", 20)
+    if not isinstance(flush_interval_ms, int):
+        raise ConfigError(f"{prefix}.flush_interval_ms must be an integer when provided")
+    if flush_interval_ms < 0:
+        raise ConfigError(f"{prefix}.flush_interval_ms must be >= 0")
+    mapping["flush_interval_ms"] = flush_interval_ms
+
+    if not allow_per_group:
+        if "per_group" in mapping:
+            raise ConfigError(f"{prefix}.per_group is not supported for nested overrides")
+        return
+
+    per_group = mapping.get("per_group", {})
+    if per_group is None:
+        per_group = {}
+    if not isinstance(per_group, dict):
+        raise ConfigError(f"{prefix}.per_group must be a mapping when provided")
+    normalized: dict[str, dict[str, object]] = {}
+    for group_name, override in per_group.items():
+        if not isinstance(group_name, str) or not group_name:
+            raise ConfigError(f"{prefix}.per_group keys must be non-empty strings")
+        if not isinstance(override, dict):
+            raise ConfigError(f"{prefix}.per_group.{group_name} must be a mapping")
+        override_copy = dict(override)
+        _normalize_execution_ipc_buffer_mapping(
+            override_copy,
+            prefix=f"{prefix}.per_group.{group_name}",
+            allow_per_group=False,
+        )
+        normalized[group_name] = override_copy
+    mapping["per_group"] = normalized
+
+
+def _normalize_execution_ipc_flow_control_mapping(
+    mapping: dict[str, object],
+    *,
+    prefix: str,
+) -> None:
+    mode = mapping.get("mode", "credits")
+    if not isinstance(mode, str) or not mode:
+        raise ConfigError(f"{prefix}.mode must be a non-empty string when provided")
+    mode = mode.strip().lower()
+    if mode not in {"credits", "token_bucket", "hybrid", "none"}:
+        raise ConfigError(
+            f"{prefix}.mode must be one of: ['credits', 'hybrid', 'none', 'token_bucket']"
+        )
+    mapping["mode"] = mode
+
+    credits = mapping.get("credits", {})
+    if credits is None:
+        credits = {}
+    if not isinstance(credits, dict):
+        raise ConfigError(f"{prefix}.credits must be a mapping when provided")
+    window_size = credits.get("window_size", 16)
+    if not isinstance(window_size, int):
+        raise ConfigError(f"{prefix}.credits.window_size must be an integer when provided")
+    if window_size <= 0:
+        raise ConfigError(f"{prefix}.credits.window_size must be > 0")
+    credits["window_size"] = window_size
+    mapping["credits"] = credits
+
+    token_bucket = mapping.get("token_bucket", {})
+    if token_bucket is None:
+        token_bucket = {}
+    if not isinstance(token_bucket, dict):
+        raise ConfigError(f"{prefix}.token_bucket must be a mapping when provided")
+    rate_per_sec = token_bucket.get("rate_per_sec", 20000)
+    if not isinstance(rate_per_sec, (int, float)):
+        raise ConfigError(f"{prefix}.token_bucket.rate_per_sec must be a number when provided")
+    if rate_per_sec <= 0:
+        raise ConfigError(f"{prefix}.token_bucket.rate_per_sec must be > 0")
+    token_bucket["rate_per_sec"] = rate_per_sec
+    burst = token_bucket.get("burst", rate_per_sec)
+    if not isinstance(burst, (int, float)):
+        raise ConfigError(f"{prefix}.token_bucket.burst must be a number when provided")
+    if burst <= 0:
+        raise ConfigError(f"{prefix}.token_bucket.burst must be > 0")
+    token_bucket["burst"] = burst
+    mapping["token_bucket"] = token_bucket
 
 
 def _normalize_runtime_ordering(runtime: dict[str, object]) -> None:
@@ -1224,7 +1398,11 @@ def _normalize_observability_service_process(
         )
     service_process["runner_profile"] = runner_profile
 
-    nodes = service_process.get("nodes", list(_DEFAULT_OBSERVABILITY_SERVICE_PROCESS_NODES))
+    nodes_value = service_process.get("nodes")
+    if nodes_value is None:
+        nodes = _default_observability_service_process_nodes(observability)
+    else:
+        nodes = nodes_value
     if not isinstance(nodes, list) or not nodes:
         raise ConfigError("runtime.observability.service_process.nodes must be a non-empty list")
     if not all(isinstance(node, str) and node for node in nodes):
@@ -1342,6 +1520,61 @@ def _has_enabled_observability_exporters(observability: dict[str, object]) -> bo
             enabled = exporter.get("enabled", True)
             if isinstance(enabled, bool) and enabled:
                 return True
+    return False
+
+
+def _default_observability_service_process_nodes(observability: dict[str, object]) -> list[str]:
+    nodes: list[str] = []
+
+    pipeline = observability.get("pipeline")
+    if isinstance(pipeline, dict):
+        system_nodes = pipeline.get("system_nodes")
+        if isinstance(system_nodes, list):
+            for entry in system_nodes:
+                if not isinstance(entry, dict):
+                    continue
+                kind = entry.get("kind")
+                enabled = entry.get("enabled", True)
+                if (
+                    isinstance(kind, str)
+                    and kind in _SUPPORTED_OBSERVABILITY_PIPELINE_SYSTEM_NODE_KINDS
+                    and enabled is not False
+                ):
+                    nodes.append(kind)
+            if nodes:
+                return list(dict.fromkeys(nodes))
+
+    if _has_enabled_observability_exporters_for_section(observability, "tracing"):
+        nodes.append("system.obs.trace_dispatch")
+    if _has_enabled_observability_exporters_for_section(observability, "logging"):
+        nodes.append("system.obs.log_dispatch")
+    if _has_enabled_observability_exporters_for_section(observability, "telemetry"):
+        nodes.append("system.obs.metric_dispatch")
+    if _has_enabled_observability_exporters_for_section(observability, "monitoring"):
+        nodes.append("system.obs.monitor_dispatch")
+        nodes.append("system.obs.monitoring_metrics_dispatch")
+
+    if not nodes:
+        nodes = list(_DEFAULT_OBSERVABILITY_SERVICE_PROCESS_NODES)
+    return list(dict.fromkeys(nodes))
+
+
+def _has_enabled_observability_exporters_for_section(
+    observability: dict[str, object],
+    section_name: str,
+) -> bool:
+    section = observability.get(section_name, {})
+    if not isinstance(section, dict):
+        return False
+    exporters = section.get("exporters", [])
+    if not isinstance(exporters, list):
+        return False
+    for exporter in exporters:
+        if not isinstance(exporter, dict):
+            continue
+        enabled = exporter.get("enabled", True)
+        if isinstance(enabled, bool) and enabled:
+            return True
     return False
 
 

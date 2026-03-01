@@ -312,6 +312,8 @@ list is authoritative for dispatch activation (including explicit disable via
 
 ## 3. Compatibility path (`runtime.tracing`)
 
+Legacy compatibility (`runtime.tracing`).
+
 `runtime.tracing` remains a compatibility path for CLI toggles and legacy
 single-sink flows.
 

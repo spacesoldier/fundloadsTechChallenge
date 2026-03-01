@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib
 import pkgutil
 from dataclasses import dataclass, field
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 from typing import Any
 
 from stream_kernel.adapters.discovery import discover_adapters
@@ -11,7 +11,6 @@ from stream_kernel.adapters.registry import AdapterRegistry
 from stream_kernel.app.extensions import framework_discovery_modules
 from stream_kernel.application_context import (
     ApplicationContext,
-    apply_injection,
     discover_services,
     service_contract_types,
 )
@@ -21,36 +20,51 @@ from stream_kernel.application_context.injection_registry import (
     InjectionRegistryError,
     ScenarioScope,
 )
-from stream_kernel.execution.transport.bootstrap_keys import (
+from stream_kernel.execution.orchestration.control_plane import (
+    build_control_plane_system_plan,
+)
+from stream_kernel.execution.orchestration.control_plane.bootstrap_keys import (
     BootstrapKeyBundle,
     resolve_execution_ipc_key_material,
 )
-from stream_kernel.execution.orchestration.lifecycle_orchestration import (
-    execute_with_bootstrap_supervisor,
+from stream_kernel.execution.orchestration.lifecycle.orchestration import (
     execute_with_runtime_lifecycle,
     runtime_bootstrap_mode,
 )
-from stream_kernel.execution.observers.observer_builder import build_execution_observers
-from stream_kernel.execution.runtime.planning import build_execution_plan, plan_pools
-from stream_kernel.execution.runtime.runner import AsyncRunner, SyncRunner
-from stream_kernel.execution.transport.secure_tcp_transport import SecureTcpConfig, SecureTcpTransport
+from stream_kernel.execution.orchestration.lifecycle.root.startup.planning import (
+    build_lifecycle_system_plan,
+)
+from stream_kernel.execution.orchestration.observability_system_nodes import (
+    build_observability_system_plan,
+)
 from stream_kernel.execution.orchestration.source_ingress import (
     WEB_INGRESS_LIMITER_QUALIFIER,
     BootstrapControl,
     build_source_ingress_plan,
 )
-from stream_kernel.execution.orchestration.observability_system_nodes import (
-    build_observability_system_plan,
+from stream_kernel.execution.orchestration.runtime import (
+    assemble_runtime_startup_scenario,
+    prepare_process_supervisor_root_runtime,
+    run_with_async_runner,
+    run_with_sync_runner,
+)
+from stream_kernel.execution.runtime.planning import build_execution_plan
+from stream_kernel.execution.transport.handoff.runtime_wiring import (
+    ensure_runtime_ipc_handoff_bindings as ensure_runtime_ipc_handoff_bindings_via_transport,
+    ensure_runtime_ipc_bindings as ensure_runtime_ipc_bindings_via_transport,
+    resolve_execution_ipc_adapter_from_adapters as resolve_execution_ipc_adapter_from_adapters_via_transport,
+)
+from stream_kernel.execution.transport.secure_tcp_transport import (
+    SecureTcpConfig,
+    SecureTcpTransport,
 )
 from stream_kernel.integration.consumer_registry import ConsumerRegistry
 from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
 from stream_kernel.kernel.dag import NodeContract
-from stream_kernel.kernel.scenario import Scenario, StepSpec
-from stream_kernel.platform.services.observability import (
-    FanoutObservabilityService,
-    ObservabilityPipelineService,
-    ObservabilityService,
-    ReplyAwareObservabilityService,
+from stream_kernel.kernel.scenario import StepSpec
+from stream_kernel.platform.services.api.outbound import (
+    InMemoryOutboundApiService,
+    OutboundApiService,
 )
 from stream_kernel.platform.services.api.policy import (
     ApiPolicyService,
@@ -58,19 +72,30 @@ from stream_kernel.platform.services.api.policy import (
     InMemoryRateLimiterService,
     RateLimiterService,
 )
-from stream_kernel.platform.services.api.outbound import (
-    InMemoryOutboundApiService,
-    OutboundApiService,
+from stream_kernel.execution.transport.ipc.ipc_transport import (
+    ExecutionIpcKvStreamPort,
+    ExecutionIpcTransportService,
 )
+from stream_kernel.platform.services.observability import (
+    ObservabilityPipelineService,
+    ObservabilityService,
+)
+from stream_kernel.platform.services.observability_dispatch import (
+    DispatchingObservabilityService,
+)
+from stream_kernel.platform.services.runtime.control_plane_discovery_adapters import (
+    platform_discovery_source_adapter,
+    project_discovery_source_adapter,
+)
+from stream_kernel.platform.services.runtime.control_plane_discovery_stream import (
+    ControlPlaneDiscoverySourceAdapter,
+)
+from stream_kernel.platform.services.runtime.lifecycle import RuntimeLifecycleManager
 from stream_kernel.platform.services.runtime.transport import (
+    IpcLocalRuntimeTransportService,
     MemoryRuntimeTransportService,
     RuntimeTransportService,
     TcpLocalRuntimeTransportService,
-)
-from stream_kernel.platform.services.runtime.bootstrap import (
-    BootstrapSupervisor,
-    LocalBootstrapSupervisor,
-    MultiprocessBootstrapSupervisor,
 )
 from stream_kernel.routing.envelope import Envelope
 
@@ -78,6 +103,7 @@ BUILD_TIME_REGISTRY_TYPES = (AdapterRegistry, InjectionRegistry)
 RUNTIME_SERVICE_REGISTRY_CONTRACTS = (ApplicationContext,)
 DEFAULT_EXECUTION_QUEUE_QUALIFIER = "execution.cpu"
 DEFAULT_ASYNC_QUEUE_QUALIFIER = "execution.asyncio"
+_LIFECYCLE_MANAGED_TRANSPORT_PROFILES = {"tcp_local", "ipc_local"}
 
 
 @dataclass(slots=True)
@@ -138,7 +164,11 @@ def load_discovery_modules(discovery_modules: list[str]) -> list[ModuleType]:
 
 def register_discovered_services(registry: InjectionRegistry, modules: list[object]) -> None:
     # Register services discovered in framework/user modules into DI unless overridden.
-    discovered = discover_services(modules)  # type: ignore[arg-type]
+    discovered = [
+        service
+        for service in discover_services(modules)  # type: ignore[arg-type]
+        if not issubclass(service, ExecutionIpcTransportService)
+    ]
     contract_to_service: dict[type[object], type[object]] = {}
     for service_cls in discovered:
         for contract in service_contract_types(service_cls):
@@ -166,82 +196,14 @@ def register_discovered_services(registry: InjectionRegistry, modules: list[obje
                 continue
 
 
-def run_with_sync_runner(
-    *,
-    scenario,
-    inputs,
-    strict: bool,
-    run_id: str,
-    scenario_id: str,
-    scenario_scope: ScenarioScope,
-    full_context_nodes: set[str] | None = None,
-    ordered_sink_mode: str = "completion",
-    queue_qualifier: str = DEFAULT_EXECUTION_QUEUE_QUALIFIER,
-) -> None:
-    # Build execution components (Execution runtime and routing integration §6).
-    nodes = {spec.name: spec.step for spec in scenario.steps}
-    runner = SyncRunner(
-        nodes=nodes,
-        full_context_nodes=set(full_context_nodes or ()),
-        ordered_sink_mode=ordered_sink_mode,
-    )
-    if queue_qualifier != DEFAULT_EXECUTION_QUEUE_QUALIFIER:
-        runner.work_queue = inject.queue(Envelope, qualifier=queue_qualifier)
-    apply_injection(runner, scenario_scope, strict)
-    try:
-        runner.run_inputs(inputs, run_id=run_id, scenario_id=scenario_id)
-    finally:
-        runner.on_run_end()
-        close_scenario_scope(scenario_scope)
-
-
-def run_with_async_runner(
-    *,
-    scenario,
-    inputs,
-    strict: bool,
-    run_id: str,
-    scenario_id: str,
-    scenario_scope: ScenarioScope,
-    full_context_nodes: set[str] | None = None,
-    ordered_sink_mode: str = "completion",
-    queue_qualifier: str = DEFAULT_ASYNC_QUEUE_QUALIFIER,
-) -> None:
-    # Build async execution components under the same DI/discovery rails as SyncRunner.
-    nodes = {spec.name: spec.step for spec in scenario.steps}
-    runner = AsyncRunner(
-        nodes=nodes,
-        full_context_nodes=set(full_context_nodes or ()),
-        ordered_sink_mode=ordered_sink_mode,
-    )
-    if queue_qualifier != DEFAULT_ASYNC_QUEUE_QUALIFIER:
-        runner.work_queue = inject.queue(Envelope, qualifier=queue_qualifier)
-    apply_injection(runner, scenario_scope, strict)
-    try:
-        runner.run_inputs(inputs, run_id=run_id, scenario_id=scenario_id)
-    finally:
-        runner.on_run_end()
-        close_scenario_scope(scenario_scope)
-
-
 def execute_runtime_artifacts(artifacts: RuntimeBuildArtifacts) -> None:
     # Single execution entrypoint for runtime-prepared artifacts.
     profile = runtime_execution_transport_profile(artifacts.runtime)
-    if profile != "tcp_local":
+    if profile not in _LIFECYCLE_MANAGED_TRANSPORT_PROFILES:
         _execute_runner(artifacts)
         return
     if runtime_bootstrap_mode(artifacts.runtime) == "process_supervisor":
-        execute_with_bootstrap_supervisor(
-            config=artifacts.config,
-            runtime=artifacts.runtime,
-            scenario_id=artifacts.scenario_id,
-            run_id=artifacts.run_id,
-            inputs=list(artifacts.inputs),
-            scenario_scope=artifacts.scenario_scope,
-            adapters=dict(artifacts.adapters),
-            run=lambda: _execute_runner(artifacts),
-        )
-        return
+        prepare_process_supervisor_root_runtime(artifacts)
     execute_with_runtime_lifecycle(
         runtime=artifacts.runtime,
         scenario_scope=artifacts.scenario_scope,
@@ -251,21 +213,8 @@ def execute_runtime_artifacts(artifacts: RuntimeBuildArtifacts) -> None:
 
 def _execute_runner(artifacts: RuntimeBuildArtifacts) -> None:
     ordered_sink_mode = runtime_ordering_sink_mode(artifacts.runtime)
-    runner_profile, queue_qualifier = _resolve_runner_profile_and_queue(artifacts)
-    if runner_profile == "async":
-        run_with_async_runner(
-            scenario=artifacts.scenario,
-            inputs=artifacts.inputs,
-            strict=artifacts.strict,
-            run_id=artifacts.run_id,
-            scenario_id=artifacts.scenario_id,
-            scenario_scope=artifacts.scenario_scope,
-            full_context_nodes=artifacts.full_context_nodes,
-            ordered_sink_mode=ordered_sink_mode,
-            queue_qualifier=queue_qualifier,
-        )
-        return
-    run_with_sync_runner(
+    queue_qualifier = _resolve_async_runner_queue_qualifier(artifacts)
+    run_with_async_runner(
         scenario=artifacts.scenario,
         inputs=artifacts.inputs,
         strict=artifacts.strict,
@@ -276,14 +225,6 @@ def _execute_runner(artifacts: RuntimeBuildArtifacts) -> None:
         ordered_sink_mode=ordered_sink_mode,
         queue_qualifier=queue_qualifier,
     )
-
-
-def close_scenario_scope(scope: ScenarioScope) -> None:
-    # Finalize scoped resources if the scope exposes lifecycle hooks.
-    close = getattr(scope, "close", None)
-    if callable(close):
-        close()
-
 
 def build_runtime_artifacts(
     config: dict[str, object],
@@ -357,30 +298,48 @@ def build_runtime_artifacts(
         consumer_registry=consumer_registry,
     )
     step_names = resolve_step_names(dag)
-    observers = build_execution_observers(
-        modules=modules,
-        runtime=runtime,
-        adapter_instances=adapter_instances,
-        run_id=run_id,
-        scenario_id=scenario_name(config),
-        node_order=step_names,
+    custom_observability_declared = any(
+        isinstance(service_cls, type)
+        and issubclass(service_cls, ObservabilityService)
+        and service_cls.__module__ != "stream_kernel.platform.services.observability"
+        and service_cls.__module__ != "stream_kernel.platform.services.observability_dispatch"
+        for service_cls in discover_services(modules)
     )
-    ensure_runtime_observability_binding(
-        injection_registry=injection_registry,
-        observers=observers,
-    )
+    if not custom_observability_declared:
+        ensure_runtime_observability_binding(
+            injection_registry=injection_registry,
+            runtime=runtime,
+            adapter_instances=adapter_instances,
+            replace=not custom_observability_declared,
+        )
     register_discovered_services(injection_registry, modules)
-    ensure_runtime_bootstrap_binding(
+    ensure_runtime_api_policy_bindings(
         injection_registry=injection_registry,
         runtime=runtime,
     )
-    ensure_runtime_api_policy_bindings(
+    ensure_runtime_control_plane_discovery_bindings(
         injection_registry=injection_registry,
         runtime=runtime,
     )
 
     scenario_id = scenario_name(config)
     ensure_runtime_transport_bindings(
+        injection_registry=injection_registry,
+        runtime=runtime,
+    )
+    ipc_adapter = resolve_execution_ipc_adapter_from_adapters(
+        adapter_bindings=adapter_bindings,
+        adapter_instances=adapter_instances,
+    )
+    ensure_runtime_ipc_bindings(
+        injection_registry=injection_registry,
+        runtime=runtime,
+        adapter=ipc_adapter,
+    )
+    ensure_runtime_ipc_handoff_bindings_via_transport(
+        injection_registry=injection_registry,
+    )
+    ensure_runtime_lifecycle_bindings(
         injection_registry=injection_registry,
         runtime=runtime,
     )
@@ -444,33 +403,45 @@ def build_runtime_artifacts(
         existing = list(get_consumers(token))
         register(token, [*existing, *node_names])
 
+    control_plane_system = build_control_plane_system_plan(
+        runtime=runtime,
+        scenario_scope=scenario_scope,
+    )
+    for token, node_names in control_plane_system.system_consumers.items():
+        get_consumers = getattr(consumer_registry, "get_consumers", None)
+        register = getattr(consumer_registry, "register", None)
+        if not callable(get_consumers) or not callable(register):
+            continue
+        existing = list(get_consumers(token))
+        register(token, [*existing, *node_names])
+
+    lifecycle_system = build_lifecycle_system_plan(
+        runtime=runtime,
+        scenario_scope=scenario_scope,
+    )
+    for token, node_names in lifecycle_system.system_consumers.items():
+        get_consumers = getattr(consumer_registry, "get_consumers", None)
+        register = getattr(consumer_registry, "register", None)
+        if not callable(get_consumers) or not callable(register):
+            continue
+        existing = list(get_consumers(token))
+        register(token, [*existing, *node_names])
+
     sink_steps = [StepSpec(name=name, step=step) for name, step in sink_nodes.items()]
-    existing_steps = list(getattr(scenario, "steps", []))
-    if isinstance(scenario, Scenario):
-        scenario = Scenario(
-            scenario_id=scenario.scenario_id,
-            steps=tuple(
-                [
-                    *source_ingress.source_steps,
-                    *existing_steps,
-                    *observability_system.system_steps,
-                    *sink_steps,
-                ]
-            ),
-        )
-    else:
-        scenario = SimpleNamespace(
-            steps=[
-                *source_ingress.source_steps,
-                *existing_steps,
-                *observability_system.system_steps,
-                *sink_steps,
-            ]
-        )
+    startup_assembly = assemble_runtime_startup_scenario(
+        runtime=runtime,
+        scenario=scenario,
+        source_steps=list(source_ingress.source_steps),
+        control_plane_steps=list(control_plane_system.system_steps),
+        lifecycle_steps=list(lifecycle_system.system_steps),
+        observability_steps=list(observability_system.system_steps),
+        sink_steps=sink_steps,
+        source_inputs=list(source_ingress.bootstrap_inputs),
+    )
 
     return RuntimeBuildArtifacts(
-        scenario=scenario,
-        inputs=source_ingress.bootstrap_inputs,
+        scenario=startup_assembly.scenario,
+        inputs=startup_assembly.inputs,
         strict=strict,
         run_id=run_id,
         scenario_id=scenario_id,
@@ -481,6 +452,8 @@ def build_runtime_artifacts(
             if bool(getattr(node_def.meta, "service", False))
         }
         | set(source_ingress.source_node_names)
+        | set(control_plane_system.system_node_names)
+        | set(lifecycle_system.system_node_names)
         | set(observability_system.system_node_names),
         adapter_registry=adapter_registry,
         injection_registry=injection_registry,
@@ -495,13 +468,25 @@ def build_runtime_artifacts(
 def ensure_runtime_observability_binding(
     *,
     injection_registry: InjectionRegistry,
-    observers: list[object],
+    runtime: dict[str, object],
+    adapter_instances: dict[str, object],
     replace: bool = True,
 ) -> None:
-    # Bind platform observability service to runtime fan-out implementation for this run.
-    requires_async = _observers_require_async_dispatch(observers)
-    factory = lambda _observers=list(observers): ReplyAwareObservabilityService(
-        inner=FanoutObservabilityService(observers=list(_observers))
+    # Bind platform observability service to dispatch-first implementation for this run.
+    requires_async = _sinks_require_async_dispatch(adapter_instances)
+    trace_sinks, log_sinks, telemetry_sinks, monitoring_sinks = _split_observability_sinks(adapter_instances)
+    factory = (
+        lambda _runtime=dict(runtime),
+        _trace=list(trace_sinks),
+        _log=list(log_sinks),
+        _telemetry=list(telemetry_sinks),
+        _monitoring=list(monitoring_sinks): DispatchingObservabilityService(
+            runtime=dict(_runtime),
+            trace_sinks=list(_trace),
+            log_sinks=list(_log),
+            telemetry_sinks=list(_telemetry),
+            monitoring_sinks=list(_monitoring),
+        )
     )
     for contract in (ObservabilityService, ObservabilityPipelineService):
         injection_registry.register_factory(
@@ -513,20 +498,46 @@ def ensure_runtime_observability_binding(
         )
 
 
-def _observers_require_async_dispatch(observers: list[object]) -> bool:
-    for observer in observers:
-        if callable(getattr(observer, "on_trace_event_async", None)):
+def _sinks_require_async_dispatch(adapter_instances: dict[str, object]) -> bool:
+    for candidate in adapter_instances.values():
+        if callable(getattr(candidate, "emit_async", None)):
             return True
-        if callable(getattr(observer, "on_log_event_async", None)):
-            return True
-        if callable(getattr(observer, "on_metric_event_async", None)):
-            return True
-        if callable(getattr(observer, "on_monitoring_event_async", None)):
-            return True
-        sink = getattr(observer, "_sink", None)
-        if callable(getattr(sink, "emit_async", None)):
+        if callable(getattr(candidate, "publish_metrics_async", None)):
             return True
     return False
+
+
+def _split_observability_sinks(
+    adapter_instances: dict[str, object],
+) -> tuple[list[object], list[object], list[object], list[object]]:
+    trace_sinks: list[object] = []
+    log_sinks: list[object] = []
+    telemetry_sinks: list[object] = []
+    monitoring_sinks: list[object] = []
+    seen: set[int] = set()
+    for role, candidate in adapter_instances.items():
+        if not isinstance(role, str):
+            continue
+        marker = id(candidate)
+        if marker in seen:
+            continue
+        if role.startswith("trace_"):
+            trace_sinks.append(candidate)
+            seen.add(marker)
+            continue
+        if role.startswith("log_"):
+            log_sinks.append(candidate)
+            seen.add(marker)
+            continue
+        if role.startswith("telemetry_"):
+            telemetry_sinks.append(candidate)
+            seen.add(marker)
+            continue
+        if role.startswith("monitoring_"):
+            monitoring_sinks.append(candidate)
+            seen.add(marker)
+            continue
+    return trace_sinks, log_sinks, telemetry_sinks, monitoring_sinks
 
 
 @dataclass(slots=True)
@@ -1063,6 +1074,49 @@ def ensure_runtime_registry_bindings(
         )
 
 
+def ensure_runtime_control_plane_discovery_bindings(
+    *,
+    injection_registry: InjectionRegistry,
+    runtime: dict[str, object],
+) -> None:
+    # Control-plane discovery stream requires qualified source adapters in DI.
+    # Bind platform/project adapter contracts explicitly for runtime startup path.
+    project_modules: list[str] = []
+    platform = runtime.get("platform", {})
+    if isinstance(platform, dict):
+        discovery = platform.get("discovery", {})
+        if isinstance(discovery, dict):
+            configured = discovery.get("project_modules", [])
+            if isinstance(configured, list):
+                project_modules = [value for value in configured if isinstance(value, str) and value]
+    if not project_modules:
+        discovered_modules = runtime.get("discovery_modules", [])
+        if isinstance(discovered_modules, list):
+            project_modules = [
+                value
+                for value in discovered_modules
+                if isinstance(value, str) and value and not value.startswith("stream_kernel")
+            ]
+
+    platform_adapter = platform_discovery_source_adapter({})
+    project_adapter = project_discovery_source_adapter({"project_modules": project_modules})
+
+    qualified_bindings: tuple[tuple[str, ControlPlaneDiscoverySourceAdapter], ...] = (
+        ("platform_discovery_source_adapter", platform_adapter),
+        ("project_discovery_source_adapter", project_adapter),
+    )
+    for qualifier, adapter in qualified_bindings:
+        try:
+            injection_registry.register_factory(
+                "service",
+                ControlPlaneDiscoverySourceAdapter,
+                lambda _adapter=adapter: _adapter,
+                qualifier=qualifier,
+            )
+        except InjectionRegistryError:
+            continue
+
+
 def ensure_runtime_transport_bindings(
     *,
     injection_registry: InjectionRegistry,
@@ -1107,24 +1161,61 @@ def ensure_runtime_transport_bindings(
             pass
 
 
-def ensure_runtime_bootstrap_binding(
+def ensure_runtime_ipc_bindings(
+    *,
+    injection_registry: InjectionRegistry,
+    runtime: dict[str, object],
+    adapter: ExecutionIpcKvStreamPort | None = None,
+    service: ExecutionIpcTransportService | None = None,
+) -> None:
+    # Transport IPC bindings are owned by execution.transport.handoff.runtime_wiring.
+    ensure_runtime_ipc_bindings_via_transport(
+        injection_registry=injection_registry,
+        runtime=runtime,
+        adapter=adapter,
+        service=service,
+    )
+
+
+def ensure_runtime_lifecycle_bindings(
     *,
     injection_registry: InjectionRegistry,
     runtime: dict[str, object],
 ) -> None:
-    # Runtime bootstrap supervisor contract is selected explicitly by bootstrap.mode
-    # so discovery order cannot silently switch process-supervisor behavior.
-    mode = runtime_bootstrap_mode(runtime)
-    supervisor_cls = (
-        MultiprocessBootstrapSupervisor if mode == "process_supervisor" else LocalBootstrapSupervisor
-    )
-    injection_registry.register_factory(
-        "service",
-        BootstrapSupervisor,
-        lambda _cls=supervisor_cls: _cls(),
-        replace=True,
+    # Process-supervisor root runtime uses control-plane-aware lifecycle manager for shutdown orchestration.
+    try:
+        mode = runtime_bootstrap_mode(runtime)
+    except Exception:
+        return
+    process_role = runtime.get("__process_role")
+    if mode != "process_supervisor":
+        return
+    if isinstance(process_role, str) and process_role in {"worker", "observability_worker"}:
+        return
+    from stream_kernel.execution.orchestration.lifecycle.root.runtime.lifecycle_manager import (
+        ControlPlaneRootRuntimeLifecycleManager,
     )
 
+    try:
+        injection_registry.register_factory(
+            "service",
+            RuntimeLifecycleManager,
+            lambda: ControlPlaneRootRuntimeLifecycleManager(),
+            replace=True,
+        )
+    except InjectionRegistryError:
+        return
+
+
+def resolve_execution_ipc_adapter_from_adapters(
+    *,
+    adapter_bindings: dict[str, object],
+    adapter_instances: dict[str, object],
+) -> ExecutionIpcKvStreamPort | None:
+    return resolve_execution_ipc_adapter_from_adapters_via_transport(
+        adapter_bindings=adapter_bindings,
+        adapter_instances=adapter_instances,
+    )
 
 def _runtime_queue_qualifiers(runtime: dict[str, object]) -> list[str]:
     qualifiers: list[str] = [DEFAULT_EXECUTION_QUEUE_QUALIFIER]
@@ -1145,26 +1236,14 @@ def _runtime_queue_qualifiers(runtime: dict[str, object]) -> list[str]:
     return qualifiers
 
 
-def _resolve_runner_profile_and_queue(artifacts: RuntimeBuildArtifacts) -> tuple[str, str]:
+def _resolve_async_runner_queue_qualifier(artifacts: RuntimeBuildArtifacts) -> str:
     runtime = artifacts.runtime
     platform = runtime.get("platform", {})
     if not isinstance(platform, dict):
-        inferred = _infer_runner_profile_from_dependencies(artifacts)
-        qualifier = (
-            DEFAULT_ASYNC_QUEUE_QUALIFIER
-            if inferred == "async"
-            else DEFAULT_EXECUTION_QUEUE_QUALIFIER
-        )
-        return (inferred, qualifier)
+        return DEFAULT_ASYNC_QUEUE_QUALIFIER
     process_groups = platform.get("process_groups", [])
     if not isinstance(process_groups, list) or not process_groups:
-        inferred = _infer_runner_profile_from_dependencies(artifacts)
-        qualifier = (
-            DEFAULT_ASYNC_QUEUE_QUALIFIER
-            if inferred == "async"
-            else DEFAULT_EXECUTION_QUEUE_QUALIFIER
-        )
-        return (inferred, qualifier)
+        return DEFAULT_ASYNC_QUEUE_QUALIFIER
 
     resolved_group: dict[str, object] | None = None
     for group in process_groups:
@@ -1177,50 +1256,10 @@ def _resolve_runner_profile_and_queue(artifacts: RuntimeBuildArtifacts) -> tuple
         break
     if resolved_group is None:
         resolved_group = next((group for group in process_groups if isinstance(group, dict)), None)
-    explicit_profile: str | None = None
-    if resolved_group is not None:
-        runner_profile = resolved_group.get("runner_profile")
-        if isinstance(runner_profile, str) and runner_profile in {"sync", "async"}:
-            explicit_profile = runner_profile
-
-    inferred_profile = _infer_runner_profile_from_dependencies(artifacts)
-    final_profile = explicit_profile or inferred_profile
     queue_qualifier = resolved_group.get("name") if isinstance(resolved_group, dict) else None
     if not isinstance(queue_qualifier, str) or not queue_qualifier:
-        queue_qualifier = (
-            DEFAULT_ASYNC_QUEUE_QUALIFIER
-            if final_profile == "async"
-            else DEFAULT_EXECUTION_QUEUE_QUALIFIER
-        )
-    return (final_profile, queue_qualifier)
-
-
-def _infer_runner_profile_from_dependencies(artifacts: RuntimeBuildArtifacts) -> str:
-    registry = artifacts.injection_registry
-    if not isinstance(registry, InjectionRegistry):
-        return "sync"
-
-    scenario_steps = getattr(artifacts.scenario, "steps", ())
-    if not isinstance(scenario_steps, (list, tuple)):
-        return "sync"
-
-    nodes: dict[str, object] = {}
-    for step_spec in scenario_steps:
-        name = getattr(step_spec, "name", None)
-        step = getattr(step_spec, "step", None)
-        if not isinstance(name, str) or not name:
-            continue
-        if step is None:
-            continue
-        nodes[name] = step
-
-    if not nodes:
-        return "sync"
-
-    pools = plan_pools(nodes, registry)
-    if any(pool == "async" for pool in pools.values()):
-        return "async"
-    return "sync"
+        queue_qualifier = DEFAULT_ASYNC_QUEUE_QUALIFIER
+    return queue_qualifier
 
 
 def _build_runtime_transport_service(
@@ -1231,6 +1270,8 @@ def _build_runtime_transport_service(
     profile = runtime_execution_transport_profile(runtime)
     if profile == "memory":
         return MemoryRuntimeTransportService()
+    if profile == "ipc_local":
+        return IpcLocalRuntimeTransportService()
     if profile == "tcp_local":
         transport = _build_secure_tcp_transport(runtime, bootstrap_key_bundle=bootstrap_key_bundle)
         return TcpLocalRuntimeTransportService(transport=transport)
@@ -1386,15 +1427,24 @@ def build_runtime_observability_adapter_instances(
     observability = runtime.get("observability", {})
     if not isinstance(observability, dict):
         return built
-    service_process_cfg = observability.get("service_process", {})
+    service_process_cfg = observability.get("service_process")
     service_process_enabled = False
-    if isinstance(service_process_cfg, dict):
+    if isinstance(service_process_cfg, dict) and service_process_cfg:
         enabled_raw = service_process_cfg.get("enabled", False)
         if isinstance(enabled_raw, bool):
             service_process_enabled = enabled_raw
         elif strict:
             raise ValueError(
                 "runtime.observability.service_process.enabled must be a boolean when provided"
+            )
+    elif isinstance(observability.get("service_worker"), dict):
+        service_worker_cfg = observability.get("service_worker", {})
+        enabled_raw = service_worker_cfg.get("enabled", False)
+        if isinstance(enabled_raw, bool):
+            service_process_enabled = enabled_raw
+        elif strict:
+            raise ValueError(
+                "runtime.observability.service_worker.enabled must be a boolean when provided"
             )
     elif service_process_cfg is not None and strict:
         raise ValueError("runtime.observability.service_process must be a mapping when provided")
@@ -1489,7 +1539,17 @@ def build_adapter_bindings(
         if meta is None:
             continue
 
-        requested = cfg.get("binds", [])
+        if "binds" in cfg:
+            requested = cfg.get("binds", [])
+        else:
+            requested = []
+            if any(
+                port_type == "kv_stream"
+                and isinstance(data_type, type)
+                and issubclass(data_type, ExecutionIpcKvStreamPort)
+                for port_type, data_type in meta.binds
+            ):
+                requested = ["kv_stream"]
         if not isinstance(requested, list):
             raise ValueError(f"adapters.{role}.binds must be a list")
         if not all(isinstance(item, str) for item in requested):

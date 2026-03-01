@@ -7,6 +7,14 @@ import pytest
 from stream_kernel.application_context.injection_registry import InjectionRegistry
 from stream_kernel.application_context.inject import inject, Injected
 from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
+from stream_kernel.execution.transport.ipc import (
+    ExecutionIpcEndpointRegistry,
+    ExecutionIpcPort,
+    ExecutionIpcReceivePolicy,
+    ExecutionIpcTransportService,
+    ExecutionIpcTransportCoordinatorService,
+    InMemoryExecutionIpcTransportAdapter,
+)
 
 
 class EventA:
@@ -120,6 +128,14 @@ def test_inject_topic_descriptor_carries_port_and_type() -> None:
     assert isinstance(dep, Injected)
     assert dep.port_type == "topic"
     assert dep.data_type is EventA
+
+
+def test_inject_ipc_descriptor_carries_port_and_type() -> None:
+    # IPC injection should carry "ipc" port metadata.
+    dep = inject.ipc(ExecutionIpcPort)
+    assert isinstance(dep, Injected)
+    assert dep.port_type == "ipc"
+    assert dep.data_type is ExecutionIpcPort
 
 
 def test_inject_kv_descriptor_accepts_marker_kv_contract() -> None:
@@ -237,6 +253,56 @@ def test_inject_topic_resolves_from_scope() -> None:
     resolved = dep.resolve(scope)
     assert isinstance(resolved, _TopicPort)
     assert resolved.name == "topic"
+
+
+def test_inject_ipc_receive_policy_registers_buffer() -> None:
+    # IPC receive policy should register buffered receiver via transport service.
+    store = InMemoryKvStore()
+    adapter = InMemoryExecutionIpcTransportAdapter(kv_store=store)
+    service = ExecutionIpcTransportCoordinatorService(adapter=adapter)
+    reg = InjectionRegistry()
+    reg.register_factory("service", ExecutionIpcTransportService, lambda _svc=service: _svc)
+    reg.register_factory("kv", ExecutionIpcEndpointRegistry, lambda _p=store: _p)
+    scope = reg.instantiate_for_scenario("s1")
+
+    dep = inject.ipc(
+        ExecutionIpcPort,
+        qualifier="alpha",
+        receive_policy=ExecutionIpcReceivePolicy(
+            buffer_enabled=True,
+            batch_max_items=4,
+            flush_interval_ms=5,
+        ),
+    )
+    port = dep.resolve(scope)
+    assert isinstance(port, ExecutionIpcPort)
+
+    registry = store.get("ipc.endpoint_registry")
+    assert isinstance(registry, dict)
+    assert "group:alpha" in registry
+    assert registry["group:alpha"]["buffer_enabled"] is True
+    assert registry["group:alpha"]["batch_max_items"] == 4
+
+
+def test_inject_ipc_receive_policy_requires_qualifier() -> None:
+    # IPC receive policy cannot be resolved without a target qualifier.
+    adapter = InMemoryExecutionIpcTransportAdapter()
+    service = ExecutionIpcTransportCoordinatorService(adapter=adapter)
+    reg = InjectionRegistry()
+    reg.register_factory("service", ExecutionIpcTransportService, lambda _svc=service: _svc)
+    reg.register_factory("kv", ExecutionIpcEndpointRegistry, lambda: InMemoryKvStore())
+    scope = reg.instantiate_for_scenario("s1")
+
+    dep = inject.ipc(
+        ExecutionIpcPort,
+        receive_policy=ExecutionIpcReceivePolicy(
+            buffer_enabled=True,
+            batch_max_items=4,
+            flush_interval_ms=5,
+        ),
+    )
+    with pytest.raises(ValueError):
+        dep.resolve(scope)
 
 
 def test_inject_missing_binding_raises() -> None:

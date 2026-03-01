@@ -18,6 +18,9 @@ from stream_kernel.integration.work_queue import InMemoryQueue, QueuePort
 from stream_kernel.integration.consumer_registry import InMemoryConsumerRegistry
 from stream_kernel.routing.envelope import Envelope
 from stream_kernel.platform.services.messaging.reply_waiter import TerminalEvent
+from stream_kernel.execution.runtime.runner_ingress import enqueue_runner_input_sync
+import threading
+import time
 
 
 def _build_sync_runner() -> SyncRunner:
@@ -73,6 +76,55 @@ def test_runner_port_run_returns_none() -> None:
     assert runner.run() is None
 
 
+def test_runners_do_not_expose_run_inputs_bootstrap_shortcut() -> None:
+    assert not hasattr(SyncRunner, "run_inputs")
+    assert not hasattr(AsyncRunner, "run_inputs")
+
+
+def test_sync_runner_run_until_stopped_processes_late_message_and_stops_gracefully() -> None:
+    queue = InMemoryQueue()
+    registry = InMemoryConsumerRegistry({int: ["sink"]})
+    routing = RoutingService(registry=registry, strict=True)
+    context_service = InMemoryKvContextService(InMemoryKvStore())
+    seen: list[int] = []
+    runner_ref: list[SyncRunner] = []
+
+    def sink(payload: object, _ctx: dict[str, object]) -> list[object]:
+        if isinstance(payload, int):
+            seen.append(payload)
+            runner_ref[0].request_stop()
+        return []
+
+    runner = SyncRunner(
+        nodes={"sink": sink},
+        work_queue=queue,
+        context_service=context_service,
+        router=routing,
+        observability=NoOpObservabilityService(),
+    )
+    runner_ref.append(runner)
+
+    thread = threading.Thread(
+        target=lambda: runner.run_until_stopped(poll_timeout_seconds=0.01, idle_timeout_seconds=1.0),
+        daemon=True,
+    )
+    thread.start()
+    time.sleep(0.02)
+    enqueue_runner_input_sync(runner, 7, run_id="r", scenario_id="s", index=1)
+    thread.join(timeout=1.0)
+
+    assert seen == [7]
+    assert thread.is_alive() is False
+
+
+def test_sync_runner_run_until_stopped_returns_on_idle_timeout() -> None:
+    runner = _build_sync_runner()
+    started = time.monotonic()
+    runner.run_until_stopped(poll_timeout_seconds=0.01, idle_timeout_seconds=0.05)
+    elapsed = time.monotonic() - started
+    assert elapsed >= 0.03
+
+
 def test_inmemory_kv_context_service_implements_context_service_contract() -> None:
     # SyncRunner depends on service contract, not storage adapter lifecycle.
     assert isinstance(InMemoryKvContextService(InMemoryKvStore()), ContextService)
@@ -115,7 +167,8 @@ def test_sync_runner_works_with_custom_queue_port_implementation() -> None:
         router=routing,
         observability=NoOpObservabilityService(),
     )
-    runner.run_inputs([7], run_id="r", scenario_id="s")
+    enqueue_runner_input_sync(runner, 7, run_id="r", scenario_id="s", index=1)
+    runner.run()
 
     assert seen == [7]
     assert any(isinstance(item, Envelope) for item in queue.pushed)
@@ -143,7 +196,8 @@ def test_sync_runner_resolves_queue_and_routing_from_di() -> None:
     scope = di.instantiate_for_scenario("s1")
     apply_injection(runner, scope, strict=True)
 
-    runner.run_inputs([11], run_id="r", scenario_id="s")
+    enqueue_runner_input_sync(runner, 11, run_id="r", scenario_id="s", index=1)
+    runner.run()
     assert seen == [11]
 
 

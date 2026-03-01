@@ -1,11 +1,6 @@
 from __future__ import annotations
 
 from stream_kernel.integration.consumer_registry import ConsumerRegistry
-from stream_kernel.platform.services.runtime.bootstrap import (
-    BootstrapSupervisor,
-    MultiprocessBootstrapSupervisor,
-    LocalBootstrapSupervisor,
-)
 from stream_kernel.platform.services.api.policy import (
     ApiPolicyService,
     InMemoryApiPolicyService,
@@ -33,6 +28,9 @@ from stream_kernel.platform.services.observability import (
     WorkerQueueTelemetryService,
     resolve_pipeline_observability,
 )
+from stream_kernel.platform.services.observability_dispatch import (
+    DispatchingObservabilityService,
+)
 from stream_kernel.platform.services.messaging.reply_waiter import (
     InMemoryReplyWaiterService,
     PendingReplyWaiterService,
@@ -46,6 +44,10 @@ from stream_kernel.platform.services.messaging.reply_coordinator import (
 )
 from stream_kernel.platform.services.runtime.lifecycle import (
     LocalRuntimeLifecycleManager,
+    LocalExecutionWorkerLifecycleService,
+    ExecutionWorkerLifecycleService,
+    ExecutionWorkerHandle,
+    ExecutionWorkerRegistry,
     RuntimeLifecycleManager,
 )
 from stream_kernel.platform.services.runtime.transport import (
@@ -53,15 +55,92 @@ from stream_kernel.platform.services.runtime.transport import (
     RuntimeTransportService,
     TcpLocalRuntimeTransportService,
 )
+from stream_kernel.execution.transport.ipc import (
+    ExecutionIpcCodec,
+    ExecutionIpcCodecError,
+    ExecutionIpcControlSignal,
+    ExecutionIpcEndpointRegistry,
+    ExecutionIpcFlowControlPolicy,
+    ExecutionIpcKvStreamPort,
+    ExecutionIpcMessage,
+    ExecutionIpcPort,
+    ExecutionIpcReceivePolicy,
+    ExecutionIpcTransportService,
+    ExecutionIpcTransportCoordinatorService,
+    CreditWindowFlowControlPolicy,
+    HybridFlowControlPolicy,
+    InMemoryExecutionIpcTransportAdapter,
+    NoopFlowControlPolicy,
+    PipeExecutionIpcTransportAdapter,
+    TokenBucketFlowControlPolicy,
+    resolve_execution_ipc_flow_control,
+)
 from stream_kernel.platform.services.runtime.async_dispatch_loop import AsyncDispatchLoop
 from stream_kernel.platform.services.runtime.process_group_router import (
     InMemoryProcessGroupRouterService,
     ProcessGroupRouterService,
 )
+from stream_kernel.platform.services.runtime.control_plane_state import (
+    ControlPlaneEventStore,
+    ControlPlaneStateService,
+    InMemoryControlPlaneStateService,
+)
+from stream_kernel.platform.services.runtime.control_plane_discovery import (
+    ControlPlaneDiscoveryRegistry,
+    ControlPlaneDiscoveryService,
+    InMemoryControlPlaneDiscoveryService,
+)
+from stream_kernel.platform.services.runtime.control_plane_bootstrapper import (
+    ControlPlaneBootstrapperService,
+    ControlPlaneDiscoveryAdapter,
+    DefaultControlPlaneDiscoveryAdapter,
+    DefaultControlPlaneBootstrapperService,
+    control_plane_discovery_adapter,
+)
+from stream_kernel.platform.services.runtime.control_plane_config_stream import (
+    ControlPlaneConfigStreamAdapter,
+    ControlPlaneConfigStreamService,
+    ControlPlaneStartupConfigRegistry,
+    ControlPlaneStartupConfigStore,
+    DefaultControlPlaneConfigStreamService,
+    InMemoryControlPlaneStartupConfigStore,
+    YamlControlPlaneConfigStreamAdapter,
+    control_plane_config_stream_adapter,
+)
+from stream_kernel.platform.services.runtime.control_plane_config_apply import (
+    ControlPlaneAppliedConfigRegistry,
+    ControlPlaneAppliedConfigStore,
+    ControlPlaneSystemConfigApplyService,
+    ControlPlaneObservabilityConfigApplyService,
+    ControlPlaneNodeConfigApplyService,
+    ControlPlaneConfigApplyProgress,
+    ControlPlaneConfigApplyTrackerService,
+    DefaultControlPlaneSystemConfigApplyService,
+    DefaultControlPlaneObservabilityConfigApplyService,
+    DefaultControlPlaneNodeConfigApplyService,
+    InMemoryControlPlaneAppliedConfigStore,
+    InMemoryControlPlaneConfigApplyTrackerService,
+    resolve_expected_config_apply_counts,
+)
+from stream_kernel.platform.services.runtime.control_plane_reply_waiter import (
+    ControlPlaneReplyWaiterService,
+    DefaultControlPlaneReplyWaiterService,
+)
+from stream_kernel.platform.services.runtime.control_plane_startup_barrier import (
+    ControlPlaneStartupBarrierService,
+    InMemoryControlPlaneStartupBarrierService,
+)
+from stream_kernel.platform.services.runtime.control_plane_launch_plan import (
+    ControlPlaneLaunchPlanService,
+    DefaultControlPlaneLaunchPlanService,
+)
+from stream_kernel.platform.services.runtime.control_plane_dag_assembly import (
+    ControlPlaneDagAssemblyService,
+    DefaultControlPlaneDagAssemblyService,
+)
 
 __all__ = [
     "ConsumerRegistry",
-    "BootstrapSupervisor",
     "ApiPolicyService",
     "ContextService",
     "DiscoveryConsumerRegistry",
@@ -69,10 +148,13 @@ __all__ = [
     "InMemoryOutboundApiService",
     "InMemoryKvContextService",
     "InMemoryRateLimiterService",
-    "MultiprocessBootstrapSupervisor",
-    "LocalBootstrapSupervisor",
     "LocalRuntimeLifecycleManager",
+    "LocalExecutionWorkerLifecycleService",
+    "ExecutionWorkerLifecycleService",
+    "ExecutionWorkerHandle",
+    "ExecutionWorkerRegistry",
     "NoOpObservabilityService",
+    "DispatchingObservabilityService",
     "InMemoryObservabilityMetricsService",
     "DefaultWorkerQueueTelemetryService",
     "coerce_pipeline_observability",
@@ -101,5 +183,63 @@ __all__ = [
     "ProcessGroupRouterService",
     "TcpLocalRuntimeTransportService",
     "AsyncDispatchLoop",
+    "ControlPlaneEventStore",
+    "ControlPlaneStateService",
+    "InMemoryControlPlaneStateService",
+    "ControlPlaneDiscoveryRegistry",
+    "ControlPlaneDiscoveryService",
+    "InMemoryControlPlaneDiscoveryService",
+    "ControlPlaneBootstrapperService",
+    "ControlPlaneDiscoveryAdapter",
+    "DefaultControlPlaneDiscoveryAdapter",
+    "DefaultControlPlaneBootstrapperService",
+    "control_plane_discovery_adapter",
+    "ControlPlaneConfigStreamAdapter",
+    "ControlPlaneConfigStreamService",
+    "ControlPlaneStartupConfigRegistry",
+    "ControlPlaneStartupConfigStore",
+    "DefaultControlPlaneConfigStreamService",
+    "InMemoryControlPlaneStartupConfigStore",
+    "YamlControlPlaneConfigStreamAdapter",
+    "control_plane_config_stream_adapter",
+    "ControlPlaneAppliedConfigRegistry",
+    "ControlPlaneAppliedConfigStore",
+    "ControlPlaneSystemConfigApplyService",
+    "ControlPlaneObservabilityConfigApplyService",
+    "ControlPlaneNodeConfigApplyService",
+    "ControlPlaneConfigApplyProgress",
+    "ControlPlaneConfigApplyTrackerService",
+    "DefaultControlPlaneSystemConfigApplyService",
+    "DefaultControlPlaneObservabilityConfigApplyService",
+    "DefaultControlPlaneNodeConfigApplyService",
+    "InMemoryControlPlaneAppliedConfigStore",
+    "InMemoryControlPlaneConfigApplyTrackerService",
+    "resolve_expected_config_apply_counts",
+    "ControlPlaneReplyWaiterService",
+    "DefaultControlPlaneReplyWaiterService",
+    "ControlPlaneStartupBarrierService",
+    "InMemoryControlPlaneStartupBarrierService",
+    "ControlPlaneLaunchPlanService",
+    "DefaultControlPlaneLaunchPlanService",
+    "ControlPlaneDagAssemblyService",
+    "DefaultControlPlaneDagAssemblyService",
     "kv_store_memory",
+    "ExecutionIpcCodec",
+    "ExecutionIpcCodecError",
+    "ExecutionIpcControlSignal",
+    "ExecutionIpcEndpointRegistry",
+    "ExecutionIpcFlowControlPolicy",
+    "ExecutionIpcKvStreamPort",
+    "ExecutionIpcMessage",
+    "ExecutionIpcPort",
+    "ExecutionIpcReceivePolicy",
+    "ExecutionIpcTransportService",
+    "ExecutionIpcTransportCoordinatorService",
+    "NoopFlowControlPolicy",
+    "CreditWindowFlowControlPolicy",
+    "TokenBucketFlowControlPolicy",
+    "HybridFlowControlPolicy",
+    "resolve_execution_ipc_flow_control",
+    "InMemoryExecutionIpcTransportAdapter",
+    "PipeExecutionIpcTransportAdapter",
 ]

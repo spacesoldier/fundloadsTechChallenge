@@ -48,10 +48,9 @@ def discover_nodes(modules: list[ModuleType]) -> list[NodeDef]:
     seen: set[str] = set()
 
     for module in modules:
-        is_platform_observer = module.__name__.startswith("stream_kernel.observability.observers")
         values = list(module.__dict__.values())
         # Top-level nodes.
-        found.extend(_collect_nodes(values, service_default=is_platform_observer))
+        found.extend(_collect_nodes(values))
 
         # Stage containers: scan their attributes for nodes.
         for value in values:
@@ -72,7 +71,7 @@ def discover_nodes(modules: list[ModuleType]) -> list[NodeDef]:
                                 stage=stage,
                                 consumes=meta.consumes,
                                 emits=meta.emits,
-                                service=bool(meta.service or is_platform_observer),
+                                service=bool(meta.service),
                             ),
                             target=attr_value,
                             container_cls=value,
@@ -87,7 +86,7 @@ def discover_nodes(modules: list[ModuleType]) -> list[NodeDef]:
                                 stage=stage,
                                 consumes=meta.consumes,
                                 emits=meta.emits,
-                                service=bool(meta.service or is_platform_observer),
+                                service=bool(meta.service),
                             ),
                             target=attr_value,
                         )

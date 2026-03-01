@@ -842,8 +842,7 @@ def test_run_with_config_uses_discovery_order_when_pipeline_missing(monkeypatch:
         "stream_kernel.execution.orchestration.builder.build_injection_registry_from_bindings",
         lambda _instances, _bindings, **_kw: InjectionRegistry(),
     )
-    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.build_execution_observers", lambda *_a, **_k: [])
-    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_sync_runner", lambda **_kw: None)
+    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_async_runner", lambda **_kw: None)
 
     cfg = {
         "version": 1,
@@ -904,8 +903,7 @@ def test_run_with_config_invokes_preflight(monkeypatch: pytest.MonkeyPatch) -> N
         "stream_kernel.execution.orchestration.builder.build_injection_registry_from_bindings",
         lambda _instances, _bindings, **_kw: InjectionRegistry(),
     )
-    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.build_execution_observers", lambda *_a, **_k: [])
-    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_sync_runner", lambda **_kw: None)
+    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_async_runner", lambda **_kw: None)
 
     cfg = {
         "scenario": {"name": "baseline"},
@@ -991,8 +989,7 @@ def test_run_with_config_ignores_runtime_pipeline_without_special_case(monkeypat
         "stream_kernel.execution.orchestration.builder.build_injection_registry_from_bindings",
         lambda _instances, _bindings, **_kw: InjectionRegistry(),
     )
-    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.build_execution_observers", lambda *_a, **_k: [])
-    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_sync_runner", lambda **_kw: None)
+    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_async_runner", lambda **_kw: None)
 
     cfg = {
         "version": 1,
@@ -1133,8 +1130,7 @@ def test_run_uses_discovery_order_when_pipeline_missing(monkeypatch: pytest.Monk
         "stream_kernel.execution.orchestration.builder.build_injection_registry_from_bindings",
         lambda _instances, _bindings, **_kw: InjectionRegistry(),
     )
-    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.build_execution_observers", lambda *_a, **_k: [])
-    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_sync_runner", lambda **_kw: None)
+    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_async_runner", lambda **_kw: None)
 
     exit_code = run(["--config", "cfg.yml"])
     assert exit_code == 0
@@ -1180,19 +1176,6 @@ def test_run_requires_source_adapter_with_read(monkeypatch: pytest.MonkeyPatch) 
             },
         )(),
     )
-    monkeypatch.setattr(
-        "stream_kernel.execution.orchestration.builder.SyncRunner",
-        lambda **_k: type(
-            "R",
-            (),
-            {
-                "run": lambda *_a, **_k: None,
-                "run_inputs": lambda *_a, **_k: None,
-                "on_run_end": lambda *_a, **_k: None,
-            },
-        )(),
-    )
-
     with pytest.raises(ValueError):
         run(["--config", "cfg.yml"])
 
@@ -1253,8 +1236,7 @@ def test_run_accepts_non_default_source_role_with_read(monkeypatch: pytest.Monke
         "stream_kernel.execution.orchestration.builder.build_injection_registry_from_bindings",
         lambda _instances, _bindings, **_kw: InjectionRegistry(),
     )
-    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.build_execution_observers", lambda *_a, **_k: [])
-    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_sync_runner", lambda **_kw: None)
+    monkeypatch.setattr("stream_kernel.execution.orchestration.builder.run_with_async_runner", lambda **_kw: None)
 
     exit_code = run(["--config", "cfg.yml"])
     assert exit_code == 0

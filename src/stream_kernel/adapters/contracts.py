@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Protocol, TypeVar, runtime_checkable
+from typing import Any, Generic, Protocol, TypeVar, runtime_checkable
 
 T = TypeVar("T")
 _SUPPORTED_ADAPTER_EXECUTION_MODES = {"sync", "async", "any"}
+
+
+@dataclass(frozen=True, slots=True)
+class AdapterBatch(Generic[T]):
+    items: list[T]
+    item_type: type[object] | None = None
+
+    def __post_init__(self) -> None:
+        if self.item_type is None and self.items:
+            object.__setattr__(self, "item_type", type(self.items[0]))
 
 
 @dataclass(frozen=True, slots=True)

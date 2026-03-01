@@ -105,6 +105,8 @@ Minimal port contract:
 
 - `push(envelope)`
 - `pop() -> envelope | None`
+- `wait_for_item(timeout_seconds) -> bool` (optional, for long-running runner loops)
+- `close()` / `is_closed() -> bool` (optional, for graceful loop shutdown)
 - optional `size()` / `ack()`
 
 #### WorkQueue behavior (logic)
@@ -112,6 +114,10 @@ Minimal port contract:
 - **FIFO** by default (deterministic for baseline runs).
 - **Single message** per `pop()` call.
 - **Empty pop** returns `None` (non-blocking default).
+- **Wait semantics** (optional): `wait_for_item(timeout)` blocks efficiently until data arrives,
+  timeout elapses, or queue is closed.
+- **Close semantics** (optional): `close()` wakes waiters and prevents long-running loops from
+  hanging on an idle queue during shutdown.
 - **Backpressure hooks** (optional): enqueue limits or reject policy.
 - **Partitioning** (future): queues per node or per pool.
 
@@ -245,6 +251,22 @@ Adapters live in the **framework**, but are wired by config.
 - `asyncio` based
 - awaits IO‑bound nodes (HTTP, DB, MCP)
 - same router contract
+
+### 6.3 Long-running loop settings (control-plane mode)
+
+When runtime switches into long-running control-plane execution (`run_until_stopped`),
+loop timing is configured from `runtime.platform.runner_loop`:
+
+- `poll_timeout_ms` — how long runner waits for new queue data before checking stop/idle conditions
+- `idle_timeout_ms` — optional idle shutdown guard for CLI/test scenarios (`null` disables idle auto-exit)
+
+Defaults remain in code (so config stays optional):
+
+- `poll_timeout_ms = 10`
+- `idle_timeout_ms = 100`
+
+These defaults are intentionally conservative to avoid CPU spin while also
+preventing accidental hangs in local runs/tests.
 
 ### 6.2.1 Network-bound workloads
 

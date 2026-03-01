@@ -458,6 +458,17 @@ def _phase0_base_config() -> dict[str, object]:
     }
 
 
+def _platform_with_process_groups(process_groups: list[dict[str, object]]) -> dict[str, object]:
+    return {
+        "process_groups": process_groups,
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "bind_host": "127.0.0.1",
+            "auth": {"mode": "hmac"},
+        },
+    }
+
+
 def test_validate_newgen_config_rejects_unknown_execution_ipc_transport() -> None:
     raw = _phase0_base_config()
     runtime = raw["runtime"]
@@ -549,6 +560,277 @@ def test_validate_newgen_config_accepts_valid_execution_ipc_config() -> None:
     execution_ipc = platform.get("execution_ipc")
     assert isinstance(execution_ipc, dict)
     assert execution_ipc.get("transport") == "tcp_local"
+    assert execution_ipc.get("codec") == "pickle"
+    assert execution_ipc.get("poll_mode") == "timer"
+    assert execution_ipc.get("poll_interval_ms") == 5
+
+
+def test_validate_newgen_config_accepts_ipc_local_execution_ipc_transport() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "ipc_local",
+            "bind_host": "127.0.0.1",
+            "bind_port": 0,
+            "auth": {"mode": "hmac", "ttl_seconds": 30, "nonce_cache_size": 1000},
+            "max_payload_bytes": 1024,
+        }
+    }
+    validated = validate_newgen_config(raw)
+    execution_ipc = validated["runtime"]["platform"]["execution_ipc"]
+    assert execution_ipc["transport"] == "ipc_local"
+
+
+@pytest.mark.parametrize("transport", ["zmq", "redis"])
+def test_validate_newgen_config_rejects_reserved_execution_ipc_transport_modes(transport: str) -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": transport,
+            "auth": {"mode": "hmac"},
+        }
+    }
+    with pytest.raises(ConfigError, match="reserved for future implementation"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_accepts_execution_ipc_codec_override() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "auth": {"mode": "hmac"},
+            "codec": "pickle",
+        }
+    }
+    validated = validate_newgen_config(raw)
+    execution_ipc = validated["runtime"]["platform"]["execution_ipc"]
+    assert execution_ipc["codec"] == "pickle"
+
+
+def test_validate_newgen_config_rejects_unknown_execution_ipc_codec() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "auth": {"mode": "hmac"},
+            "codec": "xml",
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_accepts_execution_ipc_buffer_overrides() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "auth": {"mode": "hmac"},
+            "buffer": {
+                "enabled": True,
+                "batch_max_items": 16,
+                "flush_interval_ms": 5,
+                "per_group": {"alpha": {"batch_max_items": 4, "flush_interval_ms": 1}},
+            },
+        }
+    }
+    validated = validate_newgen_config(raw)
+    platform = validated["runtime"]["platform"]
+    execution_ipc = platform["execution_ipc"]
+    buffer_cfg = execution_ipc["buffer"]
+    assert buffer_cfg["enabled"] is True
+    assert buffer_cfg["batch_max_items"] == 16
+    assert buffer_cfg["flush_interval_ms"] == 5
+    per_group = buffer_cfg["per_group"]
+    assert per_group["alpha"]["batch_max_items"] == 4
+    assert per_group["alpha"]["flush_interval_ms"] == 1
+
+
+def test_validate_newgen_config_rejects_invalid_execution_ipc_buffer_mapping() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "auth": {"mode": "hmac"},
+            "buffer": "invalid",
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_invalid_execution_ipc_buffer_batch_items() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "auth": {"mode": "hmac"},
+            "buffer": {"batch_max_items": 0},
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_invalid_execution_ipc_buffer_flush_interval() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "auth": {"mode": "hmac"},
+            "buffer": {"flush_interval_ms": -1},
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_invalid_execution_ipc_buffer_per_group() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "auth": {"mode": "hmac"},
+            "buffer": {"per_group": ["alpha"]},
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_accepts_execution_ipc_flow_control() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "auth": {"mode": "hmac"},
+            "flow_control": {
+                "mode": "hybrid",
+                "credits": {"window_size": 256},
+                "token_bucket": {"rate_per_sec": 1000, "burst": 2000},
+            },
+        }
+    }
+    validated = validate_newgen_config(raw)
+    flow_control = validated["runtime"]["platform"]["execution_ipc"]["flow_control"]
+    assert flow_control["mode"] == "hybrid"
+    assert flow_control["credits"]["window_size"] == 256
+    assert flow_control["token_bucket"]["rate_per_sec"] == 1000
+    assert flow_control["token_bucket"]["burst"] == 2000
+
+
+def test_validate_newgen_config_rejects_invalid_execution_ipc_flow_control_mode() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "auth": {"mode": "hmac"},
+            "flow_control": {"mode": "warp"},
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_invalid_execution_ipc_flow_control_window() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "auth": {"mode": "hmac"},
+            "flow_control": {"mode": "credits", "credits": {"window_size": 0}},
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_invalid_execution_ipc_flow_control_bucket() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "auth": {"mode": "hmac"},
+            "flow_control": {"mode": "token_bucket", "token_bucket": {"rate_per_sec": 0}},
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_accepts_execution_ipc_polling_settings() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "auth": {"mode": "hmac"},
+            "poll_mode": "auto",
+            "poll_interval_ms": 2,
+        }
+    }
+    validated = validate_newgen_config(raw)
+    execution_ipc = validated["runtime"]["platform"]["execution_ipc"]
+    assert execution_ipc["poll_mode"] == "auto"
+    assert execution_ipc["poll_interval_ms"] == 2
+
+
+def test_validate_newgen_config_rejects_invalid_execution_ipc_poll_mode() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "auth": {"mode": "hmac"},
+            "poll_mode": "edge",
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_invalid_execution_ipc_poll_interval() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "auth": {"mode": "hmac"},
+            "poll_interval_ms": 0,
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
 
 
 def test_validate_newgen_config_defaults_runtime_platform_bootstrap_mode_to_inline() -> None:
@@ -631,8 +913,8 @@ def test_validate_newgen_config_rejects_unknown_execution_ipc_kdf() -> None:
         validate_newgen_config(raw)
 
 
-def test_validate_newgen_config_requires_tcp_local_transport_for_process_supervisor_mode() -> None:
-    # BOOT-CFG-05: process supervisor mode requires explicit tcp_local execution_ipc section.
+def test_validate_newgen_config_requires_local_execution_ipc_transport_for_process_supervisor_mode() -> None:
+    # BOOT-CFG-05: process supervisor mode requires explicit local execution_ipc transport section.
     raw = _phase0_base_config()
     runtime = raw["runtime"]
     assert isinstance(runtime, dict)
@@ -675,6 +957,32 @@ def test_validate_newgen_config_accepts_process_supervisor_mode_with_valid_execu
     assert isinstance(auth, dict)
     assert auth.get("secret_mode") == "generated"
     assert auth.get("kdf") == "hkdf_sha256"
+
+
+def test_validate_newgen_config_accepts_process_supervisor_mode_with_ipc_local_transport() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "bootstrap": {"mode": "process_supervisor"},
+        "execution_ipc": {
+            "transport": "ipc_local",
+            "bind_host": "127.0.0.1",
+            "bind_port": 0,
+            "auth": {
+                "mode": "hmac",
+                "secret_mode": "generated",
+                "kdf": "hkdf_sha256",
+                "ttl_seconds": 30,
+                "nonce_cache_size": 1000,
+            },
+            "max_payload_bytes": 1024,
+        },
+    }
+    validated = validate_newgen_config(raw)
+    platform = validated["runtime"]["platform"]
+    assert platform["bootstrap"]["mode"] == "process_supervisor"
+    assert platform["execution_ipc"]["transport"] == "ipc_local"
 
 
 def test_validate_newgen_config_rejects_non_list_process_groups() -> None:
@@ -1905,11 +2213,7 @@ def test_validate_newgen_config_obs_cfg_a_05b_allows_async_backend_without_expli
     raw = _phase0_base_config()
     runtime = raw["runtime"]
     assert isinstance(runtime, dict)
-    runtime["platform"] = {
-        "process_groups": [
-            {"name": "execution.group"},
-        ]
-    }
+    runtime["platform"] = _platform_with_process_groups([{"name": "execution.group"}])
     runtime["observability"] = {
         "tracing": {
             "exporters": [
@@ -1988,11 +2292,11 @@ def test_validate_newgen_config_obs_mat_01_backend_runner_profile_matrix(
     raw = _phase0_base_config()
     runtime = raw["runtime"]
     assert isinstance(runtime, dict)
-    runtime["platform"] = {
-        "process_groups": [
+    runtime["platform"] = _platform_with_process_groups(
+        [
             {"name": "execution.group", "runner_profile": runner_profile},
         ]
-    }
+    )
     runtime["observability"] = {
         "tracing": {
             "exporters": [
@@ -2525,6 +2829,75 @@ def test_validate_newgen_config_rejects_runtime_platform_boundary_dispatch_bad_s
         validate_newgen_config(raw)
 
 
+def test_validate_newgen_config_accepts_runtime_platform_runner_loop_contract() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "runner_loop": {
+            "poll_timeout_ms": 7.5,
+            "idle_timeout_ms": None,
+        }
+    }
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    runner_loop = platform.get("runner_loop")
+    assert isinstance(runner_loop, dict)
+    assert runner_loop.get("poll_timeout_ms") == 7.5
+    assert runner_loop.get("idle_timeout_ms") is None
+
+
+def test_validate_newgen_config_applies_runtime_platform_runner_loop_defaults() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {"runner_loop": {}}
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    runner_loop = platform.get("runner_loop")
+    assert isinstance(runner_loop, dict)
+    assert runner_loop.get("poll_timeout_ms") == 10.0
+    assert runner_loop.get("idle_timeout_ms") == 100.0
+
+
+def test_validate_newgen_config_rejects_runtime_platform_runner_loop_unknown_keys() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {"runner_loop": {"unknown": 1}}
+
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_runtime_platform_runner_loop_bad_poll_timeout() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {"runner_loop": {"poll_timeout_ms": 0}}
+
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_runtime_platform_runner_loop_bad_idle_timeout() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {"runner_loop": {"idle_timeout_ms": "fast"}}
+
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
 def test_validate_multiprocess_jaeger_config_uses_async_otel_backend_experiment() -> None:
     root = Path(__file__).resolve().parents[3]
     raw = load_yaml_config(root / "src" / "fund_load" / "experiment_config_newgen_multiprocess_jaeger.yml")
@@ -2727,16 +3100,18 @@ def test_validate_newgen_config_accepts_process_group_services_contract() -> Non
     runtime = raw["runtime"]
     assert isinstance(runtime, dict)
     runtime["platform"] = {
-        "process_groups": [
-            {
-                "name": "execution.cpu",
-                "runner_profile": "sync",
-                "services": {
-                    "api_service_profile": "partner_api",
-                    "rate_limiter_profile": "partner_api",
-                },
-            }
-        ],
+        **_platform_with_process_groups(
+            [
+                {
+                    "name": "execution.cpu",
+                    "runner_profile": "sync",
+                    "services": {
+                        "api_service_profile": "partner_api",
+                        "rate_limiter_profile": "partner_api",
+                    },
+                }
+            ]
+        ),
         "api_policies": {
             "profiles": {
                 "partner_api": {
@@ -2779,14 +3154,14 @@ def test_validate_newgen_config_allows_process_group_without_runner_profile() ->
     raw = _phase0_base_config()
     runtime = raw["runtime"]
     assert isinstance(runtime, dict)
-    runtime["platform"] = {
-        "process_groups": [
+    runtime["platform"] = _platform_with_process_groups(
+        [
             {
                 "name": "execution.cpu",
                 "workers": 2,
             }
         ]
-    }
+    )
     validated = validate_newgen_config(raw)
     validated_runtime = validated["runtime"]
     assert isinstance(validated_runtime, dict)
@@ -2844,9 +3219,9 @@ def test_validate_newgen_config_obs_service_process_materializes_default_owner_g
     nodes = system_group.get("nodes")
     assert isinstance(nodes, list)
     assert "system.obs.trace_dispatch" in nodes
-    assert "system.obs.log_dispatch" in nodes
-    assert "system.obs.metric_dispatch" in nodes
-    assert "system.obs.monitor_dispatch" in nodes
+    assert "system.obs.log_dispatch" not in nodes
+    assert "system.obs.metric_dispatch" not in nodes
+    assert "system.obs.monitor_dispatch" not in nodes
 
 
 def test_validate_newgen_config_worker_queue_telemetry_adds_system_dispatch_node_to_owner_group() -> None:
@@ -2995,8 +3370,8 @@ def test_validate_newgen_config_obs_service_process_rejects_missing_owner_when_a
 @pytest.mark.parametrize(
     "config_path,expect_enabled",
     [
-        ("src/fund_load/baseline_config_newgen_multiprocess.yml", False),
-        ("src/fund_load/experiment_config_newgen_multiprocess.yml", False),
+        ("src/fund_load/archive/configs/baseline_config_newgen_multiprocess.yml", False),
+        ("src/fund_load/archive/configs/experiment_config_newgen_multiprocess.yml", False),
         ("src/fund_load/baseline_config_newgen_multiprocess_jaeger.yml", True),
         ("src/fund_load/experiment_config_newgen_multiprocess_jaeger.yml", True),
     ],

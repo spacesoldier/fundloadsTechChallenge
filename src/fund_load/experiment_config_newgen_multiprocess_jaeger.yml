@@ -7,7 +7,7 @@ scenario:
 runtime:
   strict: true
   tracing:
-    enabled: false
+    enabled: true
   observability:
     service_worker:
       enabled: true
@@ -158,10 +158,14 @@ runtime:
     lifecycle:
       graceful_timeout_seconds: 120
       drain_inflight: true
+      stop_command_timeout_seconds: 1.0
+      fallback_graceful_timeout_seconds: 2.0
     execution_ipc:
-      transport: tcp_local
+      transport: ipc_local
       bind_host: 127.0.0.1
       bind_port: 0
+      flow_control:
+        mode: none
       auth:
         mode: hmac
         secret_mode: generated
@@ -251,7 +255,7 @@ adapters:
       - stream
   sink:
     settings:
-      path: output_experiment_multiprocess_jaeger.txt
+      path: output_exp_mpj.txt
       format: text/jsonl
       encoding: utf-8
     binds:

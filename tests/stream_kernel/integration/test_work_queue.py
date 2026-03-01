@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 # QueuePort behavior is specified in docs/framework/initial_stage/Execution runtime and routing integration.md.
+import threading
+import time
+
 from stream_kernel.integration.work_queue import InMemoryQueue
 
 
@@ -47,3 +50,48 @@ def test_work_queue_size_tracks_items() -> None:
     assert queue.size() == 2
     queue.pop()
     assert queue.size() == 1
+
+
+def test_work_queue_wait_for_item_times_out_when_queue_is_empty() -> None:
+    queue = InMemoryQueue()
+
+    started = time.monotonic()
+    ready = queue.wait_for_item(0.05)
+    elapsed = time.monotonic() - started
+
+    assert ready is False
+    assert elapsed >= 0.03
+
+
+def test_work_queue_wait_for_item_unblocks_when_item_is_pushed() -> None:
+    queue = InMemoryQueue()
+    result: list[bool] = []
+
+    def _waiter() -> None:
+        result.append(queue.wait_for_item(0.5))
+
+    thread = threading.Thread(target=_waiter, daemon=True)
+    thread.start()
+    time.sleep(0.02)
+    queue.push("A")
+    thread.join(timeout=1.0)
+
+    assert result == [True]
+    assert queue.pop() == "A"
+
+
+def test_work_queue_close_wakes_waiters_and_reports_closed() -> None:
+    queue = InMemoryQueue()
+    result: list[bool] = []
+
+    def _waiter() -> None:
+        result.append(queue.wait_for_item(0.5))
+
+    thread = threading.Thread(target=_waiter, daemon=True)
+    thread.start()
+    time.sleep(0.02)
+    queue.close()
+    thread.join(timeout=1.0)
+
+    assert queue.is_closed() is True
+    assert result == [False]

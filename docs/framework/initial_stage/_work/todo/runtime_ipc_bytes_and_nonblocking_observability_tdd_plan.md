@@ -6,7 +6,8 @@ Close three performance-critical gaps without leaving platform rails:
 
 1. tracing/logging execution must not block business node hot path;
 2. supervisor-worker IPC must move away from object `send/recv` (implicit pickle);
-3. IPC topology must support split control/data channels (command channel != payload channel).
+3. IPC topology must support addressed message classes (command vs payload)
+   without separate ports.
 
 This plan extends:
 
@@ -14,6 +15,7 @@ This plan extends:
 - [web_phase5pre_multiprocess_supervisor_and_observability_tdd_plan](web_phase5pre_multiprocess_supervisor_and_observability_tdd_plan.md)
 - [web_multiprocessing_secure_tcp_fastapi_plan](web_multiprocessing_secure_tcp_fastapi_plan.md)
 - [runtime_async_dispatch_loop_template_tdd_plan](runtime_async_dispatch_loop_template_tdd_plan.md)
+- [execution_ipc_tcp_bytes_transport_tdd_plan](execution_ipc_tcp_bytes_transport_tdd_plan.md)
 
 ## Current state (as-is)
 
@@ -26,7 +28,7 @@ This plan extends:
 
 - business execution groups route observability events to dedicated observability execution group(s);
 - observability group uses `AsyncRunner` and async-capable adapters by default;
-- control channel and data channel are explicit platform ports/adapters;
+- IPC port is an explicit platform port/adapter; message class is address-based;
 - default wire format for IPC commands/data is bytes-framed payload (no implicit pickle path);
 - object-channel fallback remains optional and explicit for compatibility only.
 
@@ -77,38 +79,42 @@ This plan extends:
 
 - introduce lifecycle event dispatch message model and system node;
 - route supervisor/worker lifecycle telemetry via routing queue;
+- for observability boundary dispatch (`finalize=false`) use fire-and-forget:
+  - root must not wait for `leaf_boundary_result`;
+  - leaf must execute command payload but must not emit `ControlPlaneLeafBoundaryResultEvent`;
 - preserve current log format contracts.
 
 ### Exit criteria
 
 - lifecycle logging can be switched off / on / level-tuned without changing blocking profile of hot path.
+- observability dispatch does not accumulate reply backlog on control pipe.
 
 ---
 
-## Phase C — IPC port split: control vs data
+## Phase C — IPC port addressing (single port)
 
 ### Scope
 
-- explicit platform ports/adapters:
-  - `ExecutionControlChannelPort`
-  - `ExecutionDataChannelPort`
-- separate lifecycles and backpressure for control and payload traffic.
+- explicit platform port/adapter:
+  - `ExecutionIpcPort`
+- address encodes message class (control/data/observability);
+- optional prioritization/backpressure by message class.
 
 ### RED tests
 
-- control channel remains available under data saturation;
+- control-plane traffic remains available under data saturation when prioritization is enabled;
 - stop command latency unaffected by data throughput;
-- misrouted payload cannot be interpreted as control command.
+- misrouted payload is rejected by address/codec rules.
 
 ### GREEN implementation
 
-- supervisor uses control adapter for `start/ready/stop/ack`;
-- boundary payloads use data adapter only;
-- channel ownership and teardown are independent.
+- supervisor uses `ExecutionIpcPort` for `start/ready/stop/ack`;
+- boundary payloads use the same port with data-plane addresses;
+- port ownership and teardown are unified.
 
 ### Exit criteria
 
-- no mixed command/data framing on the same logical channel in process supervisor mode.
+- message class is determined by address + schema, not by separate ports.
 
 ---
 
@@ -214,6 +220,17 @@ This plan extends:
   - worker role no longer receives internal tracing flags (`supervisor_only`, `dispatch_via_runner`);
   - worker role does not materialize observability system dispatch nodes;
   - worker still emits trace events via runner boundary path; supervisor remains the only exporter owner.
+
+## Current delta (2026-02-27)
+
+- execution IPC transport profile naming is explicit:
+  - `ipc_local` means pipe-based local IPC path;
+  - `tcp_local` remains a separate profile for later dedicated transport validation;
+  - `zmq` and `redis` are recognized as reserved profile names and currently rejected as not implemented.
+- root boundary dispatch no longer waits for reply in the same hot-path call:
+  - root sends boundary execute with `wait_for_result=False`;
+  - leaf replies are ingressed separately;
+  - completed boundary outputs are drained from control-plane state by the handoff service.
 
 ---
 

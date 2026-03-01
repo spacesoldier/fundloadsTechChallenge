@@ -61,6 +61,7 @@ opentelemetry-exporter-otlp-proto-http = "^1.38"
 testpaths = ["tests"]
 addopts = [
   "-q",
+  "--import-mode=importlib",
   "--strict-markers",
   "--disable-warnings"
 ]

@@ -24,6 +24,8 @@ Obsidian plugin, but the narrative below is the human-friendly entry point.
   See: [[docs/framework/initial_stage/Node and stage specifications|Node and stage specifications]]
 - **Scenario vs node axes** → how scenarios intersect with node groups.  
   See: [[docs/framework/initial_stage/Scenario vs node axes|Scenario vs node axes]]
+- **Scenario contract exchange** → client-facing workflows derived from `workflow` + `@node`.  
+  See: [[docs/framework/initial_stage/Scenario contract exchange|Scenario contract exchange]]
 - **Auto-discovery policy** → module scanning rules and exclusions.  
   See: [[docs/framework/initial_stage/Auto-discovery policy|Auto-discovery policy]]
 - **Tracing runtime** → observability pipeline tracing configuration (with legacy compatibility notes).  
@@ -68,6 +70,7 @@ tags: [MOC]
  [[docs/framework/initial_stage/Ports and adapters model|Ports and adapters model]]
  [[docs/framework/initial_stage/Router and DAG roadmap|Router and DAG roadmap]]
  [[docs/framework/initial_stage/Routing semantics|Routing semantics]]
+ [[docs/framework/initial_stage/Scenario contract exchange|Scenario contract exchange]]
  [[docs/framework/initial_stage/Scenario vs node axes|Scenario vs node axes]]
  [[docs/framework/initial_stage/Service model|Service model]]
  [[docs/framework/initial_stage/Tracing runtime|Tracing runtime]]

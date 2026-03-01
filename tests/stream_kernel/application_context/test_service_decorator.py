@@ -9,6 +9,10 @@ from fund_load.services.window_store import InMemoryWindowStore
 from stream_kernel.application_context.service import ServiceMeta, discover_services, service
 from stream_kernel.routing.routing_service import RoutingService
 from stream_kernel.integration.work_queue import InMemoryQueue, InMemoryTopic
+from stream_kernel.execution.transport.ipc import ExecutionIpcTransportCoordinatorService
+from stream_kernel.platform.services.runtime.lifecycle import (
+    LocalExecutionWorkerLifecycleService,
+)
 from stream_kernel.platform.services.state.consumer_registry import DiscoveryConsumerRegistry
 from stream_kernel.platform.services.state.context import InMemoryKvContextService
 
@@ -78,3 +82,5 @@ def test_runtime_transport_services_are_marked() -> None:
     assert isinstance(getattr(InMemoryTopic, "__service_meta__", None), ServiceMeta)
     assert isinstance(getattr(RoutingService, "__service_meta__", None), ServiceMeta)
     assert isinstance(getattr(DiscoveryConsumerRegistry, "__service_meta__", None), ServiceMeta)
+    assert isinstance(getattr(ExecutionIpcTransportCoordinatorService, "__service_meta__", None), ServiceMeta)
+    assert isinstance(getattr(LocalExecutionWorkerLifecycleService, "__service_meta__", None), ServiceMeta)

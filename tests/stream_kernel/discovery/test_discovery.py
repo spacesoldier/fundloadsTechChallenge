@@ -83,9 +83,9 @@ def test_discover_nodes_allows_reexport_of_same_node_target() -> None:
     assert [n.meta.name for n in nodes] == ["same"]
 
 
-def test_discover_nodes_marks_framework_observer_nodes_as_service() -> None:
-    # Framework observability observer modules are auto-marked as service nodes.
-    mod = types.ModuleType("stream_kernel.observability.observers.fake")
+def test_discover_nodes_does_not_auto_mark_observability_nodes_as_service() -> None:
+    # Observability modules follow regular @node metadata; service flag is explicit.
+    mod = types.ModuleType("stream_kernel.observability.fake")
 
     @node(name="trace_observer")
     def trace_observer(msg: object, ctx: object | None) -> list[object]:
@@ -94,4 +94,4 @@ def test_discover_nodes_marks_framework_observer_nodes_as_service() -> None:
     mod.trace_observer = trace_observer
     nodes = discover_nodes([mod])
     assert len(nodes) == 1
-    assert nodes[0].meta.service is True
+    assert nodes[0].meta.service is False

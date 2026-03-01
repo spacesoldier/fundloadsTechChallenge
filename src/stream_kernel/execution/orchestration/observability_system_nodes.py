@@ -28,6 +28,10 @@ from stream_kernel.platform.services.observability import (
     WorkerQueueTelemetryService,
     coerce_pipeline_observability,
 )
+from stream_kernel.execution.transport.handoff.system_nodes import (
+    OBSERVABILITY_HANDOFF_NODE_NAME,
+    build_transport_observability_handoff_plan,
+)
 from stream_kernel.routing.envelope import Envelope
 
 _SYSTEM_NODE_KIND_TO_EVENT: dict[str, type[object]] = {}
@@ -347,16 +351,54 @@ def build_observability_system_plan(
 ) -> ObservabilitySystemPlan:
     if not isinstance(runtime, dict):
         return ObservabilitySystemPlan()
-    # Multiprocess primitive mode: worker processes execute business nodes only;
-    # observability dispatch/export is owned by supervisor.
-    if runtime.get("__process_role") == "worker":
-        return ObservabilitySystemPlan()
     observability = runtime.get("observability")
     if not isinstance(observability, dict):
         return ObservabilitySystemPlan()
     nodes_cfg = _resolve_system_nodes_config(observability)
     if not nodes_cfg:
         return ObservabilitySystemPlan()
+    if _is_observability_root_transport_only(runtime):
+        process_role = runtime.get("__process_role")
+        worker_transport_only = isinstance(process_role, str) and process_role == "worker"
+        enabled_tokens: set[type[Any]] = set()
+        kind_counts: dict[str, int] = {}
+        for cfg in nodes_cfg:
+            if not isinstance(cfg, dict):
+                continue
+            kind = cfg.get("kind")
+            if not isinstance(kind, str) or not kind or kind not in _SYSTEM_NODE_KIND_TO_EVENT:
+                continue
+            enabled = cfg.get("enabled", True)
+            if not isinstance(enabled, bool) or not enabled:
+                continue
+            qualifier = cfg.get("qualifier")
+            if not isinstance(qualifier, str) or not qualifier:
+                qualifier = None
+            suffix_index = kind_counts.get(kind, 0)
+            kind_counts[kind] = suffix_index + 1
+            _ = _build_system_node_name(kind=kind, qualifier=qualifier, index=suffix_index)
+            enabled_tokens.add(_SYSTEM_NODE_KIND_TO_EVENT[kind])
+        if not enabled_tokens:
+            return ObservabilitySystemPlan()
+        if worker_transport_only:
+            return ObservabilitySystemPlan(
+                system_steps=[],
+                system_consumers={token: [_legacy_system_obs_node_name_for_token(token)] for token in enabled_tokens},
+                system_node_names=set(),
+            )
+        handoff_steps, handoff_consumers, handoff_nodes = build_transport_observability_handoff_plan(
+            scenario_scope=scenario_scope
+        )
+        consumers: dict[type[Any], list[str]] = {}
+        for token in enabled_tokens:
+            mapped = handoff_consumers.get(token)
+            if isinstance(mapped, list) and mapped:
+                consumers[token] = list(mapped)
+        return ObservabilitySystemPlan(
+            system_steps=list(handoff_steps),
+            system_consumers=consumers,
+            system_node_names=set(handoff_nodes) if consumers else {OBSERVABILITY_HANDOFF_NODE_NAME},
+        )
 
     steps: list[StepSpec] = []
     consumers: dict[type[Any], list[str]] = {}
@@ -400,6 +442,27 @@ def build_observability_system_plan(
     )
 
 
+def _is_observability_root_transport_only(runtime: dict[str, object]) -> bool:
+    role = runtime.get("__process_role")
+    if isinstance(role, str) and role == "observability_worker":
+        return False
+    platform = runtime.get("platform", {})
+    if not isinstance(platform, dict):
+        return False
+    bootstrap = platform.get("bootstrap", {})
+    if not isinstance(bootstrap, dict) or bootstrap.get("mode") != "process_supervisor":
+        return False
+    observability = runtime.get("observability", {})
+    if not isinstance(observability, dict):
+        return False
+    service_process = observability.get("service_process")
+    if not isinstance(service_process, dict) or not service_process:
+        service_process = observability.get("service_worker", {})
+        if not isinstance(service_process, dict):
+            return False
+    return service_process.get("enabled") is True
+
+
 def _resolve_system_nodes_config(observability: dict[str, object]) -> list[dict[str, object]]:
     # External config contract stays exporter-based. If no explicit pipeline.system_nodes
     # is declared, derive default dispatch nodes from enabled exporter channels.
@@ -409,19 +472,57 @@ def _resolve_system_nodes_config(observability: dict[str, object]) -> list[dict[
         if isinstance(nodes_cfg, list):
             return [node for node in nodes_cfg if isinstance(node, dict)]
 
+    service_process_cfg = observability.get("service_process")
+    if not isinstance(service_process_cfg, dict):
+        service_process_cfg = observability.get("service_worker")
+    service_process_nodes: list[str] = []
+    if isinstance(service_process_cfg, dict):
+        configured_nodes = service_process_cfg.get("nodes")
+        if isinstance(configured_nodes, list):
+            service_process_nodes = [
+                node_name
+                for node_name in configured_nodes
+                if isinstance(node_name, str) and node_name in _SYSTEM_NODE_KIND_TO_EVENT
+            ]
+
     nodes: list[dict[str, object]] = []
-    tracing_cfg = observability.get("tracing")
-    if isinstance(tracing_cfg, dict):
-        exporters = tracing_cfg.get("exporters")
-        if isinstance(exporters, list) and any(
-            isinstance(item, dict) and item.get("enabled", True) is not False
-            for item in exporters
-        ):
-            nodes.append({"kind": "system.obs.trace_dispatch", "enabled": True})
+    for node_name in service_process_nodes:
+        nodes.append({"kind": node_name, "enabled": True})
+
+    if _has_enabled_exporters(observability, "tracing"):
+        nodes.append({"kind": "system.obs.trace_dispatch", "enabled": True})
+    if _has_enabled_exporters(observability, "logging"):
+        nodes.append({"kind": "system.obs.log_dispatch", "enabled": True})
+    if _has_enabled_exporters(observability, "telemetry"):
+        nodes.append({"kind": "system.obs.metric_dispatch", "enabled": True})
+    if _has_enabled_exporters(observability, "monitoring"):
+        nodes.append({"kind": "system.obs.monitor_dispatch", "enabled": True})
+        nodes.append({"kind": "system.obs.monitoring_metrics_dispatch", "enabled": True})
     queue_telemetry_cfg = observability.get("worker_queue_telemetry", {})
     if isinstance(queue_telemetry_cfg, dict) and queue_telemetry_cfg.get("enabled") is True:
         nodes.append({"kind": "system.obs.worker_queue_dispatch", "enabled": True})
-    return nodes
+    unique: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for node in nodes:
+        kind = node.get("kind")
+        if not isinstance(kind, str) or kind in seen:
+            continue
+        seen.add(kind)
+        unique.append(node)
+    return unique
+
+
+def _has_enabled_exporters(observability: dict[str, object], section: str) -> bool:
+    section_cfg = observability.get(section)
+    if not isinstance(section_cfg, dict):
+        return False
+    exporters = section_cfg.get("exporters")
+    if not isinstance(exporters, list):
+        return False
+    return any(
+        isinstance(item, dict) and item.get("enabled", True) is not False
+        for item in exporters
+    )
 
 
 def _build_system_dispatch_node(
@@ -505,3 +606,10 @@ def _build_system_node_name(*, kind: str, qualifier: str | None, index: int) -> 
     if index == 0:
         return kind
     return f"{kind}:{index + 1}"
+
+
+def _legacy_system_obs_node_name_for_token(token: type[Any]) -> str:
+    for node_name, mapped_token in _SYSTEM_NODE_KIND_TO_EVENT.items():
+        if mapped_token is token:
+            return node_name
+    return "system.obs.log_dispatch"
