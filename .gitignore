@@ -94,3 +94,7 @@ src/stream_kernel/execution/orchestration/lifecycle/leaf/__pycache__/*
 src/stream_kernel/execution/orchestration/lifecycle/leaf/command/__pycache__/*
 src/stream_kernel/execution/orchestration/lifecycle/leaf/runtime/__pycache__/*
 src/stream_kernel/execution/orchestration/lifecycle/leaf/startup/__pycache__/*
+run_archive/*
+logs/leaf_debug_run2/*
+research_ui/reports/*
+!research_ui/reports/.gitkeep
