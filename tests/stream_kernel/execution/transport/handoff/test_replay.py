@@ -16,6 +16,7 @@ class _HandoffService:
     last_poll_timeout_seconds: float | None = None
     clear_inflight_on_completed_drain: bool = False
     blocking_inflight: bool | None = None
+    raise_on_external_drain: bool = False
 
     def drain_external_deliveries(
         self,
@@ -23,6 +24,8 @@ class _HandoffService:
         envelopes: list[Envelope],
         source_group: str | None = None,
     ) -> list[object]:
+        if self.raise_on_external_drain:
+            raise RuntimeError("handoff unavailable")
         self.external_calls.append(
             {
                 "envelopes": list(envelopes),
@@ -83,6 +86,40 @@ def test_drain_root_boundary_handoff_prefers_external_batch_when_present() -> No
 
     assert drained == [{"ok": 1}]
     assert len(service.external_calls) == 1
+    assert service.completed_calls == 0
+
+
+def test_drain_root_boundary_handoff_raises_for_business_batch_when_handoff_raises() -> None:
+    envelope = Envelope(payload={"x": 1}, target="remote.node", trace_id="t1")
+    service = _HandoffService(raise_on_external_drain=True)
+    scope = _Scope(service=service)
+
+    try:
+        replay_module.drain_root_boundary_handoff(
+            scenario_scope=scope,
+            external_deliveries=[envelope],
+        )
+    except RuntimeError as exc:
+        assert "root boundary handoff dispatch failed" in str(exc)
+    else:
+        assert False, "expected RuntimeError"
+
+    assert len(service.external_calls) == 0
+    assert service.completed_calls == 0
+
+
+def test_drain_root_boundary_handoff_retries_observability_batch_when_handoff_raises() -> None:
+    envelope = Envelope(payload={"x": 1}, target="system.obs.log_dispatch", trace_id="t1")
+    service = _HandoffService(raise_on_external_drain=True)
+    scope = _Scope(service=service)
+
+    drained = replay_module.drain_root_boundary_handoff(
+        scenario_scope=scope,
+        external_deliveries=[envelope],
+    )
+
+    assert drained == [envelope]
+    assert len(service.external_calls) == 0
     assert service.completed_calls == 0
 
 
@@ -181,6 +218,7 @@ def test_replay_root_boundary_handoff_outputs_sync_skips_observability_requeue(
     assert enqueued == []
     assert len(runner.run_calls) == 0
     assert len(service.external_calls) == 1
+    assert service.completed_calls == 0
 
 
 def test_replay_root_boundary_handoff_uses_poll_timeout_for_completed_drain() -> None:
@@ -205,10 +243,34 @@ def test_replay_root_boundary_handoff_uses_poll_timeout_for_completed_drain() ->
 
     assert next_index == 1
     assert service.completed_calls >= 1
-    assert service.last_poll_timeout_seconds == 0.001
+    assert service.last_poll_timeout_seconds == 0.017
 
 
 def test_root_boundary_handoff_has_inflight_prefers_blocking_inflight_method() -> None:
     service = _HandoffService(inflight=True, blocking_inflight=False)
     scope = _Scope(service=service)
     assert replay_module.root_boundary_handoff_has_inflight(scope) is False
+
+
+def test_replay_root_boundary_handoff_outputs_sync_keeps_polling_when_inflight_without_progress() -> None:
+    service = _HandoffService(
+        external_result=[],
+        completed_result=[],
+        inflight=True,
+        clear_inflight_on_completed_drain=False,
+    )
+    scope = _Scope(service=service)
+    runner = _SyncRunner(external_deliveries=[])
+
+    next_index = replay_module.replay_root_boundary_handoff_outputs_sync(
+        runner=runner,  # type: ignore[arg-type]
+        scenario_scope=scope,  # type: ignore[arg-type]
+        run_id="run",
+        scenario_id="scenario",
+        start_index=1,
+        poll_timeout_seconds=0.01,
+        idle_timeout_seconds=0.1,
+    )
+
+    assert next_index == 1
+    assert service.completed_calls >= 2

@@ -8,6 +8,7 @@ def platform_discovery_modules() -> list[str]:
         "stream_kernel.execution.transport.carriers.ipc.ipc_adapters",
         "stream_kernel.platform.services",
         "stream_kernel.execution.orchestration.lifecycle.leaf.command.control_plane_service",
+        "stream_kernel.execution.orchestration.lifecycle.leaf.command.control_ingress_service",
         "stream_kernel.execution.orchestration.lifecycle.leaf.runtime.runtime_activation_service",
         "stream_kernel.execution.orchestration.lifecycle.leaf.runtime.boundary_execution_service",
         "stream_kernel.execution.orchestration.lifecycle.leaf.startup.runtime_bootstrap_service",

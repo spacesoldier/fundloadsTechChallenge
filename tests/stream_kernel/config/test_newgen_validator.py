@@ -561,7 +561,7 @@ def test_validate_newgen_config_accepts_valid_execution_ipc_config() -> None:
     assert isinstance(execution_ipc, dict)
     assert execution_ipc.get("transport") == "tcp_local"
     assert execution_ipc.get("codec") == "pickle"
-    assert execution_ipc.get("poll_mode") == "timer"
+    assert execution_ipc.get("poll_mode") == "reader"
     assert execution_ipc.get("poll_interval_ms") == 5
 
 
@@ -1109,6 +1109,76 @@ def test_validate_newgen_config_rejects_invalid_runtime_platform_readiness_timeo
         validate_newgen_config(raw)
 
 
+def test_validate_newgen_config_rejects_invalid_runtime_platform_readiness_fail_on_timeout_type() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "readiness": {
+            "enabled": True,
+            "start_work_on_all_groups_ready": True,
+            "readiness_timeout_seconds": 30,
+            "fail_on_timeout": "yes",
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_accepts_runtime_platform_debug_root_verbose_logging() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "debug": {
+            "root_verbose_logging": True,
+        }
+    }
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    debug = platform.get("debug")
+    assert isinstance(debug, dict)
+    assert debug.get("root_verbose_logging") is True
+
+
+def test_validate_newgen_config_accepts_runtime_platform_debug_leaf_logging_settings() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "debug": {
+            "leaf_verbose_logging": False,
+            "leaf_debug_logs_dir": "logs/leaf_debug_custom",
+        }
+    }
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    debug = platform.get("debug")
+    assert isinstance(debug, dict)
+    assert debug.get("leaf_verbose_logging") is False
+    assert debug.get("leaf_debug_logs_dir") == "logs/leaf_debug_custom"
+
+
+def test_validate_newgen_config_rejects_invalid_runtime_platform_debug_leaf_debug_logs_dir() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "debug": {
+            "leaf_verbose_logging": True,
+            "leaf_debug_logs_dir": "",
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
 def test_validate_newgen_config_rejects_unknown_observability_tracing_exporter_kind() -> None:
     raw = _phase0_base_config()
     runtime = raw["runtime"]
@@ -1294,6 +1364,37 @@ def test_validate_newgen_config_accepts_observability_service_worker_defaults() 
     assert service_worker.get("drop_policy") == "drop_newest"
     assert service_worker.get("block_timeout_ms") == 100
     assert service_worker.get("drain_timeout_seconds") == 30.0
+
+
+def test_validate_newgen_config_observability_service_worker_workers_propagate_to_service_process() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "bootstrap": {"mode": "process_supervisor"},
+        "execution_ipc": {"transport": "tcp_local", "auth": {"mode": "hmac"}},
+        "process_groups": [],
+    }
+    runtime["observability"] = {
+        "service_worker": {
+            "enabled": True,
+            "workers": 3,
+        },
+        "tracing": {
+            "exporters": [
+                {"kind": "jsonl", "settings": {"path": "traces/t.jsonl"}},
+            ]
+        },
+    }
+
+    validated = validate_newgen_config(raw)
+    vruntime = validated.get("runtime")
+    assert isinstance(vruntime, dict)
+    observability = vruntime.get("observability")
+    assert isinstance(observability, dict)
+    service_process = observability.get("service_process")
+    assert isinstance(service_process, dict)
+    assert service_process.get("workers") == 3
 
 
 def test_validate_newgen_config_rejects_observability_service_worker_invalid_drop_policy() -> None:
@@ -2662,6 +2763,7 @@ def test_validate_newgen_config_accepts_phase5pre_stepa_contract_and_defaults() 
     readiness = platform.get("readiness")
     assert isinstance(readiness, dict)
     assert readiness.get("readiness_timeout_seconds") == 45
+    assert readiness.get("fail_on_timeout") is False
     process_groups = platform.get("process_groups")
     assert isinstance(process_groups, list)
     assert process_groups[0]["workers"] == 2
@@ -2837,6 +2939,11 @@ def test_validate_newgen_config_accepts_runtime_platform_runner_loop_contract() 
         "runner_loop": {
             "poll_timeout_ms": 7.5,
             "idle_timeout_ms": None,
+            "startup_barrier_timeout_ms": 2500.0,
+            "post_start_settle_enabled": True,
+            "post_start_settle_max_wait_seconds": 12.0,
+            "post_start_settle_quiet_window_seconds": 0.5,
+            "require_source_tombstones": True,
         }
     }
 
@@ -2849,6 +2956,11 @@ def test_validate_newgen_config_accepts_runtime_platform_runner_loop_contract() 
     assert isinstance(runner_loop, dict)
     assert runner_loop.get("poll_timeout_ms") == 7.5
     assert runner_loop.get("idle_timeout_ms") is None
+    assert runner_loop.get("startup_barrier_timeout_ms") == 2500.0
+    assert runner_loop.get("post_start_settle_enabled") is True
+    assert runner_loop.get("post_start_settle_max_wait_seconds") == 12.0
+    assert runner_loop.get("post_start_settle_quiet_window_seconds") == 0.5
+    assert runner_loop.get("require_source_tombstones") is True
 
 
 def test_validate_newgen_config_applies_runtime_platform_runner_loop_defaults() -> None:
@@ -2866,6 +2978,116 @@ def test_validate_newgen_config_applies_runtime_platform_runner_loop_defaults() 
     assert isinstance(runner_loop, dict)
     assert runner_loop.get("poll_timeout_ms") == 10.0
     assert runner_loop.get("idle_timeout_ms") == 100.0
+    assert runner_loop.get("post_start_settle_enabled") is True
+    assert runner_loop.get("post_start_settle_max_wait_seconds") == 30.0
+    assert runner_loop.get("post_start_settle_quiet_window_seconds") == 5.0
+    assert runner_loop.get("require_source_tombstones") is False
+
+
+def test_validate_newgen_config_accepts_runtime_platform_source_ingress_contract() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {"source_ingress": {"emit_tombstone": True}}
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    source_ingress = platform.get("source_ingress")
+    assert isinstance(source_ingress, dict)
+    assert source_ingress.get("emit_tombstone") is True
+
+
+def test_validate_newgen_config_applies_runtime_platform_source_ingress_defaults() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {"source_ingress": {}}
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    source_ingress = platform.get("source_ingress")
+    assert isinstance(source_ingress, dict)
+    assert source_ingress.get("emit_tombstone") is False
+
+
+def test_validate_newgen_config_rejects_runtime_platform_source_ingress_unknown_keys() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {"source_ingress": {"unknown": 1}}
+
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_runtime_platform_source_ingress_bad_emit_tombstone() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {"source_ingress": {"emit_tombstone": "yes"}}
+
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_accepts_adapter_emit_tombstone() -> None:
+    raw = _phase0_base_config()
+    adapters = raw["adapters"]
+    assert isinstance(adapters, dict)
+    source = adapters.get("source")
+    assert isinstance(source, dict)
+    source["emit_tombstone"] = True
+
+    validated = validate_newgen_config(raw)
+    validated_adapters = validated["adapters"]
+    assert isinstance(validated_adapters, dict)
+    validated_source = validated_adapters.get("source")
+    assert isinstance(validated_source, dict)
+    assert validated_source.get("emit_tombstone") is True
+
+
+def test_validate_newgen_config_applies_adapter_emit_tombstone_default_false() -> None:
+    raw = _phase0_base_config()
+    adapters = raw["adapters"]
+    assert isinstance(adapters, dict)
+    source = adapters.get("source")
+    assert isinstance(source, dict)
+    source.pop("emit_tombstone", None)
+
+    validated = validate_newgen_config(raw)
+    validated_adapters = validated["adapters"]
+    assert isinstance(validated_adapters, dict)
+    validated_source = validated_adapters.get("source")
+    assert isinstance(validated_source, dict)
+    assert validated_source.get("emit_tombstone") is False
+
+
+def test_validate_newgen_config_rejects_adapter_bad_emit_tombstone() -> None:
+    raw = _phase0_base_config()
+    adapters = raw["adapters"]
+    assert isinstance(adapters, dict)
+    source = adapters.get("source")
+    assert isinstance(source, dict)
+    source["emit_tombstone"] = "yes"
+
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_runtime_platform_runner_loop_bad_post_start_settle_quiet_window() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {"runner_loop": {"post_start_settle_quiet_window_seconds": 0}}
+
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
 
 
 def test_validate_newgen_config_rejects_runtime_platform_runner_loop_unknown_keys() -> None:
@@ -3347,6 +3569,44 @@ def test_validate_newgen_config_obs_service_process_rejects_ambiguous_system_nod
 
     with pytest.raises(ConfigError, match="owned by multiple groups"):
         validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_obs_service_process_overrides_owner_group_runtime_shape() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "bootstrap": {"mode": "process_supervisor"},
+        "execution_ipc": {"transport": "tcp_local", "auth": {"mode": "hmac"}},
+        "process_groups": [
+            {"name": "execution.cpu", "nodes": ["compute_features"]},
+            {"name": "system.observability", "workers": 99, "runner_profile": "sync", "nodes": []},
+        ],
+    }
+    runtime["observability"] = {
+        "service_process": {"enabled": True, "workers": 2, "runner_profile": "async"},
+        "tracing": {"exporters": [{"kind": "jsonl", "settings": {"path": "traces/trace.jsonl"}}]},
+        "logging": {"exporters": [{"kind": "jsonl", "settings": {"path": "logs/runtime.jsonl"}}]},
+    }
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    groups = platform.get("process_groups")
+    assert isinstance(groups, list)
+    owner = next(
+        group
+        for group in groups
+        if isinstance(group, dict) and group.get("name") == "system.observability"
+    )
+    assert owner.get("workers") == 2
+    assert owner.get("runner_profile") == "async"
+    owner_nodes = owner.get("nodes")
+    assert isinstance(owner_nodes, list)
+    assert "system.obs.trace_dispatch" in owner_nodes
+    assert "system.obs.log_dispatch" in owner_nodes
 
 
 def test_validate_newgen_config_obs_service_process_rejects_missing_owner_when_auto_create_disabled() -> None:

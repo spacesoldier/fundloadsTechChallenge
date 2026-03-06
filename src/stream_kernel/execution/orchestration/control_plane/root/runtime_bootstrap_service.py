@@ -148,8 +148,6 @@ class DefaultControlPlaneRootRuntimeBootstrapService(ControlPlaneRootRuntimeBoot
         stream_batch_max_items = boundary_dispatch.get("stream_batch_max_items")
         observability_batch_max_items = boundary_dispatch.get("batch_max_items")
         inflight_idle_timeout_seconds = boundary_dispatch.get("inflight_idle_timeout_seconds")
-        if inflight_idle_timeout_seconds is None and isinstance(timeout_seconds, (int, float)):
-            inflight_idle_timeout_seconds = float(timeout_seconds)
         configure(
             timeout_seconds=timeout_seconds if isinstance(timeout_seconds, (int, float)) else None,
             stream_batch_max_items=(
@@ -179,6 +177,11 @@ class DefaultControlPlaneRootRuntimeBootstrapService(ControlPlaneRootRuntimeBoot
 
     def _configure_root_reply_ingress(self, runtime: dict[str, object]) -> None:
         candidate = self.root_reply_ingress
+        if hasattr(candidate, "root_boundary_handoff"):
+            try:
+                setattr(candidate, "root_boundary_handoff", self.root_boundary_handoff)
+            except Exception:
+                pass
         configure = getattr(candidate, "configure_startup_protocol_revision", None)
         if callable(configure):
             configure(_startup_protocol_revision(runtime))
@@ -194,6 +197,15 @@ class DefaultControlPlaneRootRuntimeBootstrapService(ControlPlaneRootRuntimeBoot
         elif hasattr(candidate, "discovery_request_fallback_enabled"):
             try:
                 setattr(candidate, "discovery_request_fallback_enabled", fallback_enabled)
+            except Exception:
+                pass
+        configure_verbose = getattr(candidate, "configure_verbose_logging", None)
+        verbose_enabled = _root_verbose_logging_enabled(runtime)
+        if callable(configure_verbose):
+            configure_verbose(verbose_enabled)
+        elif hasattr(candidate, "verbose_logging"):
+            try:
+                setattr(candidate, "verbose_logging", verbose_enabled)
             except Exception:
                 pass
 
@@ -300,6 +312,19 @@ def _discovery_request_fallback_enabled(runtime: dict[str, object]) -> bool:
     return True
 
 
+def _root_verbose_logging_enabled(runtime: dict[str, object]) -> bool:
+    platform = runtime.get("platform", {})
+    if not isinstance(platform, dict):
+        return False
+    debug = platform.get("debug", {})
+    if not isinstance(debug, dict):
+        return False
+    raw = debug.get("root_verbose_logging", False)
+    if isinstance(raw, bool):
+        return raw
+    return False
+
+
 def _pipe_codec_mode(runtime: dict[str, object], adapters: dict[str, object]) -> str:
     platform = runtime.get("platform", {})
     if isinstance(platform, dict):
@@ -334,16 +359,31 @@ def _router_process_groups(*, groups: list[object], runtime: dict[str, object]) 
     if not observability_node_map:
         return configured
     enriched: list[dict[str, object]] = []
+    configured_names: set[str] = set()
     for item in configured:
         name = item.get("name")
         if not isinstance(name, str) or name not in observability_node_map:
+            if isinstance(name, str) and name:
+                configured_names.add(name)
             enriched.append(item)
             continue
         merged = dict(item)
         nodes = merged.get("nodes")
         existing_nodes = [node for node in nodes if isinstance(node, str) and node] if isinstance(nodes, list) else []
         merged["nodes"] = _merge_unique_nodes(existing_nodes, observability_node_map[name])
+        configured_names.add(name)
         enriched.append(merged)
+    for group_name, node_names in observability_node_map.items():
+        if not isinstance(group_name, str) or not group_name:
+            continue
+        if group_name in configured_names:
+            continue
+        enriched.append(
+            {
+                "name": group_name,
+                "nodes": list(node_names),
+            }
+        )
     return enriched
 
 

@@ -1,0 +1,15 @@
+services:
+  research_ui:
+    build:
+      context: ..
+      dockerfile: research_ui/Dockerfile
+    container_name: fund-load-research-ui
+    ports:
+      - "${RESEARCH_UI_HTTP_PORT:-8091}:8091"
+    environment:
+      RESEARCH_UI_REPORTS_DIR: /app/research_ui/reports
+      PYTHONPATH: /app/src
+    volumes:
+      - ../src:/app/src:ro
+      - ./reports:/app/research_ui/reports:rw
+    restart: unless-stopped

@@ -9,14 +9,21 @@ from stream_kernel.application_context.service import service
 from stream_kernel.execution.orchestration.lifecycle.leaf.command.command_loop_service import (
     LeafWorkerCommandLoopService,
 )
+from stream_kernel.execution.orchestration.lifecycle.leaf.debug_logging import leaf_debug_log
 from stream_kernel.execution.orchestration.lifecycle.leaf.command.finalization_service import (
     DefaultLeafSessionFinalizationService,
     LeafSessionFinalizationService,
 )
 from stream_kernel.execution.transport.ipc.ipc_transport import (
+    EXECUTION_IPC_LANE_CONTROL,
+    EXECUTION_IPC_LANE_DATA,
+    EXECUTION_IPC_LANE_LOG,
+    EXECUTION_IPC_LANE_METRIC,
+    EXECUTION_IPC_LANE_TRACE,
     ExecutionIpcControlSignal,
     ExecutionIpcMessage,
     ExecutionIpcTransportService,
+    compose_execution_ipc_worker_target_id,
 )
 from stream_kernel.integration.consumer_registry import ConsumerRegistry
 from stream_kernel.platform.services.runtime.control_plane_events import (
@@ -79,19 +86,53 @@ class DefaultLeafControlIngressService(LeafControlIngressService):
     ) -> str:
         _ = control_pipe
         poll_interval = max(0.0, float(poll_interval_seconds))
+        leaf_debug_log(
+            event="leaf.ingress.loop.started",
+            worker_id=session.worker_id,
+            poll_interval_seconds=poll_interval,
+        )
+        idle_loops = 0
         while True:
             if _stop_requested(stop_event):
+                leaf_debug_log(
+                    event="leaf.ingress.loop.stop_event",
+                    worker_id=session.worker_id,
+                )
                 self._finalize_session(session=session)
                 return "stop_event"
             message = self._recv_control_message_nonblocking(session=session)
             if message is None:
+                idle_loops += 1
+                if idle_loops % 1000 == 0:
+                    leaf_debug_log(
+                        event="leaf.ingress.loop.idle_heartbeat",
+                        worker_id=session.worker_id,
+                        idle_loops=idle_loops,
+                    )
                 await asyncio.sleep(poll_interval)
                 continue
+            idle_loops = 0
+            leaf_debug_log(
+                event="leaf.ingress.message.received",
+                worker_id=session.worker_id,
+                message_type=type(message).__name__,
+            )
             if _is_transport_ack_signal(message):
+                leaf_debug_log(
+                    event="leaf.ingress.message.transport_ack_skipped",
+                    worker_id=session.worker_id,
+                )
                 continue
             dispatched, status = self._dispatch_via_leaf_nodes(
                 session=session,
                 message=message,
+            )
+            leaf_debug_log(
+                event="leaf.ingress.dispatch.result",
+                worker_id=session.worker_id,
+                dispatched=dispatched,
+                status=status,
+                message_type=type(message).__name__,
             )
             if not dispatched:
                 status = self.command_loop_service.handle_control_message(
@@ -99,9 +140,19 @@ class DefaultLeafControlIngressService(LeafControlIngressService):
                     control_pipe=control_pipe,
                     message=message,
                 )
+                leaf_debug_log(
+                    event="leaf.ingress.dispatch.command_loop_fallback",
+                    worker_id=session.worker_id,
+                    status=status,
+                    message_type=type(message).__name__,
+                )
             if status == "stop_requested":
                 if dispatched:
                     self._finalize_session(session=session)
+                leaf_debug_log(
+                    event="leaf.ingress.loop.stop_requested",
+                    worker_id=session.worker_id,
+                )
                 return "stop_requested"
 
     def _dispatch_via_leaf_nodes(
@@ -128,8 +179,20 @@ class DefaultLeafControlIngressService(LeafControlIngressService):
             if not callable(step):
                 continue
             dispatched = True
+            leaf_debug_log(
+                event="leaf.ingress.node.dispatch",
+                worker_id=session.worker_id,
+                node_name=node_name,
+                message_type=type(message).__name__,
+            )
             produced = step(message, {"__leaf_session": session})
             for item in _coerce_step_outputs(produced):
+                leaf_debug_log(
+                    event="leaf.ingress.node.produced",
+                    worker_id=session.worker_id,
+                    node_name=node_name,
+                    item_type=type(item).__name__,
+                )
                 if _is_leaf_control_reply(item):
                     self._send_control_message(session=session, payload=item)
                 if isinstance(item, ControlPlaneLeafConfigAckEvent):
@@ -140,16 +203,29 @@ class DefaultLeafControlIngressService(LeafControlIngressService):
                     status = "boundary_executed"
                 elif isinstance(item, ControlPlaneLeafStopAckEvent):
                     status = "stop_requested"
+                else:
+                    nested_status = self.command_loop_service.handle_control_message(
+                        session=session,
+                        control_pipe=None,
+                        message=item,
+                    )
+                    if isinstance(nested_status, str) and nested_status:
+                        status = nested_status
         return (dispatched, status)
 
     def _recv_control_message_nonblocking(self, *, session: "LeafWorkerRuntimeSession") -> object | None:
         ipc = self._resolve_execution_ipc_service(session)
         if ipc is None:
+            leaf_debug_log(
+                event="leaf.ingress.recv.no_ipc_service",
+                worker_id=session.worker_id,
+            )
             return None
-        try:
-            message = ipc.recv(session.worker_id, timeout=0.0)
-        except Exception:
-            return None
+        message = _recv_from_worker_lanes(
+            ipc=ipc,
+            worker_id=session.worker_id,
+            timeout_seconds=0.0,
+        )
         if message is None:
             return None
         if isinstance(message, ExecutionIpcMessage):
@@ -159,10 +235,30 @@ class DefaultLeafControlIngressService(LeafControlIngressService):
     def _send_control_message(self, *, session: "LeafWorkerRuntimeSession", payload: object) -> None:
         ipc = self._resolve_execution_ipc_service(session)
         if ipc is None:
+            leaf_debug_log(
+                event="leaf.ingress.send.no_ipc_service",
+                worker_id=session.worker_id,
+                payload_type=type(payload).__name__,
+            )
             return
+        lane = _lane_for_outbound_payload(payload)
+        target_id = compose_execution_ipc_worker_target_id(session.worker_id, lane=lane)
         try:
-            ipc.send(session.worker_id, payload, no_reply=True)
-        except Exception:
+            ipc.send(target_id, payload, no_reply=True)
+            leaf_debug_log(
+                event="leaf.ingress.send.sent",
+                worker_id=session.worker_id,
+                payload_type=type(payload).__name__,
+                lane=lane,
+            )
+        except Exception as exc:
+            leaf_debug_log(
+                event="leaf.ingress.send.error",
+                worker_id=session.worker_id,
+                payload_type=type(payload).__name__,
+                error=exc.__class__.__name__,
+                lane=lane,
+            )
             return
 
     def _resolve_execution_ipc_service(
@@ -315,6 +411,36 @@ def _is_leaf_control_reply(message: object) -> bool:
 
 def _is_transport_ack_signal(message: object) -> bool:
     return isinstance(message, ExecutionIpcControlSignal) and message.kind == "ack"
+
+
+def _recv_from_worker_lanes(
+    *,
+    ipc: ExecutionIpcTransportService,
+    worker_id: str,
+    timeout_seconds: float,
+) -> object | None:
+    lane_targets = (
+        compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_CONTROL),
+        compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_DATA),
+        compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_TRACE),
+        compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_LOG),
+        compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_METRIC),
+    )
+    for index, lane_target in enumerate(lane_targets):
+        timeout = max(0.0, float(timeout_seconds)) if index == 0 else 0.0
+        try:
+            message = ipc.recv(lane_target, timeout=timeout)
+        except Exception:
+            continue
+        if message is not None:
+            return message
+    return None
+
+
+def _lane_for_outbound_payload(payload: object) -> str:
+    if isinstance(payload, ControlPlaneLeafBoundaryResultEvent):
+        return EXECUTION_IPC_LANE_DATA
+    return EXECUTION_IPC_LANE_CONTROL
 
 
 __all__ = [

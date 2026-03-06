@@ -6,7 +6,14 @@ import pytest
 from stream_kernel.execution.orchestration.control_plane.root.reply_ingress_service import (
     ControlPlaneRootReplyIngressService,
 )
-from stream_kernel.platform.services.runtime.control_plane_events import ControlPlaneRootPulse
+from stream_kernel.execution.orchestration.lifecycle.root.startup.console_log_dispatch_service import (
+    RootConsoleLogDispatchService,
+)
+from stream_kernel.execution.orchestration.source_ingress import BootstrapControl
+from stream_kernel.platform.services.runtime.control_plane_events import (
+    ControlPlaneRootPulse,
+    ControlPlaneStartWorkEvent,
+)
 from stream_kernel.platform.services.runtime.control_plane_state import ControlPlaneStateService
 from stream_kernel.platform.services.runtime.control_plane_startup_barrier import (
     ControlPlaneStartupBarrierService,
@@ -122,6 +129,7 @@ class _ScopeWithStartupServices:
     barrier: ControlPlaneStartupBarrierService
     reply_ingress: ControlPlaneRootReplyIngressService
     state: ControlPlaneStateService
+    console_dispatch: RootConsoleLogDispatchService | None = None
 
     def resolve(self, port_type: str, data_type: object) -> object:  # noqa: ANN401
         if port_type != "service":
@@ -132,7 +140,25 @@ class _ScopeWithStartupServices:
             return self.reply_ingress
         if data_type is ControlPlaneStateService:
             return self.state
+        if data_type is RootConsoleLogDispatchService and self.console_dispatch is not None:
+            return self.console_dispatch
         raise ValueError(f"unsupported service contract: {data_type!r}")
+
+
+@dataclass(slots=True)
+class _ConsoleDispatch(RootConsoleLogDispatchService):
+    messages: list[object] = field(default_factory=list)
+
+    def publish(self, message):  # type: ignore[override]
+        self.messages.append(message)
+        return True
+
+    def drain(self, *, timeout_seconds: float = 1.0) -> bool:
+        _ = timeout_seconds
+        return True
+
+    def stop(self, *, drain: bool = True, timeout_seconds: float = 1.0) -> None:
+        _ = (drain, timeout_seconds)
 
 
 def test_root_loop_service_detects_root_pulse_and_splits_inputs() -> None:
@@ -239,6 +265,105 @@ def test_root_loop_service_executes_sync_root_mode_with_replay() -> None:
     assert len(enqueued) == 2
     assert len(replay_calls) == 2
     assert drained == []
+
+
+def test_root_loop_service_converts_source_bootstrap_inputs_to_start_work_command() -> None:
+    service = RootRunnerLoopOrchestrationService()
+    runner = _SyncRunner()
+    enqueued: list[object] = []
+
+    def _enqueue(
+        _runner: object,
+        payload: object,
+        *,
+        run_id: str,
+        scenario_id: str,
+        index: int,
+    ) -> None:
+        enqueued.append(payload)
+
+    def _replay(**_: object) -> int:
+        return 10
+
+    def _drain(**_: object) -> list[object]:
+        return []
+
+    inputs = [
+        ControlPlaneRootPulse(runtime={"platform": {"process_groups": [{"name": "execution.ingress"}]}}),
+        Envelope(
+            payload=BootstrapControl(target="source:source"),
+            target="source:source",
+        ),
+        Envelope(payload="business", target="biz.node", trace_id="t1"),
+    ]
+
+    service.execute_sync(
+        runner=runner,
+        inputs=inputs,
+        run_id="run",
+        scenario_id="scenario",
+        scenario_scope=object(),
+        enqueue_runner_input=_enqueue,
+        replay_root_boundary_outputs=_replay,
+        drain_root_boundary_outputs=_drain,
+    )
+
+    assert isinstance(enqueued[0], ControlPlaneRootPulse)
+    assert any(isinstance(payload, ControlPlaneStartWorkEvent) for payload in enqueued[1:])
+    assert all(not isinstance(payload, BootstrapControl) for payload in enqueued[1:])
+
+
+def test_root_loop_service_resolves_start_work_targets_from_process_groups_when_no_bootstrap_inputs() -> None:
+    service = RootRunnerLoopOrchestrationService()
+    runner = _SyncRunner()
+    enqueued: list[object] = []
+
+    def _enqueue(
+        _runner: object,
+        payload: object,
+        *,
+        run_id: str,
+        scenario_id: str,
+        index: int,
+    ) -> None:
+        _ = (run_id, scenario_id, index)
+        enqueued.append(payload)
+
+    def _replay(**_: object) -> int:
+        return 10
+
+    def _drain(**_: object) -> list[object]:
+        return []
+
+    inputs = [
+        ControlPlaneRootPulse(
+            runtime={
+                "platform": {
+                    "process_groups": [
+                        {"name": "execution.ingress", "nodes": ["source:source", "ingress_line_bridge"]},
+                        {"name": "execution.features", "nodes": ["compute_features"]},
+                    ],
+                    "readiness": {"enabled": True, "start_work_on_all_groups_ready": True},
+                }
+            }
+        ),
+        Envelope(payload="business", target="biz.node", trace_id="t1"),
+    ]
+
+    service.execute_sync(
+        runner=runner,
+        inputs=inputs,
+        run_id="run",
+        scenario_id="scenario",
+        scenario_scope=object(),
+        enqueue_runner_input=_enqueue,
+        replay_root_boundary_outputs=_replay,
+        drain_root_boundary_outputs=_drain,
+    )
+
+    events = [payload for payload in enqueued if isinstance(payload, ControlPlaneStartWorkEvent)]
+    assert len(events) == 1
+    assert events[0].source_targets == ("source:source",)
 
 
 def test_root_loop_service_waits_for_startup_barrier_before_deferred_inputs() -> None:
@@ -471,6 +596,323 @@ def test_root_loop_service_waits_for_leaf_config_ack_when_readiness_requires_all
     assert reply_ingress.calls > 0
 
 
+def test_root_loop_service_waits_for_leaf_config_ack_by_default_when_readiness_section_present() -> None:
+    service = RootRunnerLoopOrchestrationService()
+    runner = _SyncRunner()
+    barrier = _Barrier(open_after_loop_calls=0, runner=runner)
+    state = _State(
+        _events=[
+            {
+                "kind": "control_plane.lifecycle.worker_spawned",
+                "group_name": "execution.ingress",
+                "worker_id": "execution.ingress#1",
+            },
+        ]
+    )
+    reply_ingress = _ReplyIngressWithAckProgress(
+        state=state,
+        expected_worker_ids=("execution.ingress#1",),
+    )
+    scope = _ScopeWithStartupServices(
+        barrier=barrier,
+        reply_ingress=reply_ingress,
+        state=state,
+    )
+
+    def _enqueue(
+        _runner: object,
+        payload: object,
+        *,
+        run_id: str,
+        scenario_id: str,
+        index: int,
+    ) -> None:
+        _ = (payload, run_id, scenario_id, index)
+
+    def _replay(**_: object) -> int:
+        return 10
+
+    def _drain(**_: object) -> list[object]:
+        return []
+
+    inputs = [
+        ControlPlaneRootPulse(
+            runtime={
+                "platform": {
+                    "process_groups": [{"name": "execution.ingress"}],
+                    "readiness": {
+                        "enabled": True,
+                        "readiness_timeout_seconds": 3,
+                    },
+                }
+            }
+        ),
+    ]
+    service.execute_sync(
+        runner=runner,
+        inputs=inputs,
+        run_id="run",
+        scenario_id="scenario",
+        scenario_scope=scope,  # type: ignore[arg-type]
+        enqueue_runner_input=_enqueue,
+        replay_root_boundary_outputs=_replay,
+        drain_root_boundary_outputs=_drain,
+    )
+
+    assert reply_ingress.calls > 0
+
+
+def test_root_loop_service_readiness_timeout_is_non_fatal_by_default() -> None:
+    service = RootRunnerLoopOrchestrationService()
+    runner = _SyncRunner()
+    barrier = _Barrier(open_after_loop_calls=0, runner=runner)
+    reply_ingress = _ReplyIngress()
+    state = _State(
+        _events=[
+            {
+                "kind": "control_plane.lifecycle.worker_spawned",
+                "group_name": "execution.ingress",
+                "worker_id": "execution.ingress#1",
+            }
+        ]
+    )
+    scope = _ScopeWithStartupServices(
+        barrier=barrier,
+        reply_ingress=reply_ingress,
+        state=state,
+    )
+
+    def _enqueue(
+        _runner: object,
+        payload: object,
+        *,
+        run_id: str,
+        scenario_id: str,
+        index: int,
+    ) -> None:
+        _ = (payload, run_id, scenario_id, index)
+
+    def _replay(**_: object) -> int:
+        return 10
+
+    def _drain(**_: object) -> list[object]:
+        return []
+
+    inputs = [
+        ControlPlaneRootPulse(
+            runtime={
+                "platform": {
+                    "process_groups": [{"name": "execution.ingress"}],
+                    "readiness": {
+                        "enabled": True,
+                        "start_work_on_all_groups_ready": True,
+                        "readiness_timeout_seconds": 0.001,
+                    },
+                }
+            }
+        ),
+        Envelope(payload="business", target="biz.node", trace_id="t1"),
+    ]
+    service.execute_sync(
+        runner=runner,
+        inputs=inputs,
+        run_id="run",
+        scenario_id="scenario",
+        scenario_scope=scope,  # type: ignore[arg-type]
+        enqueue_runner_input=_enqueue,
+        replay_root_boundary_outputs=_replay,
+        drain_root_boundary_outputs=_drain,
+    )
+
+    assert reply_ingress.calls
+
+
+def test_root_loop_service_readiness_timeout_raises_when_fail_on_timeout_enabled() -> None:
+    service = RootRunnerLoopOrchestrationService()
+    runner = _SyncRunner()
+    barrier = _Barrier(open_after_loop_calls=0, runner=runner)
+    reply_ingress = _ReplyIngress()
+    state = _State(
+        _events=[
+            {
+                "kind": "control_plane.lifecycle.worker_spawned",
+                "group_name": "execution.ingress",
+                "worker_id": "execution.ingress#1",
+            }
+        ]
+    )
+    scope = _ScopeWithStartupServices(
+        barrier=barrier,
+        reply_ingress=reply_ingress,
+        state=state,
+    )
+
+    def _enqueue(
+        _runner: object,
+        payload: object,
+        *,
+        run_id: str,
+        scenario_id: str,
+        index: int,
+    ) -> None:
+        _ = (payload, run_id, scenario_id, index)
+
+    def _replay(**_: object) -> int:
+        return 10
+
+    def _drain(**_: object) -> list[object]:
+        return []
+
+    inputs = [
+        ControlPlaneRootPulse(
+            runtime={
+                "platform": {
+                    "process_groups": [{"name": "execution.ingress"}],
+                    "readiness": {
+                        "enabled": True,
+                        "start_work_on_all_groups_ready": True,
+                        "readiness_timeout_seconds": 0.001,
+                        "fail_on_timeout": True,
+                    },
+                }
+            }
+        ),
+        Envelope(payload="business", target="biz.node", trace_id="t1"),
+    ]
+    with pytest.raises(RuntimeError, match="readiness timeout"):
+        service.execute_sync(
+            runner=runner,
+            inputs=inputs,
+            run_id="run",
+            scenario_id="scenario",
+            scenario_scope=scope,  # type: ignore[arg-type]
+            enqueue_runner_input=_enqueue,
+            replay_root_boundary_outputs=_replay,
+            drain_root_boundary_outputs=_drain,
+        )
+
+
+def test_root_loop_service_emits_verbose_root_logs_when_debug_enabled() -> None:
+    service = RootRunnerLoopOrchestrationService()
+    runner = _SyncRunner()
+    barrier = _Barrier(open_after_loop_calls=0, runner=runner)
+    reply_ingress = _ReplyIngress()
+    state = _State(_events=[])
+    console = _ConsoleDispatch()
+    scope = _ScopeWithStartupServices(
+        barrier=barrier,
+        reply_ingress=reply_ingress,
+        state=state,
+        console_dispatch=console,
+    )
+
+    def _enqueue(
+        _runner: object,
+        payload: object,
+        *,
+        run_id: str,
+        scenario_id: str,
+        index: int,
+    ) -> None:
+        _ = (payload, run_id, scenario_id, index)
+
+    def _replay(**_: object) -> int:
+        return 10
+
+    def _drain(**_: object) -> list[object]:
+        return []
+
+    inputs = [
+        ControlPlaneRootPulse(
+            runtime={
+                "platform": {
+                    "process_groups": [{"name": "execution.ingress"}],
+                    "debug": {"root_verbose_logging": True},
+                }
+            }
+        ),
+        Envelope(payload="business", target="biz.node", trace_id="t1"),
+    ]
+
+    service.execute_sync(
+        runner=runner,
+        inputs=inputs,
+        run_id="run",
+        scenario_id="scenario",
+        scenario_scope=scope,  # type: ignore[arg-type]
+        enqueue_runner_input=_enqueue,
+        replay_root_boundary_outputs=_replay,
+        drain_root_boundary_outputs=_drain,
+    )
+
+    assert len(console.messages) >= 2
+    events = [
+        getattr(message, "fields", {}).get("event")
+        for message in console.messages
+        if hasattr(message, "fields")
+    ]
+    assert "control_plane.runtime.root_loop_started" in events
+    assert "control_plane.runtime.root_loop_finished" in events
+
+
+def test_root_loop_service_falls_back_to_stderr_when_console_dispatch_is_unavailable(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    service = RootRunnerLoopOrchestrationService()
+    runner = _SyncRunner()
+    barrier = _Barrier(open_after_loop_calls=0, runner=runner)
+    reply_ingress = _ReplyIngress()
+    state = _State(_events=[])
+    scope = _ScopeWithStartupServices(
+        barrier=barrier,
+        reply_ingress=reply_ingress,
+        state=state,
+        console_dispatch=None,
+    )
+
+    def _enqueue(
+        _runner: object,
+        payload: object,
+        *,
+        run_id: str,
+        scenario_id: str,
+        index: int,
+    ) -> None:
+        _ = (payload, run_id, scenario_id, index)
+
+    def _replay(**_: object) -> int:
+        return 10
+
+    def _drain(**_: object) -> list[object]:
+        return []
+
+    inputs = [
+        ControlPlaneRootPulse(
+            runtime={
+                "platform": {
+                    "process_groups": [{"name": "execution.ingress"}],
+                    "debug": {"root_verbose_logging": True},
+                }
+            }
+        ),
+    ]
+
+    service.execute_sync(
+        runner=runner,
+        inputs=inputs,
+        run_id="run",
+        scenario_id="scenario",
+        scenario_scope=scope,  # type: ignore[arg-type]
+        enqueue_runner_input=_enqueue,
+        replay_root_boundary_outputs=_replay,
+        drain_root_boundary_outputs=_drain,
+    )
+
+    captured = capsys.readouterr()
+    assert "control-plane root loop started" in captured.err
+    assert "control_plane.runtime.root_loop_started" in captured.err
+
+
 def test_root_loop_service_pumps_leaf_replies_once_when_startup_barrier_already_open() -> None:
     service = RootRunnerLoopOrchestrationService()
     runner = _SyncRunner()
@@ -529,3 +971,84 @@ def test_root_loop_service_pumps_leaf_replies_once_when_startup_barrier_already_
 
     drained_workers = {worker_id for worker_id, _timeout, _max_items in reply_ingress.calls}
     assert drained_workers == {"execution.ingress#1", "execution.features#1"}
+
+
+def test_root_loop_service_post_start_settle_waits_for_leaf_tombstone_completion() -> None:
+    service = RootRunnerLoopOrchestrationService()
+    runner = _SyncRunner()
+    barrier = _Barrier(open_after_loop_calls=0, runner=runner)
+    reply_ingress = _ReplyIngress()
+    state = _State(_events=[])
+    scope = _ScopeWithStartupServices(
+        barrier=barrier,
+        reply_ingress=reply_ingress,
+        state=state,
+    )
+    replay_calls = {"count": 0}
+
+    def _enqueue(
+        _runner: object,
+        payload: object,
+        *,
+        run_id: str,
+        scenario_id: str,
+        index: int,
+    ) -> None:
+        _ = (payload, run_id, scenario_id, index)
+
+    def _replay(
+        *,
+        runner: object,
+        scenario_scope: object,
+        run_id: str,
+        scenario_id: str,
+        start_index: int,
+        poll_timeout_seconds: float,
+        idle_timeout_seconds: float | None,
+    ) -> int:
+        _ = (runner, scenario_scope, run_id, scenario_id, poll_timeout_seconds, idle_timeout_seconds)
+        replay_calls["count"] += 1
+        if replay_calls["count"] == 3:
+            state.append_event(
+                {
+                    "kind": "leaf_tombstone_completed",
+                    "target_group": "execution.ingress",
+                }
+            )
+        return start_index
+
+    def _drain(**_: object) -> list[object]:
+        return []
+
+    inputs = [
+        ControlPlaneRootPulse(
+            runtime={
+                "platform": {
+                    "process_groups": [{"name": "execution.ingress"}],
+                    "runner_loop": {
+                        "post_start_settle_enabled": True,
+                        "post_start_settle_max_wait_seconds": 0.2,
+                        "post_start_settle_quiet_window_seconds": 0.01,
+                    },
+                },
+                "adapters": {"source": {"emit_tombstone": True}},
+            }
+        ),
+        Envelope(
+            payload=BootstrapControl(target="source:source"),
+            target="source:source",
+        ),
+        Envelope(payload="business", target="biz.node", trace_id="t1"),
+    ]
+    service.execute_sync(
+        runner=runner,
+        inputs=inputs,
+        run_id="run",
+        scenario_id="scenario",
+        scenario_scope=scope,  # type: ignore[arg-type]
+        enqueue_runner_input=_enqueue,
+        replay_root_boundary_outputs=_replay,
+        drain_root_boundary_outputs=_drain,
+    )
+
+    assert replay_calls["count"] >= 3

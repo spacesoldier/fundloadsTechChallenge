@@ -82,6 +82,15 @@ def test_root_lifecycle_log_factory_builds_shutdown_progress_messages() -> None:
     )
 
     started = factory.runtime_shutdown_started(total_workers=2)
+    stopping = factory.runtime_shutdown_worker_stopping(
+        target_group="execution.alpha",
+        worker_id="execution.alpha#1",
+        command_id="stop-1",
+        stop_command_timeout_seconds=0.2,
+        graceful_timeout_seconds=3.0,
+        terminate_timeout_seconds=1.0,
+        is_observability_group=False,
+    )
     finished = factory.runtime_shutdown_worker_finished(result=result)
     failed = factory.runtime_shutdown_worker_failed(
         target_group="execution.alpha",
@@ -90,6 +99,8 @@ def test_root_lifecycle_log_factory_builds_shutdown_progress_messages() -> None:
     )
 
     assert started.fields["event"] == "control_plane.lifecycle.runtime_shutdown_started"
+    assert stopping.fields["event"] == "control_plane.lifecycle.runtime_shutdown_worker_stopping"
+    assert stopping.fields["stop_command_timeout_seconds"] == 0.2
     assert finished.fields["event"] == "control_plane.lifecycle.runtime_shutdown_worker_finished"
     assert finished.fields["worker_id"] == "execution.alpha#1"
     assert failed.level == "error"

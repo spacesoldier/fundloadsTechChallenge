@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -123,7 +124,7 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
                     source_node=node_name,
                 )
             )
-        if self._runner_node_logs_enabled():
+        if self._runner_node_logs_enabled() and not self._is_log_relay_payload(payload):
             log_message = LogMessage(
                 level="info",
                 message=f"node '{node_name}' processed",
@@ -208,7 +209,7 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
                     source_node=node_name,
                 )
             )
-        if self._runner_node_logs_enabled():
+        if self._runner_node_logs_enabled() and not self._is_log_relay_payload(payload):
             log_message = LogMessage(
                 level="error",
                 message=f"node '{node_name}' failed",
@@ -275,8 +276,37 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
         trace_id: str | None = None,
         attributes: dict[str, object] | None = None,
     ) -> None:
-        _ = (trace_id, attributes)
-        self._emit_many(self.trace_sinks, event)
+        self.emit_trace_event(event=event, trace_id=trace_id, attributes=attributes)
+
+    def emit_trace_event(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> list[object]:
+        sink_errors = self._emit_many(self.trace_sinks, event)
+        return self._sink_error_events(
+            channel="trace",
+            trace_id=trace_id,
+            attributes=attributes,
+            sink_errors=sink_errors,
+        )
+
+    async def emit_trace_event_async(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> list[object]:
+        sink_errors = await self._emit_many_async(self.trace_sinks, event)
+        return self._sink_error_events(
+            channel="trace",
+            trace_id=trace_id,
+            attributes=attributes,
+            sink_errors=sink_errors,
+        )
 
     def publish_log(
         self,
@@ -285,14 +315,32 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
         trace_id: str | None = None,
         attributes: dict[str, object] | None = None,
     ) -> None:
+        self.emit_log_event(event=event, trace_id=trace_id, attributes=attributes)
+
+    def emit_log_event(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> list[object]:
         _ = (trace_id, attributes)
-        if not isinstance(event, LogMessage):
-            event = LogMessage(
-                level="info",
-                message=f"log_event:{type(event).__name__}",
-                fields={"value_type": type(event).__name__},
-            )
-        self._emit_many(self.log_sinks, event)
+        normalized = self._coerce_log_message(event)
+        # Do not emit recursive log events when log sinks fail.
+        self._emit_many(self.log_sinks, normalized)
+        return []
+
+    async def emit_log_event_async(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> list[object]:
+        _ = (trace_id, attributes)
+        normalized = self._coerce_log_message(event)
+        await self._emit_many_async(self.log_sinks, normalized)
+        return []
 
     def publish_metric(
         self,
@@ -301,10 +349,39 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
         trace_id: str | None = None,
         attributes: dict[str, object] | None = None,
     ) -> None:
-        _ = (trace_id, attributes)
-        if not isinstance(event, TelemetryMessage):
-            event = TelemetryMessage(metric="runner.metric", value=1, tags={"value_type": type(event).__name__})
-        self._emit_many(self.telemetry_sinks, event)
+        self.emit_metric_event(event=event, trace_id=trace_id, attributes=attributes)
+
+    def emit_metric_event(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> list[object]:
+        normalized = self._coerce_metric_message(event)
+        sink_errors = self._emit_many(self.telemetry_sinks, normalized)
+        return self._sink_error_events(
+            channel="metric",
+            trace_id=trace_id,
+            attributes=attributes,
+            sink_errors=sink_errors,
+        )
+
+    async def emit_metric_event_async(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> list[object]:
+        normalized = self._coerce_metric_message(event)
+        sink_errors = await self._emit_many_async(self.telemetry_sinks, normalized)
+        return self._sink_error_events(
+            channel="metric",
+            trace_id=trace_id,
+            attributes=attributes,
+            sink_errors=sink_errors,
+        )
 
     def publish_monitoring(
         self,
@@ -313,14 +390,43 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
         trace_id: str | None = None,
         attributes: dict[str, object] | None = None,
     ) -> None:
-        _ = (trace_id, attributes)
-        if not isinstance(event, MonitoringMessage):
-            event = MonitoringMessage(
-                name="runner.monitoring",
-                status="accepted",
-                details={"value_type": type(event).__name__},
-            )
-        self._emit_many(self.monitoring_sinks, event)
+        self.emit_monitoring_event(
+            event=event,
+            trace_id=trace_id,
+            attributes=attributes,
+        )
+
+    def emit_monitoring_event(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> list[object]:
+        normalized = self._coerce_monitoring_message(event)
+        sink_errors = self._emit_many(self.monitoring_sinks, normalized)
+        return self._sink_error_events(
+            channel="monitor",
+            trace_id=trace_id,
+            attributes=attributes,
+            sink_errors=sink_errors,
+        )
+
+    async def emit_monitoring_event_async(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> list[object]:
+        normalized = self._coerce_monitoring_message(event)
+        sink_errors = await self._emit_many_async(self.monitoring_sinks, normalized)
+        return self._sink_error_events(
+            channel="monitor",
+            trace_id=trace_id,
+            attributes=attributes,
+            sink_errors=sink_errors,
+        )
 
     def on_ingress(
         self,
@@ -544,14 +650,137 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
         self.publish_monitoring(event=event, trace_id=trace_id, attributes={"source_node": source_node})
         return []
 
-    def _emit_many(self, sinks: list[object], payload: object) -> None:
+    def _emit_many(self, sinks: list[object], payload: object) -> list[tuple[str, Exception]]:
+        errors: list[tuple[str, Exception]] = []
         for sink in sinks:
             emit = getattr(sink, "emit", None)
             if callable(emit):
                 try:
                     emit(payload)
-                except Exception:
+                except Exception as exc:  # noqa: BLE001 - observability channel must not break business path.
+                    errors.append((type(sink).__name__, exc))
+        return errors
+
+    async def _emit_many_async(self, sinks: list[object], payload: object) -> list[tuple[str, Exception]]:
+        errors: list[tuple[str, Exception]] = []
+        for sink in sinks:
+            emit_async = getattr(sink, "emit_async", None)
+            if callable(emit_async):
+                try:
+                    result = emit_async(payload)
+                    if inspect.isawaitable(result):
+                        await result
                     continue
+                except Exception as exc:  # noqa: BLE001 - observability channel must not break business path.
+                    errors.append((type(sink).__name__, exc))
+                    continue
+            emit = getattr(sink, "emit", None)
+            if callable(emit):
+                try:
+                    emit(payload)
+                except Exception as exc:  # noqa: BLE001 - observability channel must not break business path.
+                    errors.append((type(sink).__name__, exc))
+        return errors
+
+    def _sink_error_events(
+        self,
+        *,
+        channel: str,
+        trace_id: str | None,
+        attributes: dict[str, object] | None,
+        sink_errors: list[tuple[str, Exception]],
+    ) -> list[object]:
+        if not sink_errors:
+            return []
+        if channel == "log" or not self._channel_enabled("log"):
+            return []
+        message = self._build_sink_error_log_message(
+            channel=channel,
+            sink_errors=sink_errors,
+            source_node=self._source_node_from_attributes(attributes),
+        )
+        source_node = self._source_node_from_attributes(attributes)
+        if self._should_emit_dispatch_events():
+            return [
+                LogDispatchEvent(
+                    payload=message,
+                    trace_id=trace_id,
+                    attributes={
+                        "source_node": source_node,
+                        "origin_channel": channel,
+                    },
+                )
+            ]
+        self._emit_many(self.log_sinks, message)
+        return []
+
+    @staticmethod
+    def _source_node_from_attributes(attributes: dict[str, object] | None) -> str:
+        if isinstance(attributes, dict):
+            candidate = attributes.get("source_node")
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        return "__observability_sink__"
+
+    def _build_sink_error_log_message(
+        self,
+        *,
+        channel: str,
+        sink_errors: list[tuple[str, Exception]],
+        source_node: str,
+    ) -> LogMessage:
+        first_sink, first_exc = sink_errors[0]
+        fields: dict[str, object] = {
+            "event": "observability.sink.emit_failed",
+            "channel": channel,
+            "source_node": source_node,
+            "sink_failures_count": len(sink_errors),
+            "first_sink": first_sink,
+            "first_error_type": type(first_exc).__name__,
+            "first_error_message": str(first_exc),
+        }
+        for index, (sink_name, exc) in enumerate(sink_errors[:3]):
+            fields[f"failure_{index}_sink"] = sink_name
+            fields[f"failure_{index}_error_type"] = type(exc).__name__
+            fields[f"failure_{index}_error_message"] = str(exc)
+        return LogMessage(
+            level="error",
+            message=f"observability sink emit failed on '{channel}' channel",
+            fields=fields,
+        )
+
+    @staticmethod
+    def _coerce_log_message(event: object) -> LogMessage:
+        if isinstance(event, LogMessage):
+            return event
+        return LogMessage(
+            level="info",
+            message=f"log_event:{type(event).__name__}",
+            fields={"value_type": type(event).__name__},
+        )
+
+    @staticmethod
+    def _is_log_relay_payload(payload: object) -> bool:
+        # Do not emit runner.node.* log records when the processed payload itself
+        # is a logging message/event. This prevents log-on-log feedback loops on
+        # relay nodes such as system.lifecycle.log_dispatch.
+        return isinstance(payload, (LogMessage, LogDispatchEvent))
+
+    @staticmethod
+    def _coerce_metric_message(event: object) -> TelemetryMessage:
+        if isinstance(event, TelemetryMessage):
+            return event
+        return TelemetryMessage(metric="runner.metric", value=1, tags={"value_type": type(event).__name__})
+
+    @staticmethod
+    def _coerce_monitoring_message(event: object) -> MonitoringMessage:
+        if isinstance(event, MonitoringMessage):
+            return event
+        return MonitoringMessage(
+            name="runner.monitoring",
+            status="accepted",
+            details={"value_type": type(event).__name__},
+        )
 
     def _should_emit_dispatch_events(self) -> bool:
         role = self.runtime.get("__process_role")

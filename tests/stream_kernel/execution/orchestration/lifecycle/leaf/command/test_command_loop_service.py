@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from stream_kernel.execution.orchestration.source_ingress import BootstrapControl
 from stream_kernel.execution.orchestration.lifecycle.leaf.runtime.worker_runtime import (
     LeafWorkerRuntimeSession,
 )
 from stream_kernel.execution.transport.ipc.ipc_transport import ExecutionIpcMessage
+from stream_kernel.observability.events import TraceDispatchEvent
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneDiscoveryItemEvent,
     ControlPlaneLeafBoundaryExecuteCommand,
@@ -14,9 +16,11 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafDiscoveryRequestEvent,
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafConfigCardEvent,
+    ControlPlaneLeafStartWorkEvent,
     ControlPlaneLeafStopAckEvent,
     ControlPlaneLeafStopCommand,
 )
+from stream_kernel.routing.envelope import Envelope
 
 
 @dataclass(slots=True)
@@ -477,6 +481,47 @@ def test_leaf_worker_command_loop_service_handles_boundary_execute_and_sends_res
     assert event.outputs == ("out-1",)
 
 
+def test_leaf_worker_command_loop_service_streams_large_boundary_results_in_chunks() -> None:
+    from stream_kernel.execution.orchestration.lifecycle.leaf.command.command_loop_service import (
+        DefaultLeafWorkerCommandLoopService,
+    )
+
+    ipc = _ExecutionIpc(
+        incoming=[
+            ControlPlaneLeafBoundaryExecuteCommand(
+                target_group="execution.alpha",
+                worker_id="execution.alpha#1",
+                request_id="req-chunk-1",
+                inputs=({"payload": 1},),
+                finalize=True,
+            )
+        ]
+    )
+    boundary = _BoundaryExecution(outputs=tuple(f"out-{index}" for index in range(5)))
+    service = DefaultLeafWorkerCommandLoopService(
+        activation_service=_Activation(mode="applied"),
+        boundary_execution_service=boundary,
+        finalization_service=_Finalizer(),
+        execution_ipc=ipc,
+        boundary_result_chunk_items=2,
+    )
+
+    result = service.run_control_iteration(
+        session=_session(),
+        control_pipe=object(),
+        stop_event=_StopEvent(False),
+        poll_seconds=0.01,
+    )
+
+    assert result == "boundary_executed"
+    sent_events = [payload for _target, payload, _no_reply in ipc.sent]
+    assert len(sent_events) == 3
+    assert [event.status for event in sent_events] == ["stream", "stream", "completed"]
+    assert sent_events[0].outputs == ("out-0", "out-1")
+    assert sent_events[1].outputs == ("out-2", "out-3")
+    assert sent_events[2].outputs == ("out-4",)
+
+
 def test_leaf_worker_command_loop_service_executes_observability_boundary_without_result_reply() -> None:
     from stream_kernel.execution.orchestration.lifecycle.leaf.command.command_loop_service import (
         DefaultLeafWorkerCommandLoopService,
@@ -513,6 +558,191 @@ def test_leaf_worker_command_loop_service_executes_observability_boundary_withou
 
     assert result == "boundary_executed"
     assert boundary.seen == [(session, [{"trace": 1}], False)]
+    assert ipc.sent == []
+
+
+def test_leaf_worker_command_loop_service_executes_inline_envelope_via_boundary_and_sends_result() -> None:
+    from stream_kernel.execution.orchestration.lifecycle.leaf.command.command_loop_service import (
+        DefaultLeafWorkerCommandLoopService,
+    )
+
+    ipc = _ExecutionIpc(
+        incoming=[
+            Envelope(
+                payload=BootstrapControl(target="source:source"),
+                target="source:source",
+                trace_id="trace-inline-1",
+            )
+        ]
+    )
+    boundary = _BoundaryExecution(outputs=("out-inline",))
+    service = DefaultLeafWorkerCommandLoopService(
+        activation_service=_Activation(mode="applied"),
+        boundary_execution_service=boundary,
+        finalization_service=_Finalizer(),
+        execution_ipc=ipc,
+    )
+    session = _session()
+
+    result = service.run_control_iteration(
+        session=session,
+        control_pipe=object(),
+        stop_event=_StopEvent(False),
+        poll_seconds=0.01,
+    )
+
+    assert result == "boundary_executed"
+    assert len(boundary.seen) == 1
+    _seen_session, seen_inputs, seen_finalize = boundary.seen[0]
+    assert seen_finalize is False
+    assert isinstance(seen_inputs, list) and len(seen_inputs) == 1
+    inline = seen_inputs[0]
+    assert isinstance(inline, dict)
+    assert inline.get("dispatch_group") == "execution.alpha"
+    assert inline.get("target") == "source:source"
+    assert isinstance(inline.get("payload"), BootstrapControl)
+    assert inline.get("trace_id") == "trace-inline-1"
+    assert len(ipc.sent) == 1
+    event = ipc.sent[0][1]
+    assert isinstance(event, ControlPlaneLeafBoundaryResultEvent)
+    assert event.status == "completed"
+    assert event.outputs == ("out-inline",)
+
+
+def test_leaf_worker_command_loop_service_handles_leaf_start_work_event_without_consumer_registry() -> None:
+    from types import SimpleNamespace
+
+    from stream_kernel.execution.orchestration.lifecycle.leaf.command.command_loop_service import (
+        DefaultLeafWorkerCommandLoopService,
+    )
+
+    ipc = _ExecutionIpc(
+        incoming=[
+            ControlPlaneLeafStartWorkEvent(source_targets=("source:source",)),
+        ]
+    )
+    boundary = _BoundaryExecution(outputs=("out-start",))
+    service = DefaultLeafWorkerCommandLoopService(
+        activation_service=_Activation(mode="applied"),
+        boundary_execution_service=boundary,
+        finalization_service=_Finalizer(),
+        execution_ipc=ipc,
+    )
+    session = LeafWorkerRuntimeSession(
+        child=SimpleNamespace(scenario_steps={"source:source": object(), "parse_load_attempt": object()}),
+        worker_id="execution.alpha#1",
+        group_name="execution.alpha",
+        runner_profile_requested="async",
+        runner_profile_effective="async",
+    )
+
+    result = service.run_control_iteration(
+        session=session,
+        control_pipe=object(),
+        stop_event=_StopEvent(False),
+        poll_seconds=0.01,
+    )
+
+    assert result == "boundary_executed"
+    assert len(boundary.seen) == 1
+    _seen_session, seen_inputs, seen_finalize = boundary.seen[0]
+    assert seen_finalize is False
+    assert isinstance(seen_inputs, list) and len(seen_inputs) == 1
+    payload = seen_inputs[0]
+    assert isinstance(payload, dict)
+    assert payload.get("target") == "source:source"
+    assert isinstance(payload.get("payload"), BootstrapControl)
+    assert len(ipc.sent) == 1
+    ack = ipc.sent[0][1]
+    assert isinstance(ack, ControlPlaneLeafBoundaryResultEvent)
+    assert ack.status == "completed"
+
+
+def test_leaf_worker_command_loop_service_ignores_leaf_start_work_when_no_local_source_nodes() -> None:
+    from types import SimpleNamespace
+
+    from stream_kernel.execution.orchestration.lifecycle.leaf.command.command_loop_service import (
+        DefaultLeafWorkerCommandLoopService,
+    )
+
+    ipc = _ExecutionIpc(
+        incoming=[
+            ControlPlaneLeafStartWorkEvent(source_targets=("source:source",)),
+        ]
+    )
+    boundary = _BoundaryExecution(outputs=("out-start",))
+    service = DefaultLeafWorkerCommandLoopService(
+        activation_service=_Activation(mode="applied"),
+        boundary_execution_service=boundary,
+        finalization_service=_Finalizer(),
+        execution_ipc=ipc,
+    )
+    session = LeafWorkerRuntimeSession(
+        child=SimpleNamespace(scenario_steps={"compute_features": object(), "parse_load_attempt": object()}),
+        worker_id="execution.features#1",
+        group_name="execution.features",
+        runner_profile_requested="async",
+        runner_profile_effective="async",
+    )
+
+    result = service.run_control_iteration(
+        session=session,
+        control_pipe=object(),
+        stop_event=_StopEvent(False),
+        poll_seconds=0.01,
+    )
+
+    assert result is None
+    assert boundary.seen == []
+    assert ipc.sent == []
+
+
+def test_leaf_worker_command_loop_service_handles_trace_dispatch_event_via_boundary_execution() -> None:
+    from stream_kernel.execution.orchestration.lifecycle.leaf.command.command_loop_service import (
+        DefaultLeafWorkerCommandLoopService,
+    )
+
+    ipc = _ExecutionIpc(
+        incoming=[
+            TraceDispatchEvent(
+                payload={"span": "s1"},
+                trace_id="trace-1",
+                attributes={"source_node": "compute_features"},
+            )
+        ]
+    )
+    boundary = _BoundaryExecution(outputs=())
+    service = DefaultLeafWorkerCommandLoopService(
+        activation_service=_Activation(mode="applied"),
+        boundary_execution_service=boundary,
+        finalization_service=_Finalizer(),
+        execution_ipc=ipc,
+    )
+    session = LeafWorkerRuntimeSession(
+        child=object(),
+        worker_id="system.observability#1",
+        group_name="system.observability",
+        runner_profile_requested="async",
+        runner_profile_effective="async",
+    )
+
+    result = service.run_control_iteration(
+        session=session,
+        control_pipe=object(),
+        stop_event=_StopEvent(False),
+        poll_seconds=0.01,
+    )
+
+    assert result == "boundary_executed"
+    assert len(boundary.seen) == 1
+    _seen_session, seen_inputs, seen_finalize = boundary.seen[0]
+    assert seen_finalize is False
+    assert isinstance(seen_inputs, list) and len(seen_inputs) == 1
+    payload = seen_inputs[0]
+    assert isinstance(payload, dict)
+    assert payload.get("dispatch_group") == "system.observability"
+    assert payload.get("target") == "system.obs.trace_dispatch"
+    assert payload.get("trace_id") == "trace-1"
     assert ipc.sent == []
 
 
@@ -646,3 +876,45 @@ def test_leaf_worker_command_loop_service_accepts_discovery_transport_aliases_wi
     assert ack.status == "accepted"
     assert ack.missing_nodes == ()
     assert ack.discovered_nodes == ("node.a", "sink:sink")
+
+
+def test_leaf_worker_command_loop_service_accepts_discovery_handoff_aliases_without_metadata() -> None:
+    from stream_kernel.execution.orchestration.lifecycle.leaf.command.command_loop_service import (
+        DefaultLeafWorkerCommandLoopService,
+    )
+
+    request = ControlPlaneLeafDiscoveryRequestEvent(
+        target_group="execution.alpha",
+        worker_id="execution.alpha#1",
+        request_id="req-discovery-handoff-alias",
+        required_nodes=("node.a", "system.transport.handoff.observability_dispatch"),
+        protocol_revision=2,
+    )
+    ipc = _ExecutionIpc(incoming=[request])
+    bootstrapper = _Bootstrapper(
+        items=[ControlPlaneDiscoveryItemEvent(item_kind="node", payload={"name": "node.a"})]
+    )
+    discovery = _Discovery()
+    service = DefaultLeafWorkerCommandLoopService(
+        activation_service=_Activation(mode="applied"),
+        boundary_execution_service=_BoundaryExecution(),
+        finalization_service=_Finalizer(),
+        execution_ipc=ipc,
+        bootstrapper=bootstrapper,
+        discovery=discovery,
+    )
+
+    result = service.run_control_iteration(
+        session=_session(),
+        control_pipe=object(),
+        stop_event=_StopEvent(False),
+        poll_seconds=0.01,
+    )
+
+    assert result == "discovery_acknowledged"
+    assert len(ipc.sent) == 1
+    ack = ipc.sent[0][1]
+    assert isinstance(ack, ControlPlaneLeafDiscoveryAckEvent)
+    assert ack.status == "accepted"
+    assert ack.missing_nodes == ()
+    assert ack.discovered_nodes == ("node.a", "system.transport.handoff.observability_dispatch")

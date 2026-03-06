@@ -78,6 +78,24 @@ The sync runtime pulls one item at a time from the source adapter:
 
 This preserves deterministic ordering and makes backpressure trivial.
 
+### 3.2.1 Pull ingress wrapper contract
+
+For adapters that expose `read()`, runtime must use a dedicated pull wrapper node
+(`PullIngressSourceNode`) instead of mixing pull/push logic in one wrapper.
+
+Contract:
+
+- input trigger: control envelope (`BootstrapControl`) routed to `source:<adapter_role>`
+- action: read at most one item from adapter iterator and emit one business envelope
+- continuation: emit next `BootstrapControl` to self while source is not exhausted
+- completion: emit nothing once iterator is exhausted
+
+Notes:
+
+- wrapper is transport-agnostic and does not access pipe/tcp directly
+- wrapper interacts only through runner routing rails (node -> envelopes -> router)
+- push mode, if introduced later, must use a separate wrapper with independent contract
+
 ### 3.3 Push‑mode
 
 Async runtimes may let adapters push into queues:
@@ -85,6 +103,19 @@ Async runtimes may let adapters push into queues:
 - adapter produces payloads and enqueues via `WorkQueue.push`
 - backpressure is enforced by queue capacity or a gate
 - adapter may implement `ack()` / `commit()` semantics
+
+### 3.3.1 Push ingress wrapper contract
+
+Push mode uses a separate wrapper (`PushIngressSourceNode`) with an independent contract.
+
+Contract:
+
+- input trigger: control envelope (`BootstrapControl`) routed to `source:<adapter_role>`
+- action: perform one non-blocking poll (`poll()`/`get_nowait()`-style) on adapter
+- on item available: emit one business envelope with context/trace enrichment
+- on no item: emit nothing (no self-reschedule, no busy spin)
+
+This keeps push mode explicitly event-driven and avoids pull-mode self-reschedule loops.
 
 ### 3.4 Open‑end rule (no external tokens)
 

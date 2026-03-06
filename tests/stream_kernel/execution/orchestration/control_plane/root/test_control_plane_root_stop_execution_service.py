@@ -124,3 +124,35 @@ def test_root_stop_execution_service_raises_on_negative_ack_status() -> None:
             command_id="stop-1",
             timeout_seconds=0.1,
         )
+
+
+def test_root_stop_execution_service_waits_ack_without_dispatch_when_disabled() -> None:
+    from stream_kernel.execution.orchestration.control_plane.root.stop_execution_service import (
+        DefaultControlPlaneRootStopExecutionService,
+    )
+
+    ipc = _IpcPort()
+    commands = _RootLeafCommands(
+        result=ControlPlaneLeafStopAckEvent(
+            target_group="execution.alpha",
+            worker_id="execution.alpha#1",
+            command_id="stop-1",
+            status="accepted",
+        )
+    )
+    service = DefaultControlPlaneRootStopExecutionService(
+        root_leaf_commands=commands,
+        execution_ipc=ipc,
+    )
+
+    ack = service.stop_leaf(
+        target_group="execution.alpha",
+        worker_id="execution.alpha#1",
+        command_id="stop-1",
+        timeout_seconds=0.1,
+        dispatch_command=False,
+    )
+
+    assert isinstance(ack, ControlPlaneLeafStopAckEvent)
+    assert ipc.sends == []
+    assert len(commands.waits) == 1

@@ -4,6 +4,10 @@ from dataclasses import dataclass, field
 
 import pytest
 
+from stream_kernel.execution.transport.ipc.ipc_transport import (
+    EXECUTION_IPC_LANE_DATA,
+    compose_execution_ipc_worker_target_id,
+)
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafBoundaryResultEvent,
     ControlPlaneRootLeafBoundaryExecuteRequestEvent,
@@ -76,7 +80,10 @@ def test_root_boundary_execution_service_sends_typed_command_and_returns_routing
 
     assert len(ipc.sends) == 1
     sent = ipc.sends[0]
-    assert sent["target_id"] == "execution.alpha#1"
+    assert sent["target_id"] == compose_execution_ipc_worker_target_id(
+        "execution.alpha#1",
+        lane=EXECUTION_IPC_LANE_DATA,
+    )
     assert sent["no_reply"] is True
     assert isinstance(sent["payload"], ControlPlaneLeafBoundaryExecuteCommand)
     assert result.local_deliveries == []
@@ -131,7 +138,10 @@ def test_root_boundary_execution_service_does_not_wait_for_result_when_finalize_
 
     assert len(ipc.sends) == 1
     sent = ipc.sends[0]
-    assert sent["target_id"] == "system.observability#1"
+    assert sent["target_id"] == compose_execution_ipc_worker_target_id(
+        "system.observability#1",
+        lane=EXECUTION_IPC_LANE_DATA,
+    )
     assert sent["no_reply"] is True
     assert isinstance(sent["payload"], ControlPlaneLeafBoundaryExecuteCommand)
     assert sent["payload"].finalize is False

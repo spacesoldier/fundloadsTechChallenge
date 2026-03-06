@@ -46,6 +46,7 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneDiscoveryStartRequestedEvent,
     ControlPlaneLeafDiscoveryRequestEvent,
     ControlPlaneLeafDiscoverySnapshotEvent,
+    ControlPlaneLeafStartWorkEvent,
     ControlPlaneLeafConfigCardEvent,
     ControlPlaneLeafPulse,
     ControlPlaneLeafStopCommand,
@@ -228,6 +229,7 @@ def test_control_plane_system_plan_leaf_mode_includes_discovery_stage() -> None:
     assert "system.cp.leaf_discovery" in step_names
     assert "system.cp.leaf_snapshot_apply" in step_names
     assert "system.cp.leaf_apply_config" in step_names
+    assert "system.cp.leaf_start_work" in step_names
     assert "system.cp.leaf_boundary_execute" in step_names
     assert "system.cp.leaf_stop" in step_names
     assert "system.cp.leaf_discovery" in plan.system_consumers.get(
@@ -237,5 +239,6 @@ def test_control_plane_system_plan_leaf_mode_includes_discovery_stage() -> None:
         ControlPlaneLeafDiscoverySnapshotEvent, []
     )
     assert "system.cp.leaf_apply_config" in plan.system_consumers.get(ControlPlaneLeafConfigCardEvent, [])
+    assert "system.cp.leaf_start_work" in plan.system_consumers.get(ControlPlaneLeafStartWorkEvent, [])
     assert "system.cp.leaf_bootstrap" in plan.system_consumers.get(ControlPlaneLeafPulse, [])
     assert "system.cp.leaf_stop" in plan.system_consumers.get(ControlPlaneLeafStopCommand, [])

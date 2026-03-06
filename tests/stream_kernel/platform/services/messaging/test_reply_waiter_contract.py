@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.platform.services.messaging.reply_waiter import (
     InMemoryReplyWaiterService,
     TerminalEvent,
@@ -127,3 +128,16 @@ def test_reply_waiter_step_e_diagnostic_events_do_not_leak_secret_values() -> No
     assert secret not in serialized
     assert any(event["kind"] == "cancelled" for event in events)
     assert any(event["kind"] == "late_reply_drop" for event in events)
+
+
+def test_reply_waiter_persists_state_in_kv_store() -> None:
+    store = InMemoryKvStore()
+    first = InMemoryReplyWaiterService(store=store, now_fn=lambda: 0)
+    first.register(trace_id="t1", reply_to="http:req-1", timeout_seconds=30)
+    assert first.complete(trace_id="t1", event=TerminalEvent(status="success", payload={"ok": True}))
+
+    second = InMemoryReplyWaiterService(store=store, now_fn=lambda: 0)
+    assert second.poll(trace_id="t1") == TerminalEvent(status="success", payload={"ok": True})
+    counters = second.diagnostics_counters()
+    assert counters["registered"] == 1
+    assert counters["completed"] == 1

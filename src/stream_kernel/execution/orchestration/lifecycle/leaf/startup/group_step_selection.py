@@ -35,10 +35,18 @@ def select_group_planning_steps(
         break
     if not selected_nodes:
         return dict(scenario_steps)
-    # System observability nodes are framework-internal rails and must be available
-    # in each worker group so trace/log/metric dispatch does not leak as remote handoff.
+    # Framework-internal rails must stay available in every worker group.
+    # - system.obs.*: observability dispatch sinks
+    # - system.transport.handoff.*: observability transport relay/handoff nodes
+    # - system.cp.leaf_start_work: control-plane start signal -> local source bootstrap
     for node_name in scenario_steps:
         if node_name.startswith("system.obs."):
+            selected_nodes.add(node_name)
+            continue
+        if node_name.startswith("system.transport.handoff."):
+            selected_nodes.add(node_name)
+            continue
+        if node_name == "system.cp.leaf_start_work":
             selected_nodes.add(node_name)
     return {
         name: step

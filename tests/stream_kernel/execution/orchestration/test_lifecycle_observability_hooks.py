@@ -212,3 +212,36 @@ def test_execute_with_runtime_lifecycle_passes_stop_and_fallback_shutdown_timeou
     assert call["observability_stop_command_timeout_seconds"] == 7
     assert call["stop_command_timeout_seconds"] == 1.5
     assert call["fallback_graceful_timeout_seconds"] == 2.0
+
+
+def test_execute_with_runtime_lifecycle_keeps_observability_default_stop_timeout_when_base_timeout_is_set() -> None:
+    lifecycle = _Lifecycle()
+    registry = InjectionRegistry()
+    registry.register_factory("service", RuntimeLifecycleManager, lambda _s=lifecycle: _s)
+    registry.register_factory("service", ObservabilityService, lambda: _Obs())
+    scope = registry.instantiate_for_scenario("s5")
+
+    execute_with_runtime_lifecycle(
+        runtime={
+            "platform": {
+                "lifecycle": {
+                    "ready_timeout_seconds": 2,
+                    "graceful_timeout_seconds": 3,
+                    "stop_command_timeout_seconds": 1.0,
+                }
+            },
+            "observability": {
+                "service_worker": {
+                    "group_name": "system.observability",
+                }
+            },
+        },
+        scenario_scope=scope,
+        run=lambda: None,
+    )
+
+    assert lifecycle.shutdown_policy_calls
+    call = lifecycle.shutdown_policy_calls[-1]
+    assert call["observability_group_name"] == "system.observability"
+    assert call["observability_stop_command_timeout_seconds"] == 5.0
+    assert call["stop_command_timeout_seconds"] == 1.0

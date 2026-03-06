@@ -22,6 +22,7 @@ from stream_kernel.application_context.injection_registry import (
 )
 from stream_kernel.execution.orchestration.control_plane import (
     build_control_plane_system_plan,
+    should_include_business_steps,
 )
 from stream_kernel.execution.orchestration.control_plane.bootstrap_keys import (
     BootstrapKeyBundle,
@@ -37,28 +38,41 @@ from stream_kernel.execution.orchestration.lifecycle.root.startup.planning impor
 from stream_kernel.execution.orchestration.observability_system_nodes import (
     build_observability_system_plan,
 )
-from stream_kernel.execution.orchestration.source_ingress import (
-    WEB_INGRESS_LIMITER_QUALIFIER,
-    BootstrapControl,
-    build_source_ingress_plan,
-)
 from stream_kernel.execution.orchestration.runtime import (
     assemble_runtime_startup_scenario,
     prepare_process_supervisor_root_runtime,
     run_with_async_runner,
     run_with_sync_runner,
 )
+from stream_kernel.execution.orchestration.source_ingress import (
+    WEB_INGRESS_LIMITER_QUALIFIER,
+    BootstrapControl,
+    SourceIngressPlan,
+    build_source_ingress_plan,
+)
 from stream_kernel.execution.runtime.planning import build_execution_plan
 from stream_kernel.execution.transport.handoff.runtime_wiring import (
-    ensure_runtime_ipc_handoff_bindings as ensure_runtime_ipc_handoff_bindings_via_transport,
     ensure_runtime_ipc_bindings as ensure_runtime_ipc_bindings_via_transport,
+)
+from stream_kernel.execution.transport.handoff.runtime_wiring import (
+    ensure_runtime_ipc_handoff_bindings as ensure_runtime_ipc_handoff_bindings_via_transport,
+)
+from stream_kernel.execution.transport.handoff.runtime_wiring import (
     resolve_execution_ipc_adapter_from_adapters as resolve_execution_ipc_adapter_from_adapters_via_transport,
+)
+from stream_kernel.execution.transport.ipc.ipc_transport import (
+    ExecutionIpcKvStreamPort,
+    ExecutionIpcTransportService,
 )
 from stream_kernel.execution.transport.secure_tcp_transport import (
     SecureTcpConfig,
     SecureTcpTransport,
 )
-from stream_kernel.integration.consumer_registry import ConsumerRegistry
+from stream_kernel.integration.consumer_registry import (
+    ConsumerRegistry,
+    ConsumerRegistryStore,
+    InMemoryConsumerRegistry,
+)
 from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
 from stream_kernel.kernel.dag import NodeContract
 from stream_kernel.kernel.scenario import StepSpec
@@ -72,16 +86,15 @@ from stream_kernel.platform.services.api.policy import (
     InMemoryRateLimiterService,
     RateLimiterService,
 )
-from stream_kernel.execution.transport.ipc.ipc_transport import (
-    ExecutionIpcKvStreamPort,
-    ExecutionIpcTransportService,
-)
 from stream_kernel.platform.services.observability import (
     ObservabilityPipelineService,
     ObservabilityService,
 )
 from stream_kernel.platform.services.observability_dispatch import (
     DispatchingObservabilityService,
+)
+from stream_kernel.platform.services.messaging.reply_waiter import (
+    ReplyWaiterRegistryStore,
 )
 from stream_kernel.platform.services.runtime.control_plane_discovery_adapters import (
     platform_discovery_source_adapter,
@@ -91,6 +104,9 @@ from stream_kernel.platform.services.runtime.control_plane_discovery_stream impo
     ControlPlaneDiscoverySourceAdapter,
 )
 from stream_kernel.platform.services.runtime.lifecycle import RuntimeLifecycleManager
+from stream_kernel.platform.services.runtime.process_group_router import (
+    ProcessGroupRouterStore,
+)
 from stream_kernel.platform.services.runtime.transport import (
     IpcLocalRuntimeTransportService,
     MemoryRuntimeTransportService,
@@ -254,6 +270,7 @@ def build_runtime_artifacts(
     if not isinstance(adapters, dict):
         raise ValueError("adapters must be a mapping")
     adapters = dict(adapters)
+    _merge_runtime_source_ingress_settings(runtime=runtime, adapters=adapters)
 
     if adapter_registry is None and adapter_bindings is not None:
         raise ValueError("adapter_bindings override requires adapter_registry override")
@@ -355,15 +372,17 @@ def build_runtime_artifacts(
             "strict": strict,
         },
     )
-    source_ingress = build_source_ingress_plan(
-        adapters=adapters,
-        adapter_instances=adapter_instances,
-        adapter_registry=adapter_registry,
-        scenario_scope=scenario_scope,
-        run_id=run_id,
-        scenario_id=scenario_id,
-        runtime=runtime,
-    )
+    source_ingress = SourceIngressPlan()
+    if _should_mount_source_ingress_in_current_process(runtime):
+        source_ingress = build_source_ingress_plan(
+            adapters=adapters,
+            adapter_instances=adapter_instances,
+            adapter_registry=adapter_registry,
+            scenario_scope=scenario_scope,
+            run_id=run_id,
+            scenario_id=scenario_id,
+            runtime=runtime,
+        )
     for token, node_names in source_ingress.source_consumers.items():
         get_consumers = getattr(consumer_registry, "get_consumers", None)
         register = getattr(consumer_registry, "register", None)
@@ -496,6 +515,35 @@ def ensure_runtime_observability_binding(
             is_async=requires_async,
             replace=replace,
         )
+
+
+def _merge_runtime_source_ingress_settings(
+    *,
+    runtime: dict[str, object],
+    adapters: dict[str, object],
+) -> None:
+    platform = runtime.setdefault("platform", {})
+    if not isinstance(platform, dict):
+        return
+    source_ingress = platform.setdefault("source_ingress", {})
+    if not isinstance(source_ingress, dict):
+        return
+    if "emit_tombstone" not in source_ingress:
+        source_ingress["emit_tombstone"] = _has_source_emit_tombstone_enabled(adapters)
+    runtime["__adapters"] = {
+        role: dict(cfg)
+        for role, cfg in adapters.items()
+        if isinstance(role, str) and role and isinstance(cfg, dict)
+    }
+
+
+def _has_source_emit_tombstone_enabled(adapters: dict[str, object]) -> bool:
+    for cfg in adapters.values():
+        if not isinstance(cfg, dict):
+            continue
+        if cfg.get("emit_tombstone") is True:
+            return True
+    return False
 
 
 def _sinks_require_async_dispatch(adapter_instances: dict[str, object]) -> bool:
@@ -995,6 +1043,18 @@ def _web_ingress_rate_limit_policy(runtime: dict[str, object]) -> dict[str, obje
     return None
 
 
+def _should_mount_source_ingress_in_current_process(runtime: dict[str, object]) -> bool:
+    # Root process-supervisor with explicit worker groups should not execute source
+    # locally; start-work command is sent to leaf workers after readiness.
+    if should_include_business_steps(runtime):
+        return True
+    platform = runtime.get("platform", {})
+    if not isinstance(platform, dict):
+        return True
+    groups = platform.get("process_groups")
+    return not (isinstance(groups, list) and bool(groups))
+
+
 def runtime_kv_backend(runtime: dict[str, object]) -> str:
     # Read normalized backend path from runtime mapping (validator fills defaults).
     platform = runtime.get("platform", {})
@@ -1062,8 +1122,30 @@ def ensure_runtime_registry_bindings(
             lambda _ctx=app_context: _ctx,
             replace=True,
         )
+    try:
+        injection_registry.register_factory(
+            "kv",
+            ProcessGroupRouterStore,
+            lambda: InMemoryKvStore(),
+        )
+    except InjectionRegistryError:
+        pass
+    try:
+        injection_registry.register_factory(
+            "kv",
+            ReplyWaiterRegistryStore,
+            lambda: InMemoryKvStore(),
+        )
+    except InjectionRegistryError:
+        pass
 
     if consumer_registry is None:
+        injection_registry.register_factory(
+            "kv",
+            ConsumerRegistryStore,
+            lambda: InMemoryKvStore(),
+            replace=True,
+        )
         return
     for contract in {ConsumerRegistry, type(consumer_registry)}:
         injection_registry.register_factory(
@@ -1072,6 +1154,22 @@ def ensure_runtime_registry_bindings(
             lambda _registry=consumer_registry: _registry,
             replace=True,
         )
+
+    store = _resolve_consumer_registry_store(consumer_registry)
+    injection_registry.register_factory(
+        "kv",
+        ConsumerRegistryStore,
+        lambda _store=store: _store,
+        replace=True,
+    )
+
+
+def _resolve_consumer_registry_store(consumer_registry: ConsumerRegistry) -> KVStore:
+    if isinstance(consumer_registry, InMemoryConsumerRegistry):
+        candidate = consumer_registry.store
+        if isinstance(candidate, KVStore):
+            return candidate
+    return InMemoryKvStore()
 
 
 def ensure_runtime_control_plane_discovery_bindings(

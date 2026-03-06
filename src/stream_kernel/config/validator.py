@@ -20,7 +20,23 @@ _SUPPORTED_EXECUTION_IPC_SECRET_MODES = {"static", "generated"}
 _SUPPORTED_EXECUTION_IPC_KDFS = {"none", "hkdf_sha256"}
 _SUPPORTED_EXECUTION_IPC_CODECS = {"bytes", "pickle"}
 _SUPPORTED_BOUNDARY_DISPATCH_MODES = {"stream", "batch"}
-_SUPPORTED_RUNNER_LOOP_KEYS = {"poll_timeout_ms", "idle_timeout_ms"}
+_SUPPORTED_RUNNER_LOOP_KEYS = {
+    "poll_timeout_ms",
+    "idle_timeout_ms",
+    "startup_barrier_timeout_ms",
+    "post_start_settle_enabled",
+    "post_start_settle_max_wait_seconds",
+    "post_start_settle_quiet_window_seconds",
+    "require_source_tombstones",
+}
+_SUPPORTED_PLATFORM_SOURCE_INGRESS_KEYS = {
+    "emit_tombstone",
+}
+_SUPPORTED_PLATFORM_DEBUG_KEYS = {
+    "root_verbose_logging",
+    "leaf_verbose_logging",
+    "leaf_debug_logs_dir",
+}
 _SUPPORTED_WEB_INTERFACE_KINDS = {"http", "http_stream", "websocket", "graphql"}
 _SUPPORTED_WEB_BIND_PORT_TYPES = {"request", "response", "stream", "kv_stream"}
 _PROCESS_GROUP_SELECTOR_KEYS = {"stages", "tags", "runners", "nodes"}
@@ -253,6 +269,12 @@ def validate_newgen_config(raw: object) -> dict[str, object]:
         settings = entry.get("settings", {})
         if not isinstance(settings, dict):
             raise ConfigError(f"adapters.{role}.settings must be a mapping when provided")
+        emit_tombstone = entry.get("emit_tombstone", False)
+        if not isinstance(emit_tombstone, bool):
+            raise ConfigError(
+                f"adapters.{role}.emit_tombstone must be a boolean when provided"
+            )
+        entry["emit_tombstone"] = emit_tombstone
         fmt = settings.get("format")
         if fmt is not None:
             if not isinstance(fmt, str) or not fmt:
@@ -513,6 +535,55 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
         if readiness_timeout_seconds <= 0:
             raise ConfigError("runtime.platform.readiness.readiness_timeout_seconds must be > 0")
         readiness["readiness_timeout_seconds"] = readiness_timeout_seconds
+        fail_on_timeout = readiness.get("fail_on_timeout", False)
+        if not isinstance(fail_on_timeout, bool):
+            raise ConfigError("runtime.platform.readiness.fail_on_timeout must be a boolean when provided")
+        readiness["fail_on_timeout"] = fail_on_timeout
+
+    debug = platform.get("debug")
+    if debug is not None:
+        if not isinstance(debug, dict):
+            raise ConfigError("runtime.platform.debug must be a mapping when provided")
+        unknown_keys = [key for key in debug if key not in _SUPPORTED_PLATFORM_DEBUG_KEYS]
+        if unknown_keys:
+            raise ConfigError(
+                "runtime.platform.debug has unsupported keys: "
+                f"{sorted(unknown_keys)}"
+            )
+        root_verbose_logging = debug.get("root_verbose_logging", False)
+        if not isinstance(root_verbose_logging, bool):
+            raise ConfigError("runtime.platform.debug.root_verbose_logging must be a boolean when provided")
+        debug["root_verbose_logging"] = root_verbose_logging
+        leaf_verbose_logging = debug.get("leaf_verbose_logging", False)
+        if not isinstance(leaf_verbose_logging, bool):
+            raise ConfigError("runtime.platform.debug.leaf_verbose_logging must be a boolean when provided")
+        debug["leaf_verbose_logging"] = leaf_verbose_logging
+        leaf_debug_logs_dir = debug.get("leaf_debug_logs_dir")
+        if leaf_debug_logs_dir is not None and (
+            not isinstance(leaf_debug_logs_dir, str) or not leaf_debug_logs_dir.strip()
+        ):
+            raise ConfigError(
+                "runtime.platform.debug.leaf_debug_logs_dir must be a non-empty string when provided"
+            )
+        if isinstance(leaf_debug_logs_dir, str):
+            debug["leaf_debug_logs_dir"] = leaf_debug_logs_dir.strip()
+
+    source_ingress = platform.get("source_ingress")
+    if source_ingress is not None:
+        if not isinstance(source_ingress, dict):
+            raise ConfigError("runtime.platform.source_ingress must be a mapping when provided")
+        unknown_keys = [key for key in source_ingress if key not in _SUPPORTED_PLATFORM_SOURCE_INGRESS_KEYS]
+        if unknown_keys:
+            raise ConfigError(
+                "runtime.platform.source_ingress has unsupported keys: "
+                f"{sorted(unknown_keys)}"
+            )
+        emit_tombstone = source_ingress.get("emit_tombstone", False)
+        if not isinstance(emit_tombstone, bool):
+            raise ConfigError(
+                "runtime.platform.source_ingress.emit_tombstone must be a boolean when provided"
+            )
+        source_ingress["emit_tombstone"] = emit_tombstone
 
     runner_loop = platform.get("runner_loop")
     if runner_loop is not None:
@@ -540,6 +611,62 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
             runner_loop["idle_timeout_ms"] = float(idle_timeout_ms)
         else:
             runner_loop["idle_timeout_ms"] = None
+
+        startup_barrier_timeout_ms = runner_loop.get("startup_barrier_timeout_ms")
+        if startup_barrier_timeout_ms is not None:
+            if not isinstance(startup_barrier_timeout_ms, (int, float)):
+                raise ConfigError(
+                    "runtime.platform.runner_loop.startup_barrier_timeout_ms "
+                    "must be a number or null when provided"
+                )
+            if float(startup_barrier_timeout_ms) <= 0:
+                raise ConfigError(
+                    "runtime.platform.runner_loop.startup_barrier_timeout_ms "
+                    "must be > 0 when provided"
+                )
+            runner_loop["startup_barrier_timeout_ms"] = float(startup_barrier_timeout_ms)
+
+        post_start_settle_enabled = runner_loop.get("post_start_settle_enabled", True)
+        if not isinstance(post_start_settle_enabled, bool):
+            raise ConfigError(
+                "runtime.platform.runner_loop.post_start_settle_enabled must be a boolean when provided"
+            )
+        runner_loop["post_start_settle_enabled"] = post_start_settle_enabled
+
+        post_start_settle_max_wait_seconds = runner_loop.get("post_start_settle_max_wait_seconds", 30.0)
+        if not isinstance(post_start_settle_max_wait_seconds, (int, float)):
+            raise ConfigError(
+                "runtime.platform.runner_loop.post_start_settle_max_wait_seconds must be a number when provided"
+            )
+        if float(post_start_settle_max_wait_seconds) <= 0:
+            raise ConfigError(
+                "runtime.platform.runner_loop.post_start_settle_max_wait_seconds must be > 0 when provided"
+            )
+        runner_loop["post_start_settle_max_wait_seconds"] = float(post_start_settle_max_wait_seconds)
+
+        post_start_settle_quiet_window_seconds = runner_loop.get(
+            "post_start_settle_quiet_window_seconds",
+            5.0,
+        )
+        if not isinstance(post_start_settle_quiet_window_seconds, (int, float)):
+            raise ConfigError(
+                "runtime.platform.runner_loop.post_start_settle_quiet_window_seconds "
+                "must be a number when provided"
+            )
+        if float(post_start_settle_quiet_window_seconds) <= 0:
+            raise ConfigError(
+                "runtime.platform.runner_loop.post_start_settle_quiet_window_seconds must be > 0 when provided"
+            )
+        runner_loop["post_start_settle_quiet_window_seconds"] = float(
+            post_start_settle_quiet_window_seconds
+        )
+
+        require_source_tombstones = runner_loop.get("require_source_tombstones", False)
+        if not isinstance(require_source_tombstones, bool):
+            raise ConfigError(
+                "runtime.platform.runner_loop.require_source_tombstones must be a boolean when provided"
+            )
+        runner_loop["require_source_tombstones"] = require_source_tombstones
 
     routing_cache = platform.get("routing_cache")
     if routing_cache is not None:
@@ -575,7 +702,15 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
         unknown_keys = [
             key
             for key in boundary_dispatch
-            if key not in {"mode", "batch_max_items", "stream_batch_max_items", "control_poll_ms", "timeout_seconds"}
+            if key
+            not in {
+                "mode",
+                "batch_max_items",
+                "stream_batch_max_items",
+                "control_poll_ms",
+                "timeout_seconds",
+                "inflight_idle_timeout_seconds",
+            }
         ]
         if unknown_keys:
             raise ConfigError(
@@ -617,6 +752,18 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
         if timeout_seconds <= 0:
             raise ConfigError("runtime.platform.boundary_dispatch.timeout_seconds must be > 0")
         boundary_dispatch["timeout_seconds"] = float(timeout_seconds)
+        inflight_idle_timeout_seconds = boundary_dispatch.get("inflight_idle_timeout_seconds")
+        if inflight_idle_timeout_seconds is not None:
+            if not isinstance(inflight_idle_timeout_seconds, (int, float)):
+                raise ConfigError(
+                    "runtime.platform.boundary_dispatch.inflight_idle_timeout_seconds "
+                    "must be a number when provided"
+                )
+            if inflight_idle_timeout_seconds <= 0:
+                raise ConfigError(
+                    "runtime.platform.boundary_dispatch.inflight_idle_timeout_seconds must be > 0"
+                )
+            boundary_dispatch["inflight_idle_timeout_seconds"] = float(inflight_idle_timeout_seconds)
 
 
 def _normalize_execution_ipc_mapping(mapping: dict[str, object], *, prefix: str) -> None:
@@ -721,7 +868,7 @@ def _normalize_execution_ipc_mapping(mapping: dict[str, object], *, prefix: str)
         _normalize_execution_ipc_flow_control_mapping(flow_control, prefix=f"{prefix}.flow_control")
         mapping["flow_control"] = flow_control
 
-    poll_mode = mapping.get("poll_mode", "timer")
+    poll_mode = mapping.get("poll_mode", "reader")
     if not isinstance(poll_mode, str) or not poll_mode:
         raise ConfigError(f"{prefix}.poll_mode must be a non-empty string when provided")
     poll_mode = poll_mode.strip().lower()
@@ -1319,6 +1466,11 @@ def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
     if not isinstance(drain_timeout_seconds, (int, float)) or float(drain_timeout_seconds) <= 0:
         raise ConfigError("runtime.observability.service_worker.drain_timeout_seconds must be > 0")
     service_worker["drain_timeout_seconds"] = float(drain_timeout_seconds)
+    worker_scale = service_worker.get("workers")
+    if worker_scale is not None and (not isinstance(worker_scale, int) or worker_scale <= 0):
+        raise ConfigError("runtime.observability.service_worker.workers must be an integer > 0 when provided")
+    if worker_scale is not None:
+        service_worker["workers"] = worker_scale
 
     pipeline = observability.get("pipeline")
     if pipeline is not None and (tracing_exporters or log_exporters or monitoring_exporters):
@@ -1382,6 +1534,13 @@ def _normalize_observability_service_process(
     if not isinstance(auto_create_group, bool):
         raise ConfigError("runtime.observability.service_process.auto_create_group must be a boolean when provided")
     service_process["auto_create_group"] = auto_create_group
+
+    service_worker = observability.get("service_worker", {})
+    if not isinstance(service_worker, dict):
+        service_worker = {}
+    worker_scale = service_worker.get("workers")
+    if worker_scale is not None and "workers" not in service_process:
+        service_process["workers"] = worker_scale
 
     workers = service_process.get("workers", 1)
     if not isinstance(workers, int) or workers <= 0:
@@ -1461,6 +1620,11 @@ def _normalize_observability_service_process(
             raise ConfigError("runtime.platform.process_groups owner nodes entries must be non-empty strings")
 
         if auto_create_group:
+            owner_group["workers"] = workers
+            owner_group["runner_profile"] = runner_profile
+            owner_group.setdefault("heartbeat_seconds", 5)
+            owner_group.setdefault("start_timeout_seconds", 30)
+            owner_group.setdefault("stop_timeout_seconds", 30)
             for node in nodes:
                 if node not in owner_nodes:
                     owner_nodes.append(node)

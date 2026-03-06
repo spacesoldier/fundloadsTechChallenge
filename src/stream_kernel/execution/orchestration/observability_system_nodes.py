@@ -67,6 +67,26 @@ class TraceDispatchNode:
         payload = msg.payload if isinstance(msg, Envelope) else msg
         if not isinstance(payload, TraceDispatchEvent):
             return []
+        emit_event_async = getattr(self.pipeline, "emit_trace_event_async", None)
+        if callable(emit_event_async):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                return self._publish_async(emit_event_async, payload)
+        emit_event = getattr(self.pipeline, "emit_trace_event", None)
+        if callable(emit_event):
+            try:
+                return _coerce_outputs(
+                    emit_event(
+                        event=payload.payload,
+                        trace_id=payload.trace_id,
+                        attributes=dict(payload.attributes),
+                    )
+                )
+            except Exception:
+                return []
         publish_async = getattr(self.pipeline, "publish_trace_async", None)
         if callable(publish_async):
             try:
@@ -90,10 +110,10 @@ class TraceDispatchNode:
                 attributes=dict(payload.attributes),
             )
             if inspect.isawaitable(result):
-                await result
+                result = await result
         except Exception:
             return []
-        return []
+        return _coerce_outputs(result)
 
 
 @node(name="system.obs.log_dispatch", consumes=[LogDispatchEvent], emits=[])
@@ -110,6 +130,26 @@ class LogDispatchNode:
         payload = msg.payload if isinstance(msg, Envelope) else msg
         if not isinstance(payload, LogDispatchEvent):
             return []
+        emit_event_async = getattr(self.pipeline, "emit_log_event_async", None)
+        if callable(emit_event_async):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                return self._publish_async(emit_event_async, payload)
+        emit_event = getattr(self.pipeline, "emit_log_event", None)
+        if callable(emit_event):
+            try:
+                return _coerce_outputs(
+                    emit_event(
+                        event=payload.payload,
+                        trace_id=payload.trace_id,
+                        attributes=dict(payload.attributes),
+                    )
+                )
+            except Exception:
+                return []
         publish_async = getattr(self.pipeline, "publish_log_async", None)
         if callable(publish_async):
             try:
@@ -133,10 +173,10 @@ class LogDispatchNode:
                 attributes=dict(payload.attributes),
             )
             if inspect.isawaitable(result):
-                await result
+                result = await result
         except Exception:
             return []
-        return []
+        return _coerce_outputs(result)
 
 
 @node(name="system.obs.metric_dispatch", consumes=[MetricDispatchEvent], emits=[])
@@ -153,6 +193,26 @@ class MetricDispatchNode:
         payload = msg.payload if isinstance(msg, Envelope) else msg
         if not isinstance(payload, MetricDispatchEvent):
             return []
+        emit_event_async = getattr(self.pipeline, "emit_metric_event_async", None)
+        if callable(emit_event_async):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                return self._publish_async(emit_event_async, payload)
+        emit_event = getattr(self.pipeline, "emit_metric_event", None)
+        if callable(emit_event):
+            try:
+                return _coerce_outputs(
+                    emit_event(
+                        event=payload.payload,
+                        trace_id=payload.trace_id,
+                        attributes=dict(payload.attributes),
+                    )
+                )
+            except Exception:
+                return []
         publish_async = getattr(self.pipeline, "publish_metric_async", None)
         if callable(publish_async):
             try:
@@ -176,10 +236,10 @@ class MetricDispatchNode:
                 attributes=dict(payload.attributes),
             )
             if inspect.isawaitable(result):
-                await result
+                result = await result
         except Exception:
             return []
-        return []
+        return _coerce_outputs(result)
 
 
 @node(name="system.obs.monitor_dispatch", consumes=[MonitorDispatchEvent], emits=[])
@@ -196,6 +256,26 @@ class MonitorDispatchNode:
         payload = msg.payload if isinstance(msg, Envelope) else msg
         if not isinstance(payload, MonitorDispatchEvent):
             return []
+        emit_event_async = getattr(self.pipeline, "emit_monitoring_event_async", None)
+        if callable(emit_event_async):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                return self._publish_async(emit_event_async, payload)
+        emit_event = getattr(self.pipeline, "emit_monitoring_event", None)
+        if callable(emit_event):
+            try:
+                return _coerce_outputs(
+                    emit_event(
+                        event=payload.payload,
+                        trace_id=payload.trace_id,
+                        attributes=dict(payload.attributes),
+                    )
+                )
+            except Exception:
+                return []
         publish_async = getattr(self.pipeline, "publish_monitoring_async", None)
         if callable(publish_async):
             try:
@@ -219,10 +299,10 @@ class MonitorDispatchNode:
                 attributes=dict(payload.attributes),
             )
             if inspect.isawaitable(result):
-                await result
+                result = await result
         except Exception:
             return []
-        return []
+        return _coerce_outputs(result)
 
 
 @node(name="system.obs.monitoring_metrics_dispatch", consumes=[MonitoringMetricsSnapshotEvent], emits=[MonitoringMetricsSnapshotResult])
@@ -360,7 +440,8 @@ def build_observability_system_plan(
     if _is_observability_root_transport_only(runtime):
         process_role = runtime.get("__process_role")
         worker_transport_only = isinstance(process_role, str) and process_role == "worker"
-        enabled_tokens: set[type[Any]] = set()
+        enabled_tokens: list[type[Any]] = []
+        enabled_token_set: set[type[Any]] = set()
         kind_counts: dict[str, int] = {}
         for cfg in nodes_cfg:
             if not isinstance(cfg, dict):
@@ -377,7 +458,11 @@ def build_observability_system_plan(
             suffix_index = kind_counts.get(kind, 0)
             kind_counts[kind] = suffix_index + 1
             _ = _build_system_node_name(kind=kind, qualifier=qualifier, index=suffix_index)
-            enabled_tokens.add(_SYSTEM_NODE_KIND_TO_EVENT[kind])
+            token = _SYSTEM_NODE_KIND_TO_EVENT[kind]
+            if token in enabled_token_set:
+                continue
+            enabled_token_set.add(token)
+            enabled_tokens.append(token)
         if not enabled_tokens:
             return ObservabilitySystemPlan()
         if worker_transport_only:
@@ -387,17 +472,20 @@ def build_observability_system_plan(
                 system_node_names=set(),
             )
         handoff_steps, handoff_consumers, handoff_nodes = build_transport_observability_handoff_plan(
-            scenario_scope=scenario_scope
+            scenario_scope=scenario_scope,
+            enabled_tokens=enabled_tokens,
         )
         consumers: dict[type[Any], list[str]] = {}
         for token in enabled_tokens:
             mapped = handoff_consumers.get(token)
             if isinstance(mapped, list) and mapped:
                 consumers[token] = list(mapped)
+            else:
+                consumers[token] = [_legacy_system_obs_node_name_for_token(token)]
         return ObservabilitySystemPlan(
             system_steps=list(handoff_steps),
             system_consumers=consumers,
-            system_node_names=set(handoff_nodes) if consumers else {OBSERVABILITY_HANDOFF_NODE_NAME},
+            system_node_names=set(handoff_nodes) if handoff_nodes else {OBSERVABILITY_HANDOFF_NODE_NAME},
         )
 
     steps: list[StepSpec] = []
@@ -523,6 +611,16 @@ def _has_enabled_exporters(observability: dict[str, object], section: str) -> bo
         isinstance(item, dict) and item.get("enabled", True) is not False
         for item in exporters
     )
+
+
+def _coerce_outputs(candidate: object) -> list[object]:
+    if candidate is None:
+        return []
+    if isinstance(candidate, list):
+        return list(candidate)
+    if isinstance(candidate, tuple):
+        return list(candidate)
+    return [candidate]
 
 
 def _build_system_dispatch_node(

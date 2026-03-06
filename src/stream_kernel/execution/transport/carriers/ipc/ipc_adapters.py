@@ -162,7 +162,7 @@ class PipeExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
         endpoint_registry: KVStore | None = None,
         context: mp.context.BaseContext | None = None,
         poll_interval_seconds: float = 0.005,
-        poll_mode: str = "timer",
+        poll_mode: str = "reader",
     ) -> None:
         self._kv_store = kv_store if isinstance(kv_store, KVStore) else InMemoryKvStore()
         self._endpoint_registry = (

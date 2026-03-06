@@ -278,6 +278,8 @@ class ControlPlaneLeafBoundaryResultEvent:
     status: str
     outputs: tuple[object, ...] = field(default_factory=tuple)
     error: str | None = None
+    tombstone_input: bool = False
+    tombstone_output: bool = False
 
     def __post_init__(self) -> None:
         _require_non_empty_str(self.target_group, "ControlPlaneLeafBoundaryResultEvent.target_group")
@@ -286,6 +288,42 @@ class ControlPlaneLeafBoundaryResultEvent:
         _require_non_empty_str(self.status, "ControlPlaneLeafBoundaryResultEvent.status")
         if self.error is not None and (not isinstance(self.error, str) or not self.error):
             raise ValueError("ControlPlaneLeafBoundaryResultEvent.error must be a non-empty string when provided")
+        if not isinstance(self.tombstone_input, bool):
+            raise ValueError("ControlPlaneLeafBoundaryResultEvent.tombstone_input must be a boolean")
+        if not isinstance(self.tombstone_output, bool):
+            raise ValueError("ControlPlaneLeafBoundaryResultEvent.tombstone_output must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class ControlPlaneLeafDrainReadyEvent:
+    target_group: str
+    worker_id: str
+    request_id: str
+    tombstone_output: bool = False
+    emitted_at_epoch_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str(self.target_group, "ControlPlaneLeafDrainReadyEvent.target_group")
+        _require_non_empty_str(self.worker_id, "ControlPlaneLeafDrainReadyEvent.worker_id")
+        _require_non_empty_str(self.request_id, "ControlPlaneLeafDrainReadyEvent.request_id")
+        if not isinstance(self.tombstone_output, bool):
+            raise ValueError("ControlPlaneLeafDrainReadyEvent.tombstone_output must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class ControlPlaneShutdownReadyEvent:
+    expected_groups: tuple[str, ...] = field(default_factory=tuple)
+    ready_groups: tuple[str, ...] = field(default_factory=tuple)
+    tombstone_groups: tuple[str, ...] = field(default_factory=tuple)
+    emitted_at_epoch_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(name, str) or not name for name in self.expected_groups):
+            raise ValueError("ControlPlaneShutdownReadyEvent.expected_groups must contain non-empty strings")
+        if any(not isinstance(name, str) or not name for name in self.ready_groups):
+            raise ValueError("ControlPlaneShutdownReadyEvent.ready_groups must contain non-empty strings")
+        if any(not isinstance(name, str) or not name for name in self.tombstone_groups):
+            raise ValueError("ControlPlaneShutdownReadyEvent.tombstone_groups must contain non-empty strings")
 
 
 @dataclass(frozen=True, slots=True)
@@ -545,6 +583,28 @@ class ControlPlaneLaunchPlanEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class ControlPlaneStartWorkEvent:
+    source_targets: tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(target, str) or not target for target in self.source_targets):
+            raise ValueError(
+                "ControlPlaneStartWorkEvent.source_targets must contain non-empty strings"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ControlPlaneLeafStartWorkEvent:
+    source_targets: tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(target, str) or not target for target in self.source_targets):
+            raise ValueError(
+                "ControlPlaneLeafStartWorkEvent.source_targets must contain non-empty strings"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class ControlPlaneDagAssembledEvent:
     runtime: dict[str, object]
     plan: ControlPlaneLaunchPlan
@@ -652,6 +712,8 @@ __all__ = [
     "ControlPlaneInitEvent",
     "ControlPlaneLaunchPlan",
     "ControlPlaneLaunchPlanEvent",
+    "ControlPlaneStartWorkEvent",
+    "ControlPlaneLeafStartWorkEvent",
     "ControlPlaneDagAssembledEvent",
     "ControlPlaneLeafPulse",
     "ControlPlaneLeafHelloEvent",
@@ -664,6 +726,8 @@ __all__ = [
     "ControlPlaneLeafStopAckEvent",
     "ControlPlaneLeafBoundaryExecuteCommand",
     "ControlPlaneLeafBoundaryResultEvent",
+    "ControlPlaneLeafDrainReadyEvent",
+    "ControlPlaneShutdownReadyEvent",
     "ControlPlaneRootPulse",
     "ControlPlaneSpawnRequestedEvent",
     "ControlPlaneRootLeafStopRequestEvent",

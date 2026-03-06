@@ -16,6 +16,7 @@ from stream_kernel.platform.services.state.context import ContextService
 from stream_kernel.routing.envelope import Envelope
 from stream_kernel.routing.routing_service import RoutingService
 
+from ..debug_logging import leaf_debug_log
 from ..startup.bootstrap_models import (
     ChildBoundaryInput,
     ChildBootstrapBundle,
@@ -92,6 +93,12 @@ def execute_child_boundary_loop(
     trace_observability_meta: dict[str, dict[str, object]] = {}
     accepted = 0
     accepted_targets: set[str] = set()
+    leaf_debug_log(
+        event="leaf.boundary_runtime.execute.started",
+        process_group=child.process_group,
+        input_count=len(inputs),
+        finalize=finalize,
+    )
 
     try:
         for item in inputs:
@@ -110,6 +117,7 @@ def execute_child_boundary_loop(
                 trace_id=item.trace_id,
                 reply_to=item.reply_to,
                 span_id=item.span_id,
+                tombstone=item.tombstone,
             )
             envelope_meta: dict[str, object] = {"__process_group": item.dispatch_group}
             if isinstance(item.source_group, str) and item.source_group:
@@ -122,6 +130,10 @@ def execute_child_boundary_loop(
             work_queue.push(envelope)
 
         if accepted == 0:
+            leaf_debug_log(
+                event="leaf.boundary_runtime.execute.no_accepted_inputs",
+                process_group=child.process_group,
+            )
             return emitted
 
         def _enrich_observability_ctx(
@@ -181,12 +193,39 @@ def execute_child_boundary_loop(
         )
         if use_async_runner:
             runner = AsyncRunner(**runner_kwargs)
+            leaf_debug_log(
+                event="leaf.boundary_runtime.runner.selected",
+                process_group=child.process_group,
+                runner_type="async",
+                node_count=len(nodes),
+            )
         else:
             runner = SyncRunner(**runner_kwargs)
+            leaf_debug_log(
+                event="leaf.boundary_runtime.runner.selected",
+                process_group=child.process_group,
+                runner_type="sync",
+                node_count=len(nodes),
+            )
         runner.run()
+        leaf_debug_log(
+            event="leaf.boundary_runtime.execute.completed",
+            process_group=child.process_group,
+            accepted_inputs=accepted,
+            emitted_count=len(emitted),
+        )
     except ChildRuntimeBootstrapError:
+        leaf_debug_log(
+            event="leaf.boundary_runtime.execute.child_bootstrap_error",
+            process_group=child.process_group,
+        )
         raise
     except Exception as exc:  # noqa: BLE001 - deterministic child-boundary category.
+        leaf_debug_log(
+            event="leaf.boundary_runtime.execute.failed",
+            process_group=child.process_group,
+            error=exc.__class__.__name__,
+        )
         detail = f"{type(exc).__name__}: {exc}"
         raise ChildRuntimeBootstrapError(
             f"child boundary step failed: {detail}"
@@ -199,6 +238,11 @@ def execute_child_boundary_loop(
                 observability.on_run_end()
         except Exception:  # noqa: BLE001 - must not hide primary execution errors.
             pass
+        leaf_debug_log(
+            event="leaf.boundary_runtime.execute.finalized",
+            process_group=child.process_group,
+            finalize=finalize,
+        )
 
     return emitted
 
@@ -283,6 +327,7 @@ def _normalize_child_boundary_input(item: object) -> ChildBoundaryInput:
         source_group = item.get("source_group")
         route_hop = item.get("route_hop")
         span_id = item.get("span_id")
+        tombstone = item.get("tombstone")
     else:
         dispatch_group = getattr(item, "dispatch_group", None)
         target = getattr(item, "target", None)
@@ -292,6 +337,7 @@ def _normalize_child_boundary_input(item: object) -> ChildBoundaryInput:
         source_group = getattr(item, "source_group", None)
         route_hop = getattr(item, "route_hop", None)
         span_id = getattr(item, "span_id", None)
+        tombstone = getattr(item, "tombstone", None)
 
     if not isinstance(dispatch_group, str) or not dispatch_group:
         raise ChildRuntimeBootstrapError("child boundary input dispatch_group must be a non-empty string")
@@ -311,6 +357,8 @@ def _normalize_child_boundary_input(item: object) -> ChildBoundaryInput:
         )
     if span_id is not None and (not isinstance(span_id, str) or not span_id):
         raise ChildRuntimeBootstrapError("child boundary input span_id must be null or non-empty string")
+    if tombstone is not None and not isinstance(tombstone, bool):
+        raise ChildRuntimeBootstrapError("child boundary input tombstone must be a boolean when provided")
     return ChildBoundaryInput(
         payload=payload,
         dispatch_group=dispatch_group,
@@ -320,6 +368,7 @@ def _normalize_child_boundary_input(item: object) -> ChildBoundaryInput:
         source_group=source_group,
         route_hop=route_hop,
         span_id=span_id,
+        tombstone=bool(tombstone) if isinstance(tombstone, bool) else False,
     )
 
 

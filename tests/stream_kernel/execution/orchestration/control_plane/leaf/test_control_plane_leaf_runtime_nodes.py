@@ -5,8 +5,10 @@ from dataclasses import dataclass, field
 from stream_kernel.execution.orchestration.control_plane.leaf import (
     ControlPlaneLeafBoundaryExecuteNode,
     ControlPlaneLeafConfigApplyRuntimeNode,
+    ControlPlaneLeafStartWorkNode,
     ControlPlaneLeafStopNode,
 )
+from stream_kernel.execution.orchestration.source_ingress import BootstrapControl
 from stream_kernel.execution.orchestration.lifecycle.leaf.runtime.worker_runtime import (
     LeafWorkerRuntimeSession,
 )
@@ -15,9 +17,11 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafBoundaryResultEvent,
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafConfigCardEvent,
+    ControlPlaneLeafStartWorkEvent,
     ControlPlaneLeafStopAckEvent,
     ControlPlaneLeafStopCommand,
 )
+from stream_kernel.routing.envelope import Envelope
 
 
 def _session() -> LeafWorkerRuntimeSession:
@@ -146,3 +150,71 @@ def test_leaf_stop_node_emits_ack() -> None:
     assert isinstance(ack, ControlPlaneLeafStopAckEvent)
     assert ack.command_id == "stop-1"
     assert ack.status == "accepted"
+
+
+def test_leaf_start_work_node_emits_bootstrap_controls_for_local_sources() -> None:
+    node = ControlPlaneLeafStartWorkNode()
+    produced = node(
+        ControlPlaneLeafStartWorkEvent(source_targets=("source:source", "source:source")),
+        {
+            "__leaf_session": type(
+                "_Session",
+                (),
+                {
+                    "child": type(
+                        "_Child",
+                        (),
+                        {"scenario_steps": {"source:source": object(), "compute_features": object()}},
+                    )()
+                },
+            )()
+        },
+    )
+
+    assert produced == [
+        Envelope(payload=BootstrapControl(target="source:source"), target="source:source")
+    ]
+
+
+def test_leaf_start_work_node_filters_non_local_sources() -> None:
+    node = ControlPlaneLeafStartWorkNode()
+    produced = node(
+        ControlPlaneLeafStartWorkEvent(source_targets=("source:remote",)),
+        {
+            "__leaf_session": type(
+                "_Session",
+                (),
+                {
+                    "child": type(
+                        "_Child",
+                        (),
+                        {"scenario_steps": {"source:source": object()}},
+                    )()
+                },
+            )()
+        },
+    )
+
+    assert produced == []
+
+
+def test_leaf_start_work_node_is_noop_when_group_has_no_local_sources() -> None:
+    node = ControlPlaneLeafStartWorkNode()
+    produced = node(
+        ControlPlaneLeafStartWorkEvent(source_targets=("source:source",)),
+        {
+            "__leaf_session": type(
+                "_Session",
+                (),
+                {
+                    "child": type(
+                        "_Child",
+                        (),
+                        {"scenario_steps": {"compute_features": object(), "parse_load_attempt": object()}},
+                    )()
+                },
+            )()
+        },
+    )
+
+    assert produced == []

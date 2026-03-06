@@ -8,7 +8,11 @@ from stream_kernel.application_context.service import service
 from stream_kernel.execution.orchestration.control_plane.root.leaf_command_service import (
     ControlPlaneRootLeafCommandService,
 )
-from stream_kernel.execution.transport.ipc.ipc_transport import ExecutionIpcTransportService
+from stream_kernel.execution.transport.ipc.ipc_transport import (
+    EXECUTION_IPC_LANE_DATA,
+    ExecutionIpcTransportService,
+    compose_execution_ipc_worker_target_id,
+)
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafBoundaryExecuteCommand,
 )
@@ -74,7 +78,11 @@ class DefaultControlPlaneRootBoundaryExecutionService(ControlPlaneRootBoundaryEx
             inputs=tuple(request.inputs),
             finalize=request.finalize,
         )
-        self._ipc().send(worker_id, command, no_reply=True)
+        self._ipc().send(
+            compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_DATA),
+            command,
+            no_reply=True,
+        )
         if not request.finalize or not wait_for_result:
             return RoutingResult(
                 local_deliveries=[],

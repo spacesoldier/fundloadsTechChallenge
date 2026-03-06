@@ -42,6 +42,7 @@ class BoundaryDispatchInput:
     source_group: str | None = None
     route_hop: int | None = None
     span_id: str | None = None
+    tombstone: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +199,7 @@ def _build_boundary_dispatch_inputs(
         source_group = item.get("source_group") if isinstance(item, dict) else getattr(item, "source_group", None)
         route_hop = item.get("route_hop") if isinstance(item, dict) else getattr(item, "route_hop", None)
         span_id = item.get("span_id") if isinstance(item, dict) else getattr(item, "span_id", None)
+        tombstone = item.get("tombstone") if isinstance(item, dict) else getattr(item, "tombstone", None)
         boundary_inputs.append(
             BoundaryDispatchInput(
                 payload=payload,
@@ -208,6 +210,7 @@ def _build_boundary_dispatch_inputs(
                 source_group=source_group if isinstance(source_group, str) and source_group else None,
                 route_hop=route_hop if isinstance(route_hop, int) and route_hop >= 0 else None,
                 span_id=span_id if isinstance(span_id, str) and span_id else None,
+                tombstone=bool(tombstone) if isinstance(tombstone, bool) else False,
             )
         )
         dispatch_groups_seen.add(dispatch_group)
@@ -330,7 +333,7 @@ def _configure_runtime_lifecycle_shutdown_policy(
     )
     group_name, stop_timeout_seconds = _resolve_observability_shutdown_settings(
         runtime,
-        default_timeout_seconds=base_stop_timeout_value,
+        default_timeout_seconds=None,
     )
     fallback_graceful_timeout_seconds = lifecycle_cfg.get("fallback_graceful_timeout_seconds")
     try:

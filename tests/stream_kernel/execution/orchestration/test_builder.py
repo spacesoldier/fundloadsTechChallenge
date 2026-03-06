@@ -39,7 +39,11 @@ from stream_kernel.execution.orchestration.builder import (
     ensure_runtime_kv_binding,
     trace_id,
 )
-from stream_kernel.execution.orchestration.source_ingress import build_source_ingress_plan
+from stream_kernel.execution.orchestration.source_ingress import (
+    PullIngressSourceNode,
+    PushIngressSourceNode,
+    build_source_ingress_plan,
+)
 from stream_kernel.execution.orchestration.observability_system_nodes import (
     LogDispatchEvent,
     MetricDispatchEvent,
@@ -861,6 +865,7 @@ def test_build_injection_registry_from_bindings_marks_async_roles() -> None:
 def test_ensure_platform_discovery_modules_appends_framework_modules() -> None:
     modules = ["fund_load.usecases.steps"]
     ensure_platform_discovery_modules(modules)
+    assert "stream_kernel.execution.orchestration.lifecycle.leaf.command.control_ingress_service" in modules
     assert "stream_kernel.integration.work_queue" in modules
     assert "stream_kernel.routing.routing_service" in modules
     assert "stream_kernel.observability.adapters" in modules
@@ -870,11 +875,13 @@ def test_ensure_platform_discovery_modules_appends_framework_modules() -> None:
 def test_ensure_platform_discovery_modules_does_not_duplicate_entries() -> None:
     modules = [
         "fund_load.usecases.steps",
+        "stream_kernel.execution.orchestration.lifecycle.leaf.command.control_ingress_service",
         "stream_kernel.integration.work_queue",
         "stream_kernel.routing.routing_service",
         "stream_kernel.observability.adapters",
     ]
     ensure_platform_discovery_modules(modules)
+    assert modules.count("stream_kernel.execution.orchestration.lifecycle.leaf.command.control_ingress_service") == 1
     assert modules.count("stream_kernel.integration.work_queue") == 1
     assert modules.count("stream_kernel.routing.routing_service") == 1
     assert modules.count("stream_kernel.observability.adapters") == 1
@@ -1077,6 +1084,7 @@ def test_build_source_ingress_plan_wraps_readable_adapters() -> None:
     assert ingress.source_node_names == {"source:events_source"}
     assert [item.target for item in ingress.bootstrap_inputs] == ["source:events_source"]
     node = ingress.source_steps[0].step
+    assert isinstance(node, PullIngressSourceNode)
     first = node({}, {})
     second = node({}, {})
     third = node({}, {})
@@ -1085,6 +1093,127 @@ def test_build_source_ingress_plan_wraps_readable_adapters() -> None:
     assert [item.trace_id for item in second if isinstance(item.payload, int)] == ["run:events_source:2"]
     assert [item.payload for item in second if isinstance(item.payload, int)] == [2]
     assert third == []
+
+
+def test_build_source_ingress_plan_supports_push_ingress_wrapper() -> None:
+    # Push adapters should use dedicated push wrapper and emit one item per poll trigger.
+    registry = AdapterRegistry()
+    registry.register("events_source", "events_source", _source_factory)
+    adapters = {"events_source": {"settings": {}, "ingress_mode": "push"}}
+
+    class _PushAdapter:
+        def __init__(self) -> None:
+            self._items = iter([{"id": 1}, {"id": 2}, None])
+
+        def poll(self) -> object | None:
+            return next(self._items)
+
+    adapter_instances = {"events_source": _PushAdapter()}
+
+    injection = InjectionRegistry()
+    injection.register_factory("service", ContextService, lambda: InMemoryKvContextService(InMemoryKvStore()))
+    scope = injection.instantiate_for_scenario("s1")
+
+    ingress = build_source_ingress_plan(
+        adapters=adapters,
+        adapter_instances=adapter_instances,
+        adapter_registry=registry,
+        scenario_scope=scope,
+        run_id="run",
+        scenario_id="scenario",
+    )
+    node = ingress.source_steps[0].step
+    assert isinstance(node, PushIngressSourceNode)
+    first = node({}, {})
+    second = node({}, {})
+    third = node({}, {})
+    assert [item.payload for item in first if isinstance(item.payload, dict)] == [{"id": 1}]
+    assert [item.payload for item in second if isinstance(item.payload, dict)] == [{"id": 2}]
+    assert third == []
+
+
+def test_build_source_ingress_plan_does_not_mark_tombstone_by_default() -> None:
+    registry = AdapterRegistry()
+    registry.register("events_source", "events_source", _source_factory)
+    adapters = {"events_source": {"settings": {}}}
+    adapter_instances = {"events_source": type("I", (), {"read": lambda *_a: [1]})()}
+
+    injection = InjectionRegistry()
+    injection.register_factory("service", ContextService, lambda: InMemoryKvContextService(InMemoryKvStore()))
+    scope = injection.instantiate_for_scenario("s1")
+
+    ingress = build_source_ingress_plan(
+        adapters=adapters,
+        adapter_instances=adapter_instances,
+        adapter_registry=registry,
+        scenario_scope=scope,
+        run_id="run",
+        scenario_id="scenario",
+    )
+
+    node = ingress.source_steps[0].step
+    assert isinstance(node, PullIngressSourceNode)
+    first = node({}, {})
+    second = node({}, {})
+
+    envelopes_first = [item for item in first if isinstance(item, Envelope)]
+    assert len(envelopes_first) == 1
+    assert envelopes_first[0].payload == 1
+    assert envelopes_first[0].tombstone is False
+    assert second == []
+
+
+def test_build_source_ingress_plan_marks_last_payload_with_tombstone_when_enabled() -> None:
+    registry = AdapterRegistry()
+    registry.register("events_source", "events_source", _source_factory)
+    adapters = {"events_source": {"settings": {}, "emit_tombstone": True}}
+    adapter_instances = {"events_source": type("I", (), {"read": lambda *_a: [1]})()}
+
+    injection = InjectionRegistry()
+    injection.register_factory("service", ContextService, lambda: InMemoryKvContextService(InMemoryKvStore()))
+    scope = injection.instantiate_for_scenario("s1")
+
+    ingress = build_source_ingress_plan(
+        adapters=adapters,
+        adapter_instances=adapter_instances,
+        adapter_registry=registry,
+        scenario_scope=scope,
+        run_id="run",
+        scenario_id="scenario",
+    )
+
+    node = ingress.source_steps[0].step
+    assert isinstance(node, PullIngressSourceNode)
+    first = node({}, {})
+    second = node({}, {})
+
+    envelopes_first = [item for item in first if isinstance(item, Envelope)]
+    assert len(envelopes_first) == 1
+    assert envelopes_first[0].payload == 1
+    assert envelopes_first[0].tombstone is True
+    assert second == []
+
+
+def test_build_source_ingress_plan_rejects_push_mode_without_poll_contract() -> None:
+    # Explicit push mode must fail fast when adapter has no non-blocking poll contract.
+    registry = AdapterRegistry()
+    registry.register("events_source", "events_source", _source_factory)
+    adapters = {"events_source": {"settings": {}, "ingress_mode": "push"}}
+    adapter_instances = {"events_source": type("I", (), {"read": lambda *_a: [1, 2]})()}
+
+    injection = InjectionRegistry()
+    injection.register_factory("service", ContextService, lambda: InMemoryKvContextService(InMemoryKvStore()))
+    scope = injection.instantiate_for_scenario("s1")
+
+    with pytest.raises(ValueError, match="ingress_mode='push' requires"):
+        build_source_ingress_plan(
+            adapters=adapters,
+            adapter_instances=adapter_instances,
+            adapter_registry=registry,
+            scenario_scope=scope,
+            run_id="run",
+            scenario_id="scenario",
+        )
 
 
 def test_api_ing_01_source_ingress_rejects_when_web_limiter_exceeded() -> None:
@@ -1763,9 +1892,67 @@ def test_build_runtime_artifacts_process_supervisor_root_omits_business_nodes(tm
 
     step_names = {spec.name for spec in artifacts.scenario.steps}
     assert "biz.step" not in step_names
+    assert "source:biz_source" not in step_names
     assert "system.cp.root_bootstrap" in step_names
-    assert "system.cp.discovery_collect" in step_names
+    assert "system.cp.discovery_pump" in step_names
     assert "system.cp.init_plan" in step_names
+
+
+def test_build_runtime_artifacts_process_supervisor_root_does_not_mount_source_ingress_when_groups_defined(
+    tmp_path: Path,
+) -> None:
+    pkg = tmp_path / "root_source_pkg"
+    _write_file(pkg / "__init__.py", "")
+    _write_file(
+        pkg / "adapters.py",
+        "\n".join(
+            [
+                "from stream_kernel.adapters.contracts import adapter",
+                "",
+                "class _Source:",
+                "    def read(self):",
+                "        yield {'value': 1}",
+                "",
+                "@adapter(name='biz_source_adapter', kind='test.source', consumes=[], emits=[dict])",
+                "def biz_source_adapter(settings):",
+                "    _ = settings",
+                "    return _Source()",
+            ]
+        ),
+    )
+
+    config = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {
+            "strict": True,
+            "discovery_modules": ["root_source_pkg.adapters"],
+            "platform": {
+                "bootstrap": {"mode": "process_supervisor"},
+                "process_groups": [{"name": "execution.ingress", "nodes": ["source:biz_source_adapter"]}],
+                "readiness": {"enabled": True, "start_work_on_all_groups_ready": True},
+            },
+        },
+        "nodes": {},
+        "adapters": {
+            "biz_source_adapter": {"settings": {}},
+        },
+    }
+
+    sys.path.insert(0, str(tmp_path))
+    try:
+        artifacts = build_runtime_artifacts(config)
+    finally:
+        sys.path.remove(str(tmp_path))
+
+    step_names = {spec.name for spec in artifacts.scenario.steps}
+    assert "source:biz_source_adapter" not in step_names
+    assert any(spec.name == "system.cp.start_work_dispatch" for spec in artifacts.scenario.steps)
+    assert any(isinstance(item, ControlPlaneRootPulse) for item in artifacts.inputs)
+    assert not any(
+        isinstance(getattr(item, "payload", None), BootstrapControl)
+        for item in artifacts.inputs
+    )
 
 
 def test_build_runtime_artifacts_includes_control_plane_leaf_node_for_workers() -> None:
@@ -2713,7 +2900,7 @@ def test_build_observability_system_plan_worker_process_role_registers_transport
     }
 
 
-def test_build_observability_system_plan_root_transport_only_mounts_transport_handoff_node() -> None:
+def test_build_observability_system_plan_root_transport_only_mounts_transport_handoff_nodes_by_channel() -> None:
     registry = InjectionRegistry()
     registry.register_factory(
         "service",
@@ -2739,12 +2926,22 @@ def test_build_observability_system_plan_root_transport_only_mounts_transport_ha
         scenario_scope=scope,
     )
 
-    assert [step.name for step in plan.system_steps] == ["system.transport.handoff.observability_dispatch"]
+    assert [step.name for step in plan.system_steps] == [
+        "system.transport.handoff.trace_bypass",
+        "system.transport.handoff.trace_dispatch",
+        "system.transport.handoff.worker_queue_bypass",
+        "system.transport.handoff.worker_queue_dispatch",
+    ]
     assert plan.system_consumers == {
-        TraceDispatchEvent: ["system.transport.handoff.observability_dispatch"],
-        WorkerQueueTelemetryEvent: ["system.transport.handoff.observability_dispatch"],
+        TraceDispatchEvent: ["system.transport.handoff.trace_bypass"],
+        WorkerQueueTelemetryEvent: ["system.transport.handoff.worker_queue_bypass"],
     }
-    assert plan.system_node_names == {"system.transport.handoff.observability_dispatch"}
+    assert plan.system_node_names == {
+        "system.transport.handoff.trace_bypass",
+        "system.transport.handoff.trace_dispatch",
+        "system.transport.handoff.worker_queue_bypass",
+        "system.transport.handoff.worker_queue_dispatch",
+    }
 
 
 def test_ensure_runtime_api_policy_bindings_registers_platform_services() -> None:

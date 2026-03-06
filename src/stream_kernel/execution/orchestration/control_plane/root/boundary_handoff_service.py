@@ -174,6 +174,7 @@ class DefaultControlPlaneRootBoundaryHandoffService(ControlPlaneRootBoundaryHand
                 reply_to=envelope.reply_to,
                 source_group=source_group,
                 span_id=envelope.span_id,
+                tombstone=envelope.tombstone,
             )
             if _is_observability_dispatch_target(target):
                 _flush_pending_batch()
@@ -237,8 +238,11 @@ class DefaultControlPlaneRootBoundaryHandoffService(ControlPlaneRootBoundaryHand
             key = (event.worker_id, event.request_id)
             if key not in self._inflight:
                 continue
-            self._inflight.pop(key, None)
             completed.extend(list(event.outputs))
+            status = event.status.strip().lower()
+            if status in {"stream", "streaming", "partial"}:
+                continue
+            self._inflight.pop(key, None)
         self._event_cursor = len(events)
         self._expire_stale_inflight()
         return completed

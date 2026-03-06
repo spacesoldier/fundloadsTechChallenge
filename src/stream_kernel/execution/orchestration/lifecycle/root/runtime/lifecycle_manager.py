@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from collections import defaultdict
 from typing import Protocol, runtime_checkable
 
 from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.service import service
 from stream_kernel.execution.orchestration.control_plane.root.shutdown_service import (
     ControlPlaneRootShutdownService,
+)
+from stream_kernel.execution.transport.handoff.ipc_handoff_dispatch_service import (
+    ExecutionIpcHandoffDispatchService,
 )
 from stream_kernel.execution.orchestration.lifecycle.root.startup.console_log_dispatch_service import (
     RootConsoleLogDispatchService,
@@ -17,10 +21,12 @@ from stream_kernel.execution.orchestration.lifecycle.root.startup.log_factory_se
 )
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafConfigAckEvent,
+    ControlPlaneLeafStopCommand,
 )
 from stream_kernel.platform.services.runtime.control_plane_state import (
     ControlPlaneStateService,
 )
+from stream_kernel.routing.envelope import Envelope
 from stream_kernel.platform.services.runtime.lifecycle import RuntimeLifecycleManager
 
 
@@ -37,6 +43,7 @@ class ControlPlaneRootRuntimeLifecycleManager(RuntimeLifecycleManager):
     root_shutdown: ControlPlaneRootShutdownService = inject.service(ControlPlaneRootShutdownService)
     log_factory: RootLifecycleLogFactory = inject.service(RootLifecycleLogFactory)
     console_dispatch: RootConsoleLogDispatchService = inject.service(RootConsoleLogDispatchService)
+    handoff_dispatch: ExecutionIpcHandoffDispatchService = inject.service(ExecutionIpcHandoffDispatchService)
     stop_command_timeout_seconds: float = 0.2
     observability_group_name: str = "system.observability"
     observability_stop_command_timeout_seconds: float = 5.0
@@ -89,24 +96,48 @@ class ControlPlaneRootRuntimeLifecycleManager(RuntimeLifecycleManager):
         stop_timeout = min(graceful, stop_timeout_default) if graceful > 0 else stop_timeout_default
         terminate_timeout = max(0.0, float(self.fallback_terminate_timeout_seconds))
         spawned = list(reversed(self._spawned_workers()))
+        regular_workers, observability_workers = self._partition_shutdown_workers(spawned)
         factory = self._log_factory_optional()
         if factory is not None:
             self._publish_log_safely(factory.runtime_shutdown_started(total_workers=len(spawned)))
-        if self.parallel_shutdown_workers and len(spawned) > 1:
+        if self.parallel_shutdown_workers and len(regular_workers) > 1:
+            pre_dispatched_workers = self._dispatch_stop_commands(
+                spawned=regular_workers,
+                include_observability=False,
+            )
             self._stop_workers_parallel(
-                spawned=spawned,
+                spawned=regular_workers,
                 stop_timeout=stop_timeout,
                 graceful=graceful,
                 terminate_timeout=terminate_timeout,
                 factory=factory,
+                pre_dispatched_workers=pre_dispatched_workers,
             )
         else:
+            pre_dispatched_workers = self._dispatch_stop_commands(
+                spawned=regular_workers,
+                include_observability=False,
+            )
             self._stop_workers_sequential(
-                spawned=spawned,
+                spawned=regular_workers,
                 stop_timeout=stop_timeout,
                 graceful=graceful,
                 terminate_timeout=terminate_timeout,
                 factory=factory,
+                pre_dispatched_workers=pre_dispatched_workers,
+            )
+        if observability_workers:
+            pre_dispatched_obs_workers = self._dispatch_stop_commands(
+                spawned=observability_workers,
+                include_observability=True,
+            )
+            self._stop_workers_sequential(
+                spawned=observability_workers,
+                stop_timeout=stop_timeout,
+                graceful=graceful,
+                terminate_timeout=terminate_timeout,
+                factory=factory,
+                pre_dispatched_workers=pre_dispatched_obs_workers,
             )
         self._flush_console_logs()
 
@@ -118,6 +149,7 @@ class ControlPlaneRootRuntimeLifecycleManager(RuntimeLifecycleManager):
         graceful: float,
         terminate_timeout: float,
         factory: RootLifecycleLogFactory | None,
+        pre_dispatched_workers: set[str] | None = None,
     ) -> None:
         for group_name, worker_id in spawned:
             worker_graceful = self._graceful_timeout_for_worker(
@@ -125,20 +157,34 @@ class ControlPlaneRootRuntimeLifecycleManager(RuntimeLifecycleManager):
                 worker_id=worker_id,
                 default_graceful_timeout_seconds=graceful,
             )
+            command_id = f"runtime-stop:{worker_id}"
+            worker_stop_timeout = self._stop_timeout_for_group(
+                group_name=group_name,
+                worker_id=worker_id,
+                default_stop_timeout_seconds=stop_timeout,
+                graceful_timeout_seconds=worker_graceful,
+            )
+            self._publish_shutdown_worker_stopping(
+                factory=factory,
+                target_group=group_name,
+                worker_id=worker_id,
+                command_id=command_id,
+                stop_command_timeout_seconds=worker_stop_timeout,
+                graceful_timeout_seconds=worker_graceful,
+                terminate_timeout_seconds=terminate_timeout,
+            )
             try:
                 result = self._root_shutdown().shutdown_leaf(
                     target_group=group_name,
                     worker_id=worker_id,
-                    command_id=f"runtime-stop:{worker_id}",
-                    stop_command_timeout_seconds=self._stop_timeout_for_group(
-                        group_name=group_name,
-                        worker_id=worker_id,
-                        default_stop_timeout_seconds=stop_timeout,
-                        graceful_timeout_seconds=worker_graceful,
-                    ),
+                    command_id=command_id,
+                    stop_command_timeout_seconds=worker_stop_timeout,
                     graceful_timeout_seconds=worker_graceful,
                     terminate_timeout_seconds=terminate_timeout,
                     reason="runtime_lifecycle.stop",
+                    dispatch_command=not (
+                        isinstance(pre_dispatched_workers, set) and worker_id in pre_dispatched_workers
+                    ),
                 )
                 if factory is not None:
                     self._publish_log_safely(factory.runtime_shutdown_worker_finished(result=result))
@@ -160,6 +206,7 @@ class ControlPlaneRootRuntimeLifecycleManager(RuntimeLifecycleManager):
         graceful: float,
         terminate_timeout: float,
         factory: RootLifecycleLogFactory | None,
+        pre_dispatched_workers: set[str] | None = None,
     ) -> None:
         futures: list[tuple[str, str, Future[object]]] = []
         max_workers = max(1, len(spawned))
@@ -170,20 +217,34 @@ class ControlPlaneRootRuntimeLifecycleManager(RuntimeLifecycleManager):
                     worker_id=worker_id,
                     default_graceful_timeout_seconds=graceful,
                 )
+                command_id = f"runtime-stop:{worker_id}"
+                worker_stop_timeout = self._stop_timeout_for_group(
+                    group_name=group_name,
+                    worker_id=worker_id,
+                    default_stop_timeout_seconds=stop_timeout,
+                    graceful_timeout_seconds=worker_graceful,
+                )
+                self._publish_shutdown_worker_stopping(
+                    factory=factory,
+                    target_group=group_name,
+                    worker_id=worker_id,
+                    command_id=command_id,
+                    stop_command_timeout_seconds=worker_stop_timeout,
+                    graceful_timeout_seconds=worker_graceful,
+                    terminate_timeout_seconds=terminate_timeout,
+                )
                 future = pool.submit(
                     self._root_shutdown().shutdown_leaf,
                     target_group=group_name,
                     worker_id=worker_id,
-                    command_id=f"runtime-stop:{worker_id}",
-                    stop_command_timeout_seconds=self._stop_timeout_for_group(
-                        group_name=group_name,
-                        worker_id=worker_id,
-                        default_stop_timeout_seconds=stop_timeout,
-                        graceful_timeout_seconds=worker_graceful,
-                    ),
+                    command_id=command_id,
+                    stop_command_timeout_seconds=worker_stop_timeout,
                     graceful_timeout_seconds=worker_graceful,
                     terminate_timeout_seconds=terminate_timeout,
                     reason="runtime_lifecycle.stop",
+                    dispatch_command=not (
+                        isinstance(pre_dispatched_workers, set) and worker_id in pre_dispatched_workers
+                    ),
                 )
                 futures.append((group_name, worker_id, future))
             for group_name, worker_id, future in futures:
@@ -221,6 +282,20 @@ class ControlPlaneRootRuntimeLifecycleManager(RuntimeLifecycleManager):
             pairs.append((group_name, worker_id))
         return pairs
 
+    def _partition_shutdown_workers(
+        self,
+        spawned: list[tuple[str, str]],
+    ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+        regular: list[tuple[str, str]] = []
+        observability: list[tuple[str, str]] = []
+        obs_group_name = self.observability_group_name if isinstance(self.observability_group_name, str) else ""
+        for group_name, worker_id in spawned:
+            if obs_group_name and group_name == obs_group_name:
+                observability.append((group_name, worker_id))
+                continue
+            regular.append((group_name, worker_id))
+        return (regular, observability)
+
     def _state(self) -> ControlPlaneStateService:
         candidate = self.state
         if isinstance(candidate, ControlPlaneStateService):
@@ -228,6 +303,51 @@ class ControlPlaneRootRuntimeLifecycleManager(RuntimeLifecycleManager):
         if callable(getattr(candidate, "events", None)):
             return candidate  # type: ignore[return-value]
         raise ValueError("ControlPlaneStateService binding is required")
+
+    def _handoff_dispatch_optional(self) -> ExecutionIpcHandoffDispatchService | None:
+        candidate = self.handoff_dispatch
+        if isinstance(candidate, ExecutionIpcHandoffDispatchService):
+            return candidate
+        if callable(getattr(candidate, "dispatch_broadcast", None)):
+            return candidate  # type: ignore[return-value]
+        return None
+
+    def _dispatch_stop_commands(
+        self,
+        *,
+        spawned: list[tuple[str, str]],
+        include_observability: bool,
+    ) -> set[str] | None:
+        dispatch = self._handoff_dispatch_optional()
+        if dispatch is None:
+            return None
+        workers_by_group: dict[str, set[str]] = defaultdict(set)
+        for group_name, worker_id in spawned:
+            workers_by_group[group_name].add(worker_id)
+        if not workers_by_group:
+            return set()
+        accepted: set[str] = set()
+        for group_name in sorted(workers_by_group.keys()):
+            group_workers = workers_by_group[group_name]
+            command = ControlPlaneLeafStopCommand(
+                target_group=group_name,
+                worker_id="__broadcast__",
+                command_id="runtime-stop:{worker_id}",
+                reason="runtime_lifecycle.stop",
+            )
+            envelope = Envelope(payload=command, target="system.cp.leaf_stop")
+            try:
+                result = dispatch.dispatch_broadcast(
+                    envelope,
+                    target_group=group_name,
+                    include_observability=include_observability,
+                    policy="best_effort",
+                )
+            except Exception:
+                continue
+            failed = set(result.failed_workers)
+            accepted.update(worker_id for worker_id in group_workers if worker_id not in failed)
+        return accepted
 
     def _root_shutdown(self) -> ControlPlaneRootShutdownService:
         candidate = self.root_shutdown
@@ -270,6 +390,41 @@ class ControlPlaneRootRuntimeLifecycleManager(RuntimeLifecycleManager):
             return
         try:
             publish(message)
+        except Exception:
+            return
+
+    def _publish_shutdown_worker_stopping(
+        self,
+        *,
+        factory: RootLifecycleLogFactory | None,
+        target_group: str,
+        worker_id: str,
+        command_id: str,
+        stop_command_timeout_seconds: float,
+        graceful_timeout_seconds: float,
+        terminate_timeout_seconds: float,
+    ) -> None:
+        if factory is None:
+            return
+        maker = getattr(factory, "runtime_shutdown_worker_stopping", None)
+        if not callable(maker):
+            return
+        try:
+            self._publish_log_safely(
+                maker(
+                    target_group=target_group,
+                    worker_id=worker_id,
+                    command_id=command_id,
+                    stop_command_timeout_seconds=stop_command_timeout_seconds,
+                    graceful_timeout_seconds=graceful_timeout_seconds,
+                    terminate_timeout_seconds=terminate_timeout_seconds,
+                    is_observability_group=(
+                        isinstance(self.observability_group_name, str)
+                        and bool(self.observability_group_name)
+                        and target_group == self.observability_group_name
+                    ),
+                )
+            )
         except Exception:
             return
 

@@ -57,8 +57,15 @@ grpcio = "^1.76"
 opentelemetry-sdk = "^1.38"
 opentelemetry-exporter-otlp-proto-http = "^1.38"
 
+[tool.poetry.group.research-ui]
+optional = true
+
+[tool.poetry.group.research-ui.dependencies]
+fastapi = "^0.116"
+uvicorn = {version = "^0.35", extras = ["standard"]}
+
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "research_ui/tests"]
 addopts = [
   "-q",
   "--import-mode=importlib",
@@ -69,7 +76,7 @@ addopts = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-src = ["src", "tests"]
+src = ["src", "tests", "research_ui", "research_ui/tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
@@ -83,7 +90,7 @@ indent-style = "space"
 python_version = "3.12"
 strict = true
 warn_unused_configs = true
-mypy_path = ["src"]
+mypy_path = ["src", "."]
 exclude = ["^docs/", "^dist/", "^build/"]
 
 [build-system]

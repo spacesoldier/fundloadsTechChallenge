@@ -135,3 +135,31 @@ def test_launch_plan_service_appends_observability_service_worker_group_when_mis
         "system.obs.monitor_dispatch",
         "system.obs.monitoring_metrics_dispatch",
     )
+
+
+def test_launch_plan_service_uses_observability_service_worker_scaling_workers() -> None:
+    config_store = InMemoryControlPlaneStartupConfigStore(store=InMemoryKvStore())
+    config_store.append(
+        ExecutionGroupConfigRecord(
+            source="runtime",
+            section="execution_group",
+            record_id="execution_group:0:execution.runtime",
+            payload={"name": "execution.runtime", "workers": 1, "nodes": ["node.r1"]},
+        )
+    )
+    discovery = InMemoryControlPlaneDiscoveryService(store=InMemoryKvStore())
+    service = DefaultControlPlaneLaunchPlanService(config_store=config_store, discovery=discovery)
+
+    plan = service.build_plan(
+        runtime={
+            "platform": {"bootstrap": {"mode": "process_supervisor"}, "process_groups": []},
+            "observability": {
+                "service_worker": {"enabled": True, "workers": 3},
+                "tracing": {"exporters": [{"kind": "jsonl", "enabled": True}]},
+            },
+        }
+    )
+
+    assert plan is not None
+    obs = next(group for group in plan.groups if group.group_name == "system.observability")
+    assert obs.workers == 3

@@ -138,9 +138,9 @@ def _append_observability_service_worker_group_specs(
     observability = runtime.get("observability", {})
     if not isinstance(observability, dict):
         return groups
-    service_process = observability.get("service_worker")
+    service_process = observability.get("service_process")
     if not isinstance(service_process, dict):
-        service_process = observability.get("service_process")
+        service_process = observability.get("service_worker")
     if not isinstance(service_process, dict):
         return groups
     if service_process.get("enabled") is not True:

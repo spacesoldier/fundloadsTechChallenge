@@ -11,16 +11,17 @@ runtime:
   observability:
     service_worker:
       enabled: true
+      stop_command_timeout_seconds: 1.0
       queue_max_items: 131072
       drop_policy: block_with_timeout
-      block_timeout_ms: 5000
+      block_timeout_ms: 1000
       drain_timeout_seconds: 120
     tracing:
       dispatch_queue:
         max_items: 131072
         drop_policy: block_with_timeout
-        block_timeout_ms: 5000
-        forward_batch_max_items: 100
+        block_timeout_ms: 1000
+        forward_batch_max_items: 20
         forward_flush_interval_ms: 20
         drain_timeout_seconds: 120
       exporters:
@@ -54,12 +55,12 @@ runtime:
               backend: httpx
               timeout_seconds: 2.0
               batch:
-                max_items: 100
+                max_items: 20
                 flush_interval_ms: 100
               queue:
                 max_items: 131072
                 drop_policy: block_with_timeout
-                block_timeout_ms: 5000
+                block_timeout_ms: 1000
               httpx:
                 mode: async
             service:
@@ -84,12 +85,12 @@ runtime:
               backend: httpx
               timeout_seconds: 2.0
               batch:
-                max_items: 100
+                max_items: 20
                 flush_interval_ms: 100
               queue:
                 max_items: 131072
                 drop_policy: block_with_timeout
-                block_timeout_ms: 5000
+                block_timeout_ms: 1000
               httpx:
                 mode: async
             service:
@@ -155,6 +156,10 @@ runtime:
   discovery_modules:
     - fund_load
   platform:
+    debug:
+      root_verbose_logging: true
+      leaf_verbose_logging: false
+      leaf_debug_logs_dir: logs/leaf_debug
     lifecycle:
       graceful_timeout_seconds: 120
       drain_inflight: true
@@ -181,6 +186,7 @@ runtime:
       batch_max_items: 10
       stream_batch_max_items: 10
       timeout_seconds: 600.0
+      inflight_idle_timeout_seconds: 5.0
     process_groups:
       - name: execution.ingress
         workers: 1
@@ -209,6 +215,11 @@ runtime:
       enabled: true
       start_work_on_all_groups_ready: true
       readiness_timeout_seconds: 30
+      fail_on_timeout: true
+    runner_loop:
+      post_start_settle_enabled: true
+      post_start_settle_max_wait_seconds: 30
+      post_start_settle_quiet_window_seconds: 1.0
 
 nodes:
   compute_time_keys:
@@ -246,6 +257,7 @@ nodes:
 
 adapters:
   source:
+    emit_tombstone: true
     settings:
       path: input.txt
       format: text/jsonl

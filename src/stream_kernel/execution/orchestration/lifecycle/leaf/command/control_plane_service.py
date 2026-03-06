@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 import time
+from threading import Event
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from stream_kernel.application_context.inject import inject
@@ -10,7 +11,13 @@ from stream_kernel.application_context.service import service
 from stream_kernel.execution.orchestration.lifecycle.leaf.command.control_ingress_service import (
     LeafControlIngressService,
 )
+from stream_kernel.execution.orchestration.lifecycle.leaf.debug_logging import (
+    configure_leaf_debug_logging,
+    leaf_debug_log,
+)
 from stream_kernel.execution.transport.ipc.ipc_transport import (
+    EXECUTION_IPC_LANE_CONTROL,
+    compose_execution_ipc_worker_target_id,
     ExecutionIpcTransportService,
 )
 
@@ -18,6 +25,8 @@ if TYPE_CHECKING:
     from stream_kernel.execution.orchestration.lifecycle.leaf.runtime.worker_runtime import (
         LeafWorkerRuntimeSession,
     )
+
+_STARTUP_RETRY_WAIT = Event()
 
 
 @runtime_checkable
@@ -75,15 +84,36 @@ class DefaultLeafProcessEntryOrchestrationService(LeafProcessEntryOrchestrationS
             group_name=group_name,
             runner_profile_requested=runner_profile_requested,
         )
+        leaf_debug_log(
+            event="leaf.orchestrator.run.started",
+            worker_id=worker_id,
+            group_name=group_name,
+            process_role=runtime.get("__process_role"),
+        )
         startup_send_timeout_seconds = _resolve_leaf_startup_send_timeout_seconds(runtime)
         ipc = _resolve_execution_ipc_service(session, explicit=self.execution_ipc)
         if ipc is None:
+            leaf_debug_log(
+                event="leaf.orchestrator.run.no_ipc",
+                worker_id=worker_id,
+                group_name=group_name,
+            )
             _wait_for_stop_event(stop_event)
             return
         if worker_id not in self._bound_control_workers:
             _bind_worker_control_endpoint(ipc=ipc, worker_id=worker_id, control_pipe=control_pipe)
             self._bound_control_workers.add(worker_id)
+            leaf_debug_log(
+                event="leaf.orchestrator.control_endpoint.bound",
+                worker_id=worker_id,
+            )
         startup_events = build_leaf_startup_events(runtime=runtime)
+        leaf_debug_log(
+            event="leaf.orchestrator.startup_events.built",
+            worker_id=worker_id,
+            event_count=len(startup_events),
+            event_types=[type(event).__name__ for event in startup_events],
+        )
         for event in startup_events:
             if not _send_startup_event_with_retry(
                 ipc=ipc,
@@ -92,21 +122,49 @@ class DefaultLeafProcessEntryOrchestrationService(LeafProcessEntryOrchestrationS
                 stop_event=stop_event,
                 timeout_seconds=startup_send_timeout_seconds,
             ):
+                leaf_debug_log(
+                    event="leaf.orchestrator.startup_event.send_failed",
+                    worker_id=worker_id,
+                    startup_event=type(event).__name__,
+                )
                 return
+            leaf_debug_log(
+                event="leaf.orchestrator.startup_event.sent",
+                worker_id=worker_id,
+                startup_event=type(event).__name__,
+            )
         ingress = _resolve_ingress_contract(self.control_ingress_service)
         if ingress is None:
             ingress = resolve_leaf_control_ingress_service(session)
         if ingress is None:
+            leaf_debug_log(
+                event="leaf.orchestrator.run.no_ingress",
+                worker_id=worker_id,
+                group_name=group_name,
+            )
             _wait_for_stop_event(stop_event)
             return
         try:
+            leaf_debug_log(
+                event="leaf.orchestrator.ingress_loop.start",
+                worker_id=worker_id,
+                poll_interval_seconds=max(0.0, float(boundary_control_poll_seconds)),
+            )
             ingress.run_until_stopped(
                 session=session,
                 control_pipe=control_pipe,
                 stop_event=stop_event,
                 poll_interval_seconds=max(0.0, float(boundary_control_poll_seconds)),
             )
+            leaf_debug_log(
+                event="leaf.orchestrator.ingress_loop.finished",
+                worker_id=worker_id,
+            )
         except Exception:
+            leaf_debug_log(
+                event="leaf.orchestrator.ingress_loop.error",
+                worker_id=worker_id,
+            )
             return
 
 
@@ -136,17 +194,51 @@ def leaf_worker_process_entry(
     pipe_codec_mode: str,
 ) -> None:
     _ = (boundary_control_poll_seconds, pipe_codec_mode)
+    initial_runtime = getattr(bundle, "runtime", None)
+    configure_leaf_debug_logging(
+        runtime=initial_runtime if isinstance(initial_runtime, dict) else None,
+        group_name=group_name,
+        worker_id=worker_id,
+    )
+    leaf_debug_log(
+        event="leaf.process.entry.started",
+        group_name=group_name,
+        worker_id=worker_id,
+        runner_profile_requested=runner_profile_requested,
+        boundary_control_poll_seconds=boundary_control_poll_seconds,
+        pipe_codec_mode=pipe_codec_mode,
+    )
     session = bootstrap_leaf_worker_runtime_from_bundle(
         bundle=bundle,
         worker_id=worker_id,
         group_name=group_name,
         runner_profile_requested=runner_profile_requested,
     )
+    leaf_runtime = build_leaf_startup_runtime(
+        session=session,
+        worker_id=worker_id,
+        group_name=group_name,
+        runner_profile_requested=runner_profile_requested,
+    )
+    configure_leaf_debug_logging(
+        runtime=leaf_runtime,
+        group_name=group_name,
+        worker_id=worker_id,
+    )
+    leaf_debug_log(
+        event="leaf.process.runtime_bootstrap.completed",
+        process_role=leaf_runtime.get("__process_role"),
+        process_group=leaf_runtime.get("__process_group"),
+    )
     orchestrator = resolve_leaf_process_entry_orchestration_service(session)
     if orchestrator is None:
         ingress = resolve_leaf_control_ingress_service(session)
         orchestrator = DefaultLeafProcessEntryOrchestrationService(
             control_ingress_service=ingress or _NoopLeafControlIngressService()
+        )
+        leaf_debug_log(
+            event="leaf.process.entry.orchestrator_fallback",
+            ingress_fallback=ingress is None,
         )
     orchestrator.run(
         session=session,
@@ -156,6 +248,11 @@ def leaf_worker_process_entry(
         group_name=group_name,
         runner_profile_requested=runner_profile_requested,
         boundary_control_poll_seconds=boundary_control_poll_seconds,
+    )
+    leaf_debug_log(
+        event="leaf.process.entry.finished",
+        worker_id=worker_id,
+        group_name=group_name,
     )
 
 
@@ -198,8 +295,30 @@ def _bind_worker_control_endpoint(
     binder = getattr(ipc, "bind_local_endpoint", None)
     if not callable(binder):
         return
+    if isinstance(control_pipe, dict):
+        bound_any = False
+        for lane_name, endpoint in control_pipe.items():
+            if endpoint is None:
+                continue
+            lane_target = compose_execution_ipc_worker_target_id(
+                worker_id,
+                lane=str(lane_name),
+            )
+            try:
+                binder(lane_target, endpoint)
+                bound_any = True
+            except Exception:
+                continue
+        if bound_any:
+            return
+        control_pipe = control_pipe.get(EXECUTION_IPC_LANE_CONTROL)
+        if control_pipe is None:
+            return
     try:
-        binder(worker_id, control_pipe)
+        binder(
+            compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_CONTROL),
+            control_pipe,
+        )
     except Exception:
         return
 
@@ -330,19 +449,59 @@ def _send_startup_event_with_retry(
     timeout_seconds: float,
 ) -> bool:
     deadline = time.monotonic() + max(0.001, float(timeout_seconds))
+    attempts = 0
     while True:
+        attempts += 1
         try:
             sender = getattr(ipc, "send", None)
             if not callable(sender):
+                leaf_debug_log(
+                    event="leaf.startup_event.send.no_sender",
+                    worker_id=worker_id,
+                    startup_event=type(event).__name__,
+                )
                 return False
-            sender(worker_id, event, no_reply=True)
+            sender(
+                compose_execution_ipc_worker_target_id(
+                    worker_id,
+                    lane=EXECUTION_IPC_LANE_CONTROL,
+                ),
+                event,
+                no_reply=True,
+            )
+            leaf_debug_log(
+                event="leaf.startup_event.send.ok",
+                worker_id=worker_id,
+                startup_event=type(event).__name__,
+                attempts=attempts,
+            )
             return True
-        except Exception:
+        except Exception as exc:
             if _is_stop_set(stop_event):
+                leaf_debug_log(
+                    event="leaf.startup_event.send.stopped",
+                    worker_id=worker_id,
+                    startup_event=type(event).__name__,
+                    attempts=attempts,
+                )
                 return False
             if time.monotonic() >= deadline:
+                leaf_debug_log(
+                    event="leaf.startup_event.send.timeout",
+                    worker_id=worker_id,
+                    startup_event=type(event).__name__,
+                    attempts=attempts,
+                    error=exc.__class__.__name__,
+                )
                 return False
-            time.sleep(0.01)
+            waiter = getattr(stop_event, "wait", None)
+            if callable(waiter):
+                try:
+                    waiter(0.01)
+                except Exception:
+                    _STARTUP_RETRY_WAIT.wait(0.01)
+            else:
+                _STARTUP_RETRY_WAIT.wait(0.01)
 
 
 def _resolve_leaf_startup_send_timeout_seconds(runtime: dict[str, object]) -> float:

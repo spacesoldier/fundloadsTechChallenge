@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.service import service
+from stream_kernel.execution.orchestration.lifecycle.leaf.debug_logging import leaf_debug_log
 from stream_kernel.platform.services.runtime.control_plane_bootstrapper import (
     ControlPlaneBootstrapperService,
 )
@@ -52,6 +53,12 @@ class DefaultLeafRuntimeActivationService(LeafRuntimeActivationService):
         session: "LeafWorkerRuntimeSession",
         card: ControlPlaneLeafConfigCardEvent,
     ) -> ControlPlaneLeafConfigAckEvent:
+        leaf_debug_log(
+            event="leaf.runtime_activation.apply_config.started",
+            worker_id=session.worker_id,
+            config_id=card.config_id,
+            node_count=len(card.nodes),
+        )
         try:
             self._ensure_discovery_populated(session=session)
             discovered = self._discovered_node_names()
@@ -80,14 +87,28 @@ class DefaultLeafRuntimeActivationService(LeafRuntimeActivationService):
                 for name in card.nodes
                 if name in known_aliases or self._is_transport_alias(name)
             )
-            return ControlPlaneLeafConfigAckEvent(
+            ack = ControlPlaneLeafConfigAckEvent(
                 target_group=session.group_name,
                 worker_id=session.worker_id,
                 config_id=card.config_id,
                 status="applied",
                 resolved_nodes=resolved_nodes or tuple(card.nodes),
             )
+            leaf_debug_log(
+                event="leaf.runtime_activation.apply_config.completed",
+                worker_id=session.worker_id,
+                config_id=card.config_id,
+                status=ack.status,
+                resolved_count=len(ack.resolved_nodes),
+            )
+            return ack
         except Exception as exc:  # noqa: BLE001 - deterministic typed ack
+            leaf_debug_log(
+                event="leaf.runtime_activation.apply_config.failed",
+                worker_id=session.worker_id,
+                config_id=card.config_id,
+                error=exc.__class__.__name__,
+            )
             return ControlPlaneLeafConfigAckEvent(
                 target_group=session.group_name,
                 worker_id=session.worker_id,
@@ -198,6 +219,8 @@ class DefaultLeafRuntimeActivationService(LeafRuntimeActivationService):
         if not isinstance(node_name, str) or not node_name:
             return False
         if node_name.startswith("system.obs."):
+            return True
+        if node_name.startswith("system.transport.handoff."):
             return True
         if node_name.startswith(("source:", "sink:")):
             return True

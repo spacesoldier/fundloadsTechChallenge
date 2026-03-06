@@ -3,7 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from stream_kernel.integration.kv_store import InMemoryKvStore
+from stream_kernel.execution.transport.handoff.system_nodes import (
+    OBSERVABILITY_HANDOFF_NODE_NAME,
+)
 from stream_kernel.execution.transport.ipc.ipc_transport import ExecutionIpcMessage
+from stream_kernel.observability.events import TraceDispatchEvent
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneDiscoveryEntityRecord,
     ControlPlaneGroupSpec,
@@ -19,6 +23,7 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
 from stream_kernel.platform.services.runtime.control_plane_state import (
     InMemoryControlPlaneStateService,
 )
+from stream_kernel.routing.envelope import Envelope
 
 
 @dataclass(slots=True)
@@ -36,6 +41,20 @@ class _IpcPort:
     def send(self, target_id: str, payload: object, *, no_reply: bool = False):
         self.sends.append({"target_id": target_id, "payload": payload, "no_reply": no_reply})
         return None
+
+
+@dataclass(slots=True)
+class _BoundaryHandoff:
+    calls: list[dict[str, object]] = field(default_factory=list)
+
+    def drain_external_deliveries(self, *, envelopes: list[Envelope], source_group: str | None = None):
+        self.calls.append(
+            {
+                "envelopes": list(envelopes),
+                "source_group": source_group,
+            }
+        )
+        return []
 
 
 def test_root_reply_ingress_service_appends_boundary_result_into_state() -> None:
@@ -74,6 +93,205 @@ def test_root_reply_ingress_service_appends_boundary_result_into_state() -> None
         isinstance(item, ControlPlaneLeafBoundaryResultEvent) and item.request_id == "req-1"
         for item in events
     )
+
+
+def test_root_reply_ingress_service_routes_boundary_result_outputs_via_handoff() -> None:
+    from stream_kernel.execution.orchestration.control_plane.root.reply_ingress_service import (
+        DefaultControlPlaneRootReplyIngressService,
+    )
+
+    state = InMemoryControlPlaneStateService(store=InMemoryKvStore())
+    handoff = _BoundaryHandoff()
+    ipc = _IpcPort(
+        incoming_by_target={
+            "execution.alpha#1": [
+                ExecutionIpcMessage(
+                    target_id="execution.alpha#1",
+                    payload=ControlPlaneLeafBoundaryResultEvent(
+                        target_group="execution.alpha",
+                        worker_id="execution.alpha#1",
+                        request_id="req-2",
+                        status="completed",
+                        outputs=(
+                            Envelope(payload={"k": 1}, target="compute_time_keys"),
+                            {"ignored": True},
+                        ),
+                    ),
+                    ts_epoch_ms=2,
+                )
+            ]
+        }
+    )
+    service = DefaultControlPlaneRootReplyIngressService(
+        state=state,
+        execution_ipc=ipc,
+        root_boundary_handoff=handoff,
+    )
+
+    drained = service.drain_worker_replies(
+        worker_id="execution.alpha#1",
+        timeout_seconds=0.0,
+    )
+
+    assert drained == 1
+    assert len(handoff.calls) == 1
+    call = handoff.calls[0]
+    assert call["source_group"] == "execution.alpha"
+    envelopes = call["envelopes"]
+    assert isinstance(envelopes, list)
+    assert len(envelopes) == 1
+    assert isinstance(envelopes[0], Envelope)
+    assert envelopes[0].target == "compute_time_keys"
+
+
+def test_root_reply_ingress_service_tracks_leaf_tombstone_completion() -> None:
+    from stream_kernel.execution.orchestration.control_plane.root.reply_ingress_service import (
+        DefaultControlPlaneRootReplyIngressService,
+    )
+
+    state = InMemoryControlPlaneStateService(store=InMemoryKvStore())
+    handoff = _BoundaryHandoff()
+    ipc = _IpcPort(
+        incoming_by_target={
+            "execution.ingress#1": [
+                ExecutionIpcMessage(
+                    target_id="execution.ingress#1",
+                    payload=ControlPlaneLeafBoundaryResultEvent(
+                        target_group="execution.ingress",
+                        worker_id="execution.ingress#1",
+                        request_id="req-tomb",
+                        status="completed",
+                        tombstone_input=True,
+                        tombstone_output=True,
+                        outputs=(
+                            Envelope(payload={"k": 1}, target="compute_time_keys", tombstone=True),
+                        ),
+                    ),
+                    ts_epoch_ms=2,
+                )
+            ]
+        }
+    )
+    service = DefaultControlPlaneRootReplyIngressService(
+        state=state,
+        execution_ipc=ipc,
+        root_boundary_handoff=handoff,
+    )
+
+    drained = service.drain_worker_replies(worker_id="execution.ingress#1", timeout_seconds=0.0)
+
+    assert drained == 1
+    assert len(handoff.calls) == 1
+    envelopes = handoff.calls[0]["envelopes"]
+    assert isinstance(envelopes, list)
+    assert len(envelopes) == 1
+    assert isinstance(envelopes[0], Envelope)
+    assert envelopes[0].target == "compute_time_keys"
+    assert envelopes[0].tombstone is True
+    events = state.events()
+    completions = [
+        item for item in events if isinstance(item, dict) and item.get("kind") == "leaf_tombstone_completed"
+    ]
+    assert len(completions) == 1
+    assert completions[0]["target_group"] == "execution.ingress"
+    assert completions[0]["worker_id"] == "execution.ingress#1"
+    assert completions[0]["tombstone_output"] is True
+
+
+def test_root_reply_ingress_service_tracks_leaf_tombstone_completion_with_empty_outputs() -> None:
+    from stream_kernel.execution.orchestration.control_plane.root.reply_ingress_service import (
+        DefaultControlPlaneRootReplyIngressService,
+    )
+
+    state = InMemoryControlPlaneStateService(store=InMemoryKvStore())
+    handoff = _BoundaryHandoff()
+    ipc = _IpcPort(
+        incoming_by_target={
+            "execution.egress#1": [
+                ExecutionIpcMessage(
+                    target_id="execution.egress#1",
+                    payload=ControlPlaneLeafBoundaryResultEvent(
+                        target_group="execution.egress",
+                        worker_id="execution.egress#1",
+                        request_id="req-egress-tomb",
+                        status="completed",
+                        tombstone_input=True,
+                        tombstone_output=False,
+                        outputs=(),
+                    ),
+                    ts_epoch_ms=2,
+                )
+            ]
+        }
+    )
+    service = DefaultControlPlaneRootReplyIngressService(
+        state=state,
+        execution_ipc=ipc,
+        root_boundary_handoff=handoff,
+    )
+
+    drained = service.drain_worker_replies(worker_id="execution.egress#1", timeout_seconds=0.0)
+
+    assert drained == 1
+    assert handoff.calls == []
+    events = state.events()
+    completions = [
+        item for item in events if isinstance(item, dict) and item.get("kind") == "leaf_tombstone_completed"
+    ]
+    assert len(completions) == 1
+    assert completions[0]["target_group"] == "execution.egress"
+    assert completions[0]["worker_id"] == "execution.egress#1"
+    assert completions[0]["tombstone_output"] is False
+
+
+def test_root_reply_ingress_service_remaps_observability_relay_target_before_handoff() -> None:
+    from stream_kernel.execution.orchestration.control_plane.root.reply_ingress_service import (
+        DefaultControlPlaneRootReplyIngressService,
+    )
+
+    state = InMemoryControlPlaneStateService(store=InMemoryKvStore())
+    handoff = _BoundaryHandoff()
+    ipc = _IpcPort(
+        incoming_by_target={
+            "execution.alpha#1": [
+                ExecutionIpcMessage(
+                    target_id="execution.alpha#1",
+                    payload=ControlPlaneLeafBoundaryResultEvent(
+                        target_group="execution.alpha",
+                        worker_id="execution.alpha#1",
+                        request_id="req-obs-relay",
+                        status="completed",
+                        outputs=(
+                            Envelope(
+                                payload=TraceDispatchEvent(payload={"span": "s1"}),
+                                target=OBSERVABILITY_HANDOFF_NODE_NAME,
+                            ),
+                        ),
+                    ),
+                    ts_epoch_ms=2,
+                )
+            ]
+        }
+    )
+    service = DefaultControlPlaneRootReplyIngressService(
+        state=state,
+        execution_ipc=ipc,
+        root_boundary_handoff=handoff,
+    )
+
+    drained = service.drain_worker_replies(
+        worker_id="execution.alpha#1",
+        timeout_seconds=0.0,
+    )
+
+    assert drained == 1
+    assert len(handoff.calls) == 1
+    call = handoff.calls[0]
+    envelopes = call["envelopes"]
+    assert isinstance(envelopes, list)
+    assert len(envelopes) == 1
+    assert isinstance(envelopes[0], Envelope)
+    assert envelopes[0].target == "system.obs.trace_dispatch"
 
 
 def test_root_reply_ingress_service_processes_leaf_hello_and_sends_config_card() -> None:

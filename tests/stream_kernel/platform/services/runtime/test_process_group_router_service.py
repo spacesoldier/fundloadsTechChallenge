@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.platform.services.runtime.process_group_router import (
     InMemoryProcessGroupRouterService,
 )
@@ -115,3 +116,19 @@ def test_process_group_router_routes_system_observability_nodes_to_dedicated_gro
         )
         == "system.observability"
     )
+
+
+def test_process_group_router_persists_target_map_in_kv_store() -> None:
+    store = InMemoryKvStore()
+    first = InMemoryProcessGroupRouterService(store=store)
+    first.configure_process_groups(
+        [
+            {
+                "name": "execution.features",
+                "workers": 1,
+                "nodes": ["compute_features"],
+            }
+        ]
+    )
+    second = InMemoryProcessGroupRouterService(store=store)
+    assert second.resolve_group_for_target(target="compute_features", source_group=None) == "execution.features"

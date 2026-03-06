@@ -8,6 +8,7 @@ import pytest
 from stream_kernel.platform.services.state.context import InMemoryKvContextService
 from stream_kernel.platform.services.observability import NoOpObservabilityService
 from stream_kernel.execution.orchestration.observability_system_nodes import TraceDispatchEvent
+from stream_kernel.observability.events import LogDispatchEvent
 from stream_kernel.execution.runtime.runner import AsyncRunner, SyncRunner
 from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.routing.routing_service import RoutingService
@@ -665,3 +666,110 @@ def test_transport_handoff_observability_node_exclusion_is_deterministic_for_syn
     runner.run()
     assert observed_before == ["worker"]
     assert observed_after == ["worker"]
+
+
+@pytest.mark.parametrize("runner_kind", ["sync", "async"])
+def test_lifecycle_log_dispatch_node_is_included_in_observability_callbacks(
+    runner_kind: str,
+) -> None:
+    observed_before: list[str] = []
+    observed_after: list[str] = []
+
+    class _DispatchingObserver:
+        def before_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+        ) -> object | None:
+            _ = (payload, ctx, trace_id)
+            observed_before.append(node_name)
+            return None
+
+        def after_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            outputs: list[object],
+            state: object | None,
+        ) -> list[object] | None:
+            _ = (payload, ctx, outputs, state)
+            observed_after.append(node_name)
+            if node_name == "worker":
+                return [LogDispatchEvent(payload={"msg": "x"}, trace_id=trace_id)]
+            return None
+
+        def on_node_error(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            error: Exception,
+            state: object | None,
+        ) -> None:
+            _ = (node_name, payload, ctx, trace_id, error, state)
+            return None
+
+        def on_run_end(self) -> None:
+            return None
+
+    if runner_kind == "async":
+        async def worker(payload: object, ctx: dict[str, object]) -> list[object]:
+            _ = (payload, ctx)
+            return []
+
+        async def lifecycle_log_dispatch(payload: object, ctx: dict[str, object]) -> list[object]:
+            _ = (payload, ctx)
+            return []
+
+        runner = AsyncRunner(
+            nodes={
+                "worker": worker,
+                "system.lifecycle.log_dispatch": lifecycle_log_dispatch,
+            },
+            work_queue=InMemoryQueue(),
+            context_service=InMemoryKvContextService(InMemoryKvStore()),
+            router=RoutingService(
+                registry=InMemoryConsumerRegistry(
+                    {LogDispatchEvent: ["system.lifecycle.log_dispatch"]}
+                ),
+                strict=True,
+            ),
+            observability=_DispatchingObserver(),
+        )
+    else:
+        def worker(payload: object, ctx: dict[str, object]) -> list[object]:
+            _ = (payload, ctx)
+            return []
+
+        def lifecycle_log_dispatch(payload: object, ctx: dict[str, object]) -> list[object]:
+            _ = (payload, ctx)
+            return []
+
+        runner = SyncRunner(
+            nodes={
+                "worker": worker,
+                "system.lifecycle.log_dispatch": lifecycle_log_dispatch,
+            },
+            work_queue=InMemoryQueue(),
+            context_service=InMemoryKvContextService(InMemoryKvStore()),
+            router=RoutingService(
+                registry=InMemoryConsumerRegistry(
+                    {LogDispatchEvent: ["system.lifecycle.log_dispatch"]}
+                ),
+                strict=True,
+            ),
+            observability=_DispatchingObserver(),
+        )
+
+    runner.work_queue.push(Envelope(payload="seed", target="worker", trace_id="t1"))
+    runner.run()
+    assert observed_before == ["worker", "system.lifecycle.log_dispatch"]
+    assert observed_after == ["worker", "system.lifecycle.log_dispatch"]

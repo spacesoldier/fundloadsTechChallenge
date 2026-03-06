@@ -6,10 +6,12 @@ from types import SimpleNamespace
 from stream_kernel.execution.orchestration.lifecycle.leaf.command.control_ingress_service import (
     DefaultLeafControlIngressService,
 )
+from stream_kernel.execution.orchestration.source_ingress import BootstrapControl
 from stream_kernel.execution.transport.ipc.ipc_transport import (
     ExecutionIpcControlSignal,
     ExecutionIpcMessage,
 )
+from stream_kernel.routing.envelope import Envelope
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafBoundaryExecuteCommand,
     ControlPlaneLeafBoundaryResultEvent,
@@ -17,6 +19,7 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafDiscoveryRequestEvent,
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafConfigCardEvent,
+    ControlPlaneLeafStartWorkEvent,
     ControlPlaneLeafStopAckEvent,
     ControlPlaneLeafStopCommand,
 )
@@ -499,6 +502,89 @@ def test_leaf_control_ingress_service_dispatches_via_leaf_boundary_node() -> Non
     ]
     assert len(boundary_replies) >= 1
     assert not transport_acks
+
+
+def test_leaf_control_ingress_service_forwards_leaf_start_work_outputs_into_command_loop() -> None:
+    seen: list[object] = []
+
+    class _CommandLoop:
+        def handle_control_message(self, *, session, control_pipe, message):
+            _ = (session, control_pipe)
+            seen.append(message)
+            if isinstance(message, ControlPlaneLeafStopCommand):
+                return "stop_requested"
+            if isinstance(message, Envelope):
+                return "boundary_executed"
+            return None
+
+    class _ConsumerRegistry:
+        def get_consumers(self, token: object) -> list[str]:
+            if token is ControlPlaneLeafStartWorkEvent:
+                return ["system.cp.leaf_start_work"]
+            if token is ControlPlaneLeafStopCommand:
+                return ["system.cp.leaf_stop"]
+            return []
+
+    class _Scope:
+        def resolve(self, port_type: str, data_type: object, *, qualifier: str | None = None):
+            _ = qualifier
+            if port_type == "service" and getattr(data_type, "__name__", "") == "ConsumerRegistry":
+                return _ConsumerRegistry()
+            raise LookupError("unexpected resolve request")
+
+    class _StartWorkNode:
+        def __call__(self, msg: object, _ctx: object | None):
+            assert isinstance(msg, ControlPlaneLeafStartWorkEvent)
+            return [Envelope(payload=BootstrapControl(target="source:source"), target="source:source")]
+
+    class _StopNode:
+        def __call__(self, msg: object, _ctx: object | None):
+            assert isinstance(msg, ControlPlaneLeafStopCommand)
+            return [
+                ControlPlaneLeafStopAckEvent(
+                    target_group=msg.target_group,
+                    worker_id=msg.worker_id,
+                    command_id=msg.command_id,
+                    status="accepted",
+                )
+            ]
+
+    ipc = _ExecutionIpc(
+        incoming=[
+            ControlPlaneLeafStartWorkEvent(source_targets=("source:source",)),
+            ControlPlaneLeafStopCommand(
+                target_group="execution.alpha",
+                worker_id="execution.alpha#1",
+                command_id="stop-1",
+            ),
+        ]
+    )
+    service = DefaultLeafControlIngressService(command_loop_service=_CommandLoop(), execution_ipc=ipc)
+    session = SimpleNamespace(
+        group_name="execution.alpha",
+        worker_id="execution.alpha#1",
+        child=SimpleNamespace(
+            scenario_scope=_Scope(),
+            scenario_steps={
+                "system.cp.leaf_start_work": _StartWorkNode(),
+                "system.cp.leaf_stop": _StopNode(),
+            },
+        ),
+    )
+
+    status = service.run_until_stopped(
+        session=session,
+        control_pipe=object(),
+        stop_event=_StopEvent(stop_after_checks=1000),
+        poll_interval_seconds=0.0001,
+    )
+
+    assert status == "stop_requested"
+    assert any(isinstance(message, Envelope) for message in seen)
+    envelope = next(message for message in seen if isinstance(message, Envelope))
+    assert envelope.target == "source:source"
+    assert isinstance(envelope.payload, BootstrapControl)
+    assert any(isinstance(payload, ControlPlaneLeafStopAckEvent) for _target_id, payload, _no_reply in ipc.sent)
 
 
 def test_leaf_control_ingress_service_uses_nonblocking_poll_in_hot_path() -> None:

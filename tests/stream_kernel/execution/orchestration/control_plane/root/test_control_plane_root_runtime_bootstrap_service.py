@@ -190,6 +190,60 @@ def test_root_runtime_bootstrap_service_enriches_observability_group_with_system
     assert "system.obs.worker_queue_dispatch" in nodes
 
 
+def test_root_runtime_bootstrap_service_adds_missing_observability_group_for_router_and_route_table() -> None:
+    from stream_kernel.execution.orchestration.control_plane.root.runtime_bootstrap_service import (
+        DefaultControlPlaneRootRuntimeBootstrapService,
+    )
+
+    lifecycle = _LifecycleService()
+    router = _ProcessGroupRouter()
+    route_table = _RouteTable()
+    service = DefaultControlPlaneRootRuntimeBootstrapService(
+        lifecycle=lifecycle,
+        process_group_router=router,
+        route_table=route_table,
+    )
+    runtime = {
+        "observability": {
+            "service_worker": {"enabled": True, "group_name": "system.observability"},
+            "tracing": {"exporters": [{"kind": "jsonl", "enabled": True}]},
+            "logging": {"exporters": [{"kind": "stdout_plain", "enabled": True}]},
+            "monitoring": {"exporters": [{"kind": "jsonl", "enabled": True}]},
+        },
+        "platform": {
+            "bootstrap": {"mode": "process_supervisor"},
+            "process_groups": [
+                {"name": "execution.alpha", "nodes": ["node.a"]},
+            ],
+        },
+    }
+
+    service.prepare_root_runtime(
+        runtime=runtime,
+        config={"runtime": runtime, "nodes": {}, "adapters": {}},
+        adapters={},
+        run_id="run-1",
+        scenario_id="scenario-1",
+        discovery_modules=["fund_load"],
+    )
+
+    assert router.process_groups_calls, "process groups must be configured"
+    configured_groups = router.process_groups_calls[-1]
+    observability_group = next(
+        item for item in configured_groups if isinstance(item, dict) and item.get("name") == "system.observability"
+    )
+    nodes = observability_group.get("nodes")
+    assert isinstance(nodes, list)
+    assert "system.obs.trace_dispatch" in nodes
+    assert "system.obs.log_dispatch" in nodes
+    assert "system.obs.monitor_dispatch" in nodes
+
+    upserted_targets = {target for target, _target_id in route_table.upsert_calls}
+    assert "system.obs.trace_dispatch" in upserted_targets
+    assert "system.obs.log_dispatch" in upserted_targets
+    assert "system.obs.monitor_dispatch" in upserted_targets
+
+
 def test_root_runtime_bootstrap_service_configures_boundary_handoff_and_control_poll_from_runtime() -> None:
     from stream_kernel.execution.orchestration.control_plane.root.runtime_bootstrap_service import (
         DefaultControlPlaneRootRuntimeBootstrapService,
@@ -233,7 +287,7 @@ def test_root_runtime_bootstrap_service_configures_boundary_handoff_and_control_
             "timeout_seconds": 2.5,
             "stream_batch_max_items": 10,
             "observability_batch_max_items": None,
-            "inflight_idle_timeout_seconds": 2.5,
+            "inflight_idle_timeout_seconds": None,
         }
     ]
     assert commands.poll_calls

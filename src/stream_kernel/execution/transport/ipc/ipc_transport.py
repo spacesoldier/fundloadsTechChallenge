@@ -5,6 +5,21 @@ from typing import Protocol, runtime_checkable
 
 from stream_kernel.integration.kv_store import KVStore
 
+EXECUTION_IPC_LANE_CONTROL = "control"
+EXECUTION_IPC_LANE_DATA = "data"
+EXECUTION_IPC_LANE_TRACE = "trace"
+EXECUTION_IPC_LANE_LOG = "log"
+EXECUTION_IPC_LANE_METRIC = "metric"
+
+_EXECUTION_IPC_TARGET_LANE_SEPARATOR = "::"
+_EXECUTION_IPC_SUPPORTED_LANES = {
+    EXECUTION_IPC_LANE_CONTROL,
+    EXECUTION_IPC_LANE_DATA,
+    EXECUTION_IPC_LANE_TRACE,
+    EXECUTION_IPC_LANE_LOG,
+    EXECUTION_IPC_LANE_METRIC,
+}
+
 
 @dataclass(frozen=True, slots=True)
 class ExecutionIpcAck:
@@ -30,6 +45,71 @@ class ExecutionIpcReceivePolicy:
 class ExecutionIpcControlSignal:
     kind: str
     count: int = 0
+
+
+def normalize_execution_ipc_lane(lane: str | None) -> str:
+    if not isinstance(lane, str) or not lane:
+        return EXECUTION_IPC_LANE_CONTROL
+    normalized = lane.strip().lower()
+    if normalized in _EXECUTION_IPC_SUPPORTED_LANES:
+        return normalized
+    return EXECUTION_IPC_LANE_CONTROL
+
+
+def compose_execution_ipc_worker_target_id(
+    worker_id: str,
+    *,
+    lane: str = EXECUTION_IPC_LANE_CONTROL,
+) -> str:
+    if not isinstance(worker_id, str) or not worker_id:
+        raise ValueError("compose_execution_ipc_worker_target_id requires non-empty worker_id")
+    normalized_lane = normalize_execution_ipc_lane(lane)
+    if normalized_lane == EXECUTION_IPC_LANE_CONTROL:
+        return worker_id
+    return f"{worker_id}{_EXECUTION_IPC_TARGET_LANE_SEPARATOR}{normalized_lane}"
+
+
+def decompose_execution_ipc_worker_target_id(target_id: str) -> tuple[str, str] | None:
+    if not isinstance(target_id, str) or not target_id:
+        return None
+    if _EXECUTION_IPC_TARGET_LANE_SEPARATOR not in target_id:
+        return (target_id, EXECUTION_IPC_LANE_CONTROL)
+    worker_id, _sep, lane = target_id.partition(_EXECUTION_IPC_TARGET_LANE_SEPARATOR)
+    if not worker_id:
+        return None
+    return (worker_id, normalize_execution_ipc_lane(lane))
+
+
+def execution_ipc_worker_lane_targets(worker_id: str) -> dict[str, str]:
+    return {
+        lane: compose_execution_ipc_worker_target_id(worker_id, lane=lane)
+        for lane in (
+            EXECUTION_IPC_LANE_CONTROL,
+            EXECUTION_IPC_LANE_DATA,
+            EXECUTION_IPC_LANE_TRACE,
+            EXECUTION_IPC_LANE_LOG,
+            EXECUTION_IPC_LANE_METRIC,
+        )
+    }
+
+
+def resolve_execution_ipc_lane_for_target(target: str | None) -> str:
+    if not isinstance(target, str) or not target:
+        return EXECUTION_IPC_LANE_DATA
+    lowered = target.strip().lower()
+    if lowered.startswith("system.cp."):
+        return EXECUTION_IPC_LANE_CONTROL
+    if lowered.startswith("system.obs.trace"):
+        return EXECUTION_IPC_LANE_TRACE
+    if lowered.startswith("system.obs.log"):
+        return EXECUTION_IPC_LANE_LOG
+    if (
+        lowered.startswith("system.obs.metric")
+        or lowered.startswith("system.obs.monitor")
+        or lowered.startswith("system.obs.worker_queue")
+    ):
+        return EXECUTION_IPC_LANE_METRIC
+    return EXECUTION_IPC_LANE_DATA
 
 
 def resolve_execution_ipc_target_id(qualifier: str | None) -> str | None:

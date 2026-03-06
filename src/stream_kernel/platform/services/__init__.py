@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from stream_kernel.integration.consumer_registry import ConsumerRegistry
+from stream_kernel.integration.consumer_registry import ConsumerRegistry, ConsumerRegistryStore
 from stream_kernel.platform.services.api.policy import (
     ApiPolicyService,
     InMemoryApiPolicyService,
@@ -34,6 +34,7 @@ from stream_kernel.platform.services.observability_dispatch import (
 from stream_kernel.platform.services.messaging.reply_waiter import (
     InMemoryReplyWaiterService,
     PendingReplyWaiterService,
+    ReplyWaiterRegistryStore,
     ReplyWaiterService,
     TerminalEvent,
 )
@@ -78,6 +79,7 @@ from stream_kernel.execution.transport.ipc import (
 from stream_kernel.platform.services.runtime.async_dispatch_loop import AsyncDispatchLoop
 from stream_kernel.platform.services.runtime.process_group_router import (
     InMemoryProcessGroupRouterService,
+    ProcessGroupRouterStore,
     ProcessGroupRouterService,
 )
 from stream_kernel.platform.services.runtime.control_plane_state import (
@@ -141,6 +143,7 @@ from stream_kernel.platform.services.runtime.control_plane_dag_assembly import (
 
 __all__ = [
     "ConsumerRegistry",
+    "ConsumerRegistryStore",
     "ApiPolicyService",
     "ContextService",
     "DiscoveryConsumerRegistry",
@@ -166,6 +169,7 @@ __all__ = [
     "InMemoryReplyWaiterService",
     "InMemoryReplyCoordinatorService",
     "PendingReplyWaiterService",
+    "ReplyWaiterRegistryStore",
     "ReplyCoordinatorService",
     "ReplyWaiterService",
     "RateLimiterService",
@@ -180,6 +184,7 @@ __all__ = [
     "legacy_reply_coordinator",
     "MemoryRuntimeTransportService",
     "InMemoryProcessGroupRouterService",
+    "ProcessGroupRouterStore",
     "ProcessGroupRouterService",
     "TcpLocalRuntimeTransportService",
     "AsyncDispatchLoop",

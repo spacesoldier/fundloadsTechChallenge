@@ -9,9 +9,6 @@ from stream_kernel.execution.orchestration.lifecycle.root.startup.planning impor
 from stream_kernel.execution.orchestration.observability_system_nodes import (
     build_observability_system_plan,
 )
-from stream_kernel.execution.transport.handoff.system_nodes import (
-    build_transport_observability_handoff_plan,
-)
 from stream_kernel.kernel.scenario import StepSpec
 
 
@@ -107,25 +104,10 @@ class DefaultLeafRuntimeStepAssemblyService(LeafRuntimeStepAssemblyService):
             runtime=runtime,
             scenario_scope=scenario_scope,
         )
-        # Transport-only observability mode (no local system.obs.* steps) mounts
-        # an explicit transport handoff node so dispatch follows
-        # node->service->adapter rails in both root and worker processes.
-        use_transport_handoff_for_observability = (
-            not observability_system.system_steps
-            and bool(observability_system.system_consumers)
-        )
-        if use_transport_handoff_for_observability:
-            handoff_steps, handoff_consumers, _handoff_nodes = _build_transport_only_observability_handoff_plan(
-                scenario_scope=scenario_scope
-            )
-            for token, node_names in handoff_consumers.items():
-                _append_consumers(consumer_registry, token, node_names)
-            combined_steps.extend(handoff_steps)
-        else:
-            for token, node_names in observability_system.system_consumers.items():
-                _append_consumers(consumer_registry, token, node_names)
-            if include_observability_nodes:
-                combined_steps.extend(observability_system.system_steps)
+        for token, node_names in observability_system.system_consumers.items():
+            _append_consumers(consumer_registry, token, node_names)
+        if include_observability_nodes:
+            combined_steps.extend(observability_system.system_steps)
 
         control_plane_system = build_control_plane_system_plan(
             runtime=runtime,
@@ -154,17 +136,8 @@ class DefaultLeafRuntimeStepAssemblyService(LeafRuntimeStepAssemblyService):
             | set(control_plane_system.system_node_names)
             | set(lifecycle_system.system_node_names)
             | (
-                _build_transport_only_observability_handoff_plan(scenario_scope=scenario_scope)[2]
-                if use_transport_handoff_for_observability
-                else (
-                    set(observability_system.system_node_names)
-                    if include_observability_nodes
-                    else set()
-                )
-            )
-            | (
                 set(observability_system.system_node_names)
-                if include_observability_nodes and not use_transport_handoff_for_observability
+                if include_observability_nodes
                 else set()
             )
         )
@@ -181,17 +154,6 @@ def _append_consumers(consumer_registry: object, token: object, node_names: list
         return
     existing = list(get_consumers(token))
     register(token, [*existing, *node_names])
-
-
-def _build_transport_only_observability_handoff_plan(
-    *,
-    scenario_scope: object | None = None,
-) -> tuple[list[StepSpec], dict[object, list[str]], set[str]]:
-    steps, consumers, nodes = build_transport_observability_handoff_plan(
-        scenario_scope=scenario_scope
-    )
-    return (list(steps), dict(consumers), set(nodes))
-
 
 __all__ = [
     "LeafRuntimeStepAssemblyResult",

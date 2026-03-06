@@ -216,7 +216,7 @@ def test_leaf_runtime_step_assembly_service_filters_discovered_obs_steps_for_wor
     assert "system.cp.root_bootstrap" not in out.scenario_steps
 
 
-def test_leaf_runtime_step_assembly_service_mounts_transport_handoff_node_for_root_transport_only_observability(
+def test_leaf_runtime_step_assembly_service_keeps_observability_consumers_without_forced_handoff_for_root_transport_only_observability(
     monkeypatch,
 ) -> None:
     import stream_kernel.execution.orchestration.lifecycle.leaf.startup.runtime_step_assembly_service as mod
@@ -234,16 +234,9 @@ def test_leaf_runtime_step_assembly_service_mounts_transport_handoff_node_for_ro
     def _lc_plan(**_kwargs):
         return SimpleNamespace(system_consumers={}, system_steps=[], system_node_names=[])
 
-    handoff_node_name = "system.transport.handoff.observability_dispatch"
-    handoff_step = SimpleNamespace(name=handoff_node_name, step=lambda *_: None)
     monkeypatch.setattr(mod, "build_observability_system_plan", lambda **_: obs_plan)
     monkeypatch.setattr(mod, "build_control_plane_system_plan", _cp_plan)
     monkeypatch.setattr(mod, "build_lifecycle_system_plan", _lc_plan)
-    monkeypatch.setattr(
-        mod,
-        "_build_transport_only_observability_handoff_plan",
-        lambda **_kwargs: ([handoff_step], {obs_token: [handoff_node_name]}, {handoff_node_name}),
-    )
 
     app_context = SimpleNamespace(nodes=[_FakeNodeDef(_FakeMeta(name="business.a", service=False))])
     scenario = SimpleNamespace(steps=[SimpleNamespace(name="business.a", step=lambda *_: None)])
@@ -268,11 +261,11 @@ def test_leaf_runtime_step_assembly_service_mounts_transport_handoff_node_for_ro
         adapter_registry=None,
     )
 
-    assert handoff_node_name in out.scenario_steps
-    assert registry.values[obs_token] == [handoff_node_name]
+    assert "system.transport.handoff.observability_dispatch" not in out.scenario_steps
+    assert registry.values[obs_token] == ["system.obs.trace_dispatch"]
 
 
-def test_leaf_runtime_step_assembly_service_mounts_transport_handoff_node_for_worker_transport_only_observability(
+def test_leaf_runtime_step_assembly_service_keeps_observability_consumers_without_forced_handoff_for_worker_transport_only_observability(
     monkeypatch,
 ) -> None:
     import stream_kernel.execution.orchestration.lifecycle.leaf.startup.runtime_step_assembly_service as mod
@@ -284,9 +277,6 @@ def test_leaf_runtime_step_assembly_service_mounts_transport_handoff_node_for_wo
         system_node_names=[],
     )
 
-    handoff_node_name = "system.transport.handoff.observability_dispatch"
-    handoff_step = SimpleNamespace(name=handoff_node_name, step=lambda *_: None)
-
     monkeypatch.setattr(mod, "build_observability_system_plan", lambda **_: obs_plan)
     monkeypatch.setattr(
         mod,
@@ -297,11 +287,6 @@ def test_leaf_runtime_step_assembly_service_mounts_transport_handoff_node_for_wo
         mod,
         "build_lifecycle_system_plan",
         lambda **_kwargs: SimpleNamespace(system_consumers={}, system_steps=[], system_node_names=[]),
-    )
-    monkeypatch.setattr(
-        mod,
-        "_build_transport_only_observability_handoff_plan",
-        lambda **_kwargs: ([handoff_step], {obs_token: [handoff_node_name]}, {handoff_node_name}),
     )
 
     app_context = SimpleNamespace(nodes=[_FakeNodeDef(_FakeMeta(name="business.a", service=False))])
@@ -327,5 +312,5 @@ def test_leaf_runtime_step_assembly_service_mounts_transport_handoff_node_for_wo
         adapter_registry=None,
     )
 
-    assert handoff_node_name in out.scenario_steps
-    assert registry.values[obs_token] == [handoff_node_name]
+    assert "system.transport.handoff.observability_dispatch" not in out.scenario_steps
+    assert registry.values[obs_token] == ["system.obs.trace_dispatch"]

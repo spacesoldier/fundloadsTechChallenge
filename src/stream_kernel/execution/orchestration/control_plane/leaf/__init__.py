@@ -8,8 +8,10 @@ _EXPORTS = {
     'ControlPlaneLeafApplyConfigNode': 'system_nodes',
     'ControlPlaneLeafDiscoveryRequestNode': 'system_nodes',
     'ControlPlaneLeafSnapshotApplyNode': 'system_nodes',
+    'ControlPlaneLeafStartWorkNode': 'system_nodes',
     'ControlPlaneLeafConfigApplyRuntimeNode': 'system_nodes',
     'ControlPlaneLeafBoundaryExecuteNode': 'system_nodes',
+    'ControlPlaneLeafTombstoneFinalizeNode': 'system_nodes',
     'ControlPlaneLeafStopNode': 'system_nodes',
 }
 

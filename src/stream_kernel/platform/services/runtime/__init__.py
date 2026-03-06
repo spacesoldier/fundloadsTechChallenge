@@ -14,6 +14,7 @@ from stream_kernel.platform.services.runtime.transport import (
 )
 from stream_kernel.platform.services.runtime.process_group_router import (
     InMemoryProcessGroupRouterService,
+    ProcessGroupRouterStore,
     ProcessGroupRouterService,
 )
 from stream_kernel.platform.services.runtime.control_plane_state import (
@@ -88,6 +89,15 @@ from stream_kernel.platform.services.runtime.control_plane_dag_assembly import (
     ControlPlaneDagAssemblyService,
     DefaultControlPlaneDagAssemblyService,
 )
+from stream_kernel.platform.services.runtime.control_plane_shutdown_readiness import (
+    ControlPlaneShutdownReadinessStore,
+    ControlPlaneLeafShutdownReadinessStore,
+    ControlPlaneShutdownReadinessSnapshot,
+    ControlPlaneShutdownReadinessService,
+    ControlPlaneLeafShutdownReadinessService,
+    InMemoryControlPlaneShutdownReadinessService,
+    InMemoryControlPlaneLeafShutdownReadinessService,
+)
 from stream_kernel.platform.services.runtime.async_dispatch_loop import (
     AsyncDispatchLoop,
 )
@@ -101,6 +111,7 @@ __all__ = [
     "IpcLocalRuntimeTransportService",
     "MemoryRuntimeTransportService",
     "InMemoryProcessGroupRouterService",
+    "ProcessGroupRouterStore",
     "ProcessGroupRouterService",
     "RuntimeLifecycleManager",
     "RuntimeTransportService",
@@ -156,4 +167,11 @@ __all__ = [
     "DefaultControlPlaneLaunchPlanService",
     "ControlPlaneDagAssemblyService",
     "DefaultControlPlaneDagAssemblyService",
+    "ControlPlaneShutdownReadinessStore",
+    "ControlPlaneLeafShutdownReadinessStore",
+    "ControlPlaneShutdownReadinessSnapshot",
+    "ControlPlaneShutdownReadinessService",
+    "ControlPlaneLeafShutdownReadinessService",
+    "InMemoryControlPlaneShutdownReadinessService",
+    "InMemoryControlPlaneLeafShutdownReadinessService",
 ]

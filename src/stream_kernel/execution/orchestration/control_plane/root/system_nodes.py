@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from stream_kernel.application_context.inject import inject
+from stream_kernel.execution.transport.handoff.ipc_handoff_dispatch_service import (
+    ExecutionIpcHandoffDispatchService,
+)
+from stream_kernel.observability.domain.logging import LogMessage
 from stream_kernel.kernel.node_annotation import node
 from stream_kernel.platform.services.runtime.control_plane_config_stream import (
     ControlPlaneConfigStreamService,
@@ -40,16 +45,19 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneInitEvent,
     ControlPlaneLaunchPlan,
     ControlPlaneLaunchPlanEvent,
+    ControlPlaneStartWorkEvent,
     ControlPlaneLeafBoundaryExecuteCommand,
     ControlPlaneLeafBoundaryResultEvent,
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafConfigCardEvent,
     ControlPlaneLeafHelloEvent,
+    ControlPlaneLeafStartWorkEvent,
     ControlPlaneLeafStopAckEvent,
     ControlPlaneLeafStopCommand,
     ControlPlaneRootLeafBoundaryExecuteRequestEvent,
     ControlPlaneRootLeafStopRequestEvent,
     ControlPlaneRootPulse,
+    ControlPlaneShutdownReadyEvent,
     ControlPlaneSpawnRequestedEvent,
     NodeConfigRecord,
     ObservabilityConfigRecord,
@@ -57,6 +65,9 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneNodeConfigAppliedEvent,
     ControlPlaneObservabilityConfigAppliedEvent,
     ControlPlaneSystemConfigAppliedEvent,
+)
+from stream_kernel.platform.services.runtime.control_plane_shutdown_readiness import (
+    ControlPlaneShutdownReadinessService,
 )
 from stream_kernel.platform.services.runtime.control_plane_state import (
     ControlPlaneStateService,
@@ -117,6 +128,105 @@ class ControlPlaneInitPlanNode:
             for group in payload.plan.groups
         ]
         return [plan_event, ControlPlaneInitEvent(runtime=payload.runtime), *spawn_events]
+
+
+@node(
+    name="system.cp.start_work_dispatch",
+    consumes=[ControlPlaneStartWorkEvent],
+    emits=[LogMessage],
+)
+@dataclass
+class ControlPlaneStartWorkDispatchNode:
+    state: ControlPlaneStateService = inject.service(ControlPlaneStateService)
+    boundary_execution: object | None = None
+    handoff_dispatch: object | None = None
+
+    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
+        payload = msg.payload if isinstance(msg, Envelope) else msg
+        if not isinstance(payload, ControlPlaneStartWorkEvent):
+            return []
+        if any(isinstance(event, _StartWorkDispatchedMarker) for event in self.state.events()):
+            return []
+        source_targets = tuple(
+            dict.fromkeys(
+                payload.source_targets or _source_node_targets_from_state(self.state.events())
+            )
+        )
+        launch_plan = _latest_launch_plan_from_state(self.state.events())
+        handoff = self._handoff_dispatch()
+        if handoff is not None and launch_plan is not None:
+            requested = set(payload.source_targets) if payload.source_targets else None
+            broadcast_seed = f"start-work:{int(time.time() * 1000)}"
+            total = 0
+            accepted = 0
+            failed = 0
+            failed_workers: list[str] = []
+            for group in launch_plan.groups:
+                group_sources = tuple(
+                    node_name
+                    for node_name in group.nodes
+                    if isinstance(node_name, str) and node_name.startswith("source:")
+                )
+                if requested is not None:
+                    group_sources = tuple(node for node in group_sources if node in requested)
+                if not group_sources:
+                    continue
+                result = handoff.dispatch_broadcast(
+                    Envelope(
+                        payload=ControlPlaneLeafStartWorkEvent(source_targets=group_sources),
+                        target="system.cp.leaf_start_work",
+                    ),
+                    target_group=group.group_name,
+                    include_observability=False,
+                    policy="best_effort",
+                    broadcast_id=f"{broadcast_seed}:{group.group_name}",
+                )
+                self.state.append_event(result)
+                total += int(result.total)
+                accepted += int(result.accepted)
+                failed += int(result.failed)
+                failed_workers.extend(list(result.failed_workers))
+            self.state.append_event(_StartWorkDispatchedMarker(worker_count=max(0, total)))
+            level = "info"
+            if total == 0 or failed > 0:
+                level = "warning"
+            return [
+                LogMessage(
+                    level=level,
+                    message="control-plane start-work broadcast dispatched",
+                    fields={
+                        "event": "control_plane.runtime.start_work_broadcast_dispatched",
+                        "broadcast_id": broadcast_seed,
+                        "policy": "best_effort",
+                        "total": total,
+                        "accepted": accepted,
+                        "failed": failed,
+                        "failed_workers": failed_workers,
+                        "source_targets": list(source_targets),
+                    },
+                )
+            ]
+        self.state.append_event(_StartWorkDispatchedMarker(worker_count=0))
+        return [
+            LogMessage(
+                level="warning",
+                message="control-plane start-work dispatch unavailable",
+                fields={
+                    "event": "control_plane.runtime.start_work_dispatch_unavailable",
+                    "source_targets": list(source_targets),
+                    "launch_plan_available": launch_plan is not None,
+                    "handoff_available": handoff is not None,
+                },
+            )
+        ]
+
+    def _handoff_dispatch(self) -> ExecutionIpcHandoffDispatchService | None:
+        candidate = self.handoff_dispatch
+        if isinstance(candidate, ExecutionIpcHandoffDispatchService):
+            return candidate
+        if callable(getattr(candidate, "dispatch_broadcast", None)):
+            return candidate  # type: ignore[return-value]
+        return None
 
 
 @node(
@@ -463,6 +573,80 @@ class ControlPlaneRootLeafBoundaryResultNode:
         return []
 
 
+@dataclass
+class ControlPlaneRootTombstoneObservedNode:
+    state: ControlPlaneStateService = inject.service(ControlPlaneStateService)
+    shutdown_readiness: ControlPlaneShutdownReadinessService = inject.service(
+        ControlPlaneShutdownReadinessService
+    )
+
+    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
+        payload = msg.payload if isinstance(msg, Envelope) else msg
+        if not isinstance(payload, ControlPlaneLeafBoundaryResultEvent):
+            return []
+        if payload.status.strip().lower() != "completed" or not payload.tombstone_input:
+            return []
+        snapshot = self.shutdown_readiness.observe_tombstone(payload)
+        self.state.append_event(
+            {
+                "kind": "control_plane.shutdown.tombstone_observed",
+                "target_group": payload.target_group,
+                "worker_id": payload.worker_id,
+                "request_id": payload.request_id,
+                "tombstone_output": payload.tombstone_output,
+                "observed_groups": list(snapshot.tombstone_groups),
+                "expected_groups": list(snapshot.expected_groups),
+            }
+        )
+        return []
+
+
+@dataclass
+class ControlPlaneRootLeafDrainReadyNode:
+    state: ControlPlaneStateService = inject.service(ControlPlaneStateService)
+    shutdown_readiness: ControlPlaneShutdownReadinessService = inject.service(
+        ControlPlaneShutdownReadinessService
+    )
+
+    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
+        from stream_kernel.platform.services.runtime.control_plane_events import (
+            ControlPlaneLeafDrainReadyEvent,
+        )
+
+        payload = msg.payload if isinstance(msg, Envelope) else msg
+        if not isinstance(payload, ControlPlaneLeafDrainReadyEvent):
+            return []
+        emit_shutdown, snapshot = self.shutdown_readiness.mark_leaf_ready(payload)
+        self.state.append_event(
+            {
+                "kind": "control_plane.shutdown.leaf_ready",
+                "target_group": payload.target_group,
+                "worker_id": payload.worker_id,
+                "request_id": payload.request_id,
+                "tombstone_output": payload.tombstone_output,
+                "ready_groups": list(snapshot.ready_groups),
+                "missing_groups": list(snapshot.missing_groups),
+            }
+        )
+        if not emit_shutdown:
+            return []
+        event = ControlPlaneShutdownReadyEvent(
+            expected_groups=snapshot.expected_groups,
+            ready_groups=snapshot.ready_groups,
+            tombstone_groups=snapshot.tombstone_groups,
+        )
+        self.state.append_event(event)
+        self.state.append_event(
+            {
+                "kind": "control_plane.shutdown.all_ready",
+                "expected_groups": list(snapshot.expected_groups),
+                "ready_groups": list(snapshot.ready_groups),
+                "tombstone_groups": list(snapshot.tombstone_groups),
+            }
+        )
+        return [event]
+
+
 def resolve_group_specs(
     runtime: dict[str, object],
     *,
@@ -634,6 +818,32 @@ def _launch_plan_signature(plan: ControlPlaneLaunchPlan) -> tuple[tuple[str, int
     )
 
 
+def _source_node_targets_from_state(events: list[object]) -> tuple[str, ...]:
+    for event in reversed(events):
+        if not isinstance(event, ControlPlaneLaunchPlanEvent):
+            continue
+        targets: list[str] = []
+        for group in event.plan.groups:
+            for node_name in group.nodes:
+                if isinstance(node_name, str) and node_name.startswith("source:"):
+                    targets.append(node_name)
+        if targets:
+            return tuple(targets)
+    return ()
+
+
+@dataclass(frozen=True, slots=True)
+class _StartWorkDispatchedMarker:
+    worker_count: int
+
+
+def _latest_launch_plan_from_state(events: list[object]) -> ControlPlaneLaunchPlan | None:
+    for event in reversed(events):
+        if isinstance(event, ControlPlaneLaunchPlanEvent):
+            return event.plan
+    return None
+
+
 __all__ = [
     "ControlPlaneConfigApplyBarrierNode",
     "ControlPlaneDagAssemblyNode",
@@ -641,6 +851,7 @@ __all__ = [
     "ControlPlaneDiscoveryFinalizeNode",
     "ControlPlaneDiscoveryPumpNode",
     "ControlPlaneInitPlanNode",
+    "ControlPlaneStartWorkDispatchNode",
     "ControlPlaneNodeConfigApplyNode",
     "ControlPlaneObservabilityConfigApplyNode",
     "ControlPlaneRootLeafBoundaryDispatchNode",
@@ -651,6 +862,8 @@ __all__ = [
     "ControlPlaneRootLeafConfigAssignNode",
     "ControlPlaneRootLeafStopAckNode",
     "ControlPlaneRootLeafStopDispatchNode",
+    "ControlPlaneRootTombstoneObservedNode",
+    "ControlPlaneRootLeafDrainReadyNode",
     "ControlPlaneRootBootstrapNode",
     "ControlPlaneSystemConfigApplyNode",
 ]

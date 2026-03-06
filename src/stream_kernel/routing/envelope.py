@@ -13,6 +13,7 @@ class Envelope:
     topic: str | None = None
     reply_to: str | None = None
     span_id: str | None = None
+    tombstone: bool = False
 
     def __post_init__(self) -> None:
         # Invariants keep routing deterministic and explicit (Routing semantics §1–§2).
@@ -54,3 +55,5 @@ class Envelope:
                 raise ValueError("Envelope.span_id must be a string")
             if not self.span_id:
                 raise ValueError("Envelope.span_id must not be empty")
+        if not isinstance(self.tombstone, bool):
+            raise ValueError("Envelope.tombstone must be a boolean")

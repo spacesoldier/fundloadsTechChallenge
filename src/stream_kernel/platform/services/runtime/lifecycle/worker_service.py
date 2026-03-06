@@ -8,7 +8,10 @@ from typing import Protocol, runtime_checkable
 from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.service import service
 from stream_kernel.execution.transport.ipc.ipc_transport import (
+    EXECUTION_IPC_LANE_CONTROL,
     ExecutionIpcTransportService,
+    compose_execution_ipc_worker_target_id,
+    execution_ipc_worker_lane_targets,
 )
 from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
 
@@ -80,7 +83,19 @@ class LocalExecutionWorkerLifecycleService(ExecutionWorkerLifecycleService):
             raise ValueError("ExecutionWorkerLifecycleService.spawn_worker requires non-empty target_id")
         if not callable(target):
             raise ValueError("ExecutionWorkerLifecycleService.spawn_worker requires callable target")
-        parent_conn, child_conn = self._ipc().allocate_local_endpoints(target_id)
+        lane_targets = execution_ipc_worker_lane_targets(target_id)
+        parent_conn = None
+        child_lane_endpoints: dict[str, object] = {}
+        for lane_name, lane_target_id in lane_targets.items():
+            lane_parent_conn, lane_child_conn = self._ipc().allocate_local_endpoints(lane_target_id)
+            child_lane_endpoints[lane_name] = lane_child_conn
+            if lane_name == EXECUTION_IPC_LANE_CONTROL:
+                parent_conn = lane_parent_conn
+        if parent_conn is None:
+            parent_conn = self._ipc().allocate_local_endpoints(
+                compose_execution_ipc_worker_target_id(target_id, lane=EXECUTION_IPC_LANE_CONTROL)
+            )[0]
+        child_conn: object = child_lane_endpoints if child_lane_endpoints else None
         if stop_event is None and stop_event_position is not None:
             try:
                 stop_event = self.context.Event()
@@ -197,6 +212,14 @@ class LocalExecutionWorkerLifecycleService(ExecutionWorkerLifecycleService):
 
 
 def _close_pipe(pipe: object) -> None:
+    if isinstance(pipe, dict):
+        for item in pipe.values():
+            _close_pipe(item)
+        return
+    if isinstance(pipe, (list, tuple, set)):
+        for item in pipe:
+            _close_pipe(item)
+        return
     close = getattr(pipe, "close", None)
     if callable(close):
         close()

@@ -76,6 +76,10 @@ Notes:
 - InputSource may be implemented as a generator.
 - The engine should treat it as a single-pass iterator.
 
+Runtime integration rule:
+- adapters with `read()` are wrapped by a pull ingress runtime node (`PullIngressSourceNode`)
+- wrapper is triggered by control messages on routing rails, not by direct transport calls
+
 ---
 
 ## 4. NDJSON File Input adapter (challenge implementation)

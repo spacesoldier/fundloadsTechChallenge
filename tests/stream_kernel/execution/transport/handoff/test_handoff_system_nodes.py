@@ -3,8 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from stream_kernel.execution.transport.handoff.system_nodes import (
+    OBSERVABILITY_LOG_HANDOFF_NODE_NAME,
+    OBSERVABILITY_LOG_HANDOFF_BYPASS_NODE_NAME,
+    OBSERVABILITY_TRACE_HANDOFF_NODE_NAME,
+    OBSERVABILITY_TRACE_HANDOFF_BYPASS_NODE_NAME,
     IpcHandoffDispatchNode,
     IpcObservabilityHandoffDispatchNode,
+    build_transport_observability_handoff_plan,
 )
 from stream_kernel.observability.events import (
     LogDispatchEvent,
@@ -82,3 +87,26 @@ def test_ipc_observability_handoff_dispatch_node_maps_all_supported_dispatch_eve
         "system.obs.metric_dispatch",
         "system.obs.monitor_dispatch",
     ]
+
+
+def test_build_transport_observability_handoff_plan_creates_channel_specific_nodes() -> None:
+    steps, consumers, node_names = build_transport_observability_handoff_plan(
+        enabled_tokens=[TraceDispatchEvent, LogDispatchEvent]
+    )
+
+    assert [step.name for step in steps] == [
+        OBSERVABILITY_TRACE_HANDOFF_BYPASS_NODE_NAME,
+        OBSERVABILITY_TRACE_HANDOFF_NODE_NAME,
+        OBSERVABILITY_LOG_HANDOFF_BYPASS_NODE_NAME,
+        OBSERVABILITY_LOG_HANDOFF_NODE_NAME,
+    ]
+    assert consumers == {
+        TraceDispatchEvent: [OBSERVABILITY_TRACE_HANDOFF_BYPASS_NODE_NAME],
+        LogDispatchEvent: [OBSERVABILITY_LOG_HANDOFF_BYPASS_NODE_NAME],
+    }
+    assert node_names == {
+        OBSERVABILITY_TRACE_HANDOFF_BYPASS_NODE_NAME,
+        OBSERVABILITY_TRACE_HANDOFF_NODE_NAME,
+        OBSERVABILITY_LOG_HANDOFF_BYPASS_NODE_NAME,
+        OBSERVABILITY_LOG_HANDOFF_NODE_NAME,
+    }

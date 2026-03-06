@@ -41,6 +41,19 @@ class RootLifecycleLogFactory(Protocol):
     def runtime_shutdown_worker_finished(self, *, result: ControlPlaneRootShutdownResult) -> LogMessage:
         raise NotImplementedError
 
+    def runtime_shutdown_worker_stopping(
+        self,
+        *,
+        target_group: str,
+        worker_id: str,
+        command_id: str,
+        stop_command_timeout_seconds: float,
+        graceful_timeout_seconds: float,
+        terminate_timeout_seconds: float,
+        is_observability_group: bool,
+    ) -> LogMessage:
+        raise NotImplementedError
+
     def runtime_shutdown_worker_failed(
         self,
         *,
@@ -135,6 +148,33 @@ class DefaultRootLifecycleLogFactory(RootLifecycleLogFactory):
                 "stop_command_timed_out": result.stop_command_timed_out,
                 "worker_stopped": result.worker_stopped,
                 "stop_ack_status": result.stop_ack.status if result.stop_ack is not None else None,
+            },
+        )
+
+    def runtime_shutdown_worker_stopping(
+        self,
+        *,
+        target_group: str,
+        worker_id: str,
+        command_id: str,
+        stop_command_timeout_seconds: float,
+        graceful_timeout_seconds: float,
+        terminate_timeout_seconds: float,
+        is_observability_group: bool,
+    ) -> LogMessage:
+        return LogMessage(
+            level=self.level,
+            message="control-plane runtime shutdown worker stopping",
+            fields={
+                "event": "control_plane.lifecycle.runtime_shutdown_worker_stopping",
+                "process_name": "supervisor",
+                "group_name": target_group,
+                "worker_id": worker_id,
+                "command_id": command_id,
+                "stop_command_timeout_seconds": float(stop_command_timeout_seconds),
+                "graceful_timeout_seconds": float(graceful_timeout_seconds),
+                "terminate_timeout_seconds": float(terminate_timeout_seconds),
+                "is_observability_group": bool(is_observability_group),
             },
         )
 

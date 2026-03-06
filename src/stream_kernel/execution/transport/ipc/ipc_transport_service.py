@@ -17,6 +17,7 @@ from stream_kernel.execution.transport.ipc.ipc_transport import (
     ExecutionIpcPort,
     ExecutionIpcReceivePolicy,
     ExecutionIpcTransportService,
+    decompose_execution_ipc_worker_target_id,
 )
 from stream_kernel.execution.transport.ipc.flow_control import (
     ExecutionIpcFlowControlPolicy,
@@ -49,34 +50,38 @@ class ExecutionIpcTransportCoordinatorService(ExecutionIpcTransportService):
         *,
         no_reply: bool = False,
     ):
+        resolved_target_id = self._resolve_transport_target_id(target_id)
         try:
-            self._ensure_endpoint(target_id)
-            self._flush_pending(target_id)
-            return self._send_now(target_id, payload, no_reply=no_reply)
+            self._ensure_endpoint(resolved_target_id)
+            self._flush_pending(resolved_target_id)
+            return self._send_now(resolved_target_id, payload, no_reply=no_reply)
         except Exception as exc:
-            if self._should_buffer_until_endpoint_ready(target_id=target_id, error=exc):
-                self._enqueue_pending(target_id=target_id, payload=payload, no_reply=no_reply)
+            if self._should_buffer_until_endpoint_ready(target_id=resolved_target_id, error=exc):
+                self._enqueue_pending(target_id=resolved_target_id, payload=payload, no_reply=no_reply)
                 if no_reply:
                     return None
                 return self._buffered_ack(payload)
             raise
 
     def recv(self, target_id: str, *, timeout: float | None = None):
-        self._ensure_endpoint(target_id)
-        self._flush_pending(target_id)
-        return self.adapter.recv(target_id, timeout=timeout)
+        resolved_target_id = self._resolve_transport_target_id(target_id)
+        self._ensure_endpoint(resolved_target_id)
+        self._flush_pending(resolved_target_id)
+        return self.adapter.recv(resolved_target_id, timeout=timeout)
 
     def metrics(self, target_id: str) -> dict[str, object]:
-        data = dict(self.adapter.metrics(target_id))
-        data["pending_outbound"] = self._pending_count(target_id)
+        resolved_target_id = self._resolve_transport_target_id(target_id)
+        data = dict(self.adapter.metrics(resolved_target_id))
+        data["pending_outbound"] = self._pending_count(resolved_target_id)
         return data
 
     def flush_pending(self, target_id: str) -> int:
+        resolved_target_id = self._resolve_transport_target_id(target_id)
         try:
-            self._ensure_endpoint(target_id)
-            return self._flush_pending(target_id)
+            self._ensure_endpoint(resolved_target_id)
+            return self._flush_pending(resolved_target_id)
         except Exception as exc:
-            if self._should_buffer_until_endpoint_ready(target_id=target_id, error=exc):
+            if self._should_buffer_until_endpoint_ready(target_id=resolved_target_id, error=exc):
                 return 0
             raise
 
@@ -131,6 +136,24 @@ class ExecutionIpcTransportCoordinatorService(ExecutionIpcTransportService):
                 target_id,
                 lambda count, _target=target_id: self.flow_control.release(_target, count),
             )
+
+    def _resolve_transport_target_id(self, target_id: str) -> str:
+        if not isinstance(target_id, str) or not target_id:
+            return target_id
+        endpoint_store = self._endpoint_store()
+        if endpoint_store is None:
+            return target_id
+        if endpoint_store.get(target_id) is not None:
+            return target_id
+        resolved = decompose_execution_ipc_worker_target_id(target_id)
+        if resolved is None:
+            return target_id
+        worker_id, lane = resolved
+        if lane == "control":
+            return target_id
+        if endpoint_store.get(worker_id) is not None:
+            return worker_id
+        return target_id
 
     def _ensure_endpoint(self, target_id: str) -> None:
         registry = self._endpoint_store()

@@ -163,9 +163,9 @@ def test_pipe_ipc_send_path_does_not_start_reader_loop() -> None:
     assert adapter._loop_thread is None
 
 
-def test_pipe_ipc_adapter_poll_mode_default_timer() -> None:
+def test_pipe_ipc_adapter_poll_mode_default_reader() -> None:
     adapter = PipeExecutionIpcTransportAdapter()
-    assert adapter._poll_mode == "timer"
+    assert adapter._poll_mode == "reader"
 
 
 def test_pipe_ipc_adapter_ack_signal_is_consumed() -> None:

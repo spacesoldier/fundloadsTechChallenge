@@ -179,6 +179,35 @@ def test_leaf_runtime_activation_service_accepts_system_observability_nodes_with
     assert ack.resolved_nodes == ("system.obs.trace_dispatch", "system.obs.log_dispatch")
 
 
+def test_leaf_runtime_activation_service_accepts_transport_handoff_nodes_without_runtime_metadata() -> None:
+    from stream_kernel.execution.orchestration.lifecycle.leaf.runtime.runtime_activation_service import (
+        DefaultLeafRuntimeActivationService,
+    )
+
+    service = DefaultLeafRuntimeActivationService(
+        discovery=_Discovery(entities=[]),
+        config_store=_ConfigStore(),
+    )
+    session = _session()
+    card = ControlPlaneLeafConfigCardEvent(
+        target_group="execution.ingress",
+        worker_id="execution.ingress#1",
+        config_id="cfg-handoff",
+        run_id="run",
+        scenario_id="scenario",
+        group_name="execution.ingress",
+        nodes=("source:source", "system.transport.handoff.observability_dispatch"),
+        runner_profile="auto",
+    )
+
+    ack = service.apply_config(session=session, card=card)
+
+    assert isinstance(ack, ControlPlaneLeafConfigAckEvent)
+    assert ack.status == "applied"
+    assert ack.error is None
+    assert ack.resolved_nodes == ("source:source", "system.transport.handoff.observability_dispatch")
+
+
 def test_leaf_runtime_activation_service_accepts_logical_suffix_alias() -> None:
     from stream_kernel.execution.orchestration.lifecycle.leaf.runtime.runtime_activation_service import (
         DefaultLeafRuntimeActivationService,

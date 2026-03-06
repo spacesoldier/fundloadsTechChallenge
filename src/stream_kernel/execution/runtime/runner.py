@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import time
 from dataclasses import dataclass, field, replace
+from threading import Event
 from typing import Callable
 
 from stream_kernel.application_context.inject import inject
@@ -26,6 +27,7 @@ from stream_kernel.routing.router import RoutingResult
 from stream_kernel.routing.routing_service import RoutingService
 
 _ORDERED_SINK_MODES = {"completion", "source_seq"}
+_SYNC_IDLE_WAIT = Event()
 
 
 @dataclass(slots=True)
@@ -150,15 +152,16 @@ class SyncRunner:
                         error=exc,
                         state=observer_state,
                     )
-                    self._route_observability_service_outputs(
-                        service_outputs=error_service_outputs,
-                        source_node=node_name,
-                        trace_id=envelope.trace_id,
-                        reply_to=envelope.reply_to,
-                        span_id=self._span_id_from_observer_state(observer_state),
-                        work_queue=work_queue,
-                        router=router,
-                    )
+                self._route_observability_service_outputs(
+                    service_outputs=error_service_outputs,
+                    source_node=node_name,
+                    trace_id=envelope.trace_id,
+                    reply_to=envelope.reply_to,
+                    span_id=self._span_id_from_observer_state(observer_state),
+                    tombstone=envelope.tombstone,
+                    work_queue=work_queue,
+                    router=router,
+                )
                 raise
             # Success path callback after node output materialization.
             produced_span_id = self._span_id_from_observer_state(observer_state)
@@ -177,6 +180,7 @@ class SyncRunner:
                     trace_id=envelope.trace_id,
                     reply_to=envelope.reply_to,
                     span_id=produced_span_id,
+                    tombstone=envelope.tombstone,
                     work_queue=work_queue,
                     router=router,
                 )
@@ -206,6 +210,7 @@ class SyncRunner:
                         trace_id=resolved_trace_id,
                         reply_to=envelope.reply_to,
                         span_id=produced_span_id,
+                        tombstone=bool(envelope.tombstone),
                         work_queue=work_queue,
                         router=router,
                     )
@@ -214,12 +219,14 @@ class SyncRunner:
                 explicit_trace_id = output.trace_id if isinstance(output, Envelope) else None
                 explicit_reply_to = output.reply_to if isinstance(output, Envelope) else None
                 explicit_span_id = output.span_id if isinstance(output, Envelope) else None
+                explicit_tombstone = output.tombstone if isinstance(output, Envelope) else False
                 if self.allow_external_deliveries and isinstance(output, Envelope) and output.target is not None:
                     target_names = (
                         [output.target]
                         if isinstance(output.target, str)
                         else list(output.target)
                     )
+                    downstream_tombstone = bool(explicit_tombstone or envelope.tombstone)
                     for target_name in target_names:
                         envelope_out = Envelope(
                             payload=output.payload,
@@ -227,6 +234,7 @@ class SyncRunner:
                             trace_id=explicit_trace_id or envelope.trace_id,
                             reply_to=explicit_reply_to or envelope.reply_to,
                             span_id=explicit_span_id or produced_span_id,
+                            tombstone=downstream_tombstone,
                         )
                         if self.allow_external_deliveries and target_name not in self.nodes:
                             self._collect_external_delivery(envelope_out)
@@ -243,6 +251,7 @@ class SyncRunner:
                                 trace_id=explicit_trace_id or envelope.trace_id,
                                 reply_to=explicit_reply_to or envelope.reply_to,
                                 span_id=explicit_span_id or produced_span_id,
+                                tombstone=bool(explicit_tombstone or envelope.tombstone),
                             )
                         )
                         continue
@@ -250,6 +259,7 @@ class SyncRunner:
                 downstream_trace_id = explicit_trace_id or envelope.trace_id
                 downstream_reply_to = explicit_reply_to or envelope.reply_to
                 downstream_span_id = explicit_span_id or produced_span_id
+                downstream_tombstone = bool(explicit_tombstone or envelope.tombstone)
                 for target_name, payload in self._local_deliveries(routing_result):
                     envelope_out = Envelope(
                         payload=payload,
@@ -257,6 +267,7 @@ class SyncRunner:
                         trace_id=downstream_trace_id,
                         reply_to=downstream_reply_to,
                         span_id=downstream_span_id,
+                        tombstone=downstream_tombstone,
                     )
                     if self.allow_external_deliveries and target_name not in self.nodes:
                         self._collect_external_delivery(envelope_out)
@@ -391,7 +402,10 @@ class SyncRunner:
 
     @staticmethod
     def _is_observability_system_node(node_name: str) -> bool:
-        return node_name.startswith("system.obs.") or node_name.startswith("system.transport.handoff.")
+        return (
+            node_name.startswith("system.obs.")
+            or node_name.startswith("system.transport.handoff.")
+        )
 
     def __post_init__(self) -> None:
         if self.ordered_sink_mode not in _ORDERED_SINK_MODES:
@@ -416,6 +430,7 @@ class SyncRunner:
         trace_id: str | None,
         reply_to: str | None,
         span_id: str | None,
+        tombstone: bool = False,
         work_queue: QueuePort,
         router: RoutingService,
     ) -> None:
@@ -428,6 +443,7 @@ class SyncRunner:
             explicit_trace_id = output.trace_id if isinstance(output, Envelope) else None
             explicit_reply_to = output.reply_to if isinstance(output, Envelope) else None
             explicit_span_id = output.span_id if isinstance(output, Envelope) else None
+            explicit_tombstone = output.tombstone if isinstance(output, Envelope) else False
             if self.allow_external_deliveries and isinstance(output, Envelope) and output.target is not None:
                 target_names = (
                     [output.target]
@@ -437,6 +453,7 @@ class SyncRunner:
                 downstream_trace_id = explicit_trace_id or trace_id
                 downstream_reply_to = explicit_reply_to or reply_to
                 downstream_span_id = explicit_span_id or span_id
+                downstream_tombstone = bool(explicit_tombstone or tombstone)
                 for target_name in target_names:
                     envelope_out = Envelope(
                         payload=output.payload,
@@ -444,6 +461,7 @@ class SyncRunner:
                         trace_id=downstream_trace_id,
                         reply_to=downstream_reply_to,
                         span_id=downstream_span_id,
+                        tombstone=downstream_tombstone,
                     )
                     if self.allow_external_deliveries and target_name not in self.nodes:
                         self._collect_external_delivery(envelope_out)
@@ -460,6 +478,7 @@ class SyncRunner:
                             trace_id=explicit_trace_id or trace_id,
                             reply_to=explicit_reply_to or reply_to,
                             span_id=explicit_span_id or span_id,
+                            tombstone=bool(explicit_tombstone or tombstone),
                         )
                     )
                     continue
@@ -467,6 +486,7 @@ class SyncRunner:
             downstream_trace_id = explicit_trace_id or trace_id
             downstream_reply_to = explicit_reply_to or reply_to
             downstream_span_id = explicit_span_id or span_id
+            downstream_tombstone = bool(explicit_tombstone or tombstone)
             for target_name, payload in SyncRunner._local_deliveries(routing_result):
                 envelope_out = Envelope(
                     payload=payload,
@@ -474,6 +494,7 @@ class SyncRunner:
                     trace_id=downstream_trace_id,
                     reply_to=downstream_reply_to,
                     span_id=downstream_span_id,
+                    tombstone=downstream_tombstone,
                 )
                 if self.allow_external_deliveries and target_name not in self.nodes:
                     self._collect_external_delivery(envelope_out)
@@ -562,7 +583,7 @@ class SyncRunner:
             wait_fn = getattr(work_queue, "wait_for_item", None)
             if not callable(wait_fn):
                 if poll_timeout > 0:
-                    time.sleep(poll_timeout)
+                    _SYNC_IDLE_WAIT.wait(poll_timeout)
                 continue
             if wait_fn(poll_timeout):
                 idle_deadline = (time.monotonic() + float(idle_timeout_seconds)) if idle_deadline is not None else None
@@ -680,15 +701,16 @@ class AsyncRunner:
                             state=observer_state,
                         )
                     )
-                    self._route_observability_service_outputs(
-                        service_outputs=error_service_outputs,
-                        source_node=node_name,
-                        trace_id=envelope.trace_id,
-                        reply_to=envelope.reply_to,
-                        span_id=SyncRunner._span_id_from_observer_state(observer_state),
-                        work_queue=work_queue,
-                        router=router,
-                    )
+                self._route_observability_service_outputs(
+                    service_outputs=error_service_outputs,
+                    source_node=node_name,
+                    trace_id=envelope.trace_id,
+                    reply_to=envelope.reply_to,
+                    span_id=SyncRunner._span_id_from_observer_state(observer_state),
+                    tombstone=envelope.tombstone,
+                    work_queue=work_queue,
+                    router=router,
+                )
                 raise
             produced_span_id = SyncRunner._span_id_from_observer_state(observer_state)
             if observability_enabled:
@@ -708,6 +730,7 @@ class AsyncRunner:
                     trace_id=envelope.trace_id,
                     reply_to=envelope.reply_to,
                     span_id=produced_span_id,
+                    tombstone=envelope.tombstone,
                     work_queue=work_queue,
                     router=router,
                 )
@@ -735,6 +758,7 @@ class AsyncRunner:
                         trace_id=resolved_trace_id,
                         reply_to=envelope.reply_to,
                         span_id=produced_span_id,
+                        tombstone=bool(envelope.tombstone),
                         work_queue=work_queue,
                         router=router,
                     )
@@ -743,12 +767,14 @@ class AsyncRunner:
                 explicit_trace_id = output.trace_id if isinstance(output, Envelope) else None
                 explicit_reply_to = output.reply_to if isinstance(output, Envelope) else None
                 explicit_span_id = output.span_id if isinstance(output, Envelope) else None
+                explicit_tombstone = output.tombstone if isinstance(output, Envelope) else False
                 if self.allow_external_deliveries and isinstance(output, Envelope) and output.target is not None:
                     target_names = (
                         [output.target]
                         if isinstance(output.target, str)
                         else list(output.target)
                     )
+                    downstream_tombstone = bool(explicit_tombstone or envelope.tombstone)
                     for target_name in target_names:
                         envelope_out = Envelope(
                             payload=output.payload,
@@ -756,6 +782,7 @@ class AsyncRunner:
                             trace_id=explicit_trace_id or envelope.trace_id,
                             reply_to=explicit_reply_to or envelope.reply_to,
                             span_id=explicit_span_id or produced_span_id,
+                            tombstone=downstream_tombstone,
                         )
                         if self.allow_external_deliveries and target_name not in self.nodes:
                             self._collect_external_delivery(envelope_out)
@@ -772,6 +799,7 @@ class AsyncRunner:
                                 trace_id=explicit_trace_id or envelope.trace_id,
                                 reply_to=explicit_reply_to or envelope.reply_to,
                                 span_id=explicit_span_id or produced_span_id,
+                                tombstone=bool(explicit_tombstone or envelope.tombstone),
                             )
                         )
                         continue
@@ -779,6 +807,7 @@ class AsyncRunner:
                 downstream_trace_id = explicit_trace_id or envelope.trace_id
                 downstream_reply_to = explicit_reply_to or envelope.reply_to
                 downstream_span_id = explicit_span_id or produced_span_id
+                downstream_tombstone = bool(explicit_tombstone or envelope.tombstone)
                 for target_name, payload in SyncRunner._local_deliveries(routing_result):
                     envelope_out = Envelope(
                         payload=payload,
@@ -786,6 +815,7 @@ class AsyncRunner:
                         trace_id=downstream_trace_id,
                         reply_to=downstream_reply_to,
                         span_id=downstream_span_id,
+                        tombstone=downstream_tombstone,
                     )
                     if self.allow_external_deliveries and target_name not in self.nodes:
                         self._collect_external_delivery(envelope_out)
@@ -818,17 +848,12 @@ class AsyncRunner:
             now = time.monotonic()
             if idle_deadline is not None and now >= idle_deadline and work_queue.size() == 0:
                 return
-            wait_fn = getattr(work_queue, "wait_for_item", None)
-            if not callable(wait_fn):
-                if poll_timeout > 0:
-                    await asyncio.sleep(poll_timeout)
-                continue
-            if wait_fn(poll_timeout):
-                idle_deadline = (
-                    time.monotonic() + float(idle_timeout_seconds)
-                    if idle_deadline is not None
-                    else None
-                )
+            if poll_timeout > 0:
+                await asyncio.sleep(poll_timeout)
+            else:
+                await asyncio.sleep(0)
+            if idle_deadline is not None and work_queue.size() > 0:
+                idle_deadline = time.monotonic() + float(idle_timeout_seconds)
                 continue
             if idle_deadline is not None and work_queue.size() == 0 and time.monotonic() >= idle_deadline:
                 return
@@ -906,6 +931,7 @@ class AsyncRunner:
         trace_id: str | None,
         reply_to: str | None,
         span_id: str | None,
+        tombstone: bool = False,
         work_queue: QueuePort,
         router: RoutingService,
     ) -> None:
@@ -916,6 +942,7 @@ class AsyncRunner:
             trace_id=trace_id,
             reply_to=reply_to,
             span_id=span_id,
+            tombstone=tombstone,
             work_queue=work_queue,
             router=router,
         )

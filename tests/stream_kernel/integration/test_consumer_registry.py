@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-# ConsumerRegistry contract is documented in docs/framework/initial_stage/Execution runtime and routing integration.md.
+# ConsumerRegistry contract is documented in:
+# docs/framework/initial_stage/Execution runtime and routing integration.md.
 from stream_kernel.integration.consumer_registry import InMemoryConsumerRegistry
+from stream_kernel.integration.kv_store import InMemoryKvStore
 
 
 class X:
@@ -60,3 +62,17 @@ def test_consumer_registry_version_increments_on_register() -> None:
     version = registry.version()
     registry.register(X, ["B"])
     assert registry.version() == version + 1
+
+
+def test_consumer_registry_persists_state_in_kv_store() -> None:
+    # Different registry instances over the same KV store must observe the same state.
+    store = InMemoryKvStore()
+    first = InMemoryConsumerRegistry({X: ["A"]}, store=store)
+    first.register(Y, ["B"])
+
+    second = InMemoryConsumerRegistry(store=store)
+    assert second.get_consumers(X) == ["A"]
+    assert second.get_consumers(Y) == ["B"]
+    assert second.list_tokens() == [X, Y]
+    assert second.has_node("B") is True
+    assert second.version() == 2

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from stream_kernel.observability.domain.logging import LogMessage
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafConfigAckEvent,
+    ControlPlaneLeafStopCommand,
 )
 
 
@@ -56,6 +57,31 @@ class _LogFactory:
     def runtime_shutdown_started(self, *, total_workers: int) -> LogMessage:
         return LogMessage(level="info", message="shutdown started", fields={"total_workers": total_workers})
 
+    def runtime_shutdown_worker_stopping(
+        self,
+        *,
+        target_group: str,
+        worker_id: str,
+        command_id: str,
+        stop_command_timeout_seconds: float,
+        graceful_timeout_seconds: float,
+        terminate_timeout_seconds: float,
+        is_observability_group: bool,
+    ) -> LogMessage:
+        return LogMessage(
+            level="info",
+            message="shutdown worker stopping",
+            fields={
+                "group_name": target_group,
+                "worker_id": worker_id,
+                "command_id": command_id,
+                "stop_command_timeout_seconds": stop_command_timeout_seconds,
+                "graceful_timeout_seconds": graceful_timeout_seconds,
+                "terminate_timeout_seconds": terminate_timeout_seconds,
+                "is_observability_group": is_observability_group,
+            },
+        )
+
     def runtime_shutdown_worker_finished(self, *, result: object) -> LogMessage:
         return LogMessage(level="info", message="shutdown worker finished", fields={"result": str(result)})
 
@@ -65,6 +91,38 @@ class _LogFactory:
             message="shutdown worker failed",
             fields={"group_name": target_group, "worker_id": worker_id, "error": str(error)},
         )
+
+
+@dataclass(slots=True)
+class _HandoffDispatch:
+    calls: list[dict[str, object]] = field(default_factory=list)
+    failed_by_group: dict[str, tuple[str, ...]] = field(default_factory=dict)
+
+    def dispatch_broadcast(
+        self,
+        envelope,
+        *,
+        target_group: str | None = None,
+        include_observability: bool = False,
+        policy: str = "best_effort",
+        broadcast_id: str | None = None,
+    ):
+        _ = (broadcast_id, include_observability, policy)
+        payload = envelope.payload
+        self.calls.append(
+            {
+                "target_group": target_group,
+                "target": envelope.target,
+                "payload": payload,
+            }
+        )
+
+        class _Result:
+            def __init__(self, failed_workers: tuple[str, ...]):
+                self.failed_workers = failed_workers
+
+        failed = self.failed_by_group.get(str(target_group), ())
+        return _Result(failed_workers=failed)
 
 
 def test_control_plane_root_runtime_lifecycle_manager_stops_spawned_workers_via_root_shutdown() -> None:
@@ -112,10 +170,9 @@ def test_control_plane_root_runtime_lifecycle_manager_stops_spawned_workers_via_
     assert all(call["stop_command_timeout_seconds"] == 0.2 for call in shutdown.calls)
     assert all(call["graceful_timeout_seconds"] == 3 for call in shutdown.calls)
     assert all(call["terminate_timeout_seconds"] == 1.25 for call in shutdown.calls)
-    assert len(console.seen) == 3
+    assert len(console.seen) == 5
     assert console.seen[0].message == "shutdown started"
-    assert console.seen[1].message == "shutdown worker finished"
-    assert console.seen[2].message == "shutdown worker finished"
+    assert {msg.message for msg in console.seen} >= {"shutdown worker stopping", "shutdown worker finished"}
     assert console.drained == 1
     assert console.stopped == 1
 
@@ -336,3 +393,89 @@ def test_control_plane_root_runtime_lifecycle_manager_configures_stop_and_fallba
 
     assert manager.stop_command_timeout_seconds == 1.5
     assert manager.root_shutdown.fallback_graceful_timeout_seconds == 2.0
+
+
+def test_control_plane_root_runtime_lifecycle_manager_stops_observability_group_last() -> None:
+    from stream_kernel.execution.orchestration.lifecycle.root.runtime.lifecycle_manager import (
+        ControlPlaneRootRuntimeLifecycleManager,
+    )
+
+    state = _State(
+        _events=[
+            {
+                "kind": "control_plane.lifecycle.worker_spawned",
+                "group_name": "execution.ingress",
+                "worker_id": "execution.ingress#1",
+            },
+            {
+                "kind": "control_plane.lifecycle.worker_spawned",
+                "group_name": "system.observability",
+                "worker_id": "system.observability#1",
+            },
+            {
+                "kind": "control_plane.lifecycle.worker_spawned",
+                "group_name": "execution.egress",
+                "worker_id": "execution.egress#1",
+            },
+            ControlPlaneLeafConfigAckEvent(
+                target_group="system.observability",
+                worker_id="system.observability#1",
+                config_id="cfg-obs-1",
+                status="applied",
+                resolved_nodes=("system.obs.trace_dispatch",),
+            ),
+        ]
+    )
+    shutdown = _RootShutdown()
+    manager = ControlPlaneRootRuntimeLifecycleManager(
+        state=state,
+        root_shutdown=shutdown,
+        log_factory=_LogFactory(),
+        console_dispatch=_ConsoleDispatch(),
+        parallel_shutdown_workers=True,
+    )
+
+    manager.stop(graceful_timeout_seconds=10, drain_inflight=True)
+
+    assert shutdown.calls
+    assert shutdown.calls[-1]["target_group"] == "system.observability"
+
+
+def test_control_plane_root_runtime_lifecycle_manager_uses_broadcast_stop_dispatch_then_waits_ack_only() -> None:
+    from stream_kernel.execution.orchestration.lifecycle.root.runtime.lifecycle_manager import (
+        ControlPlaneRootRuntimeLifecycleManager,
+    )
+
+    state = _State(
+        _events=[
+            {
+                "kind": "control_plane.lifecycle.worker_spawned",
+                "group_name": "execution.alpha",
+                "worker_id": "execution.alpha#1",
+            },
+            {
+                "kind": "control_plane.lifecycle.worker_spawned",
+                "group_name": "execution.beta",
+                "worker_id": "execution.beta#1",
+            },
+        ]
+    )
+    shutdown = _RootShutdown()
+    handoff = _HandoffDispatch()
+    manager = ControlPlaneRootRuntimeLifecycleManager(
+        state=state,
+        root_shutdown=shutdown,
+        handoff_dispatch=handoff,
+        log_factory=_LogFactory(),
+        console_dispatch=_ConsoleDispatch(),
+    )
+
+    manager.stop(graceful_timeout_seconds=1, drain_inflight=True)
+
+    assert len(handoff.calls) == 2
+    assert sorted(call["target_group"] for call in handoff.calls) == ["execution.alpha", "execution.beta"]
+    assert all(call["target"] == "system.cp.leaf_stop" for call in handoff.calls)
+    assert all(isinstance(call["payload"], ControlPlaneLeafStopCommand) for call in handoff.calls)
+    assert all(call["payload"].command_id == "runtime-stop:{worker_id}" for call in handoff.calls)
+    assert sorted(call["worker_id"] for call in shutdown.calls) == ["execution.alpha#1", "execution.beta#1"]
+    assert all(call["dispatch_command"] is False for call in shutdown.calls)

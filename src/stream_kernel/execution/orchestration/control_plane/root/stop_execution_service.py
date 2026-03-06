@@ -8,7 +8,11 @@ from stream_kernel.application_context.service import service
 from stream_kernel.execution.orchestration.control_plane.root.leaf_command_service import (
     ControlPlaneRootLeafCommandService,
 )
-from stream_kernel.execution.transport.ipc.ipc_transport import ExecutionIpcTransportService
+from stream_kernel.execution.transport.ipc.ipc_transport import (
+    EXECUTION_IPC_LANE_CONTROL,
+    ExecutionIpcTransportService,
+    compose_execution_ipc_worker_target_id,
+)
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafStopAckEvent,
     ControlPlaneLeafStopCommand,
@@ -37,6 +41,7 @@ class ControlPlaneRootStopExecutionService(Protocol):
         command_id: str,
         timeout_seconds: float,
         reason: str | None = None,
+        dispatch_command: bool = True,
     ) -> ControlPlaneLeafStopAckEvent:
         raise NotImplementedError
 
@@ -55,6 +60,7 @@ class DefaultControlPlaneRootStopExecutionService(ControlPlaneRootStopExecutionS
         command_id: str,
         timeout_seconds: float,
         reason: str | None = None,
+        dispatch_command: bool = True,
     ) -> ControlPlaneLeafStopAckEvent:
         request = self._commands().make_stop_request(
             target_group=target_group,
@@ -62,13 +68,18 @@ class DefaultControlPlaneRootStopExecutionService(ControlPlaneRootStopExecutionS
             command_id=command_id,
             reason=reason,
         )
-        command = ControlPlaneLeafStopCommand(
-            target_group=request.target_group,
-            worker_id=request.worker_id,
-            command_id=request.command_id,
-            reason=request.reason,
-        )
-        self._ipc().send(worker_id, command, no_reply=True)
+        if bool(dispatch_command):
+            command = ControlPlaneLeafStopCommand(
+                target_group=request.target_group,
+                worker_id=request.worker_id,
+                command_id=request.command_id,
+                reason=request.reason,
+            )
+            self._ipc().send(
+                compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_CONTROL),
+                command,
+                no_reply=True,
+            )
         ack = self._commands().wait_stop_ack(
             target_group=target_group,
             worker_id=worker_id,

@@ -39,6 +39,7 @@ class ControlPlaneRootShutdownService(Protocol):
         graceful_timeout_seconds: float,
         terminate_timeout_seconds: float,
         reason: str | None = None,
+        dispatch_command: bool = True,
     ) -> ControlPlaneRootShutdownResult:
         raise NotImplementedError
 
@@ -60,6 +61,7 @@ class DefaultControlPlaneRootShutdownService(ControlPlaneRootShutdownService):
         graceful_timeout_seconds: float,
         terminate_timeout_seconds: float,
         reason: str | None = None,
+        dispatch_command: bool = True,
     ) -> ControlPlaneRootShutdownResult:
         ack: ControlPlaneLeafStopAckEvent | None = None
         timed_out = False
@@ -71,6 +73,7 @@ class DefaultControlPlaneRootShutdownService(ControlPlaneRootShutdownService):
                 command_id=command_id,
                 timeout_seconds=stop_command_timeout_seconds,
                 reason=reason,
+                dispatch_command=dispatch_command,
             )
         except ControlPlaneRootStopExecutionTimeoutError:
             timed_out = True

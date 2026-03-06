@@ -5,7 +5,12 @@ from dataclasses import dataclass, field
 from stream_kernel.application_context.application_context import ApplicationContext
 from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.service import service
-from stream_kernel.integration.consumer_registry import ConsumerRegistry
+from stream_kernel.integration.consumer_registry import (
+    ConsumerRegistry,
+    ConsumerRegistryStore,
+    InMemoryConsumerRegistry,
+)
+from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
 
 
 @service(name="consumer_registry")
@@ -13,38 +18,38 @@ from stream_kernel.integration.consumer_registry import ConsumerRegistry
 class DiscoveryConsumerRegistry(ConsumerRegistry):
     # Consumer registry service backed by discovered node contracts in ApplicationContext.
     app_context: object = inject.service(ApplicationContext)
-    _map: dict[type, list[str]] = field(default_factory=dict)
-    _node_set: set[str] = field(default_factory=set)
-    _version: int = 0
+    store: object = inject.kv(ConsumerRegistryStore)
+    _delegate: InMemoryConsumerRegistry | None = field(default=None, init=False, repr=False)
     _loaded: bool = False
 
     def get_consumers(self, token: type) -> list[str]:
         self._ensure_loaded()
-        return list(self._map.get(token, []))
+        return self._registry().get_consumers(token)
 
     def has_node(self, name: str) -> bool:
         self._ensure_loaded()
-        return name in self._node_set
+        return self._registry().has_node(name)
 
     def list_tokens(self) -> list[type]:
         self._ensure_loaded()
-        return list(self._map.keys())
+        return self._registry().list_tokens()
 
     def version(self) -> int:
         self._ensure_loaded()
-        return self._version
+        return self._registry().version()
 
     def register(self, token: type, consumers) -> None:
         self._ensure_loaded()
-        self._map[token] = list(consumers)
-        self._node_set = {node for values in self._map.values() for node in values}
-        self._version += 1
+        self._registry().register(token, consumers)
 
     def _ensure_loaded(self) -> None:
         if self._loaded:
             return
+        registry = self._registry()
+        if registry.version() > 0:
+            self._loaded = True
+            return
         ctx = self._context()
-        mapping: dict[type, list[str]] = {}
         for node_def in getattr(ctx, "nodes", []):
             meta = getattr(node_def, "meta", None)
             if meta is None:
@@ -52,10 +57,9 @@ class DiscoveryConsumerRegistry(ConsumerRegistry):
             node_name = getattr(meta, "name", "")
             consumes = getattr(meta, "consumes", [])
             for token in consumes:
-                mapping.setdefault(token, []).append(node_name)
-        self._map = mapping
-        self._node_set = {node for values in mapping.values() for node in values}
-        self._version += 1
+                existing = registry.get_consumers(token)
+                existing.append(node_name)
+                registry.register(token, existing)
         self._loaded = True
 
     def _context(self) -> object:
@@ -64,3 +68,11 @@ class DiscoveryConsumerRegistry(ConsumerRegistry):
         if hasattr(candidate, "nodes"):
             return candidate
         raise ValueError("DiscoveryConsumerRegistry app_context is not resolved via DI")
+
+    def _registry(self) -> InMemoryConsumerRegistry:
+        if isinstance(self._delegate, InMemoryConsumerRegistry):
+            return self._delegate
+        candidate = self.store
+        kv_store = candidate if isinstance(candidate, KVStore) else InMemoryKvStore()
+        self._delegate = InMemoryConsumerRegistry(store=kv_store)
+        return self._delegate

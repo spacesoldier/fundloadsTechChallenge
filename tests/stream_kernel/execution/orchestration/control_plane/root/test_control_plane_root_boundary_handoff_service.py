@@ -332,6 +332,58 @@ def test_root_boundary_handoff_service_does_not_track_observability_inflight_req
     assert service.has_inflight_deliveries() is False
 
 
+def test_root_boundary_handoff_service_keeps_inflight_for_stream_status_until_completed() -> None:
+    from stream_kernel.execution.orchestration.control_plane.root.boundary_handoff_service import (
+        DefaultControlPlaneRootBoundaryHandoffService,
+    )
+
+    state = InMemoryControlPlaneStateService(store=InMemoryKvStore())
+    boundary = _BoundaryExec()
+    router = _ProcessGroupRouter(groups={"remote.node": "execution.alpha"})
+    route_table = InMemoryExecutionIpcRouteTableService(store=InMemoryKvStore())
+
+    service = DefaultControlPlaneRootBoundaryHandoffService(
+        process_group_router=router,
+        root_boundary=boundary,
+        route_table=route_table,
+        state=state,
+        timeout_seconds=1.0,
+    )
+
+    _ = service.drain_external_deliveries(
+        envelopes=[Envelope(payload={"v": 1}, trace_id="t-1", target="remote.node")],
+    )
+    assert service.has_inflight_deliveries() is True
+    assert len(boundary.calls) == 1
+    request_id = str(boundary.calls[0]["request_id"])
+
+    state.append_event(
+        ControlPlaneLeafBoundaryResultEvent(
+            target_group="execution.alpha",
+            worker_id="execution.alpha#1",
+            request_id=request_id,
+            status="stream",
+            outputs=("chunk-1",),
+        )
+    )
+    drained_stream = service.drain_completed_deliveries()
+    assert drained_stream == ["chunk-1"]
+    assert service.has_inflight_deliveries() is True
+
+    state.append_event(
+        ControlPlaneLeafBoundaryResultEvent(
+            target_group="execution.alpha",
+            worker_id="execution.alpha#1",
+            request_id=request_id,
+            status="completed",
+            outputs=("chunk-2",),
+        )
+    )
+    drained_final = service.drain_completed_deliveries()
+    assert drained_final == ["chunk-2"]
+    assert service.has_inflight_deliveries() is False
+
+
 def test_root_boundary_handoff_service_uses_route_table_without_router_call_when_route_exists() -> None:
     from stream_kernel.execution.orchestration.control_plane.root.boundary_handoff_service import (
         DefaultControlPlaneRootBoundaryHandoffService,

@@ -1,17 +1,45 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import copy
+import time
+from dataclasses import dataclass, fields, is_dataclass, replace
+from threading import Event
 from typing import Protocol, runtime_checkable
 
 from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.service import service
-from stream_kernel.execution.transport.ipc.ipc_transport import ExecutionIpcTransportService
+from stream_kernel.execution.transport.ipc.ipc_transport import (
+    ExecutionIpcTransportService,
+    compose_execution_ipc_worker_target_id,
+    decompose_execution_ipc_worker_target_id,
+    resolve_execution_ipc_lane_for_target,
+)
 from stream_kernel.platform.services.runtime import ProcessGroupRouterService
+from stream_kernel.platform.services.runtime.control_plane_events import (
+    ControlPlaneLaunchPlanEvent,
+    ControlPlaneLeafConfigAckEvent,
+    ControlPlaneLeafStopAckEvent,
+)
+from stream_kernel.platform.services.runtime.control_plane_state import (
+    ControlPlaneStateService,
+)
 from stream_kernel.routing.envelope import Envelope
 
 from .ipc_route_table_service import (
     ExecutionIpcRouteTableService,
 )
+
+_RETRY_BACKOFF_WAIT = Event()
+
+
+@dataclass(frozen=True, slots=True)
+class BroadcastDispatchResult:
+    broadcast_id: str
+    policy: str
+    total: int
+    accepted: int
+    failed: int
+    failed_workers: tuple[str, ...] = ()
 
 
 @runtime_checkable
@@ -24,6 +52,17 @@ class ExecutionIpcHandoffDispatchService(Protocol):
     ) -> bool:
         raise NotImplementedError
 
+    def dispatch_broadcast(
+        self,
+        envelope: Envelope,
+        *,
+        target_group: str | None = None,
+        include_observability: bool = False,
+        policy: str = "best_effort",
+        broadcast_id: str | None = None,
+    ) -> BroadcastDispatchResult:
+        raise NotImplementedError
+
 
 @service(name="execution_ipc_handoff_dispatch_service")
 @dataclass(slots=True)
@@ -31,6 +70,9 @@ class DefaultExecutionIpcHandoffDispatchService(ExecutionIpcHandoffDispatchServi
     execution_ipc: ExecutionIpcTransportService = inject.service(ExecutionIpcTransportService)
     process_group_router: ProcessGroupRouterService = inject.service(ProcessGroupRouterService)
     route_table: ExecutionIpcRouteTableService = inject.service(ExecutionIpcRouteTableService)
+    control_plane_state: ControlPlaneStateService = inject.service(ControlPlaneStateService)
+    control_retry_attempts: int = 0
+    control_retry_backoff_seconds: float = 0.01
 
     def dispatch_envelope(
         self,
@@ -49,8 +91,142 @@ class DefaultExecutionIpcHandoffDispatchService(ExecutionIpcHandoffDispatchServi
             )
             target_id = f"{target_group}#1"
             self._route_table().upsert_route(target=target, target_id=target_id)
-        self._ipc().send(target_id, envelope.payload, no_reply=True)
+        lane = resolve_execution_ipc_lane_for_target(target)
+        resolved_target_id = _lane_target_id(target_id=target_id, lane=lane)
+        self._ipc().send(resolved_target_id, envelope.payload, no_reply=True)
         return True
+
+    def dispatch_broadcast(
+        self,
+        envelope: Envelope,
+        *,
+        target_group: str | None = None,
+        include_observability: bool = False,
+        policy: str = "best_effort",
+        broadcast_id: str | None = None,
+    ) -> BroadcastDispatchResult:
+        resolved_policy = _normalize_policy(policy)
+        target = envelope.target
+        lane = resolve_execution_ipc_lane_for_target(target if isinstance(target, str) else None)
+        is_observability_lane = (
+            isinstance(target, str) and target.startswith("system.obs.")
+        )
+        if is_observability_lane:
+            # Observability lane is always best-effort.
+            resolved_policy = "best_effort"
+        worker_ids = self._resolve_live_worker_ids(
+            target_group=target_group,
+            include_observability=include_observability,
+        )
+        bid = _resolve_broadcast_id(broadcast_id=broadcast_id)
+        total = len(worker_ids)
+        if total == 0:
+            return BroadcastDispatchResult(
+                broadcast_id=bid,
+                policy=resolved_policy,
+                total=0,
+                accepted=0,
+                failed=0,
+                failed_workers=(),
+            )
+
+        accepted = 0
+        failed_workers: list[str] = []
+        retry_attempts = 0 if is_observability_lane else max(0, int(self.control_retry_attempts))
+        require_drained_delivery = not is_observability_lane
+        for index, worker_id in enumerate(worker_ids):
+            payload = _copy_payload_with_broadcast_metadata(
+                envelope.payload,
+                broadcast_id=bid,
+                worker_id=worker_id,
+            )
+            lane_target_id = _lane_target_id(target_id=worker_id, lane=lane)
+            sent = self._send_with_retry(
+                target_id=lane_target_id,
+                payload=payload,
+                attempts=retry_attempts,
+                require_drained_delivery=require_drained_delivery,
+            )
+            if sent:
+                accepted += 1
+                continue
+            failed_workers.append(worker_id)
+            if resolved_policy == "all_or_nothing":
+                failed_workers.extend(worker_ids[index + 1 :])
+                break
+
+        failed = len(failed_workers)
+        return BroadcastDispatchResult(
+            broadcast_id=bid,
+            policy=resolved_policy,
+            total=total,
+            accepted=accepted,
+            failed=failed,
+            failed_workers=tuple(failed_workers),
+        )
+
+    def _send_with_retry(
+        self,
+        *,
+        target_id: str,
+        payload: object,
+        attempts: int,
+        require_drained_delivery: bool,
+    ) -> bool:
+        max_attempts = max(1, attempts + 1)
+        for attempt in range(max_attempts):
+            try:
+                self._ipc().send(target_id, payload, no_reply=True)
+                if not require_drained_delivery:
+                    return True
+                if self._has_pending_outbound(target_id):
+                    if attempt + 1 < max_attempts:
+                        _RETRY_BACKOFF_WAIT.wait(max(0.0, float(self.control_retry_backoff_seconds)))
+                    continue
+                return True
+            except Exception:
+                if attempt + 1 < max_attempts:
+                    _RETRY_BACKOFF_WAIT.wait(max(0.0, float(self.control_retry_backoff_seconds)))
+                continue
+        return False
+
+    def _has_pending_outbound(self, target_id: str) -> bool:
+        metrics = getattr(self._ipc(), "metrics", None)
+        if not callable(metrics):
+            return False
+        try:
+            payload = metrics(target_id)
+        except Exception:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        pending = payload.get("pending_outbound", 0)
+        if not isinstance(pending, int):
+            return False
+        return pending > 0
+
+    def _resolve_live_worker_ids(
+        self,
+        *,
+        target_group: str | None,
+        include_observability: bool,
+    ) -> list[str]:
+        events = self._state().events()
+        planned = _planned_worker_ids(events)
+        configured = _configured_worker_ids(events)
+        stopped = _stopped_worker_ids(events)
+        live = configured if configured else planned
+        live -= stopped
+
+        filtered: list[str] = []
+        for worker_id in sorted(live):
+            group = _group_from_worker_id(worker_id)
+            if isinstance(target_group, str) and target_group and group != target_group:
+                continue
+            if not include_observability and group == "system.observability":
+                continue
+            filtered.append(worker_id)
+        return filtered
 
     def _ipc(self) -> ExecutionIpcTransportService:
         candidate = self.execution_ipc
@@ -78,8 +254,113 @@ class DefaultExecutionIpcHandoffDispatchService(ExecutionIpcHandoffDispatchServi
             return candidate  # type: ignore[return-value]
         raise ValueError("ExecutionIpcRouteTableService binding is required")
 
+    def _state(self) -> ControlPlaneStateService:
+        candidate = self.control_plane_state
+        if isinstance(candidate, ControlPlaneStateService):
+            return candidate
+        if callable(getattr(candidate, "events", None)):
+            return candidate  # type: ignore[return-value]
+        raise ValueError("ControlPlaneStateService binding is required")
+
+
+def _normalize_policy(policy: str) -> str:
+    if isinstance(policy, str) and policy.strip().lower() == "all_or_nothing":
+        return "all_or_nothing"
+    return "best_effort"
+
+
+def _resolve_broadcast_id(*, broadcast_id: str | None) -> str:
+    if isinstance(broadcast_id, str) and broadcast_id:
+        return broadcast_id
+    return f"broadcast:{int(time.time() * 1000)}"
+
+
+def _group_from_worker_id(worker_id: str) -> str | None:
+    if not isinstance(worker_id, str) or not worker_id:
+        return None
+    if "#" not in worker_id:
+        return None
+    group, _sep, _suffix = worker_id.partition("#")
+    if not group:
+        return None
+    return group
+
+
+def _planned_worker_ids(events: list[object]) -> set[str]:
+    for event in reversed(events):
+        if not isinstance(event, ControlPlaneLaunchPlanEvent):
+            continue
+        workers: set[str] = set()
+        for group in event.plan.groups:
+            for slot in range(max(1, int(group.workers))):
+                workers.add(f"{group.group_name}#{slot + 1}")
+        return workers
+    return set()
+
+
+def _configured_worker_ids(events: list[object]) -> set[str]:
+    return {
+        event.worker_id
+        for event in events
+        if isinstance(event, ControlPlaneLeafConfigAckEvent)
+        and event.status == "applied"
+        and isinstance(event.worker_id, str)
+        and bool(event.worker_id)
+    }
+
+
+def _stopped_worker_ids(events: list[object]) -> set[str]:
+    return {
+        event.worker_id
+        for event in events
+        if isinstance(event, ControlPlaneLeafStopAckEvent)
+        and isinstance(event.worker_id, str)
+        and bool(event.worker_id)
+    }
+
+
+def _copy_payload_with_broadcast_metadata(
+    payload: object,
+    *,
+    broadcast_id: str,
+    worker_id: str,
+) -> object:
+    cloned = copy.deepcopy(payload)
+    if isinstance(cloned, dict):
+        result = dict(cloned)
+        result.setdefault("broadcast_id", broadcast_id)
+        result.setdefault("worker_id", worker_id)
+        return result
+    if is_dataclass(cloned):
+        dataclass_fields = {item.name for item in fields(cloned)}
+        updates: dict[str, object] = {}
+        if "worker_id" in dataclass_fields:
+            worker = getattr(cloned, "worker_id", None)
+            if isinstance(worker, str):
+                updates["worker_id"] = worker_id
+        if "command_id" in dataclass_fields:
+            command_id = getattr(cloned, "command_id", None)
+            if isinstance(command_id, str) and "{worker_id}" in command_id:
+                updates["command_id"] = command_id.replace("{worker_id}", worker_id)
+        if "broadcast_id" in dataclass_fields:
+            current = getattr(cloned, "broadcast_id", None)
+            if not isinstance(current, str) or not current:
+                updates["broadcast_id"] = broadcast_id
+        if updates:
+            return replace(cloned, **updates)
+    return cloned
+
+
+def _lane_target_id(*, target_id: str, lane: str) -> str:
+    resolved = decompose_execution_ipc_worker_target_id(target_id)
+    if resolved is None:
+        return target_id
+    worker_id, _current_lane = resolved
+    return compose_execution_ipc_worker_target_id(worker_id, lane=lane)
+
 
 __all__ = [
+    "BroadcastDispatchResult",
     "ExecutionIpcHandoffDispatchService",
     "DefaultExecutionIpcHandoffDispatchService",
 ]

@@ -4,6 +4,7 @@ import multiprocessing as mp
 from threading import Event
 
 from stream_kernel.integration.kv_store import InMemoryKvStore
+from stream_kernel.execution.transport.ipc.ipc_transport import EXECUTION_IPC_LANE_CONTROL
 from stream_kernel.platform.services.runtime.lifecycle import (
     ExecutionWorkerHandle,
     LocalExecutionWorkerLifecycleService,
@@ -82,8 +83,10 @@ def test_worker_lifecycle_spawn_injects_stop_event_when_position_provided() -> N
     stop_event = handle.process._args[0]
     child_endpoint = handle.process._args[1]
     assert stop_event is event
-    assert callable(getattr(child_endpoint, "send", None)) or callable(
-        getattr(child_endpoint, "send_bytes", None)
+    assert isinstance(child_endpoint, dict)
+    control_endpoint = child_endpoint.get(EXECUTION_IPC_LANE_CONTROL)
+    assert callable(getattr(control_endpoint, "send", None)) or callable(
+        getattr(control_endpoint, "send_bytes", None)
     )
 
 

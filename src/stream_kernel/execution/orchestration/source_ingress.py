@@ -20,6 +20,8 @@ from stream_kernel.routing.envelope import Envelope
 
 _NO_PAYLOAD = object()
 WEB_INGRESS_LIMITER_QUALIFIER = "web.ingress.default"
+_SUPPORTED_INGRESS_MODES = {"auto", "pull", "push"}
+_PUSH_INGRESS_POLL_METHODS = ("poll", "get_nowait", "recv_nowait")
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,8 +31,8 @@ class BootstrapControl:
 
 
 @dataclass(slots=True)
-class SourceBootstrapNode:
-    # Source adapter wrapper executed inside runner graph.
+class PullIngressSourceNode:
+    # Pull-mode source adapter wrapper executed inside runner graph.
     role: str
     node_name: str
     adapter: object
@@ -40,6 +42,7 @@ class SourceBootstrapNode:
     ingress_limiter: object | None = None
     observability: object | None = None
     ingress_limiter_qualifier: str | None = None
+    emit_tombstone: bool = False
     adapter_binding_marker: object | None = None
     _sequence: int = 0
     _iterator: object | None = None
@@ -107,6 +110,7 @@ class SourceBootstrapNode:
                 trace_id=trace_id,
                 reply_to=reply_to,
                 span_id=span_id,
+                tombstone=bool(self.exhausted and self.emit_tombstone),
             )
         ]
         if not self.exhausted:
@@ -198,6 +202,67 @@ class SourceBootstrapNode:
             self.exhausted = True
             self._next_payload = _NO_PAYLOAD
 
+class PushIngressSourceNode(PullIngressSourceNode):
+    # Push-mode source adapter wrapper. Triggered by control message and polls one item.
+
+    def __call__(self, _msg: object, _ctx: object | None) -> list[Envelope]:
+        raw_item = self._poll_push_item()
+        if raw_item is _NO_PAYLOAD:
+            return []
+
+        self._sequence += 1
+        payload, trace_hint, reply_to, span_id = self._normalize_ingress_item(raw_item)
+        trace_id = trace_hint or f"{self.run_id}:{self.role}:{self._sequence}"
+
+        limiter = self._ingress_limiter()
+        if limiter is not None:
+            limiter_key = reply_to or trace_id
+            allowed = bool(limiter.allow(key=limiter_key))
+            self._emit_limiter_decision(
+                trace_id=trace_id,
+                allowed=allowed,
+            )
+            if not allowed:
+                return [
+                    Envelope(
+                        payload=TerminalEvent(
+                            status="error",
+                            payload={"code": "rate_limited", "status_code": 429},
+                            error="rate_limited",
+                        ),
+                        trace_id=trace_id,
+                        reply_to=reply_to,
+                        span_id=span_id,
+                    )
+                ]
+
+        self._seed_context(
+            trace_id=trace_id,
+            payload=payload,
+            reply_to=reply_to,
+        )
+        self._emit_ingress(
+            trace_id=trace_id,
+            reply_to=reply_to,
+        )
+        return [
+            Envelope(
+                payload=payload,
+                trace_id=trace_id,
+                reply_to=reply_to,
+                span_id=span_id,
+            )
+        ]
+
+    def _poll_push_item(self) -> object:
+        poll = _resolve_push_poll_callable(self.adapter)
+        if poll is None:
+            return _NO_PAYLOAD
+        item = poll()
+        if item is None:
+            return _NO_PAYLOAD
+        return item
+
 
 @dataclass(frozen=True, slots=True)
 class SourceIngressPlan:
@@ -233,13 +298,16 @@ def build_source_ingress_plan(
             continue
         meta = _resolve_adapter_meta(role, adapter_registry=adapter_registry)
         adapter = adapter_instances[role]
-        has_reader = callable(getattr(adapter, "read", None))
-        if not has_reader:
-            continue
         if meta is not None and (meta.consumes or not meta.emits):
             continue
+        ingress_mode = _resolve_ingress_mode(role=role, config=cfg, adapter=adapter)
+        if ingress_mode is None:
+            continue
         node_name = f"source:{role}"
-        source_nodes[node_name] = SourceBootstrapNode(
+        emit_tombstone = cfg.get("emit_tombstone", False)
+        if not isinstance(emit_tombstone, bool):
+            raise ValueError(f"adapter '{role}' emit_tombstone must be a boolean when provided")
+        base_kwargs = dict(
             role=role,
             node_name=node_name,
             adapter=adapter,
@@ -249,11 +317,18 @@ def build_source_ingress_plan(
             ingress_limiter=ingress_limiter,
             observability=observability,
             ingress_limiter_qualifier=limiter_qualifier,
+            emit_tombstone=emit_tombstone,
             adapter_binding_marker=_build_stream_binding_marker(meta),
         )
+        if ingress_mode == "push":
+            source_nodes[node_name] = PushIngressSourceNode(**base_kwargs)
+        else:
+            source_nodes[node_name] = PullIngressSourceNode(**base_kwargs)
         source_consumers.setdefault(BootstrapControl, []).append(node_name)
     if adapters and not source_nodes:
-        raise ValueError("at least one source adapter (consumes=[], emits!=[]) with read() must be configured")
+        raise ValueError(
+            "at least one source adapter (consumes=[], emits!=[]) with read() or push poll method must be configured"
+        )
 
     source_steps = [StepSpec(name=name, step=step) for name, step in source_nodes.items()]
     bootstrap_inputs = [
@@ -273,6 +348,42 @@ def _resolve_adapter_meta(role: str, *, adapter_registry: AdapterRegistry | None
         meta = adapter_registry.get_meta(role, role)
         if meta is not None:
             return meta
+    return None
+
+
+def _resolve_ingress_mode(*, role: str, config: dict[str, object], adapter: object) -> str | None:
+    mode = config.get("ingress_mode", "auto")
+    if not isinstance(mode, str):
+        raise ValueError(f"adapter '{role}' ingress_mode must be a string")
+    normalized = mode.strip().lower()
+    if normalized not in _SUPPORTED_INGRESS_MODES:
+        raise ValueError(
+            f"adapter '{role}' ingress_mode must be one of: {sorted(_SUPPORTED_INGRESS_MODES)}"
+        )
+    has_reader = callable(getattr(adapter, "read", None))
+    has_push_poll = _resolve_push_poll_callable(adapter) is not None
+    if normalized == "pull":
+        if not has_reader:
+            raise ValueError(f"adapter '{role}' ingress_mode='pull' requires read()")
+        return "pull"
+    if normalized == "push":
+        if not has_push_poll:
+            raise ValueError(
+                f"adapter '{role}' ingress_mode='push' requires one of: {', '.join(_PUSH_INGRESS_POLL_METHODS)}"
+            )
+        return "push"
+    if has_reader:
+        return "pull"
+    if has_push_poll:
+        return "push"
+    return None
+
+
+def _resolve_push_poll_callable(adapter: object):
+    for method_name in _PUSH_INGRESS_POLL_METHODS:
+        candidate = getattr(adapter, method_name, None)
+        if callable(candidate):
+            return candidate
     return None
 
 
@@ -343,3 +454,7 @@ def _runtime_has_web_ingress_rate_limit(runtime: dict[str, object] | None) -> bo
         if isinstance(rate_limit, dict):
             return True
     return False
+
+
+# Backward-compatible alias while runtime/tests migrate to explicit pull wrapper naming.
+SourceBootstrapNode = PullIngressSourceNode

@@ -194,3 +194,43 @@ def test_trace_dispatch_node_uses_publish_trace_async_on_async_runner_loop() -> 
 
     asyncio.run(_run())
     assert called_box == ["async"]
+
+
+def test_trace_dispatch_node_uses_emit_trace_event_when_available() -> None:
+    from stream_kernel.execution.orchestration.observability_system_nodes import (
+        TraceDispatchNode,
+    )
+    from stream_kernel.observability.domain.logging import LogMessage
+    from stream_kernel.observability.events import LogDispatchEvent, TraceDispatchEvent
+
+    class _Pipeline:
+        def emit_trace_event(
+            self,
+            *,
+            event: object,
+            trace_id: str | None = None,
+            attributes: dict[str, object] | None = None,
+        ) -> list[object]:
+            _ = (event, trace_id, attributes)
+            return [
+                LogDispatchEvent(
+                    payload=LogMessage(level="error", message="sink-failed"),
+                    trace_id=trace_id,
+                    attributes={"source_node": "system.obs.trace_dispatch"},
+                )
+            ]
+
+        def publish_trace(
+            self,
+            *,
+            event: object,
+            trace_id: str | None = None,
+            attributes: dict[str, object] | None = None,
+        ) -> None:
+            raise AssertionError("publish_trace must not be called when emit_trace_event is available")
+
+    node = TraceDispatchNode(pipeline=_Pipeline())
+    produced = node(TraceDispatchEvent(payload={"span": "n1"}, trace_id="t1"), None)
+    assert isinstance(produced, list)
+    assert len(produced) == 1
+    assert isinstance(produced[0], LogDispatchEvent)

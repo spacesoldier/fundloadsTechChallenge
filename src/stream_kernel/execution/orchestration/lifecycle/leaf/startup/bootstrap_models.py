@@ -65,6 +65,7 @@ class ChildBoundaryInput:
     source_group: str | None = None
     route_hop: int | None = None
     span_id: str | None = None
+    tombstone: bool = False
 
 
 __all__ = [
