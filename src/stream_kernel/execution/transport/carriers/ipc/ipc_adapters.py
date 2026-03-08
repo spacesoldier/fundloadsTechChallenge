@@ -28,6 +28,7 @@ from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
 # The actual pipe endpoints live in ExecutionIpcEndpointRegistry (KV port), not here.
 _REGISTRY_KEY = "ipc.endpoint_registry"
 _BUFFER_PREFIX = "ipc.buffer."
+_SEND_RETRY_WAIT = Event()
 
 
 class InMemoryExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
@@ -186,6 +187,10 @@ class PipeExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
         self._stopping = Event()
         self._ack_handlers: dict[str, Callable[[int], None]] = {}
         self._ack_enabled = False
+        self._sender_buffers: dict[str, _PipeSendBuffer] = {}
+        self._sender_threads: dict[str, Thread] = {}
+        self._writer_last_send: dict[str, float] = {}
+        self._send_retry_backoff_seconds = 0.005
 
     def build_port(
         self,
@@ -227,12 +232,19 @@ class PipeExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
         *,
         no_reply: bool = False,
     ) -> ExecutionIpcAck | None:
-        # Resolve endpoint and push each item. Ack is returned after enqueue.
-        endpoint = self._resolve_endpoint(target_id)
+        # Resolve endpoint and enqueue for background sender.
+        # This keeps caller-side path non-blocking when OS pipe buffers are full.
+        _ = self._resolve_endpoint(target_id)
+        send_buffer = self._ensure_send_buffer(target_id)
+        send_buffer.raise_if_error()
         items = _expand_batch_payload(payload)
         enqueued = 0
         for item in items:
-            endpoint.send(item)
+            # Preserve fail-fast contract for bytes codec: unsupported payloads
+            # must raise from send() instead of surfacing later in async sender.
+            if self._codec.mode == "bytes":
+                self._codec.encode(item)
+            send_buffer.enqueue(item)
             enqueued += 1
         if no_reply:
             return None
@@ -252,7 +264,21 @@ class PipeExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
             on_ack=lambda count: self._handle_ack(target_id, count),
             ack_enabled=self._ack_enabled,
         )
-        payload = buffer.recv(timeout=timeout)
+        payload = buffer.recv(timeout=0.0)
+        if payload is None and timeout is not None and timeout > 0:
+            deadline = _deadline(timeout)
+            while payload is None:
+                remaining = _remaining(deadline)
+                if remaining <= 0:
+                    break
+                _drain_pipe(
+                    endpoint,
+                    buffer,
+                    on_read=lambda: self._touch_reader(target_id),
+                    on_ack=lambda count: self._handle_ack(target_id, count),
+                    ack_enabled=self._ack_enabled,
+                )
+                payload = buffer.recv(timeout=min(remaining, self._poll_interval_seconds))
         if payload is None:
             return None
         return ExecutionIpcMessage(
@@ -262,11 +288,19 @@ class PipeExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
         )
 
     def metrics(self, target_id: str) -> dict[str, object]:
-        # Buffer metrics reflect how much data is waiting to be consumed.
+        # Buffer metrics reflect how much data is waiting to be consumed/sent.
         buffer = self._get_buffer(target_id)
+        send_buffer = self._get_send_buffer(target_id)
+        outbound = (
+            send_buffer.metrics()
+            if send_buffer is not None
+            else {"outbound_queue_depth": 0, "outbound_oldest_age_ms": 0}
+        )
         if buffer is None:
-            return {"queue_depth": 0, "oldest_age_ms": 0}
-        return buffer.metrics()
+            return {"queue_depth": 0, "oldest_age_ms": 0, **outbound}
+        payload = buffer.metrics()
+        payload.update(outbound)
+        return payload
 
     def register_ack_handler(self, target_id: str, handler: Callable[[int], None]) -> None:
         if not callable(handler):
@@ -307,6 +341,55 @@ class PipeExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
             registry = {}
         registry[target_id] = {"codec": self._codec.mode}
         self._kv_store.set(_REGISTRY_KEY, registry)
+
+    def _ensure_send_buffer(self, target_id: str) -> "_PipeSendBuffer":
+        with self._lock:
+            buffer = self._sender_buffers.get(target_id)
+            if buffer is None:
+                buffer = _PipeSendBuffer()
+                self._sender_buffers[target_id] = buffer
+            thread = self._sender_threads.get(target_id)
+            if thread is None or not thread.is_alive():
+                thread = Thread(
+                    target=self._sender_loop,
+                    args=(target_id, buffer),
+                    daemon=True,
+                    name=f"ipc-pipe-send-{target_id}",
+                )
+                self._sender_threads[target_id] = thread
+                thread.start()
+        return buffer
+
+    def _get_send_buffer(self, target_id: str) -> "_PipeSendBuffer" | None:
+        with self._lock:
+            return self._sender_buffers.get(target_id)
+
+    def _sender_loop(self, target_id: str, buffer: "_PipeSendBuffer") -> None:
+        while not self._stopping.is_set():
+            payload = buffer.pop(timeout=0.05)
+            if payload is None:
+                if buffer.is_closed():
+                    break
+                continue
+            while not self._stopping.is_set():
+                try:
+                    endpoint = self._resolve_endpoint(target_id)
+                    endpoint.send(payload)
+                    buffer.clear_error()
+                    self._touch_writer(target_id)
+                    break
+                except ConnectionError:
+                    # Endpoint availability can be transient during lifecycle transitions.
+                    # Keep retrying without poisoning sender health for callers.
+                    buffer.requeue_left(payload)
+                    _SEND_RETRY_WAIT.wait(max(0.0, float(self._send_retry_backoff_seconds)))
+                    break
+                except Exception as exc:
+                    buffer.set_error(exc)
+                    # Requeue payload and retry asynchronously; send() caller stays non-blocking.
+                    buffer.requeue_left(payload)
+                    _SEND_RETRY_WAIT.wait(max(0.0, float(self._send_retry_backoff_seconds)))
+                    break
 
     def _coerce_endpoint(self, endpoint: object, *, target_id: str | None) -> "_PipeEndpoint" | None:
         # Accept both already-wrapped endpoints and raw pipe connections.
@@ -402,6 +485,13 @@ class PipeExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
         # Graceful shutdown for the adapter-owned asyncio loop.
         # Stops periodic polling and terminates the loop thread.
         self._stopping.set()
+        with self._lock:
+            sender_buffers = list(self._sender_buffers.values())
+            sender_threads = list(self._sender_threads.values())
+        for buffer in sender_buffers:
+            buffer.close()
+        for sender in sender_threads:
+            sender.join(timeout=max(0.01, float(self._close_join_timeout_seconds)))
         loop = self._loop
         thread = self._loop_thread
         if loop is not None:
@@ -419,6 +509,9 @@ class PipeExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
             self._reader_fds.clear()
             self._reader_backend.clear()
             self._reader_last_read.clear()
+            self._sender_threads.clear()
+            self._sender_buffers.clear()
+            self._writer_last_send.clear()
 
     def configure_polling(
         self,
@@ -444,6 +537,10 @@ class PipeExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
     def _touch_reader(self, target_id: str) -> None:
         with self._lock:
             self._reader_last_read[target_id] = time.monotonic()
+
+    def _touch_writer(self, target_id: str) -> None:
+        with self._lock:
+            self._writer_last_send[target_id] = time.monotonic()
 
     def _handle_ack(self, target_id: str, count: int) -> None:
         handler = self._ack_handlers.get(target_id)
@@ -659,6 +756,84 @@ class _PipeReceiveBuffer:
             return {
                 "queue_depth": queue_depth,
                 "oldest_age_ms": oldest_age_ms,
+            }
+
+
+class _PipeSendBuffer:
+    # Per-target outbound buffer consumed by a background sender thread.
+    # send() enqueues and returns immediately; the sender performs blocking pipe writes.
+    def __init__(self) -> None:
+        self._queue: deque[object] = deque()
+        self._condition = Condition()
+        self._closed = False
+        self._first_enqueued_at: float | None = None
+        self._last_error: Exception | None = None
+
+    def enqueue(self, payload: object) -> None:
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("ipc outbound buffer is closed")
+            if not self._queue:
+                self._first_enqueued_at = time.monotonic()
+            self._queue.append(payload)
+            self._condition.notify_all()
+
+    def requeue_left(self, payload: object) -> None:
+        with self._condition:
+            if self._closed:
+                return
+            if not self._queue:
+                self._first_enqueued_at = time.monotonic()
+            self._queue.appendleft(payload)
+            self._condition.notify_all()
+
+    def pop(self, *, timeout: float | None = None) -> object | None:
+        deadline = _deadline(timeout)
+        with self._condition:
+            while not self._queue and not self._closed:
+                remaining = _remaining(deadline)
+                if remaining <= 0:
+                    return None
+                self._condition.wait(timeout=remaining)
+            if not self._queue:
+                return None
+            payload = self._queue.popleft()
+            if not self._queue:
+                self._first_enqueued_at = None
+            return payload
+
+    def set_error(self, exc: Exception) -> None:
+        with self._condition:
+            self._last_error = exc
+
+    def clear_error(self) -> None:
+        with self._condition:
+            self._last_error = None
+
+    def raise_if_error(self) -> None:
+        with self._condition:
+            exc = self._last_error
+        if exc is not None:
+            raise ConnectionError("ipc outbound sender is not healthy") from exc
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+
+    def is_closed(self) -> bool:
+        with self._condition:
+            return self._closed
+
+    def metrics(self) -> dict[str, object]:
+        with self._condition:
+            queue_depth = len(self._queue)
+            oldest_age_ms = 0
+            if self._first_enqueued_at is not None:
+                oldest_age_ms = max(0, int((time.monotonic() - self._first_enqueued_at) * 1000))
+            return {
+                "outbound_queue_depth": queue_depth,
+                "outbound_oldest_age_ms": oldest_age_ms,
             }
 
 

@@ -56,11 +56,17 @@ class _Activation:
 
 @dataclass(slots=True)
 class _BoundaryExecution:
-    seen: list[tuple[LeafWorkerRuntimeSession, list[object]]] = field(default_factory=list)
+    seen: list[tuple[LeafWorkerRuntimeSession, list[object], bool]] = field(default_factory=list)
     fail_with: Exception | None = None
 
-    def execute(self, *, session: LeafWorkerRuntimeSession, inputs: list[object]) -> list[object]:
-        self.seen.append((session, list(inputs)))
+    def execute(
+        self,
+        *,
+        session: LeafWorkerRuntimeSession,
+        inputs: list[object],
+        finalize_runtime: bool = False,
+    ) -> list[object]:
+        self.seen.append((session, list(inputs), bool(finalize_runtime)))
         if self.fail_with is not None:
             raise self.fail_with
         return ["ok"]
@@ -106,13 +112,50 @@ def test_leaf_boundary_execute_node_emits_result_when_finalize_true() -> None:
 
     produced = node(command, {"__leaf_session": session})
 
-    assert boundary.seen == [(session, [{"payload": 1}])]
+    assert boundary.seen == [(session, [{"payload": 1}], True)]
     assert len(produced) == 1
     event = produced[0]
     assert isinstance(event, ControlPlaneLeafBoundaryResultEvent)
     assert event.request_id == "req-1"
     assert event.status == "completed"
     assert event.outputs == ("ok",)
+
+
+def test_leaf_boundary_execute_node_marks_tombstone_flags() -> None:
+    class _BoundaryWithTombstone:
+        def execute(
+            self,
+            *,
+            session: LeafWorkerRuntimeSession,
+            inputs: list[object],
+            finalize_runtime: bool = False,
+        ) -> list[object]:
+            _ = session
+            _ = inputs
+            _ = finalize_runtime
+            return [Envelope(payload={"kind": "x"}, target="system.obs.trace_dispatch", tombstone=True)]
+
+    boundary = _BoundaryWithTombstone()
+    node = ControlPlaneLeafBoundaryExecuteNode(boundary_execution=boundary)
+    session = _session()
+    command = ControlPlaneLeafBoundaryExecuteCommand(
+        target_group="execution.alpha",
+        worker_id="execution.alpha#1",
+        request_id="req-tombstone",
+        inputs=({"payload": 1, "tombstone": True},),
+        finalize=True,
+    )
+
+    produced = node(command, {"__leaf_session": session})
+
+    assert len(produced) == 1
+    event = produced[0]
+    assert isinstance(event, ControlPlaneLeafBoundaryResultEvent)
+    assert event.tombstone_input is True
+    assert event.tombstone_output is True
+    assert len(event.outputs) == 1
+    assert isinstance(event.outputs[0], Envelope)
+    assert event.outputs[0].tombstone is True
 
 
 def test_leaf_boundary_execute_node_drops_reply_when_finalize_false() -> None:
@@ -129,7 +172,7 @@ def test_leaf_boundary_execute_node_drops_reply_when_finalize_false() -> None:
 
     produced = node(command, {"__leaf_session": session})
 
-    assert boundary.seen == [(session, [{"payload": 2}])]
+    assert boundary.seen == [(session, [{"payload": 2}], False)]
     assert produced == []
 
 

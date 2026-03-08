@@ -38,6 +38,7 @@ _LEAF_NODE_EXPORTS = {
     "ControlPlaneLeafStartWorkNode",
     "ControlPlaneLeafBoundaryExecuteNode",
     "ControlPlaneLeafTombstoneFinalizeNode",
+    "ControlPlaneLeafShutdownPrepareNode",
     "ControlPlaneLeafBootstrapNode",
     "ControlPlaneLeafConfigApplyRuntimeNode",
     "ControlPlaneLeafStopNode",

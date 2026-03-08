@@ -110,8 +110,6 @@ runtime:
       drain_inflight: true
     execution_ipc:
       transport: ipc_local
-      bind_host: 127.0.0.1
-      bind_port: 0
       flow_control:
         mode: none
       auth:

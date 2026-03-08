@@ -37,10 +37,14 @@ def select_group_planning_steps(
         return dict(scenario_steps)
     # Framework-internal rails must stay available in every worker group.
     # - system.obs.*: observability dispatch sinks
+    # - system.debug.*: runtime debug sinks
     # - system.transport.handoff.*: observability transport relay/handoff nodes
     # - system.cp.leaf_start_work: control-plane start signal -> local source bootstrap
     for node_name in scenario_steps:
         if node_name.startswith("system.obs."):
+            selected_nodes.add(node_name)
+            continue
+        if node_name.startswith("system.debug."):
             selected_nodes.add(node_name)
             continue
         if node_name.startswith("system.transport.handoff."):

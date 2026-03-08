@@ -53,3 +53,10 @@ class WorkerQueueTelemetryEvent:
     inflight: int
     runner_profile: str
     ts_epoch_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class DebugDispatchEvent:
+    payload: object
+    trace_id: str | None = None
+    attributes: dict[str, object] = field(default_factory=dict)

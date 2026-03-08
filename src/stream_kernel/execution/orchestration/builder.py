@@ -38,6 +38,9 @@ from stream_kernel.execution.orchestration.lifecycle.root.startup.planning impor
 from stream_kernel.execution.orchestration.observability_system_nodes import (
     build_observability_system_plan,
 )
+from stream_kernel.execution.orchestration.debug_system_nodes import (
+    build_debug_system_plan,
+)
 from stream_kernel.execution.orchestration.runtime import (
     assemble_runtime_startup_scenario,
     prepare_process_supervisor_root_runtime,
@@ -61,8 +64,13 @@ from stream_kernel.execution.transport.handoff.runtime_wiring import (
     resolve_execution_ipc_adapter_from_adapters as resolve_execution_ipc_adapter_from_adapters_via_transport,
 )
 from stream_kernel.execution.transport.ipc.ipc_transport import (
+    ExecutionIpcEndpointRegistry,
     ExecutionIpcKvStreamPort,
     ExecutionIpcTransportService,
+)
+from stream_kernel.execution.transport.ipc.ipc_transport_service import (
+    ExecutionIpcTransportCoordinatorService,
+    InMemoryExecutionIpcTransportAdapter,
 )
 from stream_kernel.execution.transport.secure_tcp_transport import (
     SecureTcpConfig,
@@ -93,6 +101,7 @@ from stream_kernel.platform.services.observability import (
 from stream_kernel.platform.services.observability_dispatch import (
     DispatchingObservabilityService,
 )
+from stream_kernel.observability.domain.debug import DebugMessage
 from stream_kernel.platform.services.messaging.reply_waiter import (
     ReplyWaiterRegistryStore,
 )
@@ -112,6 +121,10 @@ from stream_kernel.platform.services.runtime.transport import (
     MemoryRuntimeTransportService,
     RuntimeTransportService,
     TcpLocalRuntimeTransportService,
+)
+from stream_kernel.platform.services.runtime.debug_buffer import (
+    InMemoryRuntimeDebugBufferService,
+    RuntimeDebugBufferService,
 )
 from stream_kernel.routing.envelope import Envelope
 
@@ -422,6 +435,18 @@ def build_runtime_artifacts(
         existing = list(get_consumers(token))
         register(token, [*existing, *node_names])
 
+    debug_system = build_debug_system_plan(
+        runtime=runtime,
+        scenario_scope=scenario_scope,
+    )
+    for token, node_names in debug_system.system_consumers.items():
+        get_consumers = getattr(consumer_registry, "get_consumers", None)
+        register = getattr(consumer_registry, "register", None)
+        if not callable(get_consumers) or not callable(register):
+            continue
+        existing = list(get_consumers(token))
+        register(token, [*existing, *node_names])
+
     control_plane_system = build_control_plane_system_plan(
         runtime=runtime,
         scenario_scope=scenario_scope,
@@ -453,7 +478,7 @@ def build_runtime_artifacts(
         source_steps=list(source_ingress.source_steps),
         control_plane_steps=list(control_plane_system.system_steps),
         lifecycle_steps=list(lifecycle_system.system_steps),
-        observability_steps=list(observability_system.system_steps),
+        observability_steps=[*list(observability_system.system_steps), *list(debug_system.system_steps)],
         sink_steps=sink_steps,
         source_inputs=list(source_ingress.bootstrap_inputs),
     )
@@ -473,7 +498,8 @@ def build_runtime_artifacts(
         | set(source_ingress.source_node_names)
         | set(control_plane_system.system_node_names)
         | set(lifecycle_system.system_node_names)
-        | set(observability_system.system_node_names),
+        | set(observability_system.system_node_names)
+        | set(debug_system.system_node_names),
         adapter_registry=adapter_registry,
         injection_registry=injection_registry,
         consumer_registry=consumer_registry,
@@ -493,18 +519,22 @@ def ensure_runtime_observability_binding(
 ) -> None:
     # Bind platform observability service to dispatch-first implementation for this run.
     requires_async = _sinks_require_async_dispatch(adapter_instances)
-    trace_sinks, log_sinks, telemetry_sinks, monitoring_sinks = _split_observability_sinks(adapter_instances)
+    trace_sinks, log_sinks, telemetry_sinks, monitoring_sinks, debug_sinks = _split_observability_sinks(
+        adapter_instances
+    )
     factory = (
         lambda _runtime=dict(runtime),
         _trace=list(trace_sinks),
         _log=list(log_sinks),
         _telemetry=list(telemetry_sinks),
-        _monitoring=list(monitoring_sinks): DispatchingObservabilityService(
+        _monitoring=list(monitoring_sinks),
+        _debug=list(debug_sinks): DispatchingObservabilityService(
             runtime=dict(_runtime),
             trace_sinks=list(_trace),
             log_sinks=list(_log),
             telemetry_sinks=list(_telemetry),
             monitoring_sinks=list(_monitoring),
+            debug_sinks=list(_debug),
         )
     )
     for contract in (ObservabilityService, ObservabilityPipelineService):
@@ -514,6 +544,14 @@ def ensure_runtime_observability_binding(
             factory,
             is_async=requires_async,
             replace=replace,
+        )
+    if debug_sinks:
+        injection_registry.register_factory(
+            "stream",
+            DebugMessage,
+            lambda _sink=_fanout_stream_sink(debug_sinks): _sink,
+            is_async=True,
+            replace=True,
         )
 
 
@@ -557,11 +595,12 @@ def _sinks_require_async_dispatch(adapter_instances: dict[str, object]) -> bool:
 
 def _split_observability_sinks(
     adapter_instances: dict[str, object],
-) -> tuple[list[object], list[object], list[object], list[object]]:
+) -> tuple[list[object], list[object], list[object], list[object], list[object]]:
     trace_sinks: list[object] = []
     log_sinks: list[object] = []
     telemetry_sinks: list[object] = []
     monitoring_sinks: list[object] = []
+    debug_sinks: list[object] = []
     seen: set[int] = set()
     for role, candidate in adapter_instances.items():
         if not isinstance(role, str):
@@ -577,6 +616,10 @@ def _split_observability_sinks(
             log_sinks.append(candidate)
             seen.add(marker)
             continue
+        if role.startswith("debug_"):
+            debug_sinks.append(candidate)
+            seen.add(marker)
+            continue
         if role.startswith("telemetry_"):
             telemetry_sinks.append(candidate)
             seen.add(marker)
@@ -585,7 +628,42 @@ def _split_observability_sinks(
             monitoring_sinks.append(candidate)
             seen.add(marker)
             continue
-    return trace_sinks, log_sinks, telemetry_sinks, monitoring_sinks
+    return trace_sinks, log_sinks, telemetry_sinks, monitoring_sinks, debug_sinks
+
+
+def _fanout_stream_sink(sinks: list[object]) -> object:
+    class _FanoutStreamSink:
+        def __init__(self, targets: list[object]) -> None:
+            self._targets = list(targets)
+
+        def emit(self, payload: object) -> None:
+            for sink in self._targets:
+                emit = getattr(sink, "emit", None)
+                if callable(emit):
+                    try:
+                        emit(payload)
+                    except Exception:
+                        continue
+
+        async def emit_async(self, payload: object) -> None:
+            for sink in self._targets:
+                emit_async = getattr(sink, "emit_async", None)
+                if callable(emit_async):
+                    try:
+                        result = emit_async(payload)
+                        if hasattr(result, "__await__"):
+                            await result
+                        continue
+                    except Exception:
+                        continue
+                emit = getattr(sink, "emit", None)
+                if callable(emit):
+                    try:
+                        emit(payload)
+                    except Exception:
+                        continue
+
+    return _FanoutStreamSink(sinks)
 
 
 @dataclass(slots=True)
@@ -1138,6 +1216,64 @@ def ensure_runtime_registry_bindings(
         )
     except InjectionRegistryError:
         pass
+    try:
+        injection_registry.register_factory(
+            "service",
+            RuntimeDebugBufferService,
+            lambda: InMemoryRuntimeDebugBufferService(),
+        )
+    except InjectionRegistryError:
+        pass
+    try:
+        injection_registry.register_factory(
+            "stream",
+            DebugMessage,
+            lambda: _NoOpDebugStreamSink(),
+            is_async=True,
+        )
+    except InjectionRegistryError:
+        pass
+    fallback_endpoint_registry = InMemoryKvStore()
+    fallback_ipc_transport = ExecutionIpcTransportCoordinatorService(
+        adapter=InMemoryExecutionIpcTransportAdapter(),
+        endpoint_registry=fallback_endpoint_registry,
+    )
+    try:
+        injection_registry.register_factory(
+            "kv",
+            ExecutionIpcEndpointRegistry,
+            lambda _store=fallback_endpoint_registry: _store,
+        )
+    except InjectionRegistryError:
+        pass
+    try:
+        injection_registry.register_factory(
+            "service",
+            ExecutionIpcTransportService,
+            lambda _service=fallback_ipc_transport: _service,
+        )
+    except InjectionRegistryError:
+        pass
+    default_platform_discovery_adapter = platform_discovery_source_adapter({})
+    default_project_discovery_adapter = project_discovery_source_adapter({"project_modules": []})
+    try:
+        injection_registry.register_factory(
+            "service",
+            ControlPlaneDiscoverySourceAdapter,
+            lambda _adapter=default_platform_discovery_adapter: _adapter,
+            qualifier="platform_discovery_source_adapter",
+        )
+    except InjectionRegistryError:
+        pass
+    try:
+        injection_registry.register_factory(
+            "service",
+            ControlPlaneDiscoverySourceAdapter,
+            lambda _adapter=default_project_discovery_adapter: _adapter,
+            qualifier="project_discovery_source_adapter",
+        )
+    except InjectionRegistryError:
+        pass
 
     if consumer_registry is None:
         injection_registry.register_factory(
@@ -1170,6 +1306,14 @@ def _resolve_consumer_registry_store(consumer_registry: ConsumerRegistry) -> KVS
         if isinstance(candidate, KVStore):
             return candidate
     return InMemoryKvStore()
+
+
+class _NoOpDebugStreamSink:
+    def emit(self, payload: object) -> None:
+        _ = payload
+
+    async def emit_async(self, payload: object) -> None:
+        _ = payload
 
 
 def ensure_runtime_control_plane_discovery_bindings(
@@ -1210,6 +1354,7 @@ def ensure_runtime_control_plane_discovery_bindings(
                 ControlPlaneDiscoverySourceAdapter,
                 lambda _adapter=adapter: _adapter,
                 qualifier=qualifier,
+                replace=True,
             )
         except InjectionRegistryError:
             continue
@@ -1514,6 +1659,7 @@ def build_runtime_observability_adapter_instances(
             "jsonl": "log_jsonl",
             "file_plain": "log_file_plain",
             "otel_logs_otlp": "log_otel_otlp",
+            "redis_debug": "log_redis_debug",
         },
         "monitoring": {
             "stdout": "monitoring_stdout",
@@ -1525,6 +1671,13 @@ def build_runtime_observability_adapter_instances(
     observability = runtime.get("observability", {})
     if not isinstance(observability, dict):
         return built
+    built.update(
+        _build_runtime_debug_exporter_adapters(
+            observability=observability,
+            registry=registry,
+            strict=strict,
+        )
+    )
     service_process_cfg = observability.get("service_process")
     service_process_enabled = False
     if isinstance(service_process_cfg, dict) and service_process_cfg:
@@ -1549,7 +1702,7 @@ def build_runtime_observability_adapter_instances(
 
     if bootstrap_mode == "process_supervisor" and service_process_enabled and not is_observability_worker:
         # Dedicated observability process owns all exporter adapters.
-        # Supervisor (and non-owner roles) must stay transport-only at adapter materialization stage.
+        # Supervisor (and non-owner roles) stay transport-only, except local runtime debug sink.
         return built
 
     for channel, alias_map in kind_to_alias.items():
@@ -1584,6 +1737,9 @@ def build_runtime_observability_adapter_instances(
                         f"runtime.observability.{channel}.exporters[{index}] kind '{kind}' is not supported"
                     )
                 continue
+            indexed_key = f"{alias}#{index}"
+            if indexed_key in built:
+                continue
             settings = exporter.get("settings", {})
             settings_for_build = dict(settings) if isinstance(settings, dict) else {}
             if channel == "tracing" and kind in {"otel_otlp", "otel_otlp_logical", "otel_otlp_topology"}:
@@ -1617,10 +1773,62 @@ def build_runtime_observability_adapter_instances(
                     ) from exc
                 continue
 
-            indexed_key = f"{alias}#{index}"
             built[indexed_key] = instance
             if alias not in existing and alias not in built:
                 built[alias] = instance
+    return built
+
+
+def _build_runtime_debug_exporter_adapters(
+    *,
+    observability: dict[str, object],
+    registry: AdapterRegistry,
+    strict: bool,
+) -> dict[str, object]:
+    built: dict[str, object] = {}
+    logging_cfg = observability.get("logging", {})
+    if not isinstance(logging_cfg, dict):
+        return built
+    exporters = logging_cfg.get("exporters", [])
+    if not isinstance(exporters, list):
+        return built
+    for index, exporter in enumerate(exporters):
+        if not isinstance(exporter, dict):
+            continue
+        if exporter.get("enabled") is False:
+            continue
+        if exporter.get("kind") != "redis_debug":
+            continue
+        settings = exporter.get("settings", {})
+        settings_for_build = dict(settings) if isinstance(settings, dict) else {}
+        instance = None
+        built_role = ""
+        build_errors: list[str] = []
+        for role, kind in (("debug_redis", "debug_redis"), ("log_redis_debug", "log_redis_debug")):
+            try:
+                instance = registry.build(role, {"kind": kind, "settings": settings_for_build})
+                built_role = role
+                break
+            except Exception as exc:
+                build_errors.append(f"{role}: {exc}")
+                continue
+        if instance is None:
+            if strict:
+                detail = "; ".join(error.strip() for error in build_errors if error.strip())
+                suffix = f": {detail}" if detail else ""
+                raise ValueError(
+                    "runtime.observability.logging.exporters"
+                    f"[{index}] failed to build adapter 'debug_redis'{suffix}"
+                )
+            continue
+        indexed_key = f"debug_redis#{index}"
+        built[indexed_key] = instance
+        if "debug_redis" not in built:
+            built["debug_redis"] = instance
+        if built_role == "log_redis_debug":
+            fallback_key = f"log_redis_debug#{index}"
+            built.setdefault(fallback_key, instance)
+            built.setdefault("log_redis_debug", instance)
     return built
 
 

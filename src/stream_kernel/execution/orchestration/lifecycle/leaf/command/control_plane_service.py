@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+import os
 import time
 from threading import Event
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -13,6 +14,7 @@ from stream_kernel.execution.orchestration.lifecycle.leaf.command.control_ingres
 )
 from stream_kernel.execution.orchestration.lifecycle.leaf.debug_logging import (
     configure_leaf_debug_logging,
+    flush_leaf_debug_logging,
     leaf_debug_log,
 )
 from stream_kernel.execution.transport.ipc.ipc_transport import (
@@ -165,6 +167,10 @@ class DefaultLeafProcessEntryOrchestrationService(LeafProcessEntryOrchestrationS
                 event="leaf.orchestrator.ingress_loop.error",
                 worker_id=worker_id,
             )
+            try:
+                flush_leaf_debug_logging()
+            except Exception:
+                pass
             return
 
 
@@ -194,6 +200,8 @@ def leaf_worker_process_entry(
     pipe_codec_mode: str,
 ) -> None:
     _ = (boundary_control_poll_seconds, pipe_codec_mode)
+    os.environ["STREAM_KERNEL_PROCESS_GROUP"] = group_name
+    os.environ["STREAM_KERNEL_WORKER_ID"] = worker_id
     initial_runtime = getattr(bundle, "runtime", None)
     configure_leaf_debug_logging(
         runtime=initial_runtime if isinstance(initial_runtime, dict) else None,
@@ -254,6 +262,10 @@ def leaf_worker_process_entry(
         worker_id=worker_id,
         group_name=group_name,
     )
+    try:
+        flush_leaf_debug_logging()
+    except Exception:
+        pass
 
 
 def _resolve_execution_ipc_service(

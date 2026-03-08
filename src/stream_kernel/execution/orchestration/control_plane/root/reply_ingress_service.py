@@ -39,6 +39,7 @@ from stream_kernel.execution.transport.ipc.ipc_transport import (
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafBoundaryResultEvent,
     ControlPlaneLeafDrainReadyEvent,
+    ControlPlaneLeafShutdownPrepareCommand,
     ControlPlaneLeafDiscoveryAckEvent,
     ControlPlaneLeafDiscoveryRequestEvent,
     ControlPlaneLeafDiscoverySnapshotEvent,
@@ -55,6 +56,7 @@ from stream_kernel.platform.services.runtime.control_plane_state import (
 )
 from stream_kernel.observability.domain.logging import LogMessage
 from stream_kernel.observability.events import (
+    DebugDispatchEvent,
     LogDispatchEvent,
     MetricDispatchEvent,
     MonitorDispatchEvent,
@@ -79,9 +81,6 @@ class ControlPlaneRootReplyIngressService(Protocol):
     def configure_startup_protocol_revision(self, revision: int) -> None:
         raise NotImplementedError
 
-    def configure_discovery_request_fallback(self, enabled: bool) -> None:
-        raise NotImplementedError
-
     def configure_verbose_logging(self, enabled: bool) -> None:
         raise NotImplementedError
 
@@ -96,16 +95,12 @@ class DefaultControlPlaneRootReplyIngressService(ControlPlaneRootReplyIngressSer
     snapshot_builder: object | None = inject.service(ControlPlaneRootDiscoverySnapshotService)
     root_console_dispatch: object | None = inject.service(RootConsoleLogDispatchService)
     startup_protocol_revision: int = 1
-    discovery_request_fallback_enabled: bool = False
     verbose_logging: bool = False
 
     def configure_startup_protocol_revision(self, revision: int) -> None:
         if not isinstance(revision, int):
             return
         self.startup_protocol_revision = max(1, int(revision))
-
-    def configure_discovery_request_fallback(self, enabled: bool) -> None:
-        self.discovery_request_fallback_enabled = bool(enabled)
 
     def configure_verbose_logging(self, enabled: bool) -> None:
         self.verbose_logging = bool(enabled)
@@ -161,8 +156,26 @@ class DefaultControlPlaneRootReplyIngressService(ControlPlaneRootReplyIngressSer
                             no_reply=True,
                         )
                         return True
-                    if not self.discovery_request_fallback_enabled:
-                        return True
+                    self._state().append_event(
+                        ControlPlaneLeafConfigAckEvent(
+                            target_group=payload.target_group,
+                            worker_id=payload.worker_id,
+                            config_id=f"{payload.worker_id}:cfg:snapshot-missing",
+                            status="rejected",
+                            error="discovery snapshot unavailable",
+                        )
+                    )
+                    self._emit_debug_log(
+                        level="error",
+                        message="control-plane discovery snapshot unavailable for leaf hello",
+                        fields={
+                            "event": "control_plane.reply_ingress.discovery_snapshot_unavailable",
+                            "worker_id": payload.worker_id,
+                            "target_group": payload.target_group,
+                            "startup_protocol_revision": self.startup_protocol_revision,
+                        },
+                    )
+                    return True
                 request = self._build_discovery_request(payload)
                 if request is not None:
                     self._state().append_event(request)
@@ -250,6 +263,25 @@ class DefaultControlPlaneRootReplyIngressService(ControlPlaneRootReplyIngressSer
             self._root_boundary_result_node()(payload, None)
             for event in self._root_tombstone_observed_node()(payload, None):
                 self._state().append_event(event)
+                if isinstance(event, ControlPlaneLeafShutdownPrepareCommand):
+                    self._ipc().send(
+                        compose_execution_ipc_worker_target_id(
+                            event.worker_id,
+                            lane=EXECUTION_IPC_LANE_CONTROL,
+                        ),
+                        event,
+                        no_reply=True,
+                    )
+                    self._emit_debug_log(
+                        level="debug",
+                        message="control-plane shutdown prepare dispatched",
+                        fields={
+                            "event": "control_plane.reply_ingress.shutdown_prepare_dispatched",
+                            "worker_id": event.worker_id,
+                            "target_group": event.target_group,
+                            "command_id": event.command_id,
+                        },
+                    )
             self._dispatch_leaf_boundary_outputs(payload)
             return True
         return False
@@ -292,7 +324,7 @@ class DefaultControlPlaneRootReplyIngressService(ControlPlaneRootReplyIngressSer
             )
             return
         if not isinstance(payload.outputs, tuple) or not payload.outputs:
-            if payload.status.strip().lower() == "completed" and payload.tombstone_input:
+            if payload.status.strip().lower() == "completed" and (payload.tombstone_input or payload.tombstone_output):
                 self._state().append_event(
                     {
                         "kind": "leaf_tombstone_completed",
@@ -336,7 +368,7 @@ class DefaultControlPlaneRootReplyIngressService(ControlPlaneRootReplyIngressSer
             )
             return
         envelopes, relay_remapped, relay_dropped = _normalize_observability_relay_envelopes(envelopes)
-        if payload.status.strip().lower() == "completed" and payload.tombstone_input:
+        if payload.status.strip().lower() == "completed" and (payload.tombstone_input or payload.tombstone_output):
             self._state().append_event(
                 {
                     "kind": "leaf_tombstone_completed",
@@ -572,6 +604,7 @@ def _recv_from_worker_lanes(
 _OBSERVABILITY_EVENT_TARGETS: dict[type[object], str] = {
     TraceDispatchEvent: "system.obs.trace_dispatch",
     LogDispatchEvent: "system.obs.log_dispatch",
+    DebugDispatchEvent: "system.obs.debug_dispatch",
     MetricDispatchEvent: "system.obs.metric_dispatch",
     MonitorDispatchEvent: "system.obs.monitor_dispatch",
     MonitoringMetricsSnapshotEvent: "system.obs.monitoring_metrics_dispatch",

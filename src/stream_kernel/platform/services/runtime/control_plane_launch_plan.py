@@ -178,6 +178,8 @@ def _resolve_observability_service_worker_nodes(
         resolved.append("system.obs.trace_dispatch")
     if _has_enabled_exporters(observability, "logging"):
         resolved.append("system.obs.log_dispatch")
+    if _has_enabled_exporter_kind(observability, "logging", "redis_debug"):
+        resolved.append("system.obs.debug_dispatch")
     if _has_enabled_exporters(observability, "telemetry"):
         resolved.append("system.obs.metric_dispatch")
     if _has_enabled_exporters(observability, "monitoring"):
@@ -197,6 +199,25 @@ def _has_enabled_exporters(observability: dict[str, object], section: str) -> bo
     if not isinstance(exporters, list):
         return False
     return any(isinstance(exporter, dict) and exporter.get("enabled", True) is not False for exporter in exporters)
+
+
+def _has_enabled_exporter_kind(
+    observability: dict[str, object],
+    section: str,
+    kind: str,
+) -> bool:
+    channel = observability.get(section)
+    if not isinstance(channel, dict):
+        return False
+    exporters = channel.get("exporters", [])
+    if not isinstance(exporters, list):
+        return False
+    return any(
+        isinstance(exporter, dict)
+        and exporter.get("enabled", True) is not False
+        and exporter.get("kind") == kind
+        for exporter in exporters
+    )
 
 
 def _discovered_node_names(discovery: ControlPlaneDiscoveryService | object) -> set[str] | None:

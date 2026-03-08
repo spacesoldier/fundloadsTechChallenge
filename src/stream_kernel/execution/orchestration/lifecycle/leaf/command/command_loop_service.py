@@ -32,7 +32,11 @@ from stream_kernel.execution.transport.ipc.ipc_transport import (
     ExecutionIpcTransportService,
     compose_execution_ipc_worker_target_id,
 )
+from stream_kernel.execution.transport.ipc.ipc_lane_routing_service import (
+    ExecutionIpcLaneRoutingService,
+)
 from stream_kernel.observability.events import (
+    DebugDispatchEvent,
     LogDispatchEvent,
     MetricDispatchEvent,
     MonitorDispatchEvent,
@@ -57,6 +61,7 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafDiscoveryRequestEvent,
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafConfigCardEvent,
+    ControlPlaneLeafShutdownPrepareCommand,
     ControlPlaneLeafStopAckEvent,
     ControlPlaneLeafStopCommand,
 )
@@ -115,6 +120,7 @@ class DefaultLeafWorkerCommandLoopService(LeafWorkerCommandLoopService):
     bootstrapper: object | None = inject.service(ControlPlaneBootstrapperService)
     discovery: object | None = inject.service(ControlPlaneDiscoveryService)
     execution_ipc: object | None = inject.service(ExecutionIpcTransportService)
+    lane_routing_service: object | None = inject.service(ExecutionIpcLaneRoutingService)
     leaf_shutdown_readiness_service: object | None = inject.service(ControlPlaneLeafShutdownReadinessService)
     boundary_result_chunk_items: int = 32
     control_send_attempts: int = 3
@@ -212,6 +218,28 @@ class DefaultLeafWorkerCommandLoopService(LeafWorkerCommandLoopService):
                 error=ack.error,
             )
             return "configured"
+        if isinstance(msg, ControlPlaneLeafShutdownPrepareCommand):
+            leaf_debug_log(
+                event="leaf.command_loop.shutdown_prepare_received",
+                worker_id=session.worker_id,
+                command_id=msg.command_id,
+            )
+            readiness = self._resolve_leaf_shutdown_readiness_service(session)
+            if readiness is not None:
+                observe_prepare = getattr(readiness, "observe_prepare_command", None)
+                if callable(observe_prepare):
+                    try:
+                        produced = observe_prepare(msg)
+                    except Exception:
+                        produced = None
+                    if isinstance(produced, ControlPlaneLeafDrainReadyEvent):
+                        self._send_control_message(session=session, payload=produced)
+                        leaf_debug_log(
+                            event="leaf.command_loop.shutdown_prepare_drain_ready_produced",
+                            worker_id=session.worker_id,
+                            request_id=produced.request_id,
+                        )
+            return "shutdown_prepare_observed"
         if isinstance(msg, ControlPlaneLeafStopCommand):
             leaf_debug_log(
                 event="leaf.command_loop.stop_command_received",
@@ -504,7 +532,7 @@ class DefaultLeafWorkerCommandLoopService(LeafWorkerCommandLoopService):
             return
         max_attempts = max(1, int(self.control_send_attempts))
         last_exc: Exception | None = None
-        lane = _lane_for_outbound_payload(payload)
+        lane = self._resolve_outbound_lane(payload=payload)
         target_id = compose_execution_ipc_worker_target_id(session.worker_id, lane=lane)
         for attempt in range(max_attempts):
             try:
@@ -582,6 +610,21 @@ class DefaultLeafWorkerCommandLoopService(LeafWorkerCommandLoopService):
             return resolved  # type: ignore[return-value]
         return None
 
+    def _resolve_outbound_lane(self, *, payload: object) -> str:
+        fallback = _lane_for_outbound_payload(payload)
+        candidate = self.lane_routing_service
+        if isinstance(candidate, ExecutionIpcLaneRoutingService):
+            try:
+                return candidate.resolve_lane(payload=payload, default_lane=fallback)
+            except Exception:
+                return fallback
+        if callable(getattr(candidate, "resolve_lane", None)):
+            try:
+                return candidate.resolve_lane(payload=payload, default_lane=fallback)  # type: ignore[call-arg]
+            except Exception:
+                return fallback
+        return fallback
+
     def _execute_boundary(
         self,
         *,
@@ -656,7 +699,7 @@ class DefaultLeafWorkerCommandLoopService(LeafWorkerCommandLoopService):
                     tombstone_output=output_has_tombstone or chunk_has_tombstone,
                 )
             )
-            if tombstone_input:
+            if tombstone_input or output_has_tombstone:
                 drain_ready = self._build_leaf_drain_ready_event(
                     session=session,
                     boundary_result=events[-1],
@@ -900,6 +943,8 @@ def _is_transport_alias(node_name: object) -> bool:
         return False
     if node_name.startswith("system.obs."):
         return True
+    if node_name.startswith("system.debug."):
+        return True
     if node_name.startswith("system.transport.handoff."):
         return True
     if node_name.startswith(("source:", "sink:")):
@@ -915,6 +960,7 @@ def _observability_dispatch_target(payload: object) -> str | None:
     targets: dict[type[object], str] = {
         TraceDispatchEvent: "system.obs.trace_dispatch",
         LogDispatchEvent: "system.obs.log_dispatch",
+        DebugDispatchEvent: "system.obs.debug_dispatch",
         MetricDispatchEvent: "system.obs.metric_dispatch",
         MonitorDispatchEvent: "system.obs.monitor_dispatch",
         MonitoringMetricsSnapshotEvent: "system.obs.monitoring_metrics_dispatch",
@@ -982,11 +1028,13 @@ def _lane_for_outbound_payload(payload: object) -> str:
     if isinstance(payload, ControlPlaneLeafBoundaryResultEvent):
         return EXECUTION_IPC_LANE_DATA
     if isinstance(payload, ControlPlaneLeafDrainReadyEvent):
-        # Keep shutdown-ready signal ordered after boundary data for the same request.
-        return EXECUTION_IPC_LANE_DATA
+        # Prioritize shutdown-ready signal to avoid data-lane head-of-line stalls.
+        return EXECUTION_IPC_LANE_CONTROL
     if isinstance(payload, TraceDispatchEvent):
         return EXECUTION_IPC_LANE_TRACE
     if isinstance(payload, LogDispatchEvent):
+        return EXECUTION_IPC_LANE_LOG
+    if isinstance(payload, DebugDispatchEvent):
         return EXECUTION_IPC_LANE_LOG
     if isinstance(
         payload,

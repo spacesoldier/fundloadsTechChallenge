@@ -67,13 +67,9 @@ class _RootLeafCommands:
 @dataclass(slots=True)
 class _RootReplyIngress:
     protocol_revision_calls: list[int] = field(default_factory=list)
-    fallback_calls: list[bool] = field(default_factory=list)
 
     def configure_startup_protocol_revision(self, revision: int) -> None:
         self.protocol_revision_calls.append(int(revision))
-
-    def configure_discovery_request_fallback(self, enabled: bool) -> None:
-        self.fallback_calls.append(bool(enabled))
 
 
 @dataclass(slots=True)
@@ -293,7 +289,6 @@ def test_root_runtime_bootstrap_service_configures_boundary_handoff_and_control_
     assert commands.poll_calls
     assert abs(commands.poll_calls[-1] - 0.001) < 1e-9
     assert reply_ingress.protocol_revision_calls == [2]
-    assert reply_ingress.fallback_calls == [True]
 
 
 def test_root_runtime_bootstrap_service_defaults_to_snapshot_protocol_v3() -> None:
@@ -325,7 +320,6 @@ def test_root_runtime_bootstrap_service_defaults_to_snapshot_protocol_v3() -> No
     )
 
     assert reply_ingress.protocol_revision_calls == [3]
-    assert reply_ingress.fallback_calls == [True]
 
 
 def test_root_runtime_bootstrap_service_preloads_route_table_snapshot_from_process_groups() -> None:

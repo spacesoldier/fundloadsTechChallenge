@@ -441,7 +441,7 @@ def test_control_plane_root_runtime_lifecycle_manager_stops_observability_group_
     assert shutdown.calls[-1]["target_group"] == "system.observability"
 
 
-def test_control_plane_root_runtime_lifecycle_manager_uses_broadcast_stop_dispatch_then_waits_ack_only() -> None:
+def test_control_plane_root_runtime_lifecycle_manager_uses_broadcast_stop_dispatch_and_direct_stop_command() -> None:
     from stream_kernel.execution.orchestration.lifecycle.root.runtime.lifecycle_manager import (
         ControlPlaneRootRuntimeLifecycleManager,
     )
@@ -478,4 +478,4 @@ def test_control_plane_root_runtime_lifecycle_manager_uses_broadcast_stop_dispat
     assert all(isinstance(call["payload"], ControlPlaneLeafStopCommand) for call in handoff.calls)
     assert all(call["payload"].command_id == "runtime-stop:{worker_id}" for call in handoff.calls)
     assert sorted(call["worker_id"] for call in shutdown.calls) == ["execution.alpha#1", "execution.beta#1"]
-    assert all(call["dispatch_command"] is False for call in shutdown.calls)
+    assert all(call["dispatch_command"] is True for call in shutdown.calls)

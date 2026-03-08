@@ -75,11 +75,7 @@ class DefaultControlPlaneRootStopExecutionService(ControlPlaneRootStopExecutionS
                 command_id=request.command_id,
                 reason=request.reason,
             )
-            self._ipc().send(
-                compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_CONTROL),
-                command,
-                no_reply=True,
-            )
+            self._dispatch_stop_command(worker_id=worker_id, command=command)
         ack = self._commands().wait_stop_ack(
             target_group=target_group,
             worker_id=worker_id,
@@ -113,6 +109,22 @@ class DefaultControlPlaneRootStopExecutionService(ControlPlaneRootStopExecutionS
         if callable(getattr(candidate, "send", None)):
             return candidate  # type: ignore[return-value]
         raise ValueError("ExecutionIpcTransportService binding is required")
+
+    def _dispatch_stop_command(
+        self,
+        *,
+        worker_id: str,
+        command: ControlPlaneLeafStopCommand,
+    ) -> None:
+        ipc = self._ipc()
+        target_id = compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_CONTROL)
+        ipc.send(target_id, command, no_reply=True)
+        flush_pending = getattr(ipc, "flush_pending", None)
+        if callable(flush_pending):
+            try:
+                flush_pending(target_id)
+            except Exception:
+                return
 
 
 __all__ = [

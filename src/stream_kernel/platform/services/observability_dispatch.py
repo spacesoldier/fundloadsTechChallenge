@@ -9,10 +9,12 @@ from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.service import service
 from stream_kernel.kernel.context import Context
 from stream_kernel.kernel.trace import ErrorInfo, RouteInfo, TraceRecorder, TraceSpan, TraceRecord
+from stream_kernel.observability.domain.debug import DebugMessage
 from stream_kernel.observability.domain.logging import LogMessage
 from stream_kernel.observability.domain.monitoring import MonitoringMessage
 from stream_kernel.observability.domain.telemetry import TelemetryMessage
 from stream_kernel.observability.events import (
+    DebugDispatchEvent,
     LogDispatchEvent,
     MetricDispatchEvent,
     MonitorDispatchEvent,
@@ -42,6 +44,7 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
     log_sinks: list[object] = field(default_factory=list)
     telemetry_sinks: list[object] = field(default_factory=list)
     monitoring_sinks: list[object] = field(default_factory=list)
+    debug_sinks: list[object] = field(default_factory=list)
     reply_coordinator: object = inject.service(ReplyCoordinatorService)
     _trace_recorder: TraceRecorder = field(
         default_factory=lambda: TraceRecorder(
@@ -58,6 +61,7 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
         self.log_sinks = list(self.log_sinks)
         self.telemetry_sinks = list(self.telemetry_sinks)
         self.monitoring_sinks = list(self.monitoring_sinks)
+        self.debug_sinks = list(self.debug_sinks)
 
     def before_node(
         self,
@@ -255,7 +259,13 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
         return events or None
 
     def on_run_end(self) -> None:
-        for sink in [*self.trace_sinks, *self.log_sinks, *self.telemetry_sinks, *self.monitoring_sinks]:
+        for sink in [
+            *self.trace_sinks,
+            *self.log_sinks,
+            *self.telemetry_sinks,
+            *self.monitoring_sinks,
+            *self.debug_sinks,
+        ]:
             flush = getattr(sink, "flush", None)
             if callable(flush):
                 try:
@@ -340,6 +350,39 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
         _ = (trace_id, attributes)
         normalized = self._coerce_log_message(event)
         await self._emit_many_async(self.log_sinks, normalized)
+        return []
+
+    def publish_debug(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> None:
+        self.emit_debug_event(event=event, trace_id=trace_id, attributes=attributes)
+
+    def emit_debug_event(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> list[object]:
+        _ = (trace_id, attributes)
+        normalized = self._coerce_debug_message(event)
+        self._emit_many(self.debug_sinks, normalized)
+        return []
+
+    async def emit_debug_event_async(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> list[object]:
+        _ = (trace_id, attributes)
+        normalized = self._coerce_debug_message(event)
+        await self._emit_many_async(self.debug_sinks, normalized)
         return []
 
     def publish_metric(
@@ -541,6 +584,24 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
         )
         self._emit_or_wrap_log(event=message, trace_id=None, source_node="__runtime_lifecycle__")
 
+    def on_runtime_debug_messages(
+        self,
+        *,
+        messages: list[DebugMessage],
+        source_node: str,
+        trace_id: str | None = None,
+    ) -> list[object]:
+        outputs: list[object] = []
+        for message in messages:
+            outputs.extend(
+                self._emit_or_wrap_debug(
+                    event=message,
+                    trace_id=trace_id,
+                    source_node=source_node,
+                )
+            )
+        return outputs
+
     def _finish_trace_record(
         self,
         *,
@@ -608,6 +669,26 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
                 )
             ]
         self.publish_log(event=event, trace_id=trace_id, attributes={"source_node": source_node})
+        return []
+
+    def _emit_or_wrap_debug(
+        self,
+        *,
+        event: object,
+        trace_id: str | None,
+        source_node: str,
+    ) -> list[object]:
+        if not self._channel_enabled("debug"):
+            return []
+        if self._should_emit_dispatch_events():
+            return [
+                DebugDispatchEvent(
+                    payload=self._coerce_debug_message(event),
+                    trace_id=trace_id,
+                    attributes={"source_node": source_node},
+                )
+            ]
+        self.publish_debug(event=event, trace_id=trace_id, attributes={"source_node": source_node})
         return []
 
     def _emit_or_wrap_metric(
@@ -782,6 +863,22 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
             details={"value_type": type(event).__name__},
         )
 
+    @staticmethod
+    def _coerce_debug_message(event: object) -> DebugMessage:
+        if isinstance(event, DebugMessage):
+            return event
+        return DebugMessage(
+            timestamp=datetime.now(tz=UTC),
+            event="runtime.debug.coerced",
+            source="dispatching_observability_service",
+            fields={"value_type": type(event).__name__},
+            run_id=None,
+            run_instance_id=None,
+            process_group=None,
+            worker_id=None,
+            trace_id=None,
+        )
+
     def _should_emit_dispatch_events(self) -> bool:
         role = self.runtime.get("__process_role")
         if isinstance(role, str) and role == "observability_worker":
@@ -818,12 +915,14 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
             "log": "system.obs.log_dispatch",
             "metric": "system.obs.metric_dispatch",
             "monitor": "system.obs.monitor_dispatch",
+            "debug": "system.obs.debug_dispatch",
         }
         section_by_channel = {
             "trace": "tracing",
             "log": "logging",
             "metric": "telemetry",
             "monitor": "monitoring",
+            "debug": "logging",
         }
         observability = self.runtime.get("observability", {})
         if not isinstance(observability, dict):
@@ -852,6 +951,13 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
         exporters = section_cfg.get("exporters")
         if not isinstance(exporters, list):
             return False
+        if channel == "debug":
+            return any(
+                isinstance(item, dict)
+                and item.get("enabled", True) is not False
+                and item.get("kind") == "redis_debug"
+                for item in exporters
+            )
         return any(
             isinstance(item, dict) and item.get("enabled", True) is not False
             for item in exporters

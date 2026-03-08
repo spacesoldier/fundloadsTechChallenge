@@ -16,6 +16,11 @@ from stream_kernel.execution.transport.ipc.ipc_transport import (
     ExecutionIpcTransportService,
     resolve_execution_ipc_target_id,
 )
+from stream_kernel.execution.transport.ipc.ipc_lane_routing_service import (
+    ExecutionIpcLaneRoutingStore,
+    ExecutionIpcLaneRoutingService,
+    InMemoryExecutionIpcLaneRoutingService,
+)
 from stream_kernel.execution.transport.ipc.ipc_transport_service import (
     ExecutionIpcTransportCoordinatorService,
     InMemoryExecutionIpcTransportAdapter,
@@ -74,6 +79,7 @@ def ensure_runtime_ipc_bindings(
                 "service",
                 contract,
                 lambda _service=service: _service,
+                replace=True,
             )
         except InjectionRegistryError:
             continue
@@ -166,6 +172,26 @@ def ensure_runtime_ipc_handoff_bindings(
                 "service",
                 contract,
                 lambda _service=route_table: _service,
+            )
+        except InjectionRegistryError:
+            continue
+
+    lane_store = InMemoryKvStore()
+    try:
+        injection_registry.register_factory(
+            "kv",
+            ExecutionIpcLaneRoutingStore,
+            lambda _store=lane_store: _store,
+        )
+    except InjectionRegistryError:
+        pass
+    lane_routing = InMemoryExecutionIpcLaneRoutingService(store=lane_store)
+    for contract in {ExecutionIpcLaneRoutingService, InMemoryExecutionIpcLaneRoutingService}:
+        try:
+            injection_registry.register_factory(
+                "service",
+                contract,
+                lambda _service=lane_routing: _service,
             )
         except InjectionRegistryError:
             continue

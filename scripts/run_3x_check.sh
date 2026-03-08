@@ -21,6 +21,8 @@ ARCHIVE_ROOT="${ARCHIVE_ROOT_DEFAULT}"
 PYTHON_BIN="${PYTHON_BIN_DEFAULT}"
 INTERRUPTED=0
 TMP_DEBUG_CFG=""
+LOCK_FD=9
+LOCK_PATH="/tmp/fund_load_run_3x_check.lock"
 
 usage() {
   cat <<'EOF'
@@ -70,6 +72,15 @@ if ! command -v rg >/dev/null 2>&1; then
   exit 2
 fi
 
+if command -v flock >/dev/null 2>&1; then
+  eval "exec ${LOCK_FD}>\"${LOCK_PATH}\""
+  if ! flock -n "${LOCK_FD}"; then
+    echo "Another run_3x_check.sh session is active (lock: ${LOCK_PATH})." >&2
+    echo "Wait for it to finish or kill it before starting a new run." >&2
+    exit 3
+  fi
+fi
+
 repo_path="$(pwd)"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 session_dir="${ARCHIVE_ROOT}/${timestamp}_3x"
@@ -81,6 +92,51 @@ touch "${summary_file}"
 log() {
   echo "$*"
   echo "$*" >> "${summary_file}"
+}
+
+cleanup_python_caches() {
+  local pycache_dirs=0
+  local pyc_files=0
+  local pyo_files=0
+  local tmp_file
+  tmp_file="$(mktemp)"
+  find . \
+    -path "./.venv" -prune -o \
+    -path "./run_archive" -prune -o \
+    -path "./research_ui/reports" -prune -o \
+    -type d -name "__pycache__" -print > "${tmp_file}" 2>/dev/null || true
+  pycache_dirs="$(wc -l < "${tmp_file}")"
+  if [[ "${pycache_dirs}" -gt 0 ]]; then
+    while IFS= read -r dir; do
+      [[ -n "${dir}" ]] && rm -rf "${dir}" || true
+    done < "${tmp_file}"
+  fi
+  : > "${tmp_file}"
+  find . \
+    -path "./.venv" -prune -o \
+    -path "./run_archive" -prune -o \
+    -path "./research_ui/reports" -prune -o \
+    -type f -name "*.pyc" -print > "${tmp_file}" 2>/dev/null || true
+  pyc_files="$(wc -l < "${tmp_file}")"
+  if [[ "${pyc_files}" -gt 0 ]]; then
+    while IFS= read -r file; do
+      [[ -n "${file}" ]] && rm -f "${file}" || true
+    done < "${tmp_file}"
+  fi
+  : > "${tmp_file}"
+  find . \
+    -path "./.venv" -prune -o \
+    -path "./run_archive" -prune -o \
+    -path "./research_ui/reports" -prune -o \
+    -type f -name "*.pyo" -print > "${tmp_file}" 2>/dev/null || true
+  pyo_files="$(wc -l < "${tmp_file}")"
+  if [[ "${pyo_files}" -gt 0 ]]; then
+    while IFS= read -r file; do
+      [[ -n "${file}" ]] && rm -f "${file}" || true
+    done < "${tmp_file}"
+  fi
+  rm -f "${tmp_file}" || true
+  log "Python cache cleanup: __pycache__=${pycache_dirs}, pyc=${pyc_files}, pyo=${pyo_files}"
 }
 
 kill_repo_runtime_processes() {
@@ -182,7 +238,11 @@ make_debug_cfg() {
   local src="$1"
   local dst="$2"
   cp "${src}" "${dst}"
+  perl -0777 -i -pe 's/leaf_debug_enabled:\s*false/leaf_debug_enabled: true/g' "${dst}"
   perl -0777 -i -pe 's/leaf_verbose_logging:\s*false/leaf_verbose_logging: true/g' "${dst}"
+  perl -0777 -i -pe 's/leaf_debug_write_to_file:\s*false/leaf_debug_write_to_file: true/g' "${dst}"
+  perl -0777 -i -pe 's/runtime_debug_direct_dispatch:\s*false/runtime_debug_direct_dispatch: true/g' "${dst}"
+  perl -0777 -i -pe 's/write_mode:\s*background/write_mode: inline/g' "${dst}"
   perl -0777 -i -pe 's|leaf_debug_logs_dir:\s*logs/leaf_debug|leaf_debug_logs_dir: logs/leaf_debug_run2|g' "${dst}"
 }
 
@@ -194,6 +254,7 @@ log "Archive dir: ${session_dir}"
 log ""
 
 kill_repo_runtime_processes
+cleanup_python_caches
 archive_current_artifacts "preexisting"
 
 for ((i=1; i<=RUNS; i++)); do
@@ -202,6 +263,7 @@ for ((i=1; i<=RUNS; i++)); do
   fi
   log "=== RUN ${i} ==="
   kill_repo_runtime_processes
+  cleanup_python_caches
   archive_current_artifacts "before_run_${i}"
 
   run_cfg="${CONFIG_PATH}"
@@ -216,7 +278,7 @@ for ((i=1; i<=RUNS; i++)); do
 
   set +e
   timeout --foreground --signal=TERM --kill-after=5s "${TIMEOUT_SECONDS}s" \
-    "${PYTHON_BIN}" -m fund_load --config "${run_cfg}" > logs/run_log_root.log 2>&1
+    env PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m fund_load --config "${run_cfg}" 2>&1 | tee logs/run_log_root.log
   rc=$?
   set -e
 

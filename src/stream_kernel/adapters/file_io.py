@@ -55,8 +55,10 @@ class FileOutputSink:
     path: Path
     encoding: str = "utf-8"
     atomic_replace: bool = False
+    flush_every_n: int = 1
     _handle: TextIO | None = field(default=None, init=False, repr=False)
     _temp_path: Path | None = field(default=None, init=False, repr=False)
+    _written_lines: int = field(default=0, init=False, repr=False)
 
     def write_line(self, line: str) -> None:
         # Open lazily so construction itself does not touch filesystem.
@@ -64,6 +66,9 @@ class FileOutputSink:
             self._open()
         assert self._handle is not None
         self._handle.write(line + "\n")
+        self._written_lines += 1
+        if self._written_lines % max(1, int(self.flush_every_n)) == 0:
+            self._handle.flush()
 
     def close(self) -> None:
         # Close is idempotent to simplify runner shutdown paths.
@@ -80,9 +85,9 @@ class FileOutputSink:
     def _open(self) -> None:
         if self.atomic_replace:
             self._temp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-            self._handle = self._temp_path.open("w", encoding=self.encoding)
+            self._handle = self._temp_path.open("w", encoding=self.encoding, buffering=1)
         else:
-            self._handle = self.path.open("w", encoding=self.encoding)
+            self._handle = self.path.open("w", encoding=self.encoding, buffering=1)
 
 
 @dataclass
@@ -161,11 +166,15 @@ def egress_file_sink(settings: dict[str, object]) -> SinkLineFileSink:
     encoding = settings.get("encoding", "utf-8")
     if not isinstance(encoding, str) or not encoding:
         raise ValueError("egress_file.settings.encoding must be a non-empty string")
+    flush_every_n = settings.get("flush_every_n", 1)
+    if not isinstance(flush_every_n, int) or flush_every_n <= 0:
+        raise ValueError("egress_file.settings.flush_every_n must be an integer > 0 when provided")
 
     sink = FileOutputSink(
         path=Path(str(settings["path"])),
         encoding=encoding,
         atomic_replace=bool(settings.get("atomic_replace", False)),
+        flush_every_n=flush_every_n,
     )
     return SinkLineFileSink(sink=sink)
 

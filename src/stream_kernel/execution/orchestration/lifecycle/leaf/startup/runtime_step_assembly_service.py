@@ -9,6 +9,9 @@ from stream_kernel.execution.orchestration.lifecycle.root.startup.planning impor
 from stream_kernel.execution.orchestration.observability_system_nodes import (
     build_observability_system_plan,
 )
+from stream_kernel.execution.orchestration.debug_system_nodes import (
+    build_debug_system_plan,
+)
 from stream_kernel.kernel.scenario import StepSpec
 
 
@@ -65,7 +68,9 @@ class DefaultLeafRuntimeStepAssemblyService(LeafRuntimeStepAssemblyService):
             for spec in list(getattr(scenario, "steps", []))
             if not (
                 isinstance(getattr(spec, "name", None), str)
-                and str(getattr(spec, "name")).startswith(("system.cp.", "system.lifecycle.", "system.obs."))
+                and str(getattr(spec, "name")).startswith(
+                    ("system.cp.", "system.lifecycle.", "system.obs.", "system.debug.")
+                )
             )
         ]
         if bundle_adapters and adapter_registry is not None:
@@ -109,6 +114,14 @@ class DefaultLeafRuntimeStepAssemblyService(LeafRuntimeStepAssemblyService):
         if include_observability_nodes:
             combined_steps.extend(observability_system.system_steps)
 
+        debug_system = build_debug_system_plan(
+            runtime=runtime,
+            scenario_scope=scenario_scope,
+        )
+        for token, node_names in debug_system.system_consumers.items():
+            _append_consumers(consumer_registry, token, node_names)
+        combined_steps.extend(debug_system.system_steps)
+
         control_plane_system = build_control_plane_system_plan(
             runtime=runtime,
             scenario_scope=scenario_scope,
@@ -140,6 +153,7 @@ class DefaultLeafRuntimeStepAssemblyService(LeafRuntimeStepAssemblyService):
                 if include_observability_nodes
                 else set()
             )
+            | set(debug_system.system_node_names)
         )
         return LeafRuntimeStepAssemblyResult(
             scenario_steps=scenario_steps,

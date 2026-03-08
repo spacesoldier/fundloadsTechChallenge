@@ -6,6 +6,9 @@ from typing import Protocol, runtime_checkable
 from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.service import service
 from stream_kernel.integration.kv_store import KVStore
+from stream_kernel.platform.services.runtime.debug_buffer import (
+    debug_instrument_service_methods,
+)
 
 _ROUTE_TABLE_KEY = "execution.transport.ipc.route_table"
 
@@ -36,9 +39,11 @@ class ExecutionIpcRouteTableService(Protocol):
 
 
 @service(name="execution_ipc_route_table_service")
+@debug_instrument_service_methods
 @dataclass(slots=True)
 class InMemoryExecutionIpcRouteTableService(ExecutionIpcRouteTableService):
     store: KVStore = inject.kv(ExecutionIpcRouteTableStore)
+    runtime_debug_buffer: object | None = None
 
     def upsert_route(self, *, target: str, target_id: str) -> None:
         if not isinstance(target, str) or not target:

@@ -14,6 +14,9 @@ from stream_kernel.execution.transport.ipc.ipc_transport import (
     decompose_execution_ipc_worker_target_id,
     resolve_execution_ipc_lane_for_target,
 )
+from stream_kernel.execution.transport.ipc.ipc_lane_routing_service import (
+    ExecutionIpcLaneRoutingService,
+)
 from stream_kernel.platform.services.runtime import ProcessGroupRouterService
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLaunchPlanEvent,
@@ -22,6 +25,9 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
 )
 from stream_kernel.platform.services.runtime.control_plane_state import (
     ControlPlaneStateService,
+)
+from stream_kernel.platform.services.runtime.debug_buffer import (
+    debug_instrument_service_methods,
 )
 from stream_kernel.routing.envelope import Envelope
 
@@ -65,12 +71,15 @@ class ExecutionIpcHandoffDispatchService(Protocol):
 
 
 @service(name="execution_ipc_handoff_dispatch_service")
+@debug_instrument_service_methods
 @dataclass(slots=True)
 class DefaultExecutionIpcHandoffDispatchService(ExecutionIpcHandoffDispatchService):
     execution_ipc: ExecutionIpcTransportService = inject.service(ExecutionIpcTransportService)
     process_group_router: ProcessGroupRouterService = inject.service(ProcessGroupRouterService)
     route_table: ExecutionIpcRouteTableService = inject.service(ExecutionIpcRouteTableService)
     control_plane_state: ControlPlaneStateService = inject.service(ControlPlaneStateService)
+    lane_routing: object | None = inject.service(ExecutionIpcLaneRoutingService)
+    runtime_debug_buffer: object | None = None
     control_retry_attempts: int = 0
     control_retry_backoff_seconds: float = 0.01
 
@@ -91,7 +100,7 @@ class DefaultExecutionIpcHandoffDispatchService(ExecutionIpcHandoffDispatchServi
             )
             target_id = f"{target_group}#1"
             self._route_table().upsert_route(target=target, target_id=target_id)
-        lane = resolve_execution_ipc_lane_for_target(target)
+        lane = self._resolve_lane(target=target, payload=envelope.payload)
         resolved_target_id = _lane_target_id(target_id=target_id, lane=lane)
         self._ipc().send(resolved_target_id, envelope.payload, no_reply=True)
         return True
@@ -107,7 +116,10 @@ class DefaultExecutionIpcHandoffDispatchService(ExecutionIpcHandoffDispatchServi
     ) -> BroadcastDispatchResult:
         resolved_policy = _normalize_policy(policy)
         target = envelope.target
-        lane = resolve_execution_ipc_lane_for_target(target if isinstance(target, str) else None)
+        lane = self._resolve_lane(
+            target=target if isinstance(target, str) else None,
+            payload=envelope.payload,
+        )
         is_observability_lane = (
             isinstance(target, str) and target.startswith("system.obs.")
         )
@@ -174,17 +186,24 @@ class DefaultExecutionIpcHandoffDispatchService(ExecutionIpcHandoffDispatchServi
         require_drained_delivery: bool,
     ) -> bool:
         max_attempts = max(1, attempts + 1)
+        sent = False
         for attempt in range(max_attempts):
             try:
-                self._ipc().send(target_id, payload, no_reply=True)
+                if not sent:
+                    self._ipc().send(target_id, payload, no_reply=True)
+                    sent = True
                 if not require_drained_delivery:
                     return True
                 if self._has_pending_outbound(target_id):
                     if attempt + 1 < max_attempts:
                         _RETRY_BACKOFF_WAIT.wait(max(0.0, float(self.control_retry_backoff_seconds)))
-                    continue
+                        continue
+                    # Payload is already accepted by transport. Keep success semantics
+                    # and avoid duplicate sends under transient queue backlog.
+                    return True
                 return True
             except Exception:
+                sent = False
                 if attempt + 1 < max_attempts:
                     _RETRY_BACKOFF_WAIT.wait(max(0.0, float(self.control_retry_backoff_seconds)))
                 continue
@@ -201,9 +220,10 @@ class DefaultExecutionIpcHandoffDispatchService(ExecutionIpcHandoffDispatchServi
         if not isinstance(payload, dict):
             return False
         pending = payload.get("pending_outbound", 0)
-        if not isinstance(pending, int):
-            return False
-        return pending > 0
+        outbound = payload.get("outbound_queue_depth", 0)
+        pending_count = pending if isinstance(pending, int) else 0
+        outbound_count = outbound if isinstance(outbound, int) else 0
+        return pending_count > 0 or outbound_count > 0
 
     def _resolve_live_worker_ids(
         self,
@@ -261,6 +281,28 @@ class DefaultExecutionIpcHandoffDispatchService(ExecutionIpcHandoffDispatchServi
         if callable(getattr(candidate, "events", None)):
             return candidate  # type: ignore[return-value]
         raise ValueError("ControlPlaneStateService binding is required")
+
+    def _resolve_lane(self, *, target: str | None, payload: object) -> str:
+        fallback = resolve_execution_ipc_lane_for_target(target)
+        routing = self._lane_routing_optional()
+        if routing is None:
+            return fallback
+        try:
+            return routing.resolve_lane(
+                target=target,
+                payload=payload,
+                default_lane=fallback,
+            )
+        except Exception:
+            return fallback
+
+    def _lane_routing_optional(self) -> ExecutionIpcLaneRoutingService | None:
+        candidate = self.lane_routing
+        if isinstance(candidate, ExecutionIpcLaneRoutingService):
+            return candidate
+        if callable(getattr(candidate, "resolve_lane", None)):
+            return candidate  # type: ignore[return-value]
+        return None
 
 
 def _normalize_policy(policy: str) -> str:

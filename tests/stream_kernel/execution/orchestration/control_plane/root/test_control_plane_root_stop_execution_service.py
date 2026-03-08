@@ -73,10 +73,10 @@ def test_root_stop_execution_service_sends_typed_stop_command_and_returns_ack() 
 
     assert isinstance(ack, ControlPlaneLeafStopAckEvent)
     assert len(ipc.sends) == 1
-    sent = ipc.sends[0]
-    assert sent["target_id"] == "execution.alpha#1"
-    assert sent["no_reply"] is True
-    assert isinstance(sent["payload"], ControlPlaneLeafStopCommand)
+    targets = [item["target_id"] for item in ipc.sends]
+    assert targets == ["execution.alpha#1"]
+    assert all(item["no_reply"] is True for item in ipc.sends)
+    assert all(isinstance(item["payload"], ControlPlaneLeafStopCommand) for item in ipc.sends)
 
 
 def test_root_stop_execution_service_raises_on_timeout() -> None:

@@ -182,9 +182,9 @@ class ControlPlaneRootRuntimeLifecycleManager(RuntimeLifecycleManager):
                     graceful_timeout_seconds=worker_graceful,
                     terminate_timeout_seconds=terminate_timeout,
                     reason="runtime_lifecycle.stop",
-                    dispatch_command=not (
-                        isinstance(pre_dispatched_workers, set) and worker_id in pre_dispatched_workers
-                    ),
+                    # Broadcast is best-effort warm-up. Always send a direct stop command per worker
+                    # so ack waiting cannot depend on optimistic pre-dispatch delivery.
+                    dispatch_command=True,
                 )
                 if factory is not None:
                     self._publish_log_safely(factory.runtime_shutdown_worker_finished(result=result))
@@ -242,9 +242,9 @@ class ControlPlaneRootRuntimeLifecycleManager(RuntimeLifecycleManager):
                     graceful_timeout_seconds=worker_graceful,
                     terminate_timeout_seconds=terminate_timeout,
                     reason="runtime_lifecycle.stop",
-                    dispatch_command=not (
-                        isinstance(pre_dispatched_workers, set) and worker_id in pre_dispatched_workers
-                    ),
+                    # Broadcast is best-effort warm-up. Always send a direct stop command per worker
+                    # so ack waiting cannot depend on optimistic pre-dispatch delivery.
+                    dispatch_command=True,
                 )
                 futures.append((group_name, worker_id, future))
             for group_name, worker_id, future in futures:

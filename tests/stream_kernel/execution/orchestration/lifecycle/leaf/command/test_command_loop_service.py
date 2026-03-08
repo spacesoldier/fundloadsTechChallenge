@@ -12,13 +12,18 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneDiscoveryItemEvent,
     ControlPlaneLeafBoundaryExecuteCommand,
     ControlPlaneLeafBoundaryResultEvent,
+    ControlPlaneLeafDrainReadyEvent,
     ControlPlaneLeafDiscoveryAckEvent,
     ControlPlaneLeafDiscoveryRequestEvent,
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafConfigCardEvent,
+    ControlPlaneLeafShutdownPrepareCommand,
     ControlPlaneLeafStartWorkEvent,
     ControlPlaneLeafStopAckEvent,
     ControlPlaneLeafStopCommand,
+)
+from stream_kernel.platform.services.runtime.control_plane_shutdown_readiness import (
+    InMemoryControlPlaneLeafShutdownReadinessService,
 )
 from stream_kernel.routing.envelope import Envelope
 
@@ -656,6 +661,65 @@ def test_leaf_worker_command_loop_service_handles_leaf_start_work_event_without_
     ack = ipc.sent[0][1]
     assert isinstance(ack, ControlPlaneLeafBoundaryResultEvent)
     assert ack.status == "completed"
+
+
+def test_leaf_worker_command_loop_service_emits_drain_ready_only_after_shutdown_prepare() -> None:
+    from stream_kernel.integration.kv_store import InMemoryKvStore
+    from stream_kernel.execution.orchestration.lifecycle.leaf.command.command_loop_service import (
+        DefaultLeafWorkerCommandLoopService,
+    )
+
+    ipc = _ExecutionIpc(
+        incoming=[
+            ControlPlaneLeafBoundaryExecuteCommand(
+                target_group="execution.alpha",
+                worker_id="execution.alpha#1",
+                request_id="req-boundary-tomb",
+                inputs=({"payload": 1, "tombstone": True},),
+                finalize=True,
+            ),
+            ControlPlaneLeafShutdownPrepareCommand(
+                target_group="execution.alpha",
+                worker_id="execution.alpha#1",
+                command_id="prepare-1",
+            ),
+        ]
+    )
+    boundary = _BoundaryExecution(outputs=("out-after-tomb",))
+    leaf_readiness = InMemoryControlPlaneLeafShutdownReadinessService(store=InMemoryKvStore())
+    service = DefaultLeafWorkerCommandLoopService(
+        activation_service=_Activation(mode="applied"),
+        boundary_execution_service=boundary,
+        finalization_service=_Finalizer(),
+        execution_ipc=ipc,
+        leaf_shutdown_readiness_service=leaf_readiness,
+    )
+    session = _session()
+
+    first = service.run_control_iteration(
+        session=session,
+        control_pipe=object(),
+        stop_event=_StopEvent(False),
+        poll_seconds=0.01,
+    )
+    assert first == "boundary_executed"
+    sent_results_1 = [payload for _target, payload, _nr in ipc.sent if isinstance(payload, ControlPlaneLeafBoundaryResultEvent)]
+    sent_drain_ready_1 = [payload for _target, payload, _nr in ipc.sent if isinstance(payload, ControlPlaneLeafDrainReadyEvent)]
+    assert len(sent_results_1) == 1
+    assert sent_results_1[0].tombstone_input is True
+    assert sent_drain_ready_1 == []
+
+    second = service.run_control_iteration(
+        session=session,
+        control_pipe=object(),
+        stop_event=_StopEvent(False),
+        poll_seconds=0.01,
+    )
+    assert second == "shutdown_prepare_observed"
+    sent_drain_ready_2 = [payload for _target, payload, _nr in ipc.sent if isinstance(payload, ControlPlaneLeafDrainReadyEvent)]
+    assert len(sent_drain_ready_2) == 1
+    assert sent_drain_ready_2[0].target_group == "execution.alpha"
+    assert sent_drain_ready_2[0].worker_id == "execution.alpha#1"
 
 
 def test_leaf_worker_command_loop_service_ignores_leaf_start_work_when_no_local_source_nodes() -> None:

@@ -20,6 +20,9 @@ _EXPORTS = {
     "HybridFlowControlPolicy": "flow_control",
     "resolve_execution_ipc_flow_control": "flow_control",
     "ExecutionIpcTransportCoordinatorService": "ipc_transport_service",
+    "ExecutionIpcLaneRoutingStore": "ipc_lane_routing_service",
+    "ExecutionIpcLaneRoutingService": "ipc_lane_routing_service",
+    "InMemoryExecutionIpcLaneRoutingService": "ipc_lane_routing_service",
     "InMemoryExecutionIpcTransportAdapter": "carriers.ipc",
     "PipeExecutionIpcTransportAdapter": "carriers.ipc",
 }
@@ -42,4 +45,3 @@ def __getattr__(name: str) -> Any:
 
 def __dir__() -> list[str]:
     return sorted(list(globals().keys()) + list(_EXPORTS.keys()))
-

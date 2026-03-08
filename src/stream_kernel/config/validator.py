@@ -34,8 +34,11 @@ _SUPPORTED_PLATFORM_SOURCE_INGRESS_KEYS = {
 }
 _SUPPORTED_PLATFORM_DEBUG_KEYS = {
     "root_verbose_logging",
+    "leaf_debug_enabled",
     "leaf_verbose_logging",
     "leaf_debug_logs_dir",
+    "leaf_debug_write_to_file",
+    "runtime_debug_direct_dispatch",
 }
 _SUPPORTED_WEB_INTERFACE_KINDS = {"http", "http_stream", "websocket", "graphql"}
 _SUPPORTED_WEB_BIND_PORT_TYPES = {"request", "response", "stream", "kv_stream"}
@@ -60,7 +63,14 @@ _SUPPORTED_OBSERVABILITY_TRACE_EXPORTER_KINDS = {
 }
 _SUPPORTED_OBSERVABILITY_OTEL_TRACE_VIEWS = {"logical", "topology"}
 _SUPPORTED_OBSERVABILITY_TRACE_JSONL_SLICES = {"all", "business_logic", "platform_internals"}
-_SUPPORTED_OBSERVABILITY_LOG_EXPORTER_KINDS = {"stdout", "stdout_plain", "jsonl", "file_plain", "otel_logs_otlp"}
+_SUPPORTED_OBSERVABILITY_LOG_EXPORTER_KINDS = {
+    "stdout",
+    "stdout_plain",
+    "jsonl",
+    "file_plain",
+    "otel_logs_otlp",
+    "redis_debug",
+}
 _SUPPORTED_OBSERVABILITY_LOG_EXPORTER_MODES = {"lifecycle", "all"}
 _SUPPORTED_OBSERVABILITY_LOG_LEVELS = {"off", "none", "info", "debug", "full"}
 _SUPPORTED_OBSERVABILITY_MONITORING_EXPORTER_KINDS = {"prometheus", "jsonl"}
@@ -558,6 +568,10 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
         if not isinstance(leaf_verbose_logging, bool):
             raise ConfigError("runtime.platform.debug.leaf_verbose_logging must be a boolean when provided")
         debug["leaf_verbose_logging"] = leaf_verbose_logging
+        leaf_debug_enabled = debug.get("leaf_debug_enabled", leaf_verbose_logging)
+        if not isinstance(leaf_debug_enabled, bool):
+            raise ConfigError("runtime.platform.debug.leaf_debug_enabled must be a boolean when provided")
+        debug["leaf_debug_enabled"] = leaf_debug_enabled
         leaf_debug_logs_dir = debug.get("leaf_debug_logs_dir")
         if leaf_debug_logs_dir is not None and (
             not isinstance(leaf_debug_logs_dir, str) or not leaf_debug_logs_dir.strip()
@@ -567,6 +581,16 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
             )
         if isinstance(leaf_debug_logs_dir, str):
             debug["leaf_debug_logs_dir"] = leaf_debug_logs_dir.strip()
+        leaf_debug_write_to_file = debug.get("leaf_debug_write_to_file", True)
+        if not isinstance(leaf_debug_write_to_file, bool):
+            raise ConfigError("runtime.platform.debug.leaf_debug_write_to_file must be a boolean when provided")
+        debug["leaf_debug_write_to_file"] = leaf_debug_write_to_file
+        runtime_debug_direct_dispatch = debug.get("runtime_debug_direct_dispatch", True)
+        if not isinstance(runtime_debug_direct_dispatch, bool):
+            raise ConfigError(
+                "runtime.platform.debug.runtime_debug_direct_dispatch must be a boolean when provided"
+            )
+        debug["runtime_debug_direct_dispatch"] = runtime_debug_direct_dispatch
 
     source_ingress = platform.get("source_ingress")
     if source_ingress is not None:
@@ -787,22 +811,48 @@ def _normalize_execution_ipc_mapping(mapping: dict[str, object], *, prefix: str)
         raise ConfigError(f"{prefix}.codec must be one of: {sorted(_SUPPORTED_EXECUTION_IPC_CODECS)}")
     mapping["codec"] = codec
 
-    bind_host = mapping.get("bind_host", "127.0.0.1")
-    if not isinstance(bind_host, str) or not bind_host:
-        raise ConfigError(f"{prefix}.bind_host must be a non-empty string when provided")
-    if transport in _LOCAL_EXECUTION_IPC_TRANSPORTS and bind_host != "127.0.0.1":
-        raise ConfigError(
-            f"{prefix}.bind_host must be 127.0.0.1 for local ipc transports: "
-            f"{sorted(_LOCAL_EXECUTION_IPC_TRANSPORTS)}"
-        )
-    mapping["bind_host"] = bind_host
+    if transport == "tcp_local":
+        if "bind_host" not in mapping:
+            raise ConfigError(f"{prefix}.bind_host is required when {prefix}.transport='tcp_local'")
+        bind_host = mapping.get("bind_host")
+        if not isinstance(bind_host, str) or not bind_host:
+            raise ConfigError(f"{prefix}.bind_host must be a non-empty string when provided")
+        if bind_host != "127.0.0.1":
+            raise ConfigError(
+                f"{prefix}.bind_host must be 127.0.0.1 for local ipc transports: "
+                f"{sorted(_LOCAL_EXECUTION_IPC_TRANSPORTS)}"
+            )
+        mapping["bind_host"] = bind_host
 
-    bind_port = mapping.get("bind_port", 0)
-    if not isinstance(bind_port, int):
-        raise ConfigError(f"{prefix}.bind_port must be an integer when provided")
-    if bind_port < 0 or bind_port > 65535:
-        raise ConfigError(f"{prefix}.bind_port must be in range [0, 65535]")
-    mapping["bind_port"] = bind_port
+        bind_port = mapping.get("bind_port", 0)
+        if not isinstance(bind_port, int):
+            raise ConfigError(f"{prefix}.bind_port must be an integer when provided")
+        if bind_port < 0 or bind_port > 65535:
+            raise ConfigError(f"{prefix}.bind_port must be in range [0, 65535]")
+        mapping["bind_port"] = bind_port
+    else:
+        bind_host = mapping.get("bind_host")
+        if bind_host is not None:
+            if not isinstance(bind_host, str) or not bind_host:
+                raise ConfigError(f"{prefix}.bind_host must be a non-empty string when provided")
+            if transport in _LOCAL_EXECUTION_IPC_TRANSPORTS and bind_host != "127.0.0.1":
+                raise ConfigError(
+                    f"{prefix}.bind_host must be 127.0.0.1 for local ipc transports: "
+                    f"{sorted(_LOCAL_EXECUTION_IPC_TRANSPORTS)}"
+                )
+            mapping["bind_host"] = bind_host
+        else:
+            mapping.pop("bind_host", None)
+
+        bind_port = mapping.get("bind_port")
+        if bind_port is not None:
+            if not isinstance(bind_port, int):
+                raise ConfigError(f"{prefix}.bind_port must be an integer when provided")
+            if bind_port < 0 or bind_port > 65535:
+                raise ConfigError(f"{prefix}.bind_port must be in range [0, 65535]")
+            mapping["bind_port"] = bind_port
+        else:
+            mapping.pop("bind_port", None)
 
     auth = mapping.get("auth", {})
     if not isinstance(auth, dict):
@@ -1267,6 +1317,71 @@ def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
                 raise ConfigError(
                     f"runtime.observability.logging.exporters[{index}].settings.workers_dir "
                     "is not supported; worker-local lifecycle log sinks are disabled"
+                )
+        if kind == "redis_debug":
+            host = settings.get("host")
+            if host is not None and (not isinstance(host, str) or not host):
+                raise ConfigError(
+                    f"runtime.observability.logging.exporters[{index}].settings.host "
+                    "must be a non-empty string when provided"
+                )
+            port = settings.get("port")
+            if port is not None and (not isinstance(port, int) or port <= 0):
+                raise ConfigError(
+                    f"runtime.observability.logging.exporters[{index}].settings.port "
+                    "must be an integer > 0 when provided"
+                )
+            db = settings.get("db")
+            if db is not None and (not isinstance(db, int) or db < 0):
+                raise ConfigError(
+                    f"runtime.observability.logging.exporters[{index}].settings.db "
+                    "must be an integer >= 0 when provided"
+                )
+            password = settings.get("password")
+            if password is not None and (not isinstance(password, str) or not password):
+                raise ConfigError(
+                    f"runtime.observability.logging.exporters[{index}].settings.password "
+                    "must be a non-empty string when provided"
+                )
+            key_prefix = settings.get("key_prefix")
+            if key_prefix is not None and (not isinstance(key_prefix, str) or not key_prefix):
+                raise ConfigError(
+                    f"runtime.observability.logging.exporters[{index}].settings.key_prefix "
+                    "must be a non-empty string when provided"
+                )
+            ttl_seconds = settings.get("ttl_seconds")
+            if ttl_seconds is not None and (not isinstance(ttl_seconds, int) or ttl_seconds <= 0):
+                raise ConfigError(
+                    f"runtime.observability.logging.exporters[{index}].settings.ttl_seconds "
+                    "must be an integer > 0 when provided"
+                )
+            connect_timeout_seconds = settings.get("connect_timeout_seconds")
+            if connect_timeout_seconds is not None and (
+                not isinstance(connect_timeout_seconds, (int, float)) or connect_timeout_seconds <= 0
+            ):
+                raise ConfigError(
+                    "runtime.observability.logging.exporters["
+                    f"{index}].settings.connect_timeout_seconds must be a number > 0 when provided"
+                )
+            socket_timeout_seconds = settings.get("socket_timeout_seconds")
+            if socket_timeout_seconds is not None and (
+                not isinstance(socket_timeout_seconds, (int, float)) or socket_timeout_seconds <= 0
+            ):
+                raise ConfigError(
+                    "runtime.observability.logging.exporters["
+                    f"{index}].settings.socket_timeout_seconds must be a number > 0 when provided"
+                )
+            only_debug_channel = settings.get("only_debug_channel")
+            if only_debug_channel is not None and not isinstance(only_debug_channel, bool):
+                raise ConfigError(
+                    "runtime.observability.logging.exporters["
+                    f"{index}].settings.only_debug_channel must be a boolean when provided"
+                )
+            capture_all_events = settings.get("capture_all_events")
+            if capture_all_events is not None and not isinstance(capture_all_events, bool):
+                raise ConfigError(
+                    "runtime.observability.logging.exporters["
+                    f"{index}].settings.capture_all_events must be a boolean when provided"
                 )
         exporter["settings"] = settings
 

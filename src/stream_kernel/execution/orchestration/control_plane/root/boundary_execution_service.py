@@ -13,6 +13,9 @@ from stream_kernel.execution.transport.ipc.ipc_transport import (
     ExecutionIpcTransportService,
     compose_execution_ipc_worker_target_id,
 )
+from stream_kernel.execution.transport.ipc.ipc_lane_routing_service import (
+    ExecutionIpcLaneRoutingService,
+)
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafBoundaryExecuteCommand,
 )
@@ -52,6 +55,7 @@ class ControlPlaneRootBoundaryExecutionService(Protocol):
 class DefaultControlPlaneRootBoundaryExecutionService(ControlPlaneRootBoundaryExecutionService):
     root_leaf_commands: ControlPlaneRootLeafCommandService = inject.service(ControlPlaneRootLeafCommandService)
     execution_ipc: ExecutionIpcTransportService = inject.service(ExecutionIpcTransportService)
+    lane_routing: object | None = inject.service(ExecutionIpcLaneRoutingService)
 
     def execute_boundary_on_leaf(
         self,
@@ -78,8 +82,9 @@ class DefaultControlPlaneRootBoundaryExecutionService(ControlPlaneRootBoundaryEx
             inputs=tuple(request.inputs),
             finalize=request.finalize,
         )
+        lane = self._resolve_boundary_command_lane(command=command)
         self._ipc().send(
-            compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_DATA),
+            compose_execution_ipc_worker_target_id(worker_id, lane=lane),
             command,
             no_reply=True,
         )
@@ -125,6 +130,28 @@ class DefaultControlPlaneRootBoundaryExecutionService(ControlPlaneRootBoundaryEx
         if callable(getattr(candidate, "send", None)):
             return candidate  # type: ignore[return-value]
         raise ValueError("ExecutionIpcTransportService binding is required")
+
+    def _resolve_boundary_command_lane(self, *, command: ControlPlaneLeafBoundaryExecuteCommand) -> str:
+        fallback = EXECUTION_IPC_LANE_DATA
+        routing = self._lane_routing_optional()
+        if routing is None:
+            return fallback
+        try:
+            return routing.resolve_lane(
+                target="system.cp.leaf_boundary_execute",
+                payload=command,
+                default_lane=fallback,
+            )
+        except Exception:
+            return fallback
+
+    def _lane_routing_optional(self) -> ExecutionIpcLaneRoutingService | None:
+        candidate = self.lane_routing
+        if isinstance(candidate, ExecutionIpcLaneRoutingService):
+            return candidate
+        if callable(getattr(candidate, "resolve_lane", None)):
+            return candidate  # type: ignore[return-value]
+        return None
 
 
 __all__ = [

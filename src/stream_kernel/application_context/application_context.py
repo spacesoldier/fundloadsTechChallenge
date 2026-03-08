@@ -7,6 +7,9 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from types import ModuleType
 
 from stream_kernel.application_context.config_inject import ConfigScope, ConfigValue
+from stream_kernel.application_context.inject_debug import (
+    instrument_injected_dependency,
+)
 from stream_kernel.application_context.inject import Injected
 from stream_kernel.application_context.injection_registry import (
     InjectionRegistry,
@@ -408,6 +411,13 @@ def apply_injection(obj: object, scope, strict: bool) -> None:
     for name, injected in _iter_injected_fields(obj):
         try:
             resolved = injected.resolve(scope)
+            resolved = instrument_injected_dependency(
+                resolved=resolved,
+                injected=injected,
+                scope=scope,
+                owner=obj,
+                field_name=name,
+            )
         except InjectionRegistryError as exc:
             if strict:
                 raise ContextBuildError(str(exc)) from exc
@@ -421,6 +431,13 @@ def apply_injection(obj: object, scope, strict: bool) -> None:
         for name, injected in _iter_injected_fields(container):
             try:
                 resolved = injected.resolve(scope)
+                resolved = instrument_injected_dependency(
+                    resolved=resolved,
+                    injected=injected,
+                    scope=scope,
+                    owner=container,
+                    field_name=name,
+                )
             except InjectionRegistryError as exc:
                 if strict:
                     raise ContextBuildError(str(exc)) from exc

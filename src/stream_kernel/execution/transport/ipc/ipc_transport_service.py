@@ -25,13 +25,18 @@ from stream_kernel.execution.transport.ipc.flow_control import (
     NoopFlowControlPolicy,
 )
 from stream_kernel.adapters.contracts import AdapterBatch
+from stream_kernel.platform.services.runtime.debug_buffer import (
+    debug_instrument_service_methods,
+)
 
 
 @service(name="execution_ipc_transport_service")
+@debug_instrument_service_methods
 @dataclass(slots=True)
 class ExecutionIpcTransportCoordinatorService(ExecutionIpcTransportService):
     adapter: ExecutionIpcKvStreamPort = inject.kv_stream(ExecutionIpcKvStreamPort)
     endpoint_registry: object = inject.kv(ExecutionIpcEndpointRegistry)
+    runtime_debug_buffer: object | None = None
     flow_control: ExecutionIpcFlowControlPolicy = field(
         default_factory=lambda: CreditWindowFlowControlPolicy(window_size=16)
     )
@@ -148,11 +153,12 @@ class ExecutionIpcTransportCoordinatorService(ExecutionIpcTransportService):
         resolved = decompose_execution_ipc_worker_target_id(target_id)
         if resolved is None:
             return target_id
-        worker_id, lane = resolved
+        _worker_id, lane = resolved
         if lane == "control":
             return target_id
-        if endpoint_store.get(worker_id) is not None:
-            return worker_id
+        # Keep non-control lanes isolated. Falling back to worker_id collapses
+        # lane traffic into the control pipe and can reintroduce head-of-line
+        # blocking under load.
         return target_id
 
     def _ensure_endpoint(self, target_id: str) -> None:

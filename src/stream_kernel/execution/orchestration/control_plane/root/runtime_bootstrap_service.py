@@ -190,15 +190,6 @@ class DefaultControlPlaneRootRuntimeBootstrapService(ControlPlaneRootRuntimeBoot
                 setattr(candidate, "startup_protocol_revision", _startup_protocol_revision(runtime))
             except Exception:
                 pass
-        configure_fallback = getattr(candidate, "configure_discovery_request_fallback", None)
-        fallback_enabled = _discovery_request_fallback_enabled(runtime)
-        if callable(configure_fallback):
-            configure_fallback(fallback_enabled)
-        elif hasattr(candidate, "discovery_request_fallback_enabled"):
-            try:
-                setattr(candidate, "discovery_request_fallback_enabled", fallback_enabled)
-            except Exception:
-                pass
         configure_verbose = getattr(candidate, "configure_verbose_logging", None)
         verbose_enabled = _root_verbose_logging_enabled(runtime)
         if callable(configure_verbose):
@@ -299,19 +290,6 @@ def _startup_protocol_revision(runtime: dict[str, object]) -> int:
     return 3
 
 
-def _discovery_request_fallback_enabled(runtime: dict[str, object]) -> bool:
-    platform = runtime.get("platform", {})
-    if not isinstance(platform, dict):
-        return True
-    control_plane = platform.get("control_plane", {})
-    if not isinstance(control_plane, dict):
-        return True
-    raw = control_plane.get("discovery_request_fallback")
-    if isinstance(raw, bool):
-        return raw
-    return True
-
-
 def _root_verbose_logging_enabled(runtime: dict[str, object]) -> bool:
     platform = runtime.get("platform", {})
     if not isinstance(platform, dict):
@@ -343,7 +321,6 @@ def _pipe_codec_mode(runtime: dict[str, object], adapters: dict[str, object]) ->
         if isinstance(codec, str) and codec:
             return codec
     return "pickle"
-
 
 __all__ = [
     "ControlPlaneRootRuntimeBootstrapService",

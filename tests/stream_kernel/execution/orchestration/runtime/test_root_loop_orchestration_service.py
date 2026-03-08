@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import time
 import pytest
 
 from stream_kernel.execution.orchestration.control_plane.root.reply_ingress_service import (
@@ -1052,3 +1053,91 @@ def test_root_loop_service_post_start_settle_waits_for_leaf_tombstone_completion
     )
 
     assert replay_calls["count"] >= 3
+
+
+def test_root_loop_service_post_start_settle_uses_inactivity_timeout_not_hard_deadline() -> None:
+    service = RootRunnerLoopOrchestrationService()
+    runner = _SyncRunner()
+    barrier = _Barrier(open_after_loop_calls=0, runner=runner)
+    reply_ingress = _ReplyIngress()
+    state = _State(_events=[])
+    scope = _ScopeWithStartupServices(
+        barrier=barrier,
+        reply_ingress=reply_ingress,
+        state=state,
+    )
+    replay_calls = {"count": 0}
+
+    def _enqueue(
+        _runner: object,
+        payload: object,
+        *,
+        run_id: str,
+        scenario_id: str,
+        index: int,
+    ) -> None:
+        _ = (payload, run_id, scenario_id, index)
+
+    def _replay(
+        *,
+        runner: object,
+        scenario_scope: object,
+        run_id: str,
+        scenario_id: str,
+        start_index: int,
+        poll_timeout_seconds: float,
+        idle_timeout_seconds: float | None,
+    ) -> int:
+        _ = (runner, scenario_scope, run_id, scenario_id, poll_timeout_seconds, idle_timeout_seconds)
+        replay_calls["count"] += 1
+        # Simulate a long-but-live stream where progress keeps happening.
+        time.sleep(0.02)
+        if replay_calls["count"] == 4:
+            state.append_event(
+                {
+                    "kind": "leaf_tombstone_completed",
+                    "target_group": "execution.ingress",
+                }
+            )
+            return start_index + 1
+        if replay_calls["count"] < 4:
+            return start_index + 1
+        return start_index
+
+    def _drain(**_: object) -> list[object]:
+        return []
+
+    inputs = [
+        ControlPlaneRootPulse(
+            runtime={
+                "platform": {
+                    "process_groups": [{"name": "execution.ingress"}],
+                    "runner_loop": {
+                        "post_start_settle_enabled": True,
+                        # Total replay duration (~0.08s) exceeds this value;
+                        # settle must still succeed because progress is continuous.
+                        "post_start_settle_max_wait_seconds": 0.05,
+                        "post_start_settle_quiet_window_seconds": 0.01,
+                    },
+                },
+                "adapters": {"source": {"emit_tombstone": True}},
+            }
+        ),
+        Envelope(
+            payload=BootstrapControl(target="source:source"),
+            target="source:source",
+        ),
+        Envelope(payload="business", target="biz.node", trace_id="t1"),
+    ]
+    service.execute_sync(
+        runner=runner,
+        inputs=inputs,
+        run_id="run",
+        scenario_id="scenario",
+        scenario_scope=scope,  # type: ignore[arg-type]
+        enqueue_runner_input=_enqueue,
+        replay_root_boundary_outputs=_replay,
+        drain_root_boundary_outputs=_drain,
+    )
+
+    assert replay_calls["count"] >= 4

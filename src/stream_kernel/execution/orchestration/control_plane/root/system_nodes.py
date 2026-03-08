@@ -48,6 +48,7 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneStartWorkEvent,
     ControlPlaneLeafBoundaryExecuteCommand,
     ControlPlaneLeafBoundaryResultEvent,
+    ControlPlaneLeafShutdownPrepareCommand,
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafConfigCardEvent,
     ControlPlaneLeafHelloEvent,
@@ -584,9 +585,9 @@ class ControlPlaneRootTombstoneObservedNode:
         payload = msg.payload if isinstance(msg, Envelope) else msg
         if not isinstance(payload, ControlPlaneLeafBoundaryResultEvent):
             return []
-        if payload.status.strip().lower() != "completed" or not payload.tombstone_input:
+        if payload.status.strip().lower() != "completed" or not (payload.tombstone_input or payload.tombstone_output):
             return []
-        snapshot = self.shutdown_readiness.observe_tombstone(payload)
+        emit_prepare, snapshot = self.shutdown_readiness.observe_tombstone(payload)
         self.state.append_event(
             {
                 "kind": "control_plane.shutdown.tombstone_observed",
@@ -596,9 +597,57 @@ class ControlPlaneRootTombstoneObservedNode:
                 "tombstone_output": payload.tombstone_output,
                 "observed_groups": list(snapshot.tombstone_groups),
                 "expected_groups": list(snapshot.expected_groups),
+                "prepare_emitted": bool(snapshot.prepare_emitted),
             }
         )
-        return []
+        if not emit_prepare:
+            return []
+        commands = self._prepare_commands(snapshot=snapshot)
+        if not commands:
+            return []
+        self.state.append_event(
+            {
+                "kind": "control_plane.shutdown.prepare_dispatched",
+                "command_count": len(commands),
+                "expected_groups": list(snapshot.expected_groups),
+                "targets": [item.worker_id for item in commands],
+            }
+        )
+        return commands
+
+    def _prepare_commands(
+        self,
+        *,
+        snapshot: object,
+    ) -> list[ControlPlaneLeafShutdownPrepareCommand]:
+        expected_groups = tuple(
+            sorted(
+                {
+                    item
+                    for item in getattr(snapshot, "expected_groups", ())
+                    if isinstance(item, str) and item
+                }
+            )
+        )
+        if not expected_groups:
+            return []
+        worker_ids = _worker_ids_for_groups(
+            events=self.state.events(),
+            groups=set(expected_groups),
+        )
+        if not worker_ids:
+            return []
+        command_id = f"shutdown-prepare:{int(time.time() * 1000)}"
+        commands: list[ControlPlaneLeafShutdownPrepareCommand] = []
+        for worker_id, group_name in worker_ids:
+            commands.append(
+                ControlPlaneLeafShutdownPrepareCommand(
+                    target_group=group_name,
+                    worker_id=worker_id,
+                    command_id=f"{command_id}:{worker_id}",
+                )
+            )
+        return commands
 
 
 @dataclass
@@ -842,6 +891,45 @@ def _latest_launch_plan_from_state(events: list[object]) -> ControlPlaneLaunchPl
         if isinstance(event, ControlPlaneLaunchPlanEvent):
             return event.plan
     return None
+
+
+def _worker_ids_for_groups(
+    *,
+    events: list[object],
+    groups: set[str],
+) -> list[tuple[str, str]]:
+    if not groups:
+        return []
+    resolved: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for event in events:
+        group_name: str | None = None
+        worker_id: str | None = None
+        if isinstance(event, dict):
+            if event.get("kind") == "control_plane.lifecycle.worker_spawned":
+                group_name = event.get("group_name")
+                worker_id = event.get("worker_id")
+            else:
+                group_name = event.get("target_group")
+                worker_id = event.get("worker_id")
+        else:
+            target_group = getattr(event, "target_group", None)
+            target_worker = getattr(event, "worker_id", None)
+            if isinstance(target_group, str) and target_group:
+                group_name = target_group
+            if isinstance(target_worker, str) and target_worker:
+                worker_id = target_worker
+        if (
+            not isinstance(group_name, str)
+            or group_name not in groups
+            or not isinstance(worker_id, str)
+            or not worker_id
+            or worker_id in seen
+        ):
+            continue
+        seen.add(worker_id)
+        resolved.append((worker_id, group_name))
+    return resolved
 
 
 __all__ = [

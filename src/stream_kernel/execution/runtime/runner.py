@@ -16,11 +16,13 @@ from stream_kernel.platform.services.observability import (
     resolve_pipeline_observability,
 )
 from stream_kernel.observability.events import (
+    DebugDispatchEvent,
     LogDispatchEvent,
     MetricDispatchEvent,
     MonitorDispatchEvent,
     TraceDispatchEvent,
 )
+from stream_kernel.platform.services.runtime.debug_buffer import RuntimeDebugBufferService
 from stream_kernel.platform.services.state.context import ContextService
 from stream_kernel.routing.envelope import Envelope
 from stream_kernel.routing.router import RoutingResult
@@ -49,6 +51,7 @@ class SyncRunner:
     context_service: object = inject.service(ContextService)
     # Framework-level observability gateway (tracing/metrics/logging hooks).
     observability: object = inject.service(ObservabilityService)
+    runtime_debug_buffer: object | None = None
     # Service/system nodes can request full metadata, regular nodes receive filtered view.
     full_context_nodes: set[str] = field(default_factory=set)
     # Sink delivery ordering mode: `completion` (default) or `source_seq`.
@@ -162,6 +165,15 @@ class SyncRunner:
                     work_queue=work_queue,
                     router=router,
                 )
+                self._route_runtime_debug_messages(
+                    source_node=node_name,
+                    trace_id=envelope.trace_id,
+                    reply_to=envelope.reply_to,
+                    span_id=self._span_id_from_observer_state(observer_state),
+                    tombstone=bool(envelope.tombstone),
+                    work_queue=work_queue,
+                    router=router,
+                )
                 raise
             # Success path callback after node output materialization.
             produced_span_id = self._span_id_from_observer_state(observer_state)
@@ -184,6 +196,15 @@ class SyncRunner:
                     work_queue=work_queue,
                     router=router,
                 )
+            self._route_runtime_debug_messages(
+                source_node=node_name,
+                trace_id=envelope.trace_id,
+                reply_to=envelope.reply_to,
+                span_id=produced_span_id,
+                tombstone=bool(envelope.tombstone),
+                work_queue=work_queue,
+                router=router,
+            )
 
             # Router translates outputs to concrete `(target_node, payload)` deliveries.
             # Envelope trace_id emitted by node output overrides current trace_id if present.
@@ -316,6 +337,14 @@ class SyncRunner:
             return resolved
         raise ValueError("SyncRunner observability is not resolved via DI")
 
+    def _runtime_debug_buffer(self) -> RuntimeDebugBufferService | None:
+        candidate = self.runtime_debug_buffer
+        if isinstance(candidate, RuntimeDebugBufferService):
+            return candidate
+        if callable(getattr(candidate, "publish", None)) and callable(getattr(candidate, "drain", None)):
+            return candidate  # type: ignore[return-value]
+        return None
+
     @staticmethod
     def _local_deliveries(route_result: object) -> list[tuple[str, object]]:
         # Routing contract is strict: Router/Service must return RoutingResult.
@@ -404,6 +433,7 @@ class SyncRunner:
     def _is_observability_system_node(node_name: str) -> bool:
         return (
             node_name.startswith("system.obs.")
+            or node_name.startswith("system.debug.")
             or node_name.startswith("system.transport.handoff.")
         )
 
@@ -501,6 +531,37 @@ class SyncRunner:
                     continue
                 work_queue.push(envelope_out)
 
+    def _route_runtime_debug_messages(
+        self,
+        *,
+        source_node: str,
+        trace_id: str | None,
+        reply_to: str | None,
+        span_id: str | None,
+        tombstone: bool,
+        work_queue: QueuePort,
+        router: RoutingService,
+    ) -> None:
+        buffer = self._runtime_debug_buffer()
+        if buffer is None:
+            return
+        try:
+            messages = buffer.drain(max_items=2048)
+        except Exception:
+            return
+        if not messages:
+            return
+        self._route_observability_service_outputs(
+            service_outputs=messages,
+            source_node=source_node,
+            trace_id=trace_id,
+            reply_to=reply_to,
+            span_id=span_id,
+            tombstone=tombstone,
+            work_queue=work_queue,
+            router=router,
+        )
+
     @staticmethod
     def _normalize_observability_output(
         *,
@@ -512,7 +573,7 @@ class SyncRunner:
             return output
         if not isinstance(
             output,
-            (TraceDispatchEvent, LogDispatchEvent, MetricDispatchEvent, MonitorDispatchEvent),
+            (TraceDispatchEvent, LogDispatchEvent, MetricDispatchEvent, MonitorDispatchEvent, DebugDispatchEvent),
         ):
             return output
         attrs = dict(output.attributes)
@@ -601,6 +662,7 @@ class AsyncRunner:
     router: object = inject.service(RoutingService)
     context_service: object = inject.service(ContextService)
     observability: object = inject.service(ObservabilityService)
+    runtime_debug_buffer: object | None = None
     full_context_nodes: set[str] = field(default_factory=set)
     ordered_sink_mode: str = "completion"
     allow_external_deliveries: bool = False
@@ -883,6 +945,9 @@ class AsyncRunner:
     def _observability(self) -> ObservabilityPipelineService:
         return SyncRunner._observability(self)  # type: ignore[misc]
 
+    def _runtime_debug_buffer(self) -> RuntimeDebugBufferService | None:
+        return SyncRunner._runtime_debug_buffer(self)  # type: ignore[misc]
+
     def _emit_ingress(
         self,
         *,
@@ -938,6 +1003,37 @@ class AsyncRunner:
         SyncRunner._route_observability_service_outputs(
             self,
             service_outputs=service_outputs,
+            source_node=source_node,
+            trace_id=trace_id,
+            reply_to=reply_to,
+            span_id=span_id,
+            tombstone=tombstone,
+            work_queue=work_queue,
+            router=router,
+        )
+
+    async def _route_runtime_debug_messages_async(
+        self,
+        *,
+        source_node: str,
+        trace_id: str | None,
+        reply_to: str | None,
+        span_id: str | None,
+        tombstone: bool,
+        work_queue: QueuePort,
+        router: RoutingService,
+    ) -> None:
+        buffer = self._runtime_debug_buffer()
+        if buffer is None:
+            return
+        try:
+            messages = buffer.drain(max_items=2048)
+        except Exception:
+            return
+        if not messages:
+            return
+        self._route_observability_service_outputs(
+            service_outputs=messages,
             source_node=source_node,
             trace_id=trace_id,
             reply_to=reply_to,

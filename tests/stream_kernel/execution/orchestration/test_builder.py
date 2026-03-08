@@ -620,6 +620,39 @@ def test_build_runtime_observability_adapter_instances_supports_file_plain_loggi
     assert instances["log_file_plain"] is created[0]
 
 
+def test_build_runtime_observability_adapter_instances_supports_redis_debug_logging_exporter() -> None:
+    # runtime.observability.logging.exporters.kind=redis_debug should resolve via AdapterRegistry.
+    registry = AdapterRegistry()
+    created: list[object] = []
+
+    def _factory(_settings: dict[str, object]) -> object:
+        instance = object()
+        created.append(instance)
+        return instance
+
+    registry.register("log_redis_debug", "log_redis_debug", _factory)
+
+    instances = build_runtime_observability_adapter_instances(
+        runtime={
+            "strict": True,
+            "observability": {
+                "logging": {
+                    "exporters": [
+                        {
+                            "kind": "redis_debug",
+                            "settings": {"host": "127.0.0.1", "port": 6379},
+                        },
+                    ]
+                }
+            },
+        },
+        registry=registry,
+    )
+
+    assert instances["log_redis_debug#0"] is created[0]
+    assert instances["log_redis_debug"] is created[0]
+
+
 def test_build_runtime_observability_adapter_instances_skips_monitoring_exporters_for_worker_role() -> None:
     # monitoring sinks are supervisor-owned; worker runtime must not bind monitoring HTTP/textfile exporters.
     registry = AdapterRegistry()
@@ -1838,7 +1871,7 @@ def test_build_runtime_artifacts_includes_control_plane_root_nodes() -> None:
 
     step_names = {spec.name for spec in artifacts.scenario.steps}
     assert "system.cp.root_bootstrap" in step_names
-    assert "system.cp.discovery_collect" in step_names
+    assert "system.cp.discovery_pump" in step_names
     assert "system.cp.init_plan" in step_names
 
     registry = artifacts.consumer_registry
@@ -2288,7 +2321,6 @@ def test_run_with_sync_runner_skips_observability_requeue_from_root_boundary_han
     assert "enqueue:envelope:system.obs.log_dispatch" not in calls
     assert "run_until_stopped:1" in calls
     assert "run_until_stopped:2" in calls
-    assert "run_until_stopped:3" in calls
 
 
 def test_runtime_tcp_local_rejects_invalid_signed_frame_before_enqueue() -> None:

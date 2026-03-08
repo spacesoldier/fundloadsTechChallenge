@@ -210,6 +210,8 @@ def _replay_step(
     )
     enqueued_count = 0
     for payload in replay_items:
+        if _is_observability_envelope(payload):
+            continue
         if callable(enqueue_input):
             enqueue_input(
                 runner,

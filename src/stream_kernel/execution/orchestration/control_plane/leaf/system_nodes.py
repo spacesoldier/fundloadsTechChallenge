@@ -31,6 +31,7 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafBoundaryExecuteCommand,
     ControlPlaneLeafBoundaryResultEvent,
     ControlPlaneLeafDrainReadyEvent,
+    ControlPlaneLeafShutdownPrepareCommand,
     ControlPlaneDiscoveryItemEvent,
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafConfigCardEvent,
@@ -381,6 +382,9 @@ class ControlPlaneLeafStartWorkNode:
 @dataclass
 class ControlPlaneLeafBoundaryExecuteNode:
     boundary_execution: LeafBoundaryExecutionService = inject.service(LeafBoundaryExecutionService)
+    readiness: ControlPlaneLeafShutdownReadinessService = inject.service(
+        ControlPlaneLeafShutdownReadinessService
+    )
 
     def __call__(self, msg: object, ctx: object | None) -> list[object]:
         payload = msg.payload if isinstance(msg, Envelope) else msg
@@ -395,7 +399,18 @@ class ControlPlaneLeafBoundaryExecuteNode:
         )
         session = _leaf_session_from_ctx(ctx, payload=payload)
         try:
-            outputs = tuple(self.boundary_execution.execute(session=session, inputs=list(payload.inputs)))
+            outputs = tuple(
+                self.boundary_execution.execute(
+                    session=session,
+                    inputs=list(payload.inputs),
+                    finalize_runtime=bool(payload.finalize),
+                )
+            )
+            tombstone_input = any(_leaf_boundary_input_tombstone(item) for item in payload.inputs)
+            tombstone_output = any(
+                isinstance(item, Envelope) and item.tombstone
+                for item in outputs
+            )
             if not payload.finalize:
                 leaf_debug_log(
                     event="leaf.node.boundary_execute.background_completed",
@@ -404,20 +419,29 @@ class ControlPlaneLeafBoundaryExecuteNode:
                     output_count=len(outputs),
                 )
                 return []
-            produced = [
-                ControlPlaneLeafBoundaryResultEvent(
-                    target_group=payload.target_group,
-                    worker_id=payload.worker_id,
-                    request_id=payload.request_id,
-                    status="completed",
-                    outputs=outputs,
-                )
-            ]
+            boundary_result = ControlPlaneLeafBoundaryResultEvent(
+                target_group=payload.target_group,
+                worker_id=payload.worker_id,
+                request_id=payload.request_id,
+                status="completed",
+                outputs=outputs,
+                tombstone_input=tombstone_input,
+                tombstone_output=tombstone_output,
+            )
+            produced: list[object] = [boundary_result]
+            if tombstone_input or tombstone_output:
+                observe = getattr(self.readiness, "observe_boundary_result", None)
+                if callable(observe):
+                    ready_event = observe(boundary_result)
+                    if isinstance(ready_event, ControlPlaneLeafDrainReadyEvent):
+                        produced.append(ready_event)
             leaf_debug_log(
                 event="leaf.node.boundary_execute.completed",
                 node_name="system.cp.leaf_boundary_execute",
                 request_id=payload.request_id,
                 output_count=len(outputs),
+                tombstone_input=tombstone_input,
+                tombstone_output=tombstone_output,
                 sample_targets=[
                     item.target
                     for item in outputs
@@ -449,6 +473,7 @@ class ControlPlaneLeafBoundaryExecuteNode:
                     request_id=payload.request_id,
                     status="failed",
                     error=str(exc) or exc.__class__.__name__,
+                    tombstone_input=any(_leaf_boundary_input_tombstone(item) for item in payload.inputs),
                 )
             ]
 
@@ -469,6 +494,27 @@ class ControlPlaneLeafTombstoneFinalizeNode:
         if not isinstance(payload, ControlPlaneLeafBoundaryResultEvent):
             return []
         event = self.readiness.observe_boundary_result(payload)
+        if event is None:
+            return []
+        return [event]
+
+
+@node(
+    name="system.cp.leaf_shutdown_prepare",
+    consumes=[ControlPlaneLeafShutdownPrepareCommand],
+    emits=[ControlPlaneLeafDrainReadyEvent],
+)
+@dataclass
+class ControlPlaneLeafShutdownPrepareNode:
+    readiness: ControlPlaneLeafShutdownReadinessService = inject.service(
+        ControlPlaneLeafShutdownReadinessService
+    )
+
+    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
+        payload = msg.payload if isinstance(msg, Envelope) else msg
+        if not isinstance(payload, ControlPlaneLeafShutdownPrepareCommand):
+            return []
+        event = self.readiness.observe_prepare_command(payload)
         if event is None:
             return []
         return [event]
@@ -547,6 +593,12 @@ def _leaf_runtime_from_ctx(ctx: object | None) -> dict[str, object]:
     return {}
 
 
+def _leaf_boundary_input_tombstone(item: object) -> bool:
+    if isinstance(item, dict):
+        return item.get("tombstone") is True
+    return getattr(item, "tombstone", None) is True
+
+
 def _runtime_node_names_from_ctx(ctx: object | None) -> set[str]:
     if not isinstance(ctx, dict):
         return set()
@@ -583,6 +635,8 @@ def _is_transport_alias(node_name: str) -> bool:
     if not isinstance(node_name, str) or not node_name:
         return False
     if node_name.startswith("system.obs."):
+        return True
+    if node_name.startswith("system.debug."):
         return True
     if node_name.startswith("system.transport.handoff."):
         return True
@@ -629,6 +683,7 @@ __all__ = [
     "ControlPlaneLeafStartWorkNode",
     "ControlPlaneLeafBoundaryExecuteNode",
     "ControlPlaneLeafTombstoneFinalizeNode",
+    "ControlPlaneLeafShutdownPrepareNode",
     "ControlPlaneLeafBootstrapNode",
     "ControlPlaneLeafConfigApplyRuntimeNode",
     "ControlPlaneLeafStopNode",

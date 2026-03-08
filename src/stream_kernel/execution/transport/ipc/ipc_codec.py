@@ -8,9 +8,11 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 
 from stream_kernel.kernel.trace import ErrorInfo, MessageSignature, RouteInfo, TraceRecord
+from stream_kernel.observability.domain.debug import DebugMessage
 from stream_kernel.observability.domain.logging import LogMessage
 from stream_kernel.observability.domain.monitoring import MonitoringMessage
 from stream_kernel.observability.events import (
+    DebugDispatchEvent,
     LogDispatchEvent,
     MetricDispatchEvent,
     MonitorDispatchEvent,
@@ -146,6 +148,21 @@ def _to_wire(payload: object) -> object:
                 "fields": _to_wire(payload.fields),
             },
         )
+    if isinstance(payload, DebugMessage):
+        return _wrap(
+            "DebugMessage",
+            {
+                "timestamp": _format_dt(payload.timestamp),
+                "event": payload.event,
+                "source": payload.source,
+                "fields": _to_wire(payload.fields),
+                "run_id": payload.run_id,
+                "run_instance_id": payload.run_instance_id,
+                "process_group": payload.process_group,
+                "worker_id": payload.worker_id,
+                "trace_id": payload.trace_id,
+            },
+        )
     if isinstance(payload, MonitoringMessage):
         return _wrap(
             "MonitoringMessage",
@@ -195,6 +212,15 @@ def _to_wire(payload: object) -> object:
     if isinstance(payload, LogDispatchEvent):
         return _wrap(
             "LogDispatchEvent",
+            {
+                "payload": _to_wire(payload.payload),
+                "trace_id": payload.trace_id,
+                "attributes": _to_wire(payload.attributes),
+            },
+        )
+    if isinstance(payload, DebugDispatchEvent):
+        return _wrap(
+            "DebugDispatchEvent",
             {
                 "payload": _to_wire(payload.payload),
                 "trace_id": payload.trace_id,
@@ -453,6 +479,22 @@ def _decode_monitoring_message(data: object) -> MonitoringMessage:
     )
 
 
+def _decode_debug_message(data: object) -> DebugMessage:
+    if not isinstance(data, dict):
+        raise ExecutionIpcCodecError("DebugMessage payload must be a mapping")
+    return DebugMessage(
+        timestamp=_parse_dt(data.get("timestamp") or ""),
+        event=data.get("event") or "",
+        source=data.get("source") or "",
+        fields=_from_wire(data.get("fields") or {}),
+        run_id=data.get("run_id"),
+        run_instance_id=data.get("run_instance_id"),
+        process_group=data.get("process_group"),
+        worker_id=data.get("worker_id"),
+        trace_id=data.get("trace_id"),
+    )
+
+
 def _decode_snapshot_event(data: object) -> MonitoringMetricsSnapshotEvent:
     if not isinstance(data, dict):
         raise ExecutionIpcCodecError("MonitoringMetricsSnapshotEvent payload must be a mapping")
@@ -500,6 +542,16 @@ def _decode_log_dispatch_event(data: object) -> LogDispatchEvent:
     if not isinstance(data, dict):
         raise ExecutionIpcCodecError("LogDispatchEvent payload must be a mapping")
     return LogDispatchEvent(
+        payload=_from_wire(data.get("payload")),
+        trace_id=data.get("trace_id"),
+        attributes=_from_wire(data.get("attributes") or {}),
+    )
+
+
+def _decode_debug_dispatch_event(data: object) -> DebugDispatchEvent:
+    if not isinstance(data, dict):
+        raise ExecutionIpcCodecError("DebugDispatchEvent payload must be a mapping")
+    return DebugDispatchEvent(
         payload=_from_wire(data.get("payload")),
         trace_id=data.get("trace_id"),
         attributes=_from_wire(data.get("attributes") or {}),
@@ -713,12 +765,14 @@ _DECODERS = {
     "ErrorInfo": _decode_error_info,
     "RouteInfo": _decode_route_info,
     "LogMessage": _decode_log_message,
+    "DebugMessage": _decode_debug_message,
     "MonitoringMessage": _decode_monitoring_message,
     "MonitoringMetricsSnapshotEvent": _decode_snapshot_event,
     "MonitoringMetricsSnapshotResult": _decode_snapshot_result,
     "WorkerQueueTelemetryEvent": _decode_worker_queue_telemetry,
     "TraceDispatchEvent": _decode_trace_dispatch_event,
     "LogDispatchEvent": _decode_log_dispatch_event,
+    "DebugDispatchEvent": _decode_debug_dispatch_event,
     "MetricDispatchEvent": _decode_metric_dispatch_event,
     "MonitorDispatchEvent": _decode_monitor_dispatch_event,
     "ExecutionIpcControlSignal": _decode_execution_ipc_control_signal,

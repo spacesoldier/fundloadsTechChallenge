@@ -25,11 +25,16 @@ from stream_kernel.execution.transport.ipc.ipc_transport import (
     ExecutionIpcTransportService,
     compose_execution_ipc_worker_target_id,
 )
+from stream_kernel.execution.transport.ipc.ipc_lane_routing_service import (
+    ExecutionIpcLaneRoutingService,
+)
 from stream_kernel.integration.consumer_registry import ConsumerRegistry
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafBoundaryResultEvent,
+    ControlPlaneLeafDrainReadyEvent,
     ControlPlaneLeafDiscoveryAckEvent,
     ControlPlaneLeafConfigAckEvent,
+    ControlPlaneLeafStopCommand,
     ControlPlaneLeafStopAckEvent,
 )
 
@@ -57,6 +62,7 @@ class LeafControlIngressService(Protocol):
 class DefaultLeafControlIngressService(LeafControlIngressService):
     command_loop_service: LeafWorkerCommandLoopService = inject.service(LeafWorkerCommandLoopService)
     execution_ipc: object | None = inject.service(ExecutionIpcTransportService)
+    lane_routing_service: object | None = inject.service(ExecutionIpcLaneRoutingService)
     finalization_service: object | None = inject.service(LeafSessionFinalizationService)
 
     def run_until_stopped(
@@ -92,17 +98,30 @@ class DefaultLeafControlIngressService(LeafControlIngressService):
             poll_interval_seconds=poll_interval,
         )
         idle_loops = 0
+        stop_drain_loops = 0
         while True:
-            if _stop_requested(stop_event):
-                leaf_debug_log(
-                    event="leaf.ingress.loop.stop_event",
-                    worker_id=session.worker_id,
-                )
-                self._finalize_session(session=session)
-                return "stop_event"
+            stop_requested = _stop_requested(stop_event)
             message = self._recv_control_message_nonblocking(session=session)
             if message is None:
                 idle_loops += 1
+                if stop_requested:
+                    stop_drain_loops += 1
+                    if stop_drain_loops % 1000 == 0:
+                        leaf_debug_log(
+                            event="leaf.ingress.loop.stop_drain_heartbeat",
+                            worker_id=session.worker_id,
+                            stop_drain_loops=stop_drain_loops,
+                        )
+                    if self._has_pending_transport_work(session=session):
+                        await asyncio.sleep(poll_interval)
+                        continue
+                    leaf_debug_log(
+                        event="leaf.ingress.loop.stop_event",
+                        worker_id=session.worker_id,
+                        stop_drain_loops=stop_drain_loops,
+                    )
+                    self._finalize_session(session=session)
+                    return "stop_event"
                 if idle_loops % 1000 == 0:
                     leaf_debug_log(
                         event="leaf.ingress.loop.idle_heartbeat",
@@ -112,11 +131,19 @@ class DefaultLeafControlIngressService(LeafControlIngressService):
                 await asyncio.sleep(poll_interval)
                 continue
             idle_loops = 0
+            stop_drain_loops = 0
             leaf_debug_log(
                 event="leaf.ingress.message.received",
                 worker_id=session.worker_id,
                 message_type=type(message).__name__,
             )
+            if stop_requested and isinstance(message, ControlPlaneLeafStopCommand):
+                leaf_debug_log(
+                    event="leaf.ingress.stop_command.skipped_during_stop_drain",
+                    worker_id=session.worker_id,
+                    command_id=message.command_id,
+                )
+                continue
             if _is_transport_ack_signal(message):
                 leaf_debug_log(
                     event="leaf.ingress.message.transport_ack_skipped",
@@ -201,6 +228,8 @@ class DefaultLeafControlIngressService(LeafControlIngressService):
                     status = "discovery_acknowledged"
                 elif isinstance(item, ControlPlaneLeafBoundaryResultEvent):
                     status = "boundary_executed"
+                elif isinstance(item, ControlPlaneLeafDrainReadyEvent):
+                    status = "boundary_executed"
                 elif isinstance(item, ControlPlaneLeafStopAckEvent):
                     status = "stop_requested"
                 else:
@@ -241,7 +270,7 @@ class DefaultLeafControlIngressService(LeafControlIngressService):
                 payload_type=type(payload).__name__,
             )
             return
-        lane = _lane_for_outbound_payload(payload)
+        lane = self._resolve_outbound_lane(payload=payload)
         target_id = compose_execution_ipc_worker_target_id(session.worker_id, lane=lane)
         try:
             ipc.send(target_id, payload, no_reply=True)
@@ -286,6 +315,56 @@ class DefaultLeafControlIngressService(LeafControlIngressService):
         if callable(getattr(resolved, "recv", None)) and callable(getattr(resolved, "send", None)):
             return resolved  # type: ignore[return-value]
         return None
+
+    def _resolve_outbound_lane(self, *, payload: object) -> str:
+        fallback = _lane_for_outbound_payload(payload)
+        candidate = self.lane_routing_service
+        if isinstance(candidate, ExecutionIpcLaneRoutingService):
+            try:
+                return candidate.resolve_lane(payload=payload, default_lane=fallback)
+            except Exception:
+                return fallback
+        if callable(getattr(candidate, "resolve_lane", None)):
+            try:
+                return candidate.resolve_lane(payload=payload, default_lane=fallback)  # type: ignore[call-arg]
+            except Exception:
+                return fallback
+        return fallback
+
+    def _has_pending_transport_work(self, *, session: "LeafWorkerRuntimeSession") -> bool:
+        ipc = self._resolve_execution_ipc_service(session)
+        if ipc is None:
+            return False
+        worker_id = getattr(session, "worker_id", None)
+        if not isinstance(worker_id, str) or not worker_id:
+            return False
+        metrics = getattr(ipc, "metrics", None)
+        if not callable(metrics):
+            return False
+        for lane in (
+            EXECUTION_IPC_LANE_CONTROL,
+            EXECUTION_IPC_LANE_DATA,
+            EXECUTION_IPC_LANE_TRACE,
+            EXECUTION_IPC_LANE_LOG,
+            EXECUTION_IPC_LANE_METRIC,
+        ):
+            target_id = compose_execution_ipc_worker_target_id(worker_id, lane=lane)
+            try:
+                payload = metrics(target_id)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            queue_depth = payload.get("queue_depth", 0)
+            pending_outbound = payload.get("pending_outbound", 0)
+            outbound_queue_depth = payload.get("outbound_queue_depth", 0)
+            if isinstance(queue_depth, int) and queue_depth > 0:
+                return True
+            if isinstance(pending_outbound, int) and pending_outbound > 0:
+                return True
+            if isinstance(outbound_queue_depth, int) and outbound_queue_depth > 0:
+                return True
+        return False
 
     def _finalize_session(self, *, session: "LeafWorkerRuntimeSession") -> None:
         finalizer = self._resolve_finalization_service(session)
@@ -404,6 +483,7 @@ def _is_leaf_control_reply(message: object) -> bool:
             ControlPlaneLeafDiscoveryAckEvent,
             ControlPlaneLeafConfigAckEvent,
             ControlPlaneLeafBoundaryResultEvent,
+            ControlPlaneLeafDrainReadyEvent,
             ControlPlaneLeafStopAckEvent,
         ),
     )
@@ -440,6 +520,9 @@ def _recv_from_worker_lanes(
 def _lane_for_outbound_payload(payload: object) -> str:
     if isinstance(payload, ControlPlaneLeafBoundaryResultEvent):
         return EXECUTION_IPC_LANE_DATA
+    if isinstance(payload, ControlPlaneLeafDrainReadyEvent):
+        # Prioritize shutdown-ready signal to avoid data-lane head-of-line stalls.
+        return EXECUTION_IPC_LANE_CONTROL
     return EXECUTION_IPC_LANE_CONTROL
 
 

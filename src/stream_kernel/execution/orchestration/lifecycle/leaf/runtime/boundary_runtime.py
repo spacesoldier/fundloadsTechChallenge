@@ -162,6 +162,8 @@ def execute_child_boundary_loop(
             for node_name, step in all_nodes.items():
                 if node_name.startswith("system.obs."):
                     nodes[node_name] = step
+                if node_name.startswith("system.debug."):
+                    nodes[node_name] = step
 
         full_context_nodes = {
             node_name

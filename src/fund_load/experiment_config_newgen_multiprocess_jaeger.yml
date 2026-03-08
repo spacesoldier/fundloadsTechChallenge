@@ -122,6 +122,22 @@ runtime:
           mode: all
           settings:
             path: logs/runtime_all_experiment_multiprocess_jaeger.jsonl
+        - kind: redis_debug
+          mode: all
+          settings:
+            host: 127.0.0.1
+            port: 6379
+            db: 0
+            key_prefix: stream_kernel:debug
+            ttl_seconds: 86400
+            connect_timeout_seconds: 0.2
+            socket_timeout_seconds: 1.0
+            write_mode: inline
+            queue_max_items: 32768
+            batch_max_items: 256
+            batch_flush_interval_ms: 20
+            capture_all_events: true
+            only_debug_channel: false
       lifecycle_events:
         enabled: true
         level: info
@@ -158,8 +174,11 @@ runtime:
   platform:
     debug:
       root_verbose_logging: true
+      leaf_debug_enabled: false
       leaf_verbose_logging: false
+      leaf_debug_write_to_file: false
       leaf_debug_logs_dir: logs/leaf_debug
+      runtime_debug_direct_dispatch: true
     lifecycle:
       graceful_timeout_seconds: 120
       drain_inflight: true
@@ -167,8 +186,6 @@ runtime:
       fallback_graceful_timeout_seconds: 2.0
     execution_ipc:
       transport: ipc_local
-      bind_host: 127.0.0.1
-      bind_port: 0
       flow_control:
         mode: none
       auth:

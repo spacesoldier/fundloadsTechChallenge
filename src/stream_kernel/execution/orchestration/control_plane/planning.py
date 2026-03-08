@@ -30,6 +30,7 @@ from stream_kernel.platform.services.runtime.control_plane_discovery_stream impo
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafDiscoveryRequestEvent,
     ControlPlaneLeafDiscoverySnapshotEvent,
+    ControlPlaneLeafShutdownPrepareCommand,
     ControlPlaneLeafStartWorkEvent,
     ControlPlaneLeafPulse,
     ControlPlaneRootPulse,
@@ -47,6 +48,7 @@ from .leaf.system_nodes import (
     ControlPlaneLeafConfigApplyRuntimeNode,
     ControlPlaneLeafDiscoveryRequestNode,
     ControlPlaneLeafStartWorkNode,
+    ControlPlaneLeafShutdownPrepareNode,
     ControlPlaneLeafSnapshotApplyNode,
     ControlPlaneLeafStopNode,
     ControlPlaneLeafTombstoneFinalizeNode,
@@ -97,6 +99,7 @@ def build_control_plane_system_plan(
         ControlPlaneLeafBoundaryResultEvent,
         ControlPlaneLeafDrainReadyEvent,
         ControlPlaneLeafConfigCardEvent,
+        ControlPlaneLeafShutdownPrepareCommand,
         ControlPlaneLeafStartWorkEvent,
         ControlPlaneLeafPulse,
         ControlPlaneLeafStopCommand,
@@ -147,21 +150,26 @@ def build_control_plane_system_plan(
                 method_name="apply_snapshot",
             )
         )
+        leaf_shutdown_readiness = _resolve_optional_service(
+            scope=scenario_scope,
+            contract=_leaf_shutdown_readiness_contract(),
+            method_name="observe_prepare_command",
+        ) or _noop_leaf_shutdown_readiness_service()
         leaf_boundary = ControlPlaneLeafBoundaryExecuteNode(
             boundary_execution=_resolve_required_service(
                 scope=scenario_scope,
                 contract=_leaf_boundary_execution_contract(),
                 method_name="execute",
-            )
+            ),
+            readiness=leaf_shutdown_readiness,
         )
         leaf_start_work = ControlPlaneLeafStartWorkNode()
         leaf_stop = ControlPlaneLeafStopNode()
         leaf_tombstone_finalize = ControlPlaneLeafTombstoneFinalizeNode(
-            readiness=_resolve_optional_service(
-                scope=scenario_scope,
-                contract=_leaf_shutdown_readiness_contract(),
-                method_name="observe_boundary_result",
-            ) or _noop_leaf_shutdown_readiness_service()
+            readiness=leaf_shutdown_readiness
+        )
+        leaf_shutdown_prepare = ControlPlaneLeafShutdownPrepareNode(
+            readiness=leaf_shutdown_readiness
         )
         return ControlPlaneSystemPlan(
             system_steps=[
@@ -172,6 +180,7 @@ def build_control_plane_system_plan(
                 StepSpec(name="system.cp.leaf_start_work", step=leaf_start_work),
                 StepSpec(name="system.cp.leaf_boundary_execute", step=leaf_boundary),
                 StepSpec(name="system.cp.leaf_tombstone_finalize", step=leaf_tombstone_finalize),
+                StepSpec(name="system.cp.leaf_shutdown_prepare", step=leaf_shutdown_prepare),
                 StepSpec(name="system.cp.leaf_stop", step=leaf_stop),
             ],
             system_consumers={
@@ -182,6 +191,7 @@ def build_control_plane_system_plan(
                 ControlPlaneLeafStartWorkEvent: ["system.cp.leaf_start_work"],
                 ControlPlaneLeafBoundaryExecuteCommand: ["system.cp.leaf_boundary_execute"],
                 ControlPlaneLeafBoundaryResultEvent: ["system.cp.leaf_tombstone_finalize"],
+                ControlPlaneLeafShutdownPrepareCommand: ["system.cp.leaf_shutdown_prepare"],
                 ControlPlaneLeafStopCommand: ["system.cp.leaf_stop"],
             },
             system_node_names={
@@ -192,6 +202,7 @@ def build_control_plane_system_plan(
                 "system.cp.leaf_start_work",
                 "system.cp.leaf_boundary_execute",
                 "system.cp.leaf_tombstone_finalize",
+                "system.cp.leaf_shutdown_prepare",
                 "system.cp.leaf_stop",
             },
         )
@@ -534,8 +545,11 @@ def _noop_shutdown_readiness_service() -> object:
         def configure_expected_groups(self, groups: tuple[str, ...]) -> None:  # noqa: ARG002
             return None
 
-        def observe_tombstone(self, result: object) -> ControlPlaneShutdownReadinessSnapshot:  # noqa: ARG002
-            return ControlPlaneShutdownReadinessSnapshot()
+        def observe_tombstone(
+            self,
+            result: object,  # noqa: ARG002
+        ) -> tuple[bool, ControlPlaneShutdownReadinessSnapshot]:
+            return (False, ControlPlaneShutdownReadinessSnapshot())
 
         def mark_leaf_ready(
             self,
@@ -552,6 +566,9 @@ def _noop_shutdown_readiness_service() -> object:
 def _noop_leaf_shutdown_readiness_service() -> object:
     class _NoopLeafShutdownReadiness:
         def observe_boundary_result(self, result: object) -> None:  # noqa: ARG002
+            return None
+
+        def observe_prepare_command(self, command: object) -> None:  # noqa: ARG002
             return None
 
     return _NoopLeafShutdownReadiness()

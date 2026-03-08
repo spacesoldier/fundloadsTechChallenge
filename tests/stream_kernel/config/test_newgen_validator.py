@@ -605,6 +605,8 @@ def test_validate_newgen_config_accepts_execution_ipc_codec_override() -> None:
     runtime["platform"] = {
         "execution_ipc": {
             "transport": "tcp_local",
+            "bind_host": "127.0.0.1",
+            "bind_port": 0,
             "auth": {"mode": "hmac"},
             "codec": "pickle",
         }
@@ -636,6 +638,8 @@ def test_validate_newgen_config_accepts_execution_ipc_buffer_overrides() -> None
     runtime["platform"] = {
         "execution_ipc": {
             "transport": "tcp_local",
+            "bind_host": "127.0.0.1",
+            "bind_port": 0,
             "auth": {"mode": "hmac"},
             "buffer": {
                 "enabled": True,
@@ -724,6 +728,8 @@ def test_validate_newgen_config_accepts_execution_ipc_flow_control() -> None:
     runtime["platform"] = {
         "execution_ipc": {
             "transport": "tcp_local",
+            "bind_host": "127.0.0.1",
+            "bind_port": 0,
             "auth": {"mode": "hmac"},
             "flow_control": {
                 "mode": "hybrid",
@@ -792,6 +798,8 @@ def test_validate_newgen_config_accepts_execution_ipc_polling_settings() -> None
     runtime["platform"] = {
         "execution_ipc": {
             "transport": "tcp_local",
+            "bind_host": "127.0.0.1",
+            "bind_port": 0,
             "auth": {"mode": "hmac"},
             "poll_mode": "auto",
             "poll_interval_ms": 2,
@@ -831,6 +839,37 @@ def test_validate_newgen_config_rejects_invalid_execution_ipc_poll_interval() ->
     }
     with pytest.raises(ConfigError):
         validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_tcp_local_execution_ipc_without_bind_host() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "auth": {"mode": "hmac"},
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_accepts_ipc_local_execution_ipc_without_bind_host_and_port() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "ipc_local",
+            "auth": {"mode": "hmac"},
+        }
+    }
+    validated = validate_newgen_config(raw)
+    execution_ipc = validated["runtime"]["platform"]["execution_ipc"]
+    assert execution_ipc["transport"] == "ipc_local"
+    assert "bind_host" not in execution_ipc
+    assert "bind_port" not in execution_ipc
 
 
 def test_validate_newgen_config_defaults_runtime_platform_bootstrap_mode_to_inline() -> None:
@@ -1150,8 +1189,10 @@ def test_validate_newgen_config_accepts_runtime_platform_debug_leaf_logging_sett
     assert isinstance(runtime, dict)
     runtime["platform"] = {
         "debug": {
+            "leaf_debug_enabled": True,
             "leaf_verbose_logging": False,
             "leaf_debug_logs_dir": "logs/leaf_debug_custom",
+            "runtime_debug_direct_dispatch": True,
         }
     }
     validated = validate_newgen_config(raw)
@@ -1161,8 +1202,10 @@ def test_validate_newgen_config_accepts_runtime_platform_debug_leaf_logging_sett
     assert isinstance(platform, dict)
     debug = platform.get("debug")
     assert isinstance(debug, dict)
+    assert debug.get("leaf_debug_enabled") is True
     assert debug.get("leaf_verbose_logging") is False
     assert debug.get("leaf_debug_logs_dir") == "logs/leaf_debug_custom"
+    assert debug.get("runtime_debug_direct_dispatch") is True
 
 
 def test_validate_newgen_config_rejects_invalid_runtime_platform_debug_leaf_debug_logs_dir() -> None:
@@ -1173,6 +1216,19 @@ def test_validate_newgen_config_rejects_invalid_runtime_platform_debug_leaf_debu
         "debug": {
             "leaf_verbose_logging": True,
             "leaf_debug_logs_dir": "",
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_invalid_runtime_platform_debug_runtime_debug_direct_dispatch() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "debug": {
+            "runtime_debug_direct_dispatch": "yes",
         }
     }
     with pytest.raises(ConfigError):
@@ -1372,7 +1428,7 @@ def test_validate_newgen_config_observability_service_worker_workers_propagate_t
     assert isinstance(runtime, dict)
     runtime["platform"] = {
         "bootstrap": {"mode": "process_supervisor"},
-        "execution_ipc": {"transport": "tcp_local", "auth": {"mode": "hmac"}},
+        "execution_ipc": {"transport": "tcp_local", "bind_host": "127.0.0.1", "bind_port": 0, "auth": {"mode": "hmac"}},
         "process_groups": [],
     }
     runtime["observability"] = {
@@ -1548,6 +1604,81 @@ def test_validate_newgen_config_accepts_observability_logging_exporter_mode_all(
     exporters = logging.get("exporters")
     assert isinstance(exporters, list)
     assert exporters and exporters[0].get("mode") == "all"
+
+
+def test_validate_newgen_config_accepts_observability_logging_redis_debug_exporter() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "logging": {
+            "exporters": [
+                {
+                    "kind": "redis_debug",
+                    "settings": {
+                        "host": "127.0.0.1",
+                        "port": 6379,
+                        "db": 0,
+                        "key_prefix": "stream_kernel:debug",
+                        "ttl_seconds": 3600,
+                        "capture_all_events": True,
+                        "only_debug_channel": False,
+                    },
+                }
+            ],
+        }
+    }
+    validated = validate_newgen_config(raw)
+    vruntime = validated.get("runtime")
+    assert isinstance(vruntime, dict)
+    observability = vruntime.get("observability")
+    assert isinstance(observability, dict)
+    logging = observability.get("logging")
+    assert isinstance(logging, dict)
+    exporters = logging.get("exporters")
+    assert isinstance(exporters, list)
+    assert exporters and exporters[0].get("kind") == "redis_debug"
+
+
+def test_validate_newgen_config_rejects_observability_logging_redis_debug_invalid_port() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "logging": {
+            "exporters": [
+                {
+                    "kind": "redis_debug",
+                    "settings": {
+                        "host": "127.0.0.1",
+                        "port": -1,
+                    },
+                }
+            ],
+        }
+    }
+    with pytest.raises(ConfigError, match="logging\\.exporters\\[0\\]\\.settings\\.port"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_observability_logging_redis_debug_invalid_capture_all_events() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "logging": {
+            "exporters": [
+                {
+                    "kind": "redis_debug",
+                    "settings": {
+                        "capture_all_events": "yes",
+                    },
+                }
+            ],
+        }
+    }
+    with pytest.raises(ConfigError, match="logging\\.exporters\\[0\\]\\.settings\\.capture_all_events"):
+        validate_newgen_config(raw)
 
 
 def test_validate_newgen_config_rejects_observability_logging_exporter_unknown_mode() -> None:
@@ -3418,7 +3549,7 @@ def test_validate_newgen_config_obs_service_process_materializes_default_owner_g
     assert isinstance(runtime, dict)
     runtime["platform"] = {
         "bootstrap": {"mode": "process_supervisor"},
-        "execution_ipc": {"transport": "tcp_local", "auth": {"mode": "hmac"}},
+        "execution_ipc": {"transport": "tcp_local", "bind_host": "127.0.0.1", "bind_port": 0, "auth": {"mode": "hmac"}},
         "process_groups": [{"name": "execution.cpu", "nodes": ["compute_features"]}],
     }
     runtime["observability"] = {
@@ -3452,7 +3583,7 @@ def test_validate_newgen_config_worker_queue_telemetry_adds_system_dispatch_node
     assert isinstance(runtime, dict)
     runtime["platform"] = {
         "bootstrap": {"mode": "process_supervisor"},
-        "execution_ipc": {"transport": "tcp_local", "auth": {"mode": "hmac"}},
+        "execution_ipc": {"transport": "tcp_local", "bind_host": "127.0.0.1", "bind_port": 0, "auth": {"mode": "hmac"}},
         "process_groups": [{"name": "execution.cpu", "nodes": ["compute_features"]}],
     }
     runtime["observability"] = {
@@ -3492,7 +3623,7 @@ def test_validate_newgen_config_obs_service_process_defaults_to_enabled_for_proc
     assert isinstance(runtime, dict)
     runtime["platform"] = {
         "bootstrap": {"mode": "process_supervisor"},
-        "execution_ipc": {"transport": "tcp_local", "auth": {"mode": "hmac"}},
+        "execution_ipc": {"transport": "tcp_local", "bind_host": "127.0.0.1", "bind_port": 0, "auth": {"mode": "hmac"}},
         "process_groups": [{"name": "execution.cpu", "nodes": ["compute_features"]}],
     }
     runtime["observability"] = {
@@ -3524,7 +3655,7 @@ def test_validate_newgen_config_obs_service_process_can_be_explicitly_disabled()
     assert isinstance(runtime, dict)
     runtime["platform"] = {
         "bootstrap": {"mode": "process_supervisor"},
-        "execution_ipc": {"transport": "tcp_local", "auth": {"mode": "hmac"}},
+        "execution_ipc": {"transport": "tcp_local", "bind_host": "127.0.0.1", "bind_port": 0, "auth": {"mode": "hmac"}},
         "process_groups": [{"name": "execution.cpu", "nodes": ["compute_features"]}],
     }
     runtime["observability"] = {
@@ -3556,7 +3687,7 @@ def test_validate_newgen_config_obs_service_process_rejects_ambiguous_system_nod
     assert isinstance(runtime, dict)
     runtime["platform"] = {
         "bootstrap": {"mode": "process_supervisor"},
-        "execution_ipc": {"transport": "tcp_local", "auth": {"mode": "hmac"}},
+        "execution_ipc": {"transport": "tcp_local", "bind_host": "127.0.0.1", "bind_port": 0, "auth": {"mode": "hmac"}},
         "process_groups": [
             {"name": "execution.cpu", "nodes": ["compute_features", "system.obs.trace_dispatch"]},
             {"name": "system.observability", "nodes": ["system.obs.trace_dispatch"]},
@@ -3577,7 +3708,7 @@ def test_validate_newgen_config_obs_service_process_overrides_owner_group_runtim
     assert isinstance(runtime, dict)
     runtime["platform"] = {
         "bootstrap": {"mode": "process_supervisor"},
-        "execution_ipc": {"transport": "tcp_local", "auth": {"mode": "hmac"}},
+        "execution_ipc": {"transport": "tcp_local", "bind_host": "127.0.0.1", "bind_port": 0, "auth": {"mode": "hmac"}},
         "process_groups": [
             {"name": "execution.cpu", "nodes": ["compute_features"]},
             {"name": "system.observability", "workers": 99, "runner_profile": "sync", "nodes": []},
@@ -3615,7 +3746,7 @@ def test_validate_newgen_config_obs_service_process_rejects_missing_owner_when_a
     assert isinstance(runtime, dict)
     runtime["platform"] = {
         "bootstrap": {"mode": "process_supervisor"},
-        "execution_ipc": {"transport": "tcp_local", "auth": {"mode": "hmac"}},
+        "execution_ipc": {"transport": "tcp_local", "bind_host": "127.0.0.1", "bind_port": 0, "auth": {"mode": "hmac"}},
         "process_groups": [{"name": "execution.cpu", "nodes": ["compute_features"]}],
     }
     runtime["observability"] = {

@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from stream_kernel.application_context.service import service
 from stream_kernel.platform.services.observability import ObservabilityService
+from stream_kernel.execution.orchestration.lifecycle.leaf.debug_logging import (
+    flush_leaf_debug_logging,
+)
 
 if TYPE_CHECKING:
     from stream_kernel.execution.orchestration.lifecycle.leaf.runtime.worker_runtime import (
@@ -24,6 +27,10 @@ class LeafSessionFinalizationService(Protocol):
 @dataclass(slots=True)
 class DefaultLeafSessionFinalizationService(LeafSessionFinalizationService):
     def finalize(self, *, session: "LeafWorkerRuntimeSession") -> None:
+        try:
+            flush_leaf_debug_logging()
+        except Exception:
+            pass
         child = getattr(session, "child", None)
         scope = getattr(child, "scenario_scope", None)
         if scope is None:
@@ -55,4 +62,3 @@ __all__ = [
     "LeafSessionFinalizationService",
     "DefaultLeafSessionFinalizationService",
 ]
-

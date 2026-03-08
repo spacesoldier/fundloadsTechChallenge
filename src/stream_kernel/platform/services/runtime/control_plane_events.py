@@ -295,6 +295,19 @@ class ControlPlaneLeafBoundaryResultEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class ControlPlaneLeafShutdownPrepareCommand:
+    target_group: str
+    worker_id: str
+    command_id: str
+    emitted_at_epoch_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str(self.target_group, "ControlPlaneLeafShutdownPrepareCommand.target_group")
+        _require_non_empty_str(self.worker_id, "ControlPlaneLeafShutdownPrepareCommand.worker_id")
+        _require_non_empty_str(self.command_id, "ControlPlaneLeafShutdownPrepareCommand.command_id")
+
+
+@dataclass(frozen=True, slots=True)
 class ControlPlaneLeafDrainReadyEvent:
     target_group: str
     worker_id: str
@@ -726,6 +739,7 @@ __all__ = [
     "ControlPlaneLeafStopAckEvent",
     "ControlPlaneLeafBoundaryExecuteCommand",
     "ControlPlaneLeafBoundaryResultEvent",
+    "ControlPlaneLeafShutdownPrepareCommand",
     "ControlPlaneLeafDrainReadyEvent",
     "ControlPlaneShutdownReadyEvent",
     "ControlPlaneRootPulse",

@@ -205,6 +205,7 @@ class RootRunnerLoopOrchestrationService:
             self._configure_shutdown_readiness_expected_groups(
                 scenario_scope=scenario_scope,
                 inputs=inputs,
+                source_start_targets=tuple(source_start_targets),
             )
             replay_started = time.monotonic()
             self._emit_root_log(
@@ -447,6 +448,7 @@ class RootRunnerLoopOrchestrationService:
             self._configure_shutdown_readiness_expected_groups(
                 scenario_scope=scenario_scope,
                 inputs=inputs,
+                source_start_targets=tuple(source_start_targets),
             )
             replay_started = time.monotonic()
             self._emit_root_log(
@@ -1035,12 +1037,16 @@ class RootRunnerLoopOrchestrationService:
         enabled, max_wait_seconds, quiet_window_seconds = self._resolve_post_start_settle_settings(inputs)
         if not enabled:
             return next_replay_index
+        _wait_enabled, _wait_timeout, fail_on_timeout = self._resolve_readiness_wait_settings(inputs)
         require_tombstones = self._runtime_has_tombstone_enabled_sources(
             inputs=inputs,
             source_start_targets=source_start_targets,
         )
         required_tombstone_groups = (
-            self._expected_business_groups_for_tombstone(inputs)
+            self._expected_tombstone_groups_for_start_targets(
+                inputs=inputs,
+                source_start_targets=source_start_targets,
+            )
             if require_tombstones
             else set()
         )
@@ -1049,11 +1055,15 @@ class RootRunnerLoopOrchestrationService:
         run_until_stopped = getattr(runner, "run_until_stopped", None)
         if not callable(run_until_stopped):
             return next_replay_index
-        deadline = time.monotonic() + max_wait_seconds
         last_activity = time.monotonic()
         loops = 0
         settle_idle_timeout = max(0.001, float(poll_timeout_seconds))
-        while time.monotonic() < deadline:
+        while True:
+            # `post_start_settle_max_wait_seconds` is treated as the maximum
+            # idle window without progress, not as a hard cap for total stream
+            # duration. This prevents false timeouts on long-but-healthy runs.
+            if time.monotonic() - last_activity >= max_wait_seconds:
+                break
             loops += 1
             before_index = next_replay_index
             pending_external = getattr(runner, "external_deliveries", None)
@@ -1152,6 +1162,26 @@ class RootRunnerLoopOrchestrationService:
             verbose_only=True,
             verbose_enabled=verbose_logging,
         )
+        shutdown_ready = self._is_shutdown_ready(scenario_scope)
+        if require_tombstones and required_tombstone_groups and not shutdown_ready:
+            message = "control-plane post-start settle timeout waiting for tombstone shutdown readiness"
+            self._emit_root_log(
+                scenario_scope=scenario_scope,
+                level="warning",
+                message=message,
+                fields={
+                    "event": "control_plane.runtime.post_start_settle_timeout",
+                    "max_wait_seconds": max_wait_seconds,
+                    "required_tombstones": sorted(required_tombstone_groups),
+                    "observed_tombstones": sorted(self._observed_tombstone_completed_groups(scenario_scope)),
+                    "shutdown_ready": shutdown_ready,
+                    "fail_on_timeout": fail_on_timeout,
+                },
+                verbose_only=False,
+                verbose_enabled=verbose_logging,
+            )
+            if fail_on_timeout:
+                raise RuntimeError(message)
         return next_replay_index
 
     def _expected_business_groups_for_tombstone(
@@ -1237,11 +1267,19 @@ class RootRunnerLoopOrchestrationService:
         *,
         scenario_scope: ScenarioScope,
         inputs: list[object] | tuple[object, ...] | object,
+        source_start_targets: tuple[str, ...],
     ) -> None:
         readiness = self._resolve_shutdown_readiness_service(scenario_scope)
         if readiness is None:
             return
-        expected = tuple(sorted(self._expected_business_groups_for_tombstone(inputs)))
+        expected = tuple(
+            sorted(
+                self._expected_tombstone_groups_for_start_targets(
+                    inputs=inputs,
+                    source_start_targets=source_start_targets,
+                )
+            )
+        )
         if not expected:
             return
         configure = getattr(readiness, "configure_expected_groups", None)
@@ -1285,6 +1323,17 @@ class RootRunnerLoopOrchestrationService:
             if isinstance(group_name, str) and group_name:
                 observed.add(group_name)
         return observed
+
+    def _expected_tombstone_groups_for_start_targets(
+        self,
+        *,
+        inputs: list[object] | tuple[object, ...] | object,
+        source_start_targets: tuple[str, ...],
+    ) -> set[str]:
+        _ = source_start_targets
+        # Tombstone completion should gate shutdown for the full business pipeline,
+        # not only for the ingress group that owns source nodes.
+        return self._expected_business_groups_for_tombstone(inputs)
 
     def _emit_root_log(
         self,

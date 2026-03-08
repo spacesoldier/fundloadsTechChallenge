@@ -4,6 +4,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any
 
+from stream_kernel.application_context.inject_debug import (
+    instrument_injected_dependency,
+)
 from stream_kernel.integration.kv_store import KVStore, validate_kv_contract_type
 
 
@@ -143,6 +146,13 @@ def _iter_injected_fields(obj: object):
 def _apply_scope_injection(obj: object, scope: ScenarioScope) -> None:
     for name, injected in _iter_injected_fields(obj):
         resolved = injected.resolve(scope)
+        resolved = instrument_injected_dependency(
+            resolved=resolved,
+            injected=injected,
+            scope=scope,
+            owner=obj,
+            field_name=name,
+        )
         object.__setattr__(obj, name, resolved)
 
 

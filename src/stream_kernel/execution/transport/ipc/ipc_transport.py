@@ -103,6 +103,8 @@ def resolve_execution_ipc_lane_for_target(target: str | None) -> str:
         return EXECUTION_IPC_LANE_TRACE
     if lowered.startswith("system.obs.log"):
         return EXECUTION_IPC_LANE_LOG
+    if lowered.startswith("system.obs.debug"):
+        return EXECUTION_IPC_LANE_LOG
     if (
         lowered.startswith("system.obs.metric")
         or lowered.startswith("system.obs.monitor")

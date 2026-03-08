@@ -14,6 +14,7 @@ from stream_kernel.application_context.injection_registry import (
 from stream_kernel.kernel.node_annotation import node
 from stream_kernel.kernel.scenario import StepSpec
 from stream_kernel.observability.events import (
+    DebugDispatchEvent,
     LogDispatchEvent,
     MetricDispatchEvent,
     MonitorDispatchEvent,
@@ -28,6 +29,10 @@ from stream_kernel.platform.services.observability import (
     WorkerQueueTelemetryService,
     coerce_pipeline_observability,
 )
+from stream_kernel.platform.services.observability_debug import (
+    NoOpRuntimeDebugDispatchService,
+    RuntimeDebugDispatchService,
+)
 from stream_kernel.execution.transport.handoff.system_nodes import (
     OBSERVABILITY_HANDOFF_NODE_NAME,
     build_transport_observability_handoff_plan,
@@ -40,6 +45,7 @@ _SYSTEM_NODE_KIND_TO_EVENT: dict[str, type[object]] = {}
 _SYSTEM_NODE_KIND_TO_EVENT = {
     "system.obs.trace_dispatch": TraceDispatchEvent,
     "system.obs.log_dispatch": LogDispatchEvent,
+    "system.obs.debug_dispatch": DebugDispatchEvent,
     "system.obs.metric_dispatch": MetricDispatchEvent,
     "system.obs.monitor_dispatch": MonitorDispatchEvent,
     "system.obs.monitoring_metrics_dispatch": MonitoringMetricsSnapshotEvent,
@@ -177,6 +183,23 @@ class LogDispatchNode:
         except Exception:
             return []
         return _coerce_outputs(result)
+
+
+@node(name="system.obs.debug_dispatch", consumes=[DebugDispatchEvent], emits=[])
+@dataclass
+class DebugDispatchNode:
+    service: RuntimeDebugDispatchService
+    qualifier: str | None = None
+    _marker: object = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._marker = inject.service(RuntimeDebugDispatchService, qualifier=self.qualifier)
+
+    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
+        payload = msg.payload if isinstance(msg, Envelope) else msg
+        if not isinstance(payload, DebugDispatchEvent):
+            return []
+        return _coerce_outputs(self.service.dispatch(event=payload))
 
 
 @node(name="system.obs.metric_dispatch", consumes=[MetricDispatchEvent], emits=[])
@@ -410,6 +433,7 @@ class TraceSinkNode:
 _KIND_TO_NODE_CLS: dict[str, type] = {
     "system.obs.trace_dispatch": TraceDispatchNode,
     "system.obs.log_dispatch": LogDispatchNode,
+    "system.obs.debug_dispatch": DebugDispatchNode,
     "system.obs.metric_dispatch": MetricDispatchNode,
     "system.obs.monitor_dispatch": MonitorDispatchNode,
     "system.obs.monitoring_metrics_dispatch": MonitoringMetricsDispatchNode,
@@ -581,6 +605,8 @@ def _resolve_system_nodes_config(observability: dict[str, object]) -> list[dict[
         nodes.append({"kind": "system.obs.trace_dispatch", "enabled": True})
     if _has_enabled_exporters(observability, "logging"):
         nodes.append({"kind": "system.obs.log_dispatch", "enabled": True})
+    if _has_enabled_exporter_kind(observability, "logging", "redis_debug"):
+        nodes.append({"kind": "system.obs.debug_dispatch", "enabled": True})
     if _has_enabled_exporters(observability, "telemetry"):
         nodes.append({"kind": "system.obs.metric_dispatch", "enabled": True})
     if _has_enabled_exporters(observability, "monitoring"):
@@ -613,6 +639,21 @@ def _has_enabled_exporters(observability: dict[str, object], section: str) -> bo
     )
 
 
+def _has_enabled_exporter_kind(observability: dict[str, object], section: str, kind: str) -> bool:
+    section_cfg = observability.get(section)
+    if not isinstance(section_cfg, dict):
+        return False
+    exporters = section_cfg.get("exporters")
+    if not isinstance(exporters, list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and item.get("enabled", True) is not False
+        and item.get("kind") == kind
+        for item in exporters
+    )
+
+
 def _coerce_outputs(candidate: object) -> list[object]:
     if candidate is None:
         return []
@@ -638,6 +679,9 @@ def _build_system_dispatch_node(
     }:
         pipeline = _resolve_pipeline_service(scope=scope, qualifier=qualifier)
         return node_cls(pipeline=pipeline, qualifier=qualifier)
+    if kind == "system.obs.debug_dispatch":
+        service = _resolve_runtime_debug_dispatch_service(scope=scope, qualifier=qualifier)
+        return node_cls(service=service, qualifier=qualifier)
     if kind == "system.obs.monitoring_metrics_dispatch":
         service = _resolve_monitoring_metrics_dispatch_service(scope=scope, qualifier=qualifier)
         return node_cls(service=service, qualifier=qualifier)
@@ -696,6 +740,25 @@ def _resolve_worker_queue_telemetry_service(
     except InjectionRegistryError:
         pass
     return _NoOpWorkerQueueTelemetryService()
+
+
+def _resolve_runtime_debug_dispatch_service(
+    *,
+    scope: ScenarioScope,
+    qualifier: str | None,
+) -> RuntimeDebugDispatchService:
+    try:
+        if isinstance(qualifier, str):
+            resolved = scope.resolve("service", RuntimeDebugDispatchService, qualifier=qualifier)
+        else:
+            resolved = scope.resolve("service", RuntimeDebugDispatchService)
+        if isinstance(resolved, RuntimeDebugDispatchService):
+            return resolved
+        if callable(getattr(resolved, "dispatch", None)):
+            return resolved  # type: ignore[return-value]
+    except InjectionRegistryError:
+        pass
+    return NoOpRuntimeDebugDispatchService()
 
 
 def _build_system_node_name(*, kind: str, qualifier: str | None, index: int) -> str:

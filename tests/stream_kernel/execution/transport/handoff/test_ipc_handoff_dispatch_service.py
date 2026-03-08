@@ -380,7 +380,7 @@ def test_ipc_handoff_dispatch_service_broadcast_dataclass_payload_is_projected_p
     assert by_worker["execution.ingress#1"].command_id == "runtime-stop:execution.ingress#1"
 
 
-def test_ipc_handoff_dispatch_service_broadcast_control_lane_requires_drained_delivery() -> None:
+def test_ipc_handoff_dispatch_service_broadcast_control_lane_no_duplicate_on_pending() -> None:
     route_table = InMemoryExecutionIpcRouteTableService(store=InMemoryKvStore())
     router = _Router(groups={})
     ipc = _IpcPort(
@@ -408,6 +408,16 @@ def test_ipc_handoff_dispatch_service_broadcast_control_lane_requires_drained_de
     )
 
     assert result.total == 2
-    assert result.accepted == 1
-    assert result.failed == 1
-    assert result.failed_workers == ("execution.features#1",)
+    assert result.accepted == 2
+    assert result.failed == 0
+    assert result.failed_workers == ()
+    assert sorted(item["target_id"] for item in ipc.sends) == [
+        compose_execution_ipc_worker_target_id(
+            "execution.features#1",
+            lane=EXECUTION_IPC_LANE_CONTROL,
+        ),
+        compose_execution_ipc_worker_target_id(
+            "execution.ingress#1",
+            lane=EXECUTION_IPC_LANE_CONTROL,
+        ),
+    ]

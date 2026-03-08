@@ -14,11 +14,16 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLaunchPlan,
     ControlPlaneLaunchPlanEvent,
     ControlPlaneLeafBoundaryResultEvent,
+    ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafDiscoveryAckEvent,
     ControlPlaneLeafDiscoveryRequestEvent,
     ControlPlaneLeafDiscoverySnapshotEvent,
     ControlPlaneLeafConfigCardEvent,
     ControlPlaneLeafHelloEvent,
+    ControlPlaneLeafShutdownPrepareCommand,
+)
+from stream_kernel.platform.services.runtime.control_plane_shutdown_readiness import (
+    InMemoryControlPlaneShutdownReadinessService,
 )
 from stream_kernel.platform.services.runtime.control_plane_state import (
     InMemoryControlPlaneStateService,
@@ -242,6 +247,81 @@ def test_root_reply_ingress_service_tracks_leaf_tombstone_completion_with_empty_
     assert completions[0]["target_group"] == "execution.egress"
     assert completions[0]["worker_id"] == "execution.egress#1"
     assert completions[0]["tombstone_output"] is False
+
+
+def test_root_reply_ingress_service_dispatches_shutdown_prepare_when_all_tombstones_observed() -> None:
+    from stream_kernel.execution.orchestration.control_plane.root.reply_ingress_service import (
+        DefaultControlPlaneRootReplyIngressService,
+    )
+
+    store = InMemoryKvStore()
+    state = InMemoryControlPlaneStateService(store=store)
+    # Simulate live workers for expected groups.
+    state.append_event(
+        {
+            "kind": "control_plane.lifecycle.worker_spawned",
+            "group_name": "execution.features",
+            "worker_id": "execution.features#1",
+        }
+    )
+    state.append_event(
+        {
+            "kind": "control_plane.lifecycle.worker_spawned",
+            "group_name": "execution.policy",
+            "worker_id": "execution.policy#1",
+        }
+    )
+    shutdown_readiness = InMemoryControlPlaneShutdownReadinessService(store=store)
+    shutdown_readiness.configure_expected_groups(("execution.features", "execution.policy"))
+    ipc = _IpcPort(
+        incoming_by_target={
+            "execution.features#1": [
+                ExecutionIpcMessage(
+                    target_id="execution.features#1",
+                    payload=ControlPlaneLeafBoundaryResultEvent(
+                        target_group="execution.features",
+                        worker_id="execution.features#1",
+                        request_id="req-tomb-1",
+                        status="completed",
+                        tombstone_input=True,
+                        outputs=(),
+                    ),
+                    ts_epoch_ms=1,
+                )
+            ],
+            "execution.policy#1": [
+                ExecutionIpcMessage(
+                    target_id="execution.policy#1",
+                    payload=ControlPlaneLeafBoundaryResultEvent(
+                        target_group="execution.policy",
+                        worker_id="execution.policy#1",
+                        request_id="req-tomb-2",
+                        status="completed",
+                        tombstone_input=True,
+                        outputs=(),
+                    ),
+                    ts_epoch_ms=2,
+                )
+            ],
+        }
+    )
+    service = DefaultControlPlaneRootReplyIngressService(
+        state=state,
+        execution_ipc=ipc,
+        shutdown_readiness=shutdown_readiness,
+    )
+
+    drained_1 = service.drain_worker_replies(worker_id="execution.features#1", timeout_seconds=0.0)
+    drained_2 = service.drain_worker_replies(worker_id="execution.policy#1", timeout_seconds=0.0)
+
+    assert drained_1 == 1
+    assert drained_2 == 1
+    prepare_messages = [
+        item for item in ipc.sends if isinstance(item["payload"], ControlPlaneLeafShutdownPrepareCommand)
+    ]
+    assert len(prepare_messages) == 2
+    targets = {item["target_id"] for item in prepare_messages}
+    assert targets == {"execution.features#1", "execution.policy#1"}
 
 
 def test_root_reply_ingress_service_remaps_observability_relay_target_before_handoff() -> None:
@@ -572,7 +652,7 @@ def test_root_reply_ingress_service_v3_sends_discovery_snapshot_card() -> None:
     assert payload.protocol_revision == 3
 
 
-def test_root_reply_ingress_service_v3_without_snapshot_does_not_fallback_by_default() -> None:
+def test_root_reply_ingress_service_v3_without_snapshot_marks_leaf_rejected() -> None:
     from stream_kernel.execution.orchestration.control_plane.root.reply_ingress_service import (
         DefaultControlPlaneRootReplyIngressService,
     )
@@ -629,64 +709,12 @@ def test_root_reply_ingress_service_v3_without_snapshot_does_not_fallback_by_def
 
     assert drained == 1
     assert ipc.sends == []
-
-
-def test_root_reply_ingress_service_v3_can_fallback_to_discovery_request_when_enabled() -> None:
-    from stream_kernel.execution.orchestration.control_plane.root.reply_ingress_service import (
-        DefaultControlPlaneRootReplyIngressService,
-    )
-
-    @dataclass(slots=True)
-    class _SnapshotBuilder:
-        def build_snapshot(
-            self,
-            *,
-            hello: ControlPlaneLeafHelloEvent,
-            protocol_revision: int,
-        ) -> ControlPlaneLeafDiscoverySnapshotEvent | None:
-            _ = hello
-            _ = protocol_revision
-            return None
-
-    state = InMemoryControlPlaneStateService(store=InMemoryKvStore())
-    state.append_event(
-        ControlPlaneLaunchPlanEvent(
-            plan=ControlPlaneLaunchPlan(
-                groups=(
-                    ControlPlaneGroupSpec(
-                        group_name="execution.alpha",
-                        workers=1,
-                        nodes=("node.a", "node.b"),
-                    ),
-                )
-            )
-        )
-    )
-    ipc = _IpcPort(
-        incoming_by_target={
-            "execution.alpha#1": [
-                ExecutionIpcMessage(
-                    target_id="execution.alpha#1",
-                    payload=ControlPlaneLeafHelloEvent(
-                        target_group="execution.alpha",
-                        worker_id="execution.alpha#1",
-                        pid=123,
-                    ),
-                    ts_epoch_ms=1,
-                )
-            ]
-        }
-    )
-    service = DefaultControlPlaneRootReplyIngressService(
-        state=state,
-        execution_ipc=ipc,
-        startup_protocol_revision=3,
-        snapshot_builder=_SnapshotBuilder(),
-        discovery_request_fallback_enabled=True,
-    )
-
-    drained = service.drain_worker_replies(worker_id="execution.alpha#1", timeout_seconds=0.0)
-
-    assert drained == 1
-    assert len(ipc.sends) == 1
-    assert isinstance(ipc.sends[0]["payload"], ControlPlaneLeafDiscoveryRequestEvent)
+    config_acks = [
+        event
+        for event in state.events()
+        if isinstance(event, ControlPlaneLeafConfigAckEvent)
+    ]
+    assert len(config_acks) == 1
+    assert config_acks[0].worker_id == "execution.alpha#1"
+    assert config_acks[0].status == "rejected"
+    assert config_acks[0].error == "discovery snapshot unavailable"

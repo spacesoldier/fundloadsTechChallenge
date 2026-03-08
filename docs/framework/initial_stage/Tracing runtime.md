@@ -57,6 +57,14 @@ runtime:
 - `kind: jsonl`
 - `kind: file_plain`
 
+Runtime debug direct sink:
+
+- `kind: redis_debug` enables per-process runtime debug pipeline where
+  `DebugMessage` is consumed by `system.debug.message_dispatch` locally in each
+  process and written directly to Redis via platform adapter rails.
+- Detailed architecture and lane interaction model:
+  `docs/framework/initial_stage/web/analysis/IPC lanes and runtime debug Redis pipeline.md`.
+
 Exporter entry fields:
 
 - `enabled: true|false` — enable/disable this exporter instance.

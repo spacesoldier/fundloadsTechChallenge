@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -147,6 +149,9 @@ def run_with_config(
             trace_path=argv_overrides.get("trace_path"),
         )
         apply_cli_overrides(config, args, discovery_modules=discovery_modules)
+    os.environ["STREAM_KERNEL_LOGICAL_RUN_ID"] = run_id
+    os.environ["STREAM_KERNEL_RUN_INSTANCE_ID"] = _build_run_instance_id()
+    _configure_process_debug_env(config)
     artifacts = execution_builder.build_runtime_artifacts(
         config,
         adapter_registry=adapter_registry,
@@ -184,3 +189,47 @@ def run(argv: list[str] | None) -> int:
     config = validate_newgen_config(load_yaml_config(Path(args.config)))
     apply_cli_overrides(config, args, discovery_modules=None)
     return run_with_config(config, argv_overrides=None, run_id="run")
+
+
+def _build_run_instance_id() -> str:
+    ts = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    return f"{ts}-pid{os.getpid()}"
+
+
+def _configure_process_debug_env(config: dict[str, object]) -> None:
+    runtime = config.get("runtime", {})
+    if not isinstance(runtime, dict):
+        return
+    platform = runtime.get("platform", {})
+    if not isinstance(platform, dict):
+        return
+    debug = platform.get("debug", {})
+    if not isinstance(debug, dict):
+        debug = {}
+    root_verbose = bool(debug.get("root_verbose_logging", False))
+    leaf_verbose = bool(debug.get("leaf_verbose_logging", False))
+    leaf_debug_enabled = bool(debug.get("leaf_debug_enabled", leaf_verbose))
+    direct_dispatch = bool(debug.get("runtime_debug_direct_dispatch", True))
+    enabled = root_verbose or leaf_verbose or leaf_debug_enabled or _runtime_debug_exporter_enabled(runtime)
+    os.environ["STREAM_KERNEL_INJECT_PORT_DEBUG_ENABLED"] = "1" if enabled else "0"
+    os.environ["STREAM_KERNEL_RUNTIME_DEBUG_DIRECT_DISPATCH"] = "1" if (enabled and direct_dispatch) else "0"
+    os.environ.setdefault("STREAM_KERNEL_PROCESS_GROUP", "supervisor")
+    os.environ.setdefault("STREAM_KERNEL_WORKER_ID", "supervisor#1")
+
+
+def _runtime_debug_exporter_enabled(runtime: dict[str, object]) -> bool:
+    observability = runtime.get("observability", {})
+    if not isinstance(observability, dict):
+        return False
+    logging_cfg = observability.get("logging", {})
+    if not isinstance(logging_cfg, dict):
+        return False
+    exporters = logging_cfg.get("exporters", [])
+    if not isinstance(exporters, list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and item.get("enabled", True) is not False
+        and item.get("kind") == "redis_debug"
+        for item in exporters
+    )

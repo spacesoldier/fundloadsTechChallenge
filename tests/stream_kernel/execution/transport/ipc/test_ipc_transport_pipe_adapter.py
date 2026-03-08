@@ -7,8 +7,10 @@ import pytest
 from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.execution.transport.ipc.ipc_codec import ExecutionIpcCodecError
 from stream_kernel.execution.transport.ipc.ipc_transport import (
+    EXECUTION_IPC_LANE_DATA,
     ExecutionIpcControlSignal,
     ExecutionIpcEndpointRegistry,
+    compose_execution_ipc_worker_target_id,
 )
 from stream_kernel.execution.transport.ipc.ipc_transport_service import (
     ExecutionIpcTransportCoordinatorService,
@@ -258,3 +260,32 @@ def test_ipc_transport_coordinator_flush_pending_is_idempotent() -> None:
     assert child.recv("group:late-flush", timeout=0.1).payload == "early"
     # Second flush should be safe and do nothing.
     assert service.flush_pending("group:late-flush") == 0
+
+
+def test_ipc_transport_coordinator_does_not_collapse_non_control_lane_to_worker_target() -> None:
+    registry = _EndpointRegistry()
+    parent = PipeExecutionIpcTransportAdapter(codec="pickle", endpoint_registry=registry)
+    child = PipeExecutionIpcTransportAdapter(codec="pickle", endpoint_registry=registry)
+    service = ExecutionIpcTransportCoordinatorService(
+        adapter=parent,
+        endpoint_registry=registry,
+        flow_control=NoopFlowControlPolicy(),
+    )
+
+    # Register only a plain worker target endpoint (control lane shape).
+    worker_id = "execution.ingress#1"
+    parent_endpoint, child_endpoint = parent.allocate_endpoints(worker_id)
+    registry.set(worker_id, parent_endpoint.connection)
+    child.attach_endpoint(child_endpoint)
+
+    data_lane_target = compose_execution_ipc_worker_target_id(
+        worker_id,
+        lane=EXECUTION_IPC_LANE_DATA,
+    )
+    ack = service.send(data_lane_target, "lane-payload")
+    assert ack is not None
+    # Non-control lanes must stay isolated and buffer until their own endpoint exists.
+    assert ack.status == "buffered"
+
+    # Ensure payload was not misrouted into the worker/control target.
+    assert child.recv(worker_id, timeout=0.01) is None

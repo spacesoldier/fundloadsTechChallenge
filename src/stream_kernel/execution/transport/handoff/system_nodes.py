@@ -6,6 +6,7 @@ from stream_kernel.application_context.inject import inject
 from stream_kernel.kernel.scenario import StepSpec
 from stream_kernel.kernel.node_annotation import node
 from stream_kernel.observability.events import (
+    DebugDispatchEvent,
     LogDispatchEvent,
     MetricDispatchEvent,
     MonitorDispatchEvent,
@@ -22,12 +23,14 @@ from .ipc_handoff_dispatch_service import (
 OBSERVABILITY_HANDOFF_NODE_NAME = "system.transport.handoff.observability_dispatch"
 OBSERVABILITY_TRACE_HANDOFF_BYPASS_NODE_NAME = "system.transport.handoff.trace_bypass"
 OBSERVABILITY_LOG_HANDOFF_BYPASS_NODE_NAME = "system.transport.handoff.log_bypass"
+OBSERVABILITY_DEBUG_HANDOFF_BYPASS_NODE_NAME = "system.transport.handoff.debug_bypass"
 OBSERVABILITY_METRIC_HANDOFF_BYPASS_NODE_NAME = "system.transport.handoff.metric_bypass"
 OBSERVABILITY_MONITOR_HANDOFF_BYPASS_NODE_NAME = "system.transport.handoff.monitor_bypass"
 OBSERVABILITY_MONITORING_METRICS_HANDOFF_BYPASS_NODE_NAME = "system.transport.handoff.monitoring_metrics_bypass"
 OBSERVABILITY_WORKER_QUEUE_HANDOFF_BYPASS_NODE_NAME = "system.transport.handoff.worker_queue_bypass"
 OBSERVABILITY_TRACE_HANDOFF_NODE_NAME = "system.transport.handoff.trace_dispatch"
 OBSERVABILITY_LOG_HANDOFF_NODE_NAME = "system.transport.handoff.log_dispatch"
+OBSERVABILITY_DEBUG_HANDOFF_NODE_NAME = "system.transport.handoff.debug_dispatch"
 OBSERVABILITY_METRIC_HANDOFF_NODE_NAME = "system.transport.handoff.metric_dispatch"
 OBSERVABILITY_MONITOR_HANDOFF_NODE_NAME = "system.transport.handoff.monitor_dispatch"
 OBSERVABILITY_MONITORING_METRICS_HANDOFF_NODE_NAME = "system.transport.handoff.monitoring_metrics_dispatch"
@@ -36,6 +39,7 @@ OBSERVABILITY_WORKER_QUEUE_HANDOFF_NODE_NAME = "system.transport.handoff.worker_
 _OBSERVABILITY_EVENT_TARGETS: dict[type[object], str] = {
     TraceDispatchEvent: "system.obs.trace_dispatch",
     LogDispatchEvent: "system.obs.log_dispatch",
+    DebugDispatchEvent: "system.obs.debug_dispatch",
     MetricDispatchEvent: "system.obs.metric_dispatch",
     MonitorDispatchEvent: "system.obs.monitor_dispatch",
     MonitoringMetricsSnapshotEvent: "system.obs.monitoring_metrics_dispatch",
@@ -45,6 +49,7 @@ _OBSERVABILITY_EVENT_TARGETS: dict[type[object], str] = {
 _OBSERVABILITY_EVENT_NODE_NAMES: dict[type[object], str] = {
     TraceDispatchEvent: OBSERVABILITY_TRACE_HANDOFF_NODE_NAME,
     LogDispatchEvent: OBSERVABILITY_LOG_HANDOFF_NODE_NAME,
+    DebugDispatchEvent: OBSERVABILITY_DEBUG_HANDOFF_NODE_NAME,
     MetricDispatchEvent: OBSERVABILITY_METRIC_HANDOFF_NODE_NAME,
     MonitorDispatchEvent: OBSERVABILITY_MONITOR_HANDOFF_NODE_NAME,
     MonitoringMetricsSnapshotEvent: OBSERVABILITY_MONITORING_METRICS_HANDOFF_NODE_NAME,
@@ -54,6 +59,7 @@ _OBSERVABILITY_EVENT_NODE_NAMES: dict[type[object], str] = {
 _OBSERVABILITY_EVENT_BYPASS_NODE_NAMES: dict[type[object], str] = {
     TraceDispatchEvent: OBSERVABILITY_TRACE_HANDOFF_BYPASS_NODE_NAME,
     LogDispatchEvent: OBSERVABILITY_LOG_HANDOFF_BYPASS_NODE_NAME,
+    DebugDispatchEvent: OBSERVABILITY_DEBUG_HANDOFF_BYPASS_NODE_NAME,
     MetricDispatchEvent: OBSERVABILITY_METRIC_HANDOFF_BYPASS_NODE_NAME,
     MonitorDispatchEvent: OBSERVABILITY_MONITOR_HANDOFF_BYPASS_NODE_NAME,
     MonitoringMetricsSnapshotEvent: OBSERVABILITY_MONITORING_METRICS_HANDOFF_BYPASS_NODE_NAME,
@@ -250,12 +256,14 @@ __all__ = [
     "OBSERVABILITY_HANDOFF_NODE_NAME",
     "OBSERVABILITY_TRACE_HANDOFF_BYPASS_NODE_NAME",
     "OBSERVABILITY_LOG_HANDOFF_BYPASS_NODE_NAME",
+    "OBSERVABILITY_DEBUG_HANDOFF_BYPASS_NODE_NAME",
     "OBSERVABILITY_METRIC_HANDOFF_BYPASS_NODE_NAME",
     "OBSERVABILITY_MONITOR_HANDOFF_BYPASS_NODE_NAME",
     "OBSERVABILITY_MONITORING_METRICS_HANDOFF_BYPASS_NODE_NAME",
     "OBSERVABILITY_WORKER_QUEUE_HANDOFF_BYPASS_NODE_NAME",
     "OBSERVABILITY_TRACE_HANDOFF_NODE_NAME",
     "OBSERVABILITY_LOG_HANDOFF_NODE_NAME",
+    "OBSERVABILITY_DEBUG_HANDOFF_NODE_NAME",
     "OBSERVABILITY_METRIC_HANDOFF_NODE_NAME",
     "OBSERVABILITY_MONITOR_HANDOFF_NODE_NAME",
     "OBSERVABILITY_MONITORING_METRICS_HANDOFF_NODE_NAME",

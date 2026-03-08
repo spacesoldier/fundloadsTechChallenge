@@ -220,6 +220,8 @@ class DefaultLeafRuntimeActivationService(LeafRuntimeActivationService):
             return False
         if node_name.startswith("system.obs."):
             return True
+        if node_name.startswith("system.debug."):
+            return True
         if node_name.startswith("system.transport.handoff."):
             return True
         if node_name.startswith(("source:", "sink:")):
