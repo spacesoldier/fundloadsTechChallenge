@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafBoundaryResultEvent,
-    ControlPlaneLeafStopAckEvent,
     ControlPlaneRootLeafBoundaryExecuteRequestEvent,
     ControlPlaneRootLeafStopRequestEvent,
 )
@@ -12,31 +11,16 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
 
 @dataclass(slots=True)
 class _ReplyWaiter:
-    stop_acks: list[object] = field(default_factory=list)
     boundary_results: list[object] = field(default_factory=list)
-    stop_calls: list[dict[str, object]] = field(default_factory=list)
     boundary_calls: list[dict[str, object]] = field(default_factory=list)
-
-    def wait_for_leaf_stop_ack(self, **kwargs: object):
-        self.stop_calls.append(dict(kwargs))
-        return self.stop_acks[-1] if self.stop_acks else None
+    on_boundary_call: object | None = None
 
     def wait_for_leaf_boundary_result(self, **kwargs: object):
         self.boundary_calls.append(dict(kwargs))
-        return self.boundary_results[-1] if self.boundary_results else None
-
-
-@dataclass(slots=True)
-class _ReplyIngress:
-    calls: list[dict[str, object]] = field(default_factory=list)
-    on_drain: object | None = None
-
-    def drain_worker_replies(self, **kwargs: object) -> int:
-        self.calls.append(dict(kwargs))
-        callback = self.on_drain
+        callback = self.on_boundary_call
         if callable(callback):
             callback()
-        return 1
+        return self.boundary_results[-1] if self.boundary_results else None
 
 
 def test_root_leaf_command_service_builds_typed_stop_request() -> None:
@@ -57,33 +41,6 @@ def test_root_leaf_command_service_builds_typed_stop_request() -> None:
     assert req.target_group == "execution.alpha"
     assert req.worker_id == "execution.alpha#1"
     assert req.command_id == "stop-1"
-
-
-def test_root_leaf_command_service_delegates_wait_stop_ack_to_reply_waiter() -> None:
-    from stream_kernel.execution.orchestration.control_plane.root.leaf_command_service import (
-        DefaultControlPlaneRootLeafCommandService,
-    )
-
-    waiter = _ReplyWaiter(
-        stop_acks=[
-            ControlPlaneLeafStopAckEvent(
-                target_group="execution.alpha",
-                worker_id="execution.alpha#1",
-                command_id="stop-1",
-            )
-        ]
-    )
-    service = DefaultControlPlaneRootLeafCommandService(reply_waiter=waiter)
-
-    ack = service.wait_stop_ack(
-        target_group="execution.alpha",
-        worker_id="execution.alpha#1",
-        command_id="stop-1",
-        timeout_seconds=0.1,
-    )
-
-    assert isinstance(ack, ControlPlaneLeafStopAckEvent)
-    assert waiter.stop_calls and waiter.stop_calls[-1]["command_id"] == "stop-1"
 
 
 def test_root_leaf_command_service_builds_boundary_request_and_waits_result() -> None:
@@ -124,13 +81,12 @@ def test_root_leaf_command_service_builds_boundary_request_and_waits_result() ->
     assert waiter.boundary_calls and waiter.boundary_calls[-1]["request_id"] == "req-1"
 
 
-def test_root_leaf_command_service_pumps_reply_ingress_while_waiting() -> None:
+def test_root_leaf_command_service_waits_result_via_reply_waiter_without_ingress_pump() -> None:
     from stream_kernel.execution.orchestration.control_plane.root.leaf_command_service import (
         DefaultControlPlaneRootLeafCommandService,
     )
 
     waiter = _ReplyWaiter()
-    ingress = _ReplyIngress()
 
     def _release_result() -> None:
         if waiter.boundary_results:
@@ -145,10 +101,9 @@ def test_root_leaf_command_service_pumps_reply_ingress_while_waiting() -> None:
             )
         )
 
-    ingress.on_drain = _release_result
+    waiter.on_boundary_call = _release_result
     service = DefaultControlPlaneRootLeafCommandService(
         reply_waiter=waiter,
-        reply_ingress=ingress,
         poll_interval_seconds=0.001,
     )
 
@@ -160,5 +115,5 @@ def test_root_leaf_command_service_pumps_reply_ingress_while_waiting() -> None:
     )
 
     assert isinstance(result, ControlPlaneLeafBoundaryResultEvent)
-    assert ingress.calls
-    assert ingress.calls[0]["worker_id"] == "execution.alpha#1"
+    assert waiter.boundary_calls
+    assert waiter.boundary_calls[0]["worker_id"] == "execution.alpha#1"

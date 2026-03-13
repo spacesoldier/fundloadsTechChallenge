@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import atexit
 import json
 import os
+from queue import Empty, SimpleQueue
 import socket
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event, Thread
 from typing import Any
 
 from stream_kernel.adapters.contracts import adapter
@@ -124,7 +127,7 @@ class JsonlLogSink:
 
 
 class RedisDebugLogSink:
-    # Redis-backed structured log sink for runtime debug events.
+    # Redis-backed structured log sink for runtime debug events (Redis Streams).
     def __init__(
         self,
         *,
@@ -137,6 +140,10 @@ class RedisDebugLogSink:
         connect_timeout_seconds: float,
         socket_timeout_seconds: float,
         only_debug_channel: bool,
+        write_mode: str = "background",
+        queue_max_items: int = 8192,
+        batch_max_items: int = 64,
+        batch_flush_interval_ms: int = 20,
     ) -> None:
         self._host = host
         self._port = port
@@ -148,6 +155,22 @@ class RedisDebugLogSink:
         self._socket_timeout_seconds = socket_timeout_seconds
         self._only_debug_channel = only_debug_channel
         self._session_id = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ") + f"-pid{os.getpid()}"
+        self._write_mode = write_mode
+        self._queue_max_items = max(1, int(queue_max_items))
+        self._batch_max_items = max(1, int(batch_max_items))
+        self._batch_flush_interval_ms = max(1, int(batch_flush_interval_ms))
+        self._bg_queue: SimpleQueue[list[list[object]]] = SimpleQueue()
+        self._bg_wake = Event()
+        self._bg_closed = Event()
+        self._bg_thread: Thread | None = None
+        if self._write_mode == "background":
+            self._bg_thread = Thread(
+                name=f"sk-log-redis-writer-{os.getpid()}",
+                target=self._run_background_writer,
+                daemon=True,
+            )
+            self._bg_thread.start()
+            atexit.register(self.close)
 
     def emit(self, message: LogMessage) -> None:
         fields = message.fields if isinstance(message.fields, dict) else {}
@@ -172,7 +195,7 @@ class RedisDebugLogSink:
         process_member = f"{run_id}:{process_id}"
         payload = json.dumps(_log_to_dict(message), separators=(",", ":"), ensure_ascii=False)
         commands: list[list[object]] = [
-            ["RPUSH", record_key, payload],
+            ["XADD", record_key, "*", "payload", payload],
             ["SADD", run_processes_key, process_id],
             ["ZADD", run_processes_by_time_key, ts_epoch_ms, process_id],
             ["HSETNX", run_meta_key, "logical_run_id", logical_run_id],
@@ -204,10 +227,23 @@ class RedisDebugLogSink:
                 commands.append(["HSET", run_meta_key, f"summary:{key}", _to_redis_string(value)])
             if self._ttl_seconds > 0:
                 commands.append(["EXPIRE", run_meta_key, self._ttl_seconds])
+        if self._write_mode == "background":
+            self._enqueue_background(commands)
+            return
         self._execute(commands)
 
     async def emit_async(self, message: LogMessage) -> None:
         self.emit(message)
+
+    def close(self) -> None:
+        if self._write_mode != "background":
+            return
+        if self._bg_closed.is_set():
+            return
+        self._bg_closed.set()
+        self._bg_wake.set()
+        if isinstance(self._bg_thread, Thread) and self._bg_thread.is_alive():
+            self._bg_thread.join(timeout=max(0.1, self._socket_timeout_seconds * 2.0))
 
     def _execute(self, commands: list[list[object]]) -> None:
         if not commands:
@@ -226,6 +262,34 @@ class RedisDebugLogSink:
             for _ in range(len(prelude) + len(commands)):
                 if not _read_redis_reply(conn):
                     raise RuntimeError("redis reply indicates failure")
+
+    def _enqueue_background(self, commands: list[list[object]]) -> None:
+        if not commands:
+            return
+        if self._bg_closed.is_set():
+            return
+        self._bg_queue.put(commands)
+        self._bg_wake.set()
+
+    def _run_background_writer(self) -> None:
+        wait_seconds = max(0.001, float(self._batch_flush_interval_ms) / 1000.0)
+        while True:
+            self._bg_wake.wait(wait_seconds)
+            self._bg_wake.clear()
+            batch: list[list[object]] = []
+            while len(batch) < self._batch_max_items:
+                try:
+                    batch.extend(self._bg_queue.get_nowait())
+                except Empty:
+                    break
+            if batch:
+                try:
+                    self._execute(batch)
+                except Exception:
+                    # Log sink must stay best-effort to avoid impacting runtime loop.
+                    pass
+            if self._bg_closed.is_set() and self._bg_queue.empty():
+                break
 
 
 @adapter(
@@ -335,6 +399,20 @@ def log_redis_debug(settings: dict[str, object]) -> RedisDebugLogSink:
         raise ValueError("log_redis_debug.settings.only_debug_channel must be a boolean when provided")
     if isinstance(capture_all_events, bool):
         only_debug_channel = not capture_all_events
+    write_mode = settings.get("write_mode", "background")
+    if not isinstance(write_mode, str) or write_mode not in {"background", "inline"}:
+        raise ValueError("log_redis_debug.settings.write_mode must be one of: ['background', 'inline']")
+    queue_max_items = settings.get("queue_max_items", 8192)
+    if not isinstance(queue_max_items, int) or queue_max_items <= 0:
+        raise ValueError("log_redis_debug.settings.queue_max_items must be an integer > 0 when provided")
+    batch_max_items = settings.get("batch_max_items", 64)
+    if not isinstance(batch_max_items, int) or batch_max_items <= 0:
+        raise ValueError("log_redis_debug.settings.batch_max_items must be an integer > 0 when provided")
+    batch_flush_interval_ms = settings.get("batch_flush_interval_ms", 20)
+    if not isinstance(batch_flush_interval_ms, int) or batch_flush_interval_ms <= 0:
+        raise ValueError(
+            "log_redis_debug.settings.batch_flush_interval_ms must be an integer > 0 when provided"
+        )
     return RedisDebugLogSink(
         host=host,
         port=port,
@@ -345,6 +423,10 @@ def log_redis_debug(settings: dict[str, object]) -> RedisDebugLogSink:
         connect_timeout_seconds=float(connect_timeout_seconds),
         socket_timeout_seconds=float(socket_timeout_seconds),
         only_debug_channel=only_debug_channel,
+        write_mode=write_mode,
+        queue_max_items=queue_max_items,
+        batch_max_items=batch_max_items,
+        batch_flush_interval_ms=batch_flush_interval_ms,
     )
 
 

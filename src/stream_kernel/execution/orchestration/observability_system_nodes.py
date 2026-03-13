@@ -6,11 +6,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from stream_kernel.adapters.contracts import TraceSinkPort
+from stream_kernel.application_context import apply_injection
 from stream_kernel.application_context.inject import inject
-from stream_kernel.application_context.injection_registry import (
-    InjectionRegistryError,
-    ScenarioScope,
-)
+from stream_kernel.application_context.injection_registry import ScenarioScope
 from stream_kernel.kernel.node_annotation import node
 from stream_kernel.kernel.scenario import StepSpec
 from stream_kernel.observability.events import (
@@ -381,6 +379,29 @@ class WorkerQueueTelemetryDispatchNode:
         return []
 
 
+@node(name="system.obs.trace_sink", consumes=[], emits=[])
+@dataclass
+class TraceSinkNode:
+    # inject.stream(TraceSinkPort) is resolved by the DI layer at wiring time.
+    # The inject marker enables plan_pools() to detect async capability.
+    sink: object = inject.stream(TraceSinkPort)
+
+    def __call__(self, msg: object, _ctx: object | None) -> object:
+        record = msg.payload if isinstance(msg, Envelope) else msg
+        emit_async_fn = getattr(self.sink, "emit_async", None)
+        if callable(emit_async_fn):
+            # Return coroutine — AsyncRunner awaits it via _coerce_node_outputs.
+            return self._async_emit(emit_async_fn, record)
+        emit = getattr(self.sink, "emit", None)
+        if callable(emit):
+            emit(record)
+        return []
+
+    async def _async_emit(self, fn: Any, record: object) -> list[object]:
+        await fn(record)
+        return []
+
+
 @dataclass(slots=True)
 class _NoOpObservabilityMetricsDispatchService(ObservabilityMetricsDispatchService):
     def dispatch_snapshot(
@@ -404,29 +425,6 @@ class _NoOpWorkerQueueTelemetryService(WorkerQueueTelemetryService):
     async def publish_sample_async(self, *, sample: WorkerQueueTelemetryEvent) -> None:
         _ = sample
         return None
-
-
-@node(name="system.obs.trace_sink", consumes=[], emits=[])
-@dataclass
-class TraceSinkNode:
-    # inject.stream(TraceSinkPort) is resolved by the DI layer at wiring time.
-    # The inject marker enables plan_pools() to detect async capability.
-    sink: object = inject.stream(TraceSinkPort)
-
-    def __call__(self, msg: object, _ctx: object | None) -> object:
-        record = msg.payload if isinstance(msg, Envelope) else msg
-        emit_async_fn = getattr(self.sink, "emit_async", None)
-        if callable(emit_async_fn):
-            # Return coroutine — AsyncRunner awaits it via _coerce_node_outputs.
-            return self._async_emit(emit_async_fn, record)
-        emit = getattr(self.sink, "emit", None)
-        if callable(emit):
-            emit(record)
-        return []
-
-    async def _async_emit(self, fn: Any, record: object) -> list[object]:
-        await fn(record)
-        return []
 
 
 # Mapping used by build_observability_system_plan() to select the concrete class per kind.
@@ -463,7 +461,6 @@ def build_observability_system_plan(
         return ObservabilitySystemPlan()
     if _is_observability_root_transport_only(runtime):
         process_role = runtime.get("__process_role")
-        worker_transport_only = isinstance(process_role, str) and process_role == "worker"
         enabled_tokens: list[type[Any]] = []
         enabled_token_set: set[type[Any]] = set()
         kind_counts: dict[str, int] = {}
@@ -489,12 +486,7 @@ def build_observability_system_plan(
             enabled_tokens.append(token)
         if not enabled_tokens:
             return ObservabilitySystemPlan()
-        if worker_transport_only:
-            return ObservabilitySystemPlan(
-                system_steps=[],
-                system_consumers={token: [_legacy_system_obs_node_name_for_token(token)] for token in enabled_tokens},
-                system_node_names=set(),
-            )
+        _ = process_role
         handoff_steps, handoff_consumers, handoff_nodes = build_transport_observability_handoff_plan(
             scenario_scope=scenario_scope,
             enabled_tokens=enabled_tokens,
@@ -541,9 +533,11 @@ def build_observability_system_plan(
         dispatch_node = _build_system_dispatch_node(
             kind=kind,
             node_cls=node_cls,
-            scope=scenario_scope,
             qualifier=qualifier,
         )
+        apply_injection(dispatch_node, scenario_scope, False)
+        _finalize_observability_dispatch_node(dispatch_node=dispatch_node, kind=kind)
+        _restore_observability_plan_marker(dispatch_node=dispatch_node, kind=kind, qualifier=qualifier)
         steps.append(StepSpec(name=node_name, step=dispatch_node))
         consumers.setdefault(_SYSTEM_NODE_KIND_TO_EVENT[kind], []).append(node_name)
         node_names.add(node_name)
@@ -668,7 +662,6 @@ def _build_system_dispatch_node(
     *,
     kind: str,
     node_cls: type[Any],
-    scope: ScenarioScope,
     qualifier: str | None,
 ) -> object:
     if kind in {
@@ -677,88 +670,78 @@ def _build_system_dispatch_node(
         "system.obs.metric_dispatch",
         "system.obs.monitor_dispatch",
     }:
-        pipeline = _resolve_pipeline_service(scope=scope, qualifier=qualifier)
-        return node_cls(pipeline=pipeline, qualifier=qualifier)
+        return node_cls(
+            pipeline=inject.service(ObservabilityPipelineService, qualifier=qualifier),
+            qualifier=qualifier,
+        )
     if kind == "system.obs.debug_dispatch":
-        service = _resolve_runtime_debug_dispatch_service(scope=scope, qualifier=qualifier)
-        return node_cls(service=service, qualifier=qualifier)
+        return node_cls(
+            service=inject.service(RuntimeDebugDispatchService, qualifier=qualifier),
+            qualifier=qualifier,
+        )
     if kind == "system.obs.monitoring_metrics_dispatch":
-        service = _resolve_monitoring_metrics_dispatch_service(scope=scope, qualifier=qualifier)
-        return node_cls(service=service, qualifier=qualifier)
+        return node_cls(
+            service=inject.service(ObservabilityMetricsDispatchService, qualifier=qualifier),
+            qualifier=qualifier,
+        )
     if kind == "system.obs.worker_queue_dispatch":
-        service = _resolve_worker_queue_telemetry_service(scope=scope, qualifier=qualifier)
-        return node_cls(service=service, qualifier=qualifier)
+        return node_cls(
+            service=inject.service(WorkerQueueTelemetryService, qualifier=qualifier),
+            qualifier=qualifier,
+        )
     raise ValueError(f"unsupported observability system node kind: {kind}")
 
 
-def _resolve_pipeline_service(
-    *, scope: ScenarioScope, qualifier: str | None
-) -> ObservabilityPipelineService:
-    try:
-        if isinstance(qualifier, str):
-            return coerce_pipeline_observability(
-                scope.resolve("service", ObservabilityPipelineService, qualifier=qualifier)
-            )
-        return coerce_pipeline_observability(scope.resolve("service", ObservabilityPipelineService))
-    except InjectionRegistryError:
-        return coerce_pipeline_observability(None)
-
-
-def _resolve_monitoring_metrics_dispatch_service(
+def _restore_observability_plan_marker(
     *,
-    scope: ScenarioScope,
+    dispatch_node: object,
+    kind: str,
     qualifier: str | None,
-) -> ObservabilityMetricsDispatchService:
-    try:
-        if isinstance(qualifier, str):
-            resolved = scope.resolve("service", ObservabilityMetricsDispatchService, qualifier=qualifier)
-        else:
-            resolved = scope.resolve("service", ObservabilityMetricsDispatchService)
-        if isinstance(resolved, ObservabilityMetricsDispatchService):
-            return resolved
-        if callable(getattr(resolved, "dispatch_snapshot", None)):
-            return resolved  # type: ignore[return-value]
-    except InjectionRegistryError:
-        pass
-    return _NoOpObservabilityMetricsDispatchService()
+) -> None:
+    marker: object | None = None
+    if kind in {
+        "system.obs.trace_dispatch",
+        "system.obs.log_dispatch",
+        "system.obs.metric_dispatch",
+        "system.obs.monitor_dispatch",
+    }:
+        marker = inject.service(ObservabilityPipelineService, qualifier=qualifier)
+        setattr(dispatch_node, "_obs_marker", marker)
+        return
+    if kind == "system.obs.debug_dispatch":
+        marker = inject.service(RuntimeDebugDispatchService, qualifier=qualifier)
+        setattr(dispatch_node, "_marker", marker)
+        return
+    if kind == "system.obs.monitoring_metrics_dispatch":
+        marker = inject.service(ObservabilityMetricsDispatchService, qualifier=qualifier)
+        setattr(dispatch_node, "_metrics_marker", marker)
+        return
+    if kind == "system.obs.worker_queue_dispatch":
+        marker = inject.service(WorkerQueueTelemetryService, qualifier=qualifier)
+        setattr(dispatch_node, "_marker", marker)
 
 
-def _resolve_worker_queue_telemetry_service(
-    *,
-    scope: ScenarioScope,
-    qualifier: str | None,
-) -> WorkerQueueTelemetryService:
-    try:
-        if isinstance(qualifier, str):
-            resolved = scope.resolve("service", WorkerQueueTelemetryService, qualifier=qualifier)
-        else:
-            resolved = scope.resolve("service", WorkerQueueTelemetryService)
-        if isinstance(resolved, WorkerQueueTelemetryService):
-            return resolved
-        if callable(getattr(resolved, "publish_sample", None)):
-            return resolved  # type: ignore[return-value]
-    except InjectionRegistryError:
-        pass
-    return _NoOpWorkerQueueTelemetryService()
-
-
-def _resolve_runtime_debug_dispatch_service(
-    *,
-    scope: ScenarioScope,
-    qualifier: str | None,
-) -> RuntimeDebugDispatchService:
-    try:
-        if isinstance(qualifier, str):
-            resolved = scope.resolve("service", RuntimeDebugDispatchService, qualifier=qualifier)
-        else:
-            resolved = scope.resolve("service", RuntimeDebugDispatchService)
-        if isinstance(resolved, RuntimeDebugDispatchService):
-            return resolved
-        if callable(getattr(resolved, "dispatch", None)):
-            return resolved  # type: ignore[return-value]
-    except InjectionRegistryError:
-        pass
-    return NoOpRuntimeDebugDispatchService()
+def _finalize_observability_dispatch_node(*, dispatch_node: object, kind: str) -> None:
+    if kind in {
+        "system.obs.trace_dispatch",
+        "system.obs.log_dispatch",
+        "system.obs.metric_dispatch",
+        "system.obs.monitor_dispatch",
+    }:
+        if getattr(dispatch_node, "pipeline", None) is None:
+            setattr(dispatch_node, "pipeline", coerce_pipeline_observability(None))
+        return
+    if kind == "system.obs.debug_dispatch":
+        if getattr(dispatch_node, "service", None) is None:
+            setattr(dispatch_node, "service", NoOpRuntimeDebugDispatchService())
+        return
+    if kind == "system.obs.monitoring_metrics_dispatch":
+        if getattr(dispatch_node, "service", None) is None:
+            setattr(dispatch_node, "service", _NoOpObservabilityMetricsDispatchService())
+        return
+    if kind == "system.obs.worker_queue_dispatch":
+        if getattr(dispatch_node, "service", None) is None:
+            setattr(dispatch_node, "service", _NoOpWorkerQueueTelemetryService())
 
 
 def _build_system_node_name(*, kind: str, qualifier: str | None, index: int) -> str:

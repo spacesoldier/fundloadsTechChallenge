@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from stream_kernel.platform.services.runtime.control_plane_events import (
@@ -52,11 +53,15 @@ def execute_leaf_boundary_batch(
     session: LeafWorkerRuntimeSession,
     inputs: list[object],
     finalize_runtime: bool = False,
+    stream_callback: Callable[[list[object]], bool] | None = None,
+    stream_batch_max_items: int = 1,
 ) -> list[Envelope]:
     return resolve_leaf_runtime_boundary_service().execute_boundary_batch(
         child=session.child,
         inputs=list(inputs),
         finalize_runtime=bool(finalize_runtime),
+        stream_callback=stream_callback,
+        stream_batch_max_items=stream_batch_max_items,
     )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 
 from stream_kernel.application_context.injection_registry import (
     InjectionRegistryError,
@@ -16,7 +17,7 @@ from stream_kernel.platform.services.state.context import ContextService
 from stream_kernel.routing.envelope import Envelope
 from stream_kernel.routing.routing_service import RoutingService
 
-from ..debug_logging import leaf_debug_log
+from ..debug_logging import LeafLifecycleDebugLoggingService, leaf_debug_log
 from ..startup.bootstrap_models import (
     ChildBoundaryInput,
     ChildBootstrapBundle,
@@ -24,6 +25,45 @@ from ..startup.bootstrap_models import (
     ChildRuntimeBootstrapError,
 )
 from ..startup.group_step_selection import select_group_planning_steps
+
+
+class _StreamingBoundaryOutputs(list[Envelope]):
+    def __init__(
+        self,
+        *,
+        on_chunk: Callable[[list[Envelope]], bool],
+        batch_max_items: int,
+    ) -> None:
+        super().__init__()
+        self._on_chunk = on_chunk
+        self._batch_max_items = max(1, int(batch_max_items))
+        self.streamed_total = 0
+
+    def append(self, item: Envelope) -> None:  # type: ignore[override]
+        super().append(item)
+        self.flush(force=False)
+
+    def flush(self, *, force: bool) -> None:
+        while True:
+            flushable = self._flushable_prefix_size()
+            if flushable <= 0:
+                return
+            if not force and flushable < self._batch_max_items:
+                return
+            take = flushable if force else min(flushable, self._batch_max_items)
+            chunk = list(self[:take])
+            if not chunk:
+                return
+            if not self._on_chunk(chunk):
+                return
+            del self[:take]
+            self.streamed_total += len(chunk)
+
+    def _flushable_prefix_size(self) -> int:
+        for idx, item in enumerate(self):
+            if isinstance(item, Envelope) and item.tombstone:
+                return idx
+        return len(self)
 
 
 def execute_child_boundary_loop_from_bundle(
@@ -60,10 +100,18 @@ def execute_child_boundary_loop_with_runtime(
     child: ChildRuntimeBootstrap,
     inputs: list[object],
     finalize: bool = True,
+    stream_callback: Callable[[list[Envelope]], bool] | None = None,
+    stream_batch_max_items: int = 1,
 ) -> list[Envelope]:
     # Execute boundary batch using an already-bootstrapped child runtime (stateful nodes preserved).
     normalized = [_normalize_child_boundary_input(item) for item in inputs]
-    return execute_child_boundary_loop(child=child, inputs=normalized, finalize=finalize)
+    return execute_child_boundary_loop(
+        child=child,
+        inputs=normalized,
+        finalize=finalize,
+        stream_callback=stream_callback,
+        stream_batch_max_items=stream_batch_max_items,
+    )
 
 
 def execute_child_boundary_loop(
@@ -71,6 +119,8 @@ def execute_child_boundary_loop(
     child: ChildRuntimeBootstrap,
     inputs: list[ChildBoundaryInput],
     finalize: bool = True,
+    stream_callback: Callable[[list[Envelope]], bool] | None = None,
+    stream_batch_max_items: int = 1,
 ) -> list[Envelope]:
     # Child runtime consume->execute->emit loop for boundary-dispatched workload.
     # Phase C unification: route boundary items through runner engine semantics.
@@ -87,14 +137,24 @@ def execute_child_boundary_loop(
     context_service = _resolve_context_service(child.scenario_scope)
     observability = _resolve_observability_service(child.scenario_scope)
     router = _resolve_routing_service(child.scenario_scope)
+    _apply_startup_bindings_for_boundary_runtime(child.scenario_scope)
+    debug_logging = _resolve_leaf_debug_logging_service(child.scenario_scope)
     work_queue = InMemoryQueue()
-    emitted: list[Envelope] = []
+    emitted: list[Envelope]
+    if callable(stream_callback):
+        emitted = _StreamingBoundaryOutputs(
+            on_chunk=stream_callback,
+            batch_max_items=stream_batch_max_items,
+        )
+    else:
+        emitted = []
     envelope_observability_meta: dict[int, dict[str, object]] = {}
     trace_observability_meta: dict[str, dict[str, object]] = {}
     accepted = 0
     accepted_targets: set[str] = set()
     leaf_debug_log(
         event="leaf.boundary_runtime.execute.started",
+        service=debug_logging,
         process_group=child.process_group,
         input_count=len(inputs),
         finalize=finalize,
@@ -132,6 +192,7 @@ def execute_child_boundary_loop(
         if accepted == 0:
             leaf_debug_log(
                 event="leaf.boundary_runtime.execute.no_accepted_inputs",
+                service=debug_logging,
                 process_group=child.process_group,
             )
             return emitted
@@ -197,6 +258,7 @@ def execute_child_boundary_loop(
             runner = AsyncRunner(**runner_kwargs)
             leaf_debug_log(
                 event="leaf.boundary_runtime.runner.selected",
+                service=debug_logging,
                 process_group=child.process_group,
                 runner_type="async",
                 node_count=len(nodes),
@@ -205,26 +267,37 @@ def execute_child_boundary_loop(
             runner = SyncRunner(**runner_kwargs)
             leaf_debug_log(
                 event="leaf.boundary_runtime.runner.selected",
+                service=debug_logging,
                 process_group=child.process_group,
                 runner_type="sync",
                 node_count=len(nodes),
             )
         runner.run()
+        if isinstance(emitted, _StreamingBoundaryOutputs):
+            emitted.flush(force=True)
         leaf_debug_log(
             event="leaf.boundary_runtime.execute.completed",
+            service=debug_logging,
             process_group=child.process_group,
             accepted_inputs=accepted,
             emitted_count=len(emitted),
+            streamed_count=(
+                emitted.streamed_total
+                if isinstance(emitted, _StreamingBoundaryOutputs)
+                else 0
+            ),
         )
     except ChildRuntimeBootstrapError:
         leaf_debug_log(
             event="leaf.boundary_runtime.execute.child_bootstrap_error",
+            service=debug_logging,
             process_group=child.process_group,
         )
         raise
     except Exception as exc:  # noqa: BLE001 - deterministic child-boundary category.
         leaf_debug_log(
             event="leaf.boundary_runtime.execute.failed",
+            service=debug_logging,
             process_group=child.process_group,
             error=exc.__class__.__name__,
         )
@@ -242,6 +315,7 @@ def execute_child_boundary_loop(
             pass
         leaf_debug_log(
             event="leaf.boundary_runtime.execute.finalized",
+            service=debug_logging,
             process_group=child.process_group,
             finalize=finalize,
         )
@@ -286,6 +360,37 @@ def _resolve_context_service(scope: ScenarioScope) -> ContextService:
     )
 
 
+def _apply_startup_bindings_for_boundary_runtime(scope: ScenarioScope) -> None:
+    # Boundary execution may run without full control-plane init path; apply staged
+    # startup bindings once so sink/control consumers are available for routing.
+    from stream_kernel.platform.services.runtime.control_plane_consumer_registry import (
+        ControlPlaneDynamicConsumerRoutingService,
+    )
+    from stream_kernel.platform.services.runtime.control_plane_startup_bindings import (
+        ControlPlaneStartupConsumerBindingsService,
+    )
+
+    try:
+        startup_bindings = scope.resolve("service", ControlPlaneStartupConsumerBindingsService)
+        routing = scope.resolve("service", ControlPlaneDynamicConsumerRoutingService)
+    except InjectionRegistryError:
+        return
+    collect_once = getattr(startup_bindings, "collect_once", None)
+    apply_bindings = getattr(routing, "apply_bindings", None)
+    if not callable(collect_once) or not callable(apply_bindings):
+        return
+    try:
+        bindings = collect_once()
+    except Exception:
+        return
+    if not isinstance(bindings, tuple | list) or not bindings:
+        return
+    try:
+        apply_bindings(tuple(bindings))
+    except Exception:
+        return
+
+
 def _resolve_observability_service(scope: ScenarioScope) -> ObservabilityService:
     try:
         observability_obj = scope.resolve("service", ObservabilityService)
@@ -317,6 +422,18 @@ def _resolve_routing_service(scope: ScenarioScope) -> RoutingService:
     raise ChildRuntimeBootstrapError(
         "child bootstrap resolved service does not match RoutingService contract"
     )
+
+
+def _resolve_leaf_debug_logging_service(
+    scope: ScenarioScope,
+) -> LeafLifecycleDebugLoggingService | None:
+    try:
+        service = scope.resolve("service", LeafLifecycleDebugLoggingService)
+    except InjectionRegistryError:
+        return None
+    if isinstance(service, LeafLifecycleDebugLoggingService):
+        return service
+    return None
 
 
 def _normalize_child_boundary_input(item: object) -> ChildBoundaryInput:

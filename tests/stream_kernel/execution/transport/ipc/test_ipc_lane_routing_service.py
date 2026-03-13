@@ -72,3 +72,14 @@ def test_ipc_lane_routing_service_routes_leaf_drain_ready_to_control_lane() -> N
     )
 
     assert lane == EXECUTION_IPC_LANE_CONTROL
+
+
+def test_ipc_lane_routing_service_uses_default_lane_when_target_missing() -> None:
+    service = InMemoryExecutionIpcLaneRoutingService(store=InMemoryKvStore())
+
+    lane = service.resolve_lane(
+        payload={"kind": "control-reply"},
+        default_lane=EXECUTION_IPC_LANE_CONTROL,
+    )
+
+    assert lane == EXECUTION_IPC_LANE_CONTROL

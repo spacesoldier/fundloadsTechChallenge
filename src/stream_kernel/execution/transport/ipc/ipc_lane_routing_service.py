@@ -18,7 +18,6 @@ from .ipc_transport import (
     EXECUTION_IPC_LANE_METRIC,
     EXECUTION_IPC_LANE_TRACE,
     normalize_execution_ipc_lane,
-    resolve_execution_ipc_lane_for_target,
 )
 
 _PAYLOAD_LANES_KEY = "execution.transport.ipc.lane_routing.payload_lanes"
@@ -103,9 +102,6 @@ class InMemoryExecutionIpcLaneRoutingService(ExecutionIpcLaneRoutingService):
             for prefix, lane in sorted(target_prefix_lanes.items(), key=lambda item: len(item[0]), reverse=True):
                 if lowered_target.startswith(prefix):
                     return normalize_execution_ipc_lane(lane)
-        fallback_lane = resolve_execution_ipc_lane_for_target(target)
-        if isinstance(fallback_lane, str) and fallback_lane:
-            return normalize_execution_ipc_lane(fallback_lane)
         return normalize_execution_ipc_lane(default_lane)
 
     def preload_snapshot(

@@ -1421,6 +1421,49 @@ def test_otel_otlp_trace_sink_obs_aio_02c_block_with_timeout_can_flush_and_admit
     assert diagnostics["block_wait_ms_total"] >= 1
 
 
+def test_otel_otlp_trace_sink_obs_aio_02d_block_forever_retries_without_drop() -> None:
+    # OBS-AIO-02D: block_forever should keep buffered spans on transient export failures.
+    exported_payloads: list[list[str]] = []
+    attempts = {"count": 0}
+    clock = {"now": 0.0}
+
+    def _time_fn() -> float:
+        return float(clock["now"])
+
+    def _sleep_fn(seconds: float) -> None:
+        clock["now"] = float(clock["now"]) + max(0.0, seconds)
+
+    sink = OTelOtlpTraceSink(
+        endpoint="http://collector:4318/v1/traces",
+        backend="urllib",
+        batch_max_items=10,
+        queue_max_items=1,
+        queue_drop_policy="block_forever",
+        time_fn=_time_fn,
+        sleep_fn=_sleep_fn,
+    )
+
+    def _post_http(spans: list[dict[str, object]]) -> None:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise OSError("temporary export failure")
+        exported_payloads.append([str(span.get("name")) for span in spans])
+
+    sink._post_http = _post_http  # type: ignore[method-assign]
+
+    sink.emit(_record("step-a", 0))
+    sink.emit(_record("step-b", 1))
+    sink.close()
+    diagnostics = sink.diagnostics()
+
+    assert diagnostics["dropped"] == 0
+    assert diagnostics["exported"] == 2
+    assert diagnostics["submit_timeout_total"] == 0
+    assert attempts["count"] >= 2
+    assert exported_payloads[0] == ["step-a"]
+    assert exported_payloads[1] == ["step-b"]
+
+
 def test_otel_otlp_trace_sink_obs_aio_03_flush_interval_sends_under_low_throughput(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

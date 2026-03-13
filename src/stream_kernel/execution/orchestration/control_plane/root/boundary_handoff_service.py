@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
@@ -9,14 +10,10 @@ from stream_kernel.application_context.service import service
 from stream_kernel.execution.orchestration.control_plane.root.boundary_execution_service import (
     ControlPlaneRootBoundaryExecutionService,
 )
-from stream_kernel.execution.orchestration.control_plane.root.reply_ingress_service import (
-    ControlPlaneRootReplyIngressService,
-)
 from stream_kernel.execution.orchestration.lifecycle import BoundaryDispatchInput
 from stream_kernel.execution.transport.handoff.ipc_route_table_service import (
     ExecutionIpcRouteTableService,
 )
-from stream_kernel.platform.services.runtime import ProcessGroupRouterService
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafBoundaryResultEvent,
 )
@@ -33,6 +30,7 @@ class ControlPlaneRootBoundaryHandoffService(Protocol):
         *,
         envelopes: list[Envelope],
         source_group: str | None = None,
+        pump_replies: bool = False,
     ) -> list[object]:
         raise NotImplementedError
 
@@ -53,19 +51,25 @@ class ControlPlaneRootBoundaryHandoffService(Protocol):
 @service(name="control_plane_root_boundary_handoff_service")
 @dataclass(slots=True)
 class DefaultControlPlaneRootBoundaryHandoffService(ControlPlaneRootBoundaryHandoffService):
-    process_group_router: ProcessGroupRouterService = inject.service(ProcessGroupRouterService)
+    process_group_router: object | None = None
     root_boundary: ControlPlaneRootBoundaryExecutionService = inject.service(ControlPlaneRootBoundaryExecutionService)
     route_table: ExecutionIpcRouteTableService = inject.service(ExecutionIpcRouteTableService)
-    reply_ingress: ControlPlaneRootReplyIngressService = inject.service(ControlPlaneRootReplyIngressService)
+    leaf_ingress: object | None = None
     state: ControlPlaneStateService = inject.service(ControlPlaneStateService)
     timeout_seconds: float = 10.0
     stream_batch_max_items: int = 1
     observability_batch_max_items: int = 32
     inflight_idle_timeout_seconds: float = 5.0
+    dispatch_max_envelopes_per_tick: int = 128
     _inflight: dict[tuple[str, str], tuple[float, bool]] = field(default_factory=dict, init=False, repr=False)
     _event_cursor: int = field(default=0, init=False, repr=False)
     _stream_request_seq: int = field(default=0, init=False, repr=False)
     _observability_request_seq: int = field(default=0, init=False, repr=False)
+    _pending_dispatch: deque[tuple[list[Envelope], str | None]] = field(
+        default_factory=deque,
+        init=False,
+        repr=False,
+    )
 
     def configure_dispatch(
         self,
@@ -74,6 +78,7 @@ class DefaultControlPlaneRootBoundaryHandoffService(ControlPlaneRootBoundaryHand
         stream_batch_max_items: int | None = None,
         observability_batch_max_items: int | None = None,
         inflight_idle_timeout_seconds: float | None = None,
+        dispatch_max_envelopes_per_tick: int | None = None,
     ) -> None:
         if isinstance(timeout_seconds, (int, float)) and float(timeout_seconds) > 0:
             self.timeout_seconds = float(timeout_seconds)
@@ -86,8 +91,86 @@ class DefaultControlPlaneRootBoundaryHandoffService(ControlPlaneRootBoundaryHand
             and float(inflight_idle_timeout_seconds) > 0
         ):
             self.inflight_idle_timeout_seconds = float(inflight_idle_timeout_seconds)
+        if isinstance(dispatch_max_envelopes_per_tick, int) and dispatch_max_envelopes_per_tick > 0:
+            self.dispatch_max_envelopes_per_tick = int(dispatch_max_envelopes_per_tick)
 
     def drain_external_deliveries(
+        self,
+        *,
+        envelopes: list[Envelope],
+        source_group: str | None = None,
+        pump_replies: bool = False,
+    ) -> list[object]:
+        if envelopes:
+            self._pending_dispatch.append((list(envelopes), source_group))
+        return self.drain_pending_dispatch(pump_replies=pump_replies)
+
+    def drain_pending_dispatch(
+        self,
+        *,
+        max_envelopes: int | None = None,
+        pump_replies: bool = False,
+    ) -> list[object]:
+        budget = (
+            max(1, int(self.dispatch_max_envelopes_per_tick))
+            if max_envelopes is None
+            else max(1, int(max_envelopes))
+        )
+        terminal_outputs: list[object] = []
+        # Cascade boundary outputs synchronously inside handoff so multi-hop
+        # chains can progress during a single root runner tick.
+        while True:
+            terminal_outputs.extend(
+                self._drain_pending_dispatch_queue(max_envelopes=budget)
+            )
+            completed = self.drain_completed_deliveries(
+                poll_timeout_seconds=0.0,
+                pump_replies=pump_replies,
+            )
+            if not completed:
+                break
+            chained_envelopes: list[Envelope] = []
+            for item in completed:
+                if (
+                    isinstance(item, Envelope)
+                    and isinstance(item.target, str)
+                    and item.target
+                ):
+                    chained_envelopes.append(item)
+                    continue
+                terminal_outputs.append(item)
+            if not chained_envelopes:
+                break
+            self._pending_dispatch.append((chained_envelopes, None))
+        return terminal_outputs
+
+    def _drain_pending_dispatch_queue(
+        self,
+        *,
+        max_envelopes: int,
+    ) -> list[object]:
+        budget = max(1, int(max_envelopes))
+        terminal_outputs: list[object] = []
+        while budget > 0 and self._pending_dispatch:
+            queued_envelopes, source_group = self._pending_dispatch[0]
+            if not queued_envelopes:
+                self._pending_dispatch.popleft()
+                continue
+            take = min(budget, len(queued_envelopes))
+            chunk = list(queued_envelopes[:take])
+            del queued_envelopes[:take]
+            if not queued_envelopes:
+                self._pending_dispatch.popleft()
+            terminal_outputs.extend(
+                self._dispatch_external_chunk(
+                    envelopes=chunk,
+                    source_group=source_group,
+                )
+            )
+            budget -= take
+        return terminal_outputs
+
+    def _dispatch_external_chunk(
         self,
         *,
         envelopes: list[Envelope],
@@ -148,9 +231,6 @@ class DefaultControlPlaneRootBoundaryHandoffService(ControlPlaneRootBoundaryHand
             )
             self._inflight[(worker_id, request_id)] = (time.monotonic(), False)
             terminal_outputs.extend(list(routing.terminal_outputs))
-            # Interleave reply ingress pumping with outbound dispatch to prevent
-            # producer-side stalling when credit-based flow control reaches its window.
-            terminal_outputs.extend(self.drain_completed_deliveries())
             pending_batch = []
             pending_batch_group = None
             pending_batch_worker = None
@@ -162,10 +242,17 @@ class DefaultControlPlaneRootBoundaryHandoffService(ControlPlaneRootBoundaryHand
             target = envelope.target
             if not isinstance(target, str) or not target:
                 continue
-            target_group, worker_id = self._resolve_dispatch_route(
+            resolved_route = self._resolve_dispatch_route(
                 target=target,
                 source_group=source_group,
             )
+            if not isinstance(resolved_route, tuple):
+                self._append_route_miss_event(
+                    target=target,
+                    source_group=source_group,
+                )
+                continue
+            target_group, worker_id = resolved_route
             dispatch_input = BoundaryDispatchInput(
                 payload=envelope.payload,
                 dispatch_group=target_group,
@@ -217,16 +304,16 @@ class DefaultControlPlaneRootBoundaryHandoffService(ControlPlaneRootBoundaryHand
                     wait_for_result=False,
                 )
                 terminal_outputs.extend(list(routing.terminal_outputs))
-        terminal_outputs.extend(self.drain_completed_deliveries())
         return terminal_outputs
 
     def drain_completed_deliveries(
         self,
         *,
         poll_timeout_seconds: float = 0.0,
+        pump_replies: bool = False,
     ) -> list[object]:
+        _ = (poll_timeout_seconds, pump_replies)
         completed: list[object] = []
-        self._pump_reply_ingress(poll_timeout_seconds=poll_timeout_seconds)
         try:
             events = self._state().events()
         except Exception:
@@ -255,14 +342,6 @@ class DefaultControlPlaneRootBoundaryHandoffService(ControlPlaneRootBoundaryHand
         self._expire_stale_inflight()
         return any(not bool(is_background) for _started_at, is_background in self._inflight.values())
 
-    def _router(self) -> ProcessGroupRouterService:
-        candidate = self.process_group_router
-        if isinstance(candidate, ProcessGroupRouterService):
-            return candidate
-        if callable(getattr(candidate, "resolve_group_for_target", None)):
-            return candidate  # type: ignore[return-value]
-        raise ValueError("ProcessGroupRouterService binding is required")
-
     def _route_table(self) -> ExecutionIpcRouteTableService:
         candidate = self.route_table
         if isinstance(candidate, ExecutionIpcRouteTableService):
@@ -273,16 +352,20 @@ class DefaultControlPlaneRootBoundaryHandoffService(ControlPlaneRootBoundaryHand
             return candidate  # type: ignore[return-value]
         raise ValueError("ExecutionIpcRouteTableService binding is required")
 
-    def _resolve_dispatch_route(self, *, target: str, source_group: str | None) -> tuple[str, str]:
+    def _resolve_dispatch_route(
+        self,
+        *,
+        target: str,
+        source_group: str | None,
+    ) -> tuple[str, str] | None:
+        _ = source_group
         target_id = self._route_table().resolve_route(target=target)
-        if isinstance(target_id, str) and target_id:
-            target_group = _target_group_from_worker_id(target_id)
-            if isinstance(target_group, str) and target_group:
-                return (target_group, target_id)
-        target_group = self._router().resolve_group_for_target(target=target, source_group=source_group)
-        worker_id = f"{target_group}#1"
-        self._route_table().upsert_route(target=target, target_id=worker_id)
-        return (target_group, worker_id)
+        if not isinstance(target_id, str) or not target_id:
+            return None
+        target_group = _target_group_from_worker_id(target_id)
+        if not isinstance(target_group, str) or not target_group:
+            return None
+        return (target_group, target_id)
 
     def _boundary(self) -> ControlPlaneRootBoundaryExecutionService:
         candidate = self.root_boundary
@@ -292,14 +375,6 @@ class DefaultControlPlaneRootBoundaryHandoffService(ControlPlaneRootBoundaryHand
             return candidate  # type: ignore[return-value]
         raise ValueError("ControlPlaneRootBoundaryExecutionService binding is required")
 
-    def _reply_ingress(self) -> ControlPlaneRootReplyIngressService | None:
-        candidate = self.reply_ingress
-        if isinstance(candidate, ControlPlaneRootReplyIngressService):
-            return candidate
-        if callable(getattr(candidate, "drain_worker_replies", None)):
-            return candidate  # type: ignore[return-value]
-        return None
-
     def _state(self) -> ControlPlaneStateService:
         candidate = self.state
         if isinstance(candidate, ControlPlaneStateService):
@@ -308,18 +383,22 @@ class DefaultControlPlaneRootBoundaryHandoffService(ControlPlaneRootBoundaryHand
             return candidate  # type: ignore[return-value]
         raise ValueError("ControlPlaneStateService binding is required")
 
-    def _pump_reply_ingress(self, *, poll_timeout_seconds: float = 0.0) -> None:
-        ingress = self._reply_ingress()
-        if ingress is None:
-            return
-        worker_ids = {worker_id for worker_id, _request_id in self._inflight.keys()}
-        for index, worker_id in enumerate(sorted(worker_ids)):
-            timeout = max(0.0, float(poll_timeout_seconds)) if index == 0 else 0.0
-            ingress.drain_worker_replies(
-                worker_id=worker_id,
-                timeout_seconds=timeout,
-                max_items=256,
+    def _append_route_miss_event(
+        self,
+        *,
+        target: str,
+        source_group: str | None,
+    ) -> None:
+        try:
+            self._state().append_event(
+                {
+                    "kind": "control_plane.boundary.route_miss",
+                    "target": target,
+                    "source_group": source_group,
+                }
             )
+        except Exception:
+            return
 
     def _expire_stale_inflight(self) -> None:
         if not self._inflight:

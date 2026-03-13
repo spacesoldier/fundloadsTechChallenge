@@ -1,0 +1,27 @@
+[tool.poetry]
+name = "research-ui-local"
+version = "0.1.0"
+description = "Local dev runtime for research UI (FastAPI + debug vitrine)"
+authors = ["Research UI Team"]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.14"
+fastapi = "^0.135.1"
+uvicorn = { version = "^0.41.0", extras = ["standard"] }
+pydantic = "^2.12.5"
+pyyaml = "^6.0.3"
+rich = "^14.0.0"
+psycopg = { version = "^3.3.3", extras = ["binary"] }
+pymongo = "^4.16.0"
+motor = "^3.7.1"
+mcp = "^1.26.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.0.1"
+ruff = "^0.14.0"
+playwright = "^1.58.0"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

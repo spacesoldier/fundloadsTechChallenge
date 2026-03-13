@@ -1,5 +1,36 @@
 services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: fund-load-research-postgres
+    environment:
+      POSTGRES_DB: research_ui
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      PGDATA: /var/lib/postgresql/18/docker
+    volumes:
+      - ~/projects/tools/db/pg/ringo/research_ui/research_ui_postgres:/var/lib/postgresql
+    ports:
+      - "${RESEARCH_UI_POSTGRES_PORT:-5432}:5432"
+    # networks:
+    #   - default
+    #   - ringonet
+    restart: unless-stopped
+
+  mongodb:
+    image: mongo:8.2.5
+    container_name: fund-load-research-mongodb
+    volumes:
+      - ~/projects/tools/db/mongo/ringo/research_ui_mongodb:/data/db
+    ports:
+      - "${RESEARCH_UI_MONGO_PORT:-27017}:27017"
+    # networks:
+    #   - default
+    #   - ringonet
+    restart: unless-stopped
+
   research_ui:
+    profiles:
+      - docker-ui
     build:
       context: ..
       dockerfile: research_ui/Dockerfile
@@ -9,7 +40,33 @@ services:
     environment:
       RESEARCH_UI_REPORTS_DIR: /app/research_ui/reports
       PYTHONPATH: /app/src
+      RESEARCH_UI_REDIS_HOST: ${RESEARCH_UI_REDIS_HOST:-redis}
+      RESEARCH_UI_REDIS_PORT: ${RESEARCH_UI_REDIS_PORT:-6379}
+      RESEARCH_UI_REDIS_DB: ${RESEARCH_UI_REDIS_DB:-0}
+      RESEARCH_UI_REDIS_KEY_PREFIX: ${RESEARCH_UI_REDIS_KEY_PREFIX:-stream_kernel:debug}
+      RESEARCH_UI_POSTGRES_ENABLED: ${RESEARCH_UI_POSTGRES_ENABLED:-true}
+      RESEARCH_UI_MONGO_ENABLED: ${RESEARCH_UI_MONGO_ENABLED:-true}
+      RESEARCH_UI_POSTGRES_DSN: ${RESEARCH_UI_POSTGRES_DSN:-postgresql://postgres:postgres@postgres:5432/research_ui}
+      RESEARCH_UI_MONGO_URI: ${RESEARCH_UI_MONGO_URI:-mongodb://mongodb:27017}
+      RESEARCH_UI_MONGO_DB: ${RESEARCH_UI_MONGO_DB:-research_ui}
     volumes:
       - ../src:/app/src:ro
       - ./reports:/app/research_ui/reports:rw
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+    depends_on:
+      - postgres
+      - mongodb
+    # networks:
+    #   - default
+    #   - ringonet
     restart: unless-stopped
+
+# volumes:
+#   research_ui_postgres:
+#   research_ui_mongodb:
+
+networks:
+  default:
+    name: ringonet
+    external: true

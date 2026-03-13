@@ -2,15 +2,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from stream_kernel.execution.orchestration.control_plane import ControlPlaneStartWorkDispatchNode
+from stream_kernel.execution.orchestration.control_plane import (
+    ControlPlaneRootLeafStartWorkDispatchNode,
+    ControlPlaneStartWorkReadinessNode,
+    ControlPlaneStartWorkDispatchNode,
+)
+from stream_kernel.execution.transport.ipc.ipc_transport import (
+    EXECUTION_IPC_LANE_CONTROL,
+    compose_execution_ipc_worker_target_id,
+)
 from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.observability.domain.logging import LogMessage
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneGroupSpec,
-    ControlPlaneLeafStartWorkEvent,
     ControlPlaneLaunchPlan,
     ControlPlaneLaunchPlanEvent,
+    ControlPlaneLeafConfigAckEvent,
+    ControlPlaneLeafConfigCardEvent,
+    ControlPlaneRootLeafStartWorkCommand,
+    ControlPlaneLeafStartWorkEvent,
     ControlPlaneStartWorkEvent,
+    SystemRuntimeConfigRecord,
+)
+from stream_kernel.platform.services.runtime.control_plane_config_stream import (
+    InMemoryControlPlaneStartupConfigStore,
 )
 from stream_kernel.platform.services.runtime.control_plane_state import (
     InMemoryControlPlaneStateService,
@@ -18,80 +33,15 @@ from stream_kernel.platform.services.runtime.control_plane_state import (
 
 
 @dataclass(slots=True)
-class _BoundaryExec:
-    calls: list[dict[str, object]] = field(default_factory=list)
+class _ControlLaneIpc:
+    sent: list[tuple[str, object, bool]] = field(default_factory=list)
 
-    def execute_boundary_on_leaf(
-        self,
-        *,
-        target_group: str,
-        worker_id: str,
-        request_id: str,
-        inputs: tuple[object, ...],
-        timeout_seconds: float,
-        finalize: bool = True,
-        wait_for_result: bool = True,
-    ):
-        self.calls.append(
-            {
-                "target_group": target_group,
-                "worker_id": worker_id,
-                "request_id": request_id,
-                "inputs": inputs,
-                "timeout_seconds": timeout_seconds,
-                "finalize": finalize,
-                "wait_for_result": wait_for_result,
-            }
-        )
-        class _Routing:
-            terminal_outputs: list[object] = []
-        return _Routing()
-
-
-@dataclass(slots=True)
-class _HandoffDispatch:
-    calls: list[dict[str, object]] = field(default_factory=list)
-
-    def dispatch_broadcast(
-        self,
-        envelope: object,
-        *,
-        target_group: str | None = None,
-        include_observability: bool = False,
-        policy: str = "best_effort",
-        broadcast_id: str | None = None,
-    ):
-        self.calls.append(
-            {
-                "envelope": envelope,
-                "target_group": target_group,
-                "include_observability": include_observability,
-                "policy": policy,
-                "broadcast_id": broadcast_id,
-            }
-        )
-
-        @dataclass(frozen=True, slots=True)
-        class _Result:
-            broadcast_id: str
-            policy: str
-            total: int
-            accepted: int
-            failed: int
-            failed_workers: tuple[str, ...] = ()
-
-        return _Result(
-            broadcast_id=broadcast_id or "broadcast:test",
-            policy=policy,
-            total=2,
-            accepted=2,
-            failed=0,
-        )
+    def send(self, target_id: str, payload: object, *, no_reply: bool = False) -> None:
+        self.sent.append((target_id, payload, bool(no_reply)))
 
 
 def test_control_plane_start_work_dispatch_fans_out_start_to_all_workers() -> None:
     state = InMemoryControlPlaneStateService(store=InMemoryKvStore())
-    handoff = _HandoffDispatch()
     state.append_event(
         ControlPlaneLaunchPlanEvent(
             plan=ControlPlaneLaunchPlan(
@@ -110,7 +60,7 @@ def test_control_plane_start_work_dispatch_fans_out_start_to_all_workers() -> No
             )
         )
     )
-    node = ControlPlaneStartWorkDispatchNode(state=state, handoff_dispatch=handoff)
+    node = ControlPlaneStartWorkDispatchNode(state=state)
 
     produced = node(
         ControlPlaneStartWorkEvent(
@@ -118,21 +68,19 @@ def test_control_plane_start_work_dispatch_fans_out_start_to_all_workers() -> No
         ),
         None,
     )
-    assert len(produced) == 1
+    assert len(produced) == 2
     assert isinstance(produced[0], LogMessage)
-    assert produced[0].fields.get("event") == "control_plane.runtime.start_work_broadcast_dispatched"
-    assert len(handoff.calls) == 1
-    dispatch_call = handoff.calls[0]
-    assert dispatch_call["target_group"] == "execution.ingress"
-    envelope = dispatch_call["envelope"]
-    assert getattr(envelope, "target", None) == "system.cp.leaf_start_work"
-    assert isinstance(getattr(envelope, "payload", None), ControlPlaneLeafStartWorkEvent)
-    assert getattr(envelope, "payload").source_targets == ("source:source",)
+    assert produced[0].fields.get("event") == "control_plane.runtime.start_work_commands_enqueued"
+    command = produced[1]
+    assert isinstance(command, ControlPlaneRootLeafStartWorkCommand)
+    assert command.worker_id == "execution.ingress#1"
+    assert command.target_group == "execution.ingress"
+    assert command.source_targets == ("source:source",)
+    assert isinstance(command.command_id, str) and command.command_id
 
 
 def test_control_plane_start_work_dispatch_is_idempotent() -> None:
     state = InMemoryControlPlaneStateService(store=InMemoryKvStore())
-    handoff = _HandoffDispatch()
     state.append_event(
         ControlPlaneLaunchPlanEvent(
             plan=ControlPlaneLaunchPlan(
@@ -146,21 +94,90 @@ def test_control_plane_start_work_dispatch_is_idempotent() -> None:
             )
         )
     )
-    node = ControlPlaneStartWorkDispatchNode(state=state, handoff_dispatch=handoff)
+    node = ControlPlaneStartWorkDispatchNode(state=state)
 
     first = node(ControlPlaneStartWorkEvent(), None)
     second = node(ControlPlaneStartWorkEvent(), None)
 
-    assert len(first) == 1
+    assert len(first) == 2
     assert isinstance(first[0], LogMessage)
     assert second == []
-    assert len(handoff.calls) == 1
+    assert isinstance(first[1], ControlPlaneRootLeafStartWorkCommand)
 
 
-def test_control_plane_start_work_dispatch_prefers_handoff_broadcast_over_boundary_service() -> None:
+def test_control_plane_start_work_dispatch_targets_each_worker_when_group_has_multiple_workers() -> None:
     state = InMemoryControlPlaneStateService(store=InMemoryKvStore())
-    boundary = _BoundaryExec()
-    handoff = _HandoffDispatch()
+    state.append_event(
+        ControlPlaneLaunchPlanEvent(
+            plan=ControlPlaneLaunchPlan(
+                groups=(
+                    ControlPlaneGroupSpec(
+                        group_name="execution.ingress",
+                        workers=2,
+                        nodes=("source:source", "ingress_line_bridge"),
+                    ),
+                )
+            )
+        )
+    )
+    node = ControlPlaneStartWorkDispatchNode(state=state)
+
+    produced = node(ControlPlaneStartWorkEvent(source_targets=("source:source",)), None)
+
+    assert len(produced) == 3
+    assert isinstance(produced[0], LogMessage)
+    assert produced[0].fields.get("event") == "control_plane.runtime.start_work_commands_enqueued"
+    commands = [item for item in produced[1:] if isinstance(item, ControlPlaneRootLeafStartWorkCommand)]
+    assert len(commands) == 2
+    assert {item.worker_id for item in commands} == {
+        "execution.ingress#1",
+        "execution.ingress#2",
+    }
+
+
+def test_root_leaf_start_work_dispatch_sends_command_to_control_lane() -> None:
+    ipc = _ControlLaneIpc()
+    node = ControlPlaneRootLeafStartWorkDispatchNode(control_lane_ipc=ipc)  # type: ignore[arg-type]
+    command = ControlPlaneRootLeafStartWorkCommand(
+        target_group="execution.ingress",
+        worker_id="execution.ingress#1",
+        source_targets=("source:source",),
+        command_id="start-1",
+    )
+
+    produced = node(command, None)
+
+    assert produced == []
+    assert len(ipc.sent) == 1
+    target_id, payload, no_reply = ipc.sent[0]
+    assert target_id == compose_execution_ipc_worker_target_id(
+        "execution.ingress#1",
+        lane=EXECUTION_IPC_LANE_CONTROL,
+    )
+    assert no_reply is True
+    assert isinstance(payload, ControlPlaneLeafStartWorkEvent)
+    assert payload.source_targets == ("source:source",)
+    assert payload.command_id == "start-1"
+
+
+def test_start_work_readiness_emits_start_when_all_non_observability_workers_applied() -> None:
+    state = InMemoryControlPlaneStateService(store=InMemoryKvStore())
+    store = InMemoryControlPlaneStartupConfigStore(store=InMemoryKvStore())
+    store.append(
+        SystemRuntimeConfigRecord(
+            source="runtime",
+            section="system_runtime",
+            record_id="system_runtime:0",
+            payload={
+                "platform": {
+                    "readiness": {
+                        "enabled": True,
+                        "start_work_on_all_groups_ready": True,
+                    }
+                }
+            },
+        )
+    )
     state.append_event(
         ControlPlaneLaunchPlanEvent(
             plan=ControlPlaneLaunchPlan(
@@ -171,24 +188,98 @@ def test_control_plane_start_work_dispatch_prefers_handoff_broadcast_over_bounda
                         nodes=("source:source", "ingress_line_bridge"),
                     ),
                     ControlPlaneGroupSpec(
-                        group_name="execution.features",
+                        group_name="system.observability",
                         workers=1,
-                        nodes=("compute_time_keys", "compute_features"),
+                        nodes=("system.obs.trace_dispatch",),
                     ),
                 )
             )
         )
     )
-    node = ControlPlaneStartWorkDispatchNode(
-        state=state,
-        boundary_execution=boundary,
-        handoff_dispatch=handoff,
+    state.append_event(
+        ControlPlaneLeafConfigCardEvent(
+            target_group="execution.ingress",
+            worker_id="execution.ingress#1",
+            config_id="cfg-1",
+            run_id="run",
+            scenario_id="scenario",
+            group_name="execution.ingress",
+            nodes=("source:source",),
+            runner_profile="async",
+            worker_slot=0,
+            config_revision=1,
+        )
+    )
+    node = ControlPlaneStartWorkReadinessNode(state=state, config_store=store)
+
+    produced = node(
+        ControlPlaneLeafConfigAckEvent(
+            target_group="execution.ingress",
+            worker_id="execution.ingress#1",
+            config_id="cfg-1",
+            status="applied",
+        ),
+        None,
     )
 
-    produced = node(ControlPlaneStartWorkEvent(source_targets=("source:source",)), None)
+    assert produced == [ControlPlaneStartWorkEvent(source_targets=("source:source",))]
 
-    assert len(produced) == 1
-    assert isinstance(produced[0], LogMessage)
-    assert produced[0].fields.get("event") == "control_plane.runtime.start_work_broadcast_dispatched"
-    assert boundary.calls == []
-    assert len(handoff.calls) == 1
+
+def test_start_work_readiness_respects_start_work_on_all_groups_ready_flag() -> None:
+    state = InMemoryControlPlaneStateService(store=InMemoryKvStore())
+    store = InMemoryControlPlaneStartupConfigStore(store=InMemoryKvStore())
+    store.append(
+        SystemRuntimeConfigRecord(
+            source="runtime",
+            section="system_runtime",
+            record_id="system_runtime:0",
+            payload={
+                "platform": {
+                    "readiness": {
+                        "enabled": True,
+                        "start_work_on_all_groups_ready": False,
+                    }
+                }
+            },
+        )
+    )
+    state.append_event(
+        ControlPlaneLaunchPlanEvent(
+            plan=ControlPlaneLaunchPlan(
+                groups=(
+                    ControlPlaneGroupSpec(
+                        group_name="execution.ingress",
+                        workers=1,
+                        nodes=("source:source", "ingress_line_bridge"),
+                    ),
+                )
+            )
+        )
+    )
+    state.append_event(
+        ControlPlaneLeafConfigCardEvent(
+            target_group="execution.ingress",
+            worker_id="execution.ingress#1",
+            config_id="cfg-1",
+            run_id="run",
+            scenario_id="scenario",
+            group_name="execution.ingress",
+            nodes=("source:source",),
+            runner_profile="async",
+            worker_slot=0,
+            config_revision=1,
+        )
+    )
+    node = ControlPlaneStartWorkReadinessNode(state=state, config_store=store)
+
+    produced = node(
+        ControlPlaneLeafConfigAckEvent(
+            target_group="execution.ingress",
+            worker_id="execution.ingress#1",
+            config_id="cfg-1",
+            status="applied",
+        ),
+        None,
+    )
+
+    assert produced == []

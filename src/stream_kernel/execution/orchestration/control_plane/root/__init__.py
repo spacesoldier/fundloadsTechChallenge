@@ -4,10 +4,12 @@ from importlib import import_module
 from typing import Any
 
 _EXPORTS = {
+    'ControlPlaneRootRunnerControlService': 'channel_services',
+    'DefaultControlPlaneRootRunnerControlService': 'channel_services',
     'ControlPlaneRootLeafCommandService': 'leaf_command_service',
     'DefaultControlPlaneRootLeafCommandService': 'leaf_command_service',
-    'ControlPlaneRootReplyIngressService': 'reply_ingress_service',
-    'DefaultControlPlaneRootReplyIngressService': 'reply_ingress_service',
+    'ControlPlaneRootLeafIngressService': 'leaf_ingress_service',
+    'DefaultControlPlaneRootLeafIngressService': 'leaf_ingress_service',
     'ControlPlaneRootRuntimeBootstrapService': 'runtime_bootstrap_service',
     'DefaultControlPlaneRootRuntimeBootstrapService': 'runtime_bootstrap_service',
     'ControlPlaneRootBoundaryExecutionService': 'boundary_execution_service',
@@ -16,12 +18,6 @@ _EXPORTS = {
     'ControlPlaneRootBoundaryExecutionFailedError': 'boundary_execution_service',
     'ControlPlaneRootBoundaryHandoffService': 'boundary_handoff_service',
     'DefaultControlPlaneRootBoundaryHandoffService': 'boundary_handoff_service',
-    'ControlPlaneRootStopExecutionService': 'stop_execution_service',
-    'DefaultControlPlaneRootStopExecutionService': 'stop_execution_service',
-    'ControlPlaneRootStopExecutionTimeoutError': 'stop_execution_service',
-    'ControlPlaneRootShutdownService': 'shutdown_service',
-    'DefaultControlPlaneRootShutdownService': 'shutdown_service',
-    'ControlPlaneRootShutdownResult': 'shutdown_service',
     'ControlPlaneRootDiscoverySnapshotService': 'discovery_snapshot_service',
     'DefaultControlPlaneRootDiscoverySnapshotService': 'discovery_snapshot_service',
 }

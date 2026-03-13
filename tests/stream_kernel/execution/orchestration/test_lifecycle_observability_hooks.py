@@ -175,7 +175,7 @@ def test_execute_with_runtime_lifecycle_does_not_use_observability_drain_timeout
     assert lifecycle.shutdown_policy_calls
     call = lifecycle.shutdown_policy_calls[-1]
     assert call["observability_group_name"] == "system.observability"
-    assert call["observability_stop_command_timeout_seconds"] == 5.0
+    assert call["observability_stop_command_timeout_seconds"] == 0.0
 
 
 def test_execute_with_runtime_lifecycle_passes_stop_and_fallback_shutdown_timeouts() -> None:
@@ -243,5 +243,5 @@ def test_execute_with_runtime_lifecycle_keeps_observability_default_stop_timeout
     assert lifecycle.shutdown_policy_calls
     call = lifecycle.shutdown_policy_calls[-1]
     assert call["observability_group_name"] == "system.observability"
-    assert call["observability_stop_command_timeout_seconds"] == 5.0
+    assert call["observability_stop_command_timeout_seconds"] == 0.0
     assert call["stop_command_timeout_seconds"] == 1.0

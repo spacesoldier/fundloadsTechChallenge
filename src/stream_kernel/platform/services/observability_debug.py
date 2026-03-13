@@ -11,6 +11,12 @@ from stream_kernel.observability.events import DebugDispatchEvent
 
 
 @runtime_checkable
+class RuntimeDebugSinkPort(Protocol):
+    def emit_async(self, message: DebugMessage) -> object:
+        raise NotImplementedError
+
+
+@runtime_checkable
 class RuntimeDebugDispatchService(Protocol):
     # System dispatch service for runtime debug events.
     def dispatch(self, *, event: DebugDispatchEvent) -> list[object]:
@@ -20,7 +26,7 @@ class RuntimeDebugDispatchService(Protocol):
 @service(name="runtime_debug_dispatch_service")
 @dataclass(slots=True)
 class DefaultRuntimeDebugDispatchService(RuntimeDebugDispatchService):
-    sink: object = inject.stream(DebugMessage)
+    sink: RuntimeDebugSinkPort = inject.stream(DebugMessage)
 
     def dispatch(self, *, event: DebugDispatchEvent) -> list[object]:
         if not isinstance(event, DebugDispatchEvent):
@@ -28,21 +34,12 @@ class DefaultRuntimeDebugDispatchService(RuntimeDebugDispatchService):
         message = event.payload
         if not isinstance(message, DebugMessage):
             return []
-        emit_async = getattr(self.sink, "emit_async", None)
-        if callable(emit_async):
-            try:
-                result = emit_async(message)
-                if inspect.isawaitable(result):
-                    return [result]
-            except Exception:
-                return []
+        try:
+            result = self.sink.emit_async(message)
+        except Exception:
             return []
-        emit = getattr(self.sink, "emit", None)
-        if callable(emit):
-            try:
-                emit(message)
-            except Exception:
-                return []
+        if inspect.isawaitable(result):
+            return [result]
         return []
 
 
@@ -54,6 +51,7 @@ class NoOpRuntimeDebugDispatchService(RuntimeDebugDispatchService):
 
 
 __all__ = [
+    "RuntimeDebugSinkPort",
     "RuntimeDebugDispatchService",
     "DefaultRuntimeDebugDispatchService",
     "NoOpRuntimeDebugDispatchService",

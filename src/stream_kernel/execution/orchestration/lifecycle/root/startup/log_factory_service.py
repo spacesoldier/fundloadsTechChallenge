@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from stream_kernel.application_context.service import service
-from stream_kernel.execution.orchestration.control_plane.root.shutdown_service import (
+from stream_kernel.execution.orchestration.lifecycle.root.runtime.shutdown_result import (
     ControlPlaneRootShutdownResult,
 )
 from stream_kernel.observability.domain.logging import LogMessage

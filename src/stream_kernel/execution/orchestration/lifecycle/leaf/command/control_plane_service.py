@@ -3,20 +3,41 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 import os
-import time
-from threading import Event
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from stream_kernel.application_context import apply_injection
 from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.service import service
-from stream_kernel.execution.orchestration.lifecycle.leaf.command.control_ingress_service import (
-    LeafControlIngressService,
+from stream_kernel.execution.orchestration.control_plane.leaf.system_nodes import (
+    is_leaf_command_ingress_source_node_name,
+)
+from stream_kernel.execution.orchestration.lifecycle.leaf.command.channel_services import (
+    LeafCommandChannelIngressService,
+    LeafRunnerControlService,
+)
+from stream_kernel.execution.orchestration.lifecycle.leaf.command.finalization_service import (
+    LeafSessionFinalizationService,
+)
+from stream_kernel.execution.orchestration.lifecycle.leaf.runtime.session_state_service import (
+    LeafRuntimeSessionStateService,
 )
 from stream_kernel.execution.orchestration.lifecycle.leaf.debug_logging import (
+    LeafLifecycleDebugLoggingService,
+    bind_leaf_debug_sink,
     configure_leaf_debug_logging,
     flush_leaf_debug_logging,
     leaf_debug_log,
 )
+from stream_kernel.platform.services.runtime.control_plane_events import (
+    ControlPlaneInitEvent,
+)
+from stream_kernel.platform.services.runtime.debug_buffer import RuntimeDebugBufferService
+from stream_kernel.execution.runtime.runner import AsyncRunner, SyncRunner
+from stream_kernel.execution.runtime.runner_ingress import (
+    enqueue_runner_input_async,
+    enqueue_runner_input_sync,
+)
+from stream_kernel.routing.envelope import Envelope
 from stream_kernel.execution.transport.ipc.ipc_transport import (
     EXECUTION_IPC_LANE_CONTROL,
     compose_execution_ipc_worker_target_id,
@@ -27,8 +48,6 @@ if TYPE_CHECKING:
     from stream_kernel.execution.orchestration.lifecycle.leaf.runtime.worker_runtime import (
         LeafWorkerRuntimeSession,
     )
-
-_STARTUP_RETRY_WAIT = Event()
 
 
 @runtime_checkable
@@ -65,8 +84,11 @@ class DefaultLeafWorkerControlPlaneService(LeafWorkerControlPlaneService):
 @service(name="leaf_process_entry_orchestration_service")
 @dataclass(slots=True)
 class DefaultLeafProcessEntryOrchestrationService(LeafProcessEntryOrchestrationService):
-    control_ingress_service: object | None = None
-    execution_ipc: object | None = inject.service(ExecutionIpcTransportService)
+    execution_ipc: ExecutionIpcTransportService = inject.service(ExecutionIpcTransportService)
+    command_channel_ingress: LeafCommandChannelIngressService = inject.service(LeafCommandChannelIngressService)
+    runner_control: LeafRunnerControlService = inject.service(LeafRunnerControlService)
+    session_state: LeafRuntimeSessionStateService = inject.service(LeafRuntimeSessionStateService)
+    finalization_service: LeafSessionFinalizationService = inject.service(LeafSessionFinalizationService)
     _bound_control_workers: set[str] = field(default_factory=set)
 
     def run(
@@ -86,107 +108,89 @@ class DefaultLeafProcessEntryOrchestrationService(LeafProcessEntryOrchestrationS
             group_name=group_name,
             runner_profile_requested=runner_profile_requested,
         )
+        debug_logging = resolve_leaf_debug_logging_service(session)
+        _bind_leaf_debug_runtime_sink(session, debug_logging=debug_logging)
+        configure_leaf_debug_logging(
+            runtime=runtime,
+            group_name=group_name,
+            worker_id=worker_id,
+            service=debug_logging,
+        )
         leaf_debug_log(
             event="leaf.orchestrator.run.started",
+            service=debug_logging,
             worker_id=worker_id,
             group_name=group_name,
             process_role=runtime.get("__process_role"),
         )
-        startup_send_timeout_seconds = _resolve_leaf_startup_send_timeout_seconds(runtime)
-        ipc = _resolve_execution_ipc_service(session, explicit=self.execution_ipc)
-        if ipc is None:
-            leaf_debug_log(
-                event="leaf.orchestrator.run.no_ipc",
-                worker_id=worker_id,
-                group_name=group_name,
-            )
-            _wait_for_stop_event(stop_event)
-            return
+        ipc = self.execution_ipc
+        session_state = self.session_state
+        session_state.bind_session(session)
         if worker_id not in self._bound_control_workers:
             _bind_worker_control_endpoint(ipc=ipc, worker_id=worker_id, control_pipe=control_pipe)
             self._bound_control_workers.add(worker_id)
             leaf_debug_log(
                 event="leaf.orchestrator.control_endpoint.bound",
+                service=debug_logging,
                 worker_id=worker_id,
             )
-        startup_events = build_leaf_startup_events(runtime=runtime)
-        leaf_debug_log(
-            event="leaf.orchestrator.startup_events.built",
-            worker_id=worker_id,
-            event_count=len(startup_events),
-            event_types=[type(event).__name__ for event in startup_events],
+        ingress = self.command_channel_ingress
+        ingress.configure_poll_timeout_seconds(max(0.0, float(boundary_control_poll_seconds)))
+        runner = _build_leaf_runner(
+            session=session,
+            runtime=runtime,
         )
-        for event in startup_events:
-            if not _send_startup_event_with_retry(
-                ipc=ipc,
-                worker_id=worker_id,
-                event=event,
-                stop_event=stop_event,
-                timeout_seconds=startup_send_timeout_seconds,
-            ):
-                leaf_debug_log(
-                    event="leaf.orchestrator.startup_event.send_failed",
-                    worker_id=worker_id,
-                    startup_event=type(event).__name__,
-                )
-                return
-            leaf_debug_log(
-                event="leaf.orchestrator.startup_event.sent",
-                worker_id=worker_id,
-                startup_event=type(event).__name__,
-            )
-        ingress = _resolve_ingress_contract(self.control_ingress_service)
-        if ingress is None:
-            ingress = resolve_leaf_control_ingress_service(session)
-        if ingress is None:
-            leaf_debug_log(
-                event="leaf.orchestrator.run.no_ingress",
-                worker_id=worker_id,
-                group_name=group_name,
-            )
-            _wait_for_stop_event(stop_event)
-            return
+        apply_injection(runner, session.child.scenario_scope, True)
+        runner_control = self.runner_control
+        runner_control.bind_runner_stop(runner.request_stop)
         try:
             leaf_debug_log(
-                event="leaf.orchestrator.ingress_loop.start",
+                event="leaf.orchestrator.runner_loop.start",
+                service=debug_logging,
                 worker_id=worker_id,
                 poll_interval_seconds=max(0.0, float(boundary_control_poll_seconds)),
             )
-            ingress.run_until_stopped(
+            _enqueue_leaf_startup_init(
+                runner=runner,
                 session=session,
-                control_pipe=control_pipe,
-                stop_event=stop_event,
-                poll_interval_seconds=max(0.0, float(boundary_control_poll_seconds)),
+                runtime=runtime,
             )
+            if isinstance(runner, AsyncRunner):
+                runner.run_until_stopped(
+                    poll_timeout_seconds=max(0.0, float(boundary_control_poll_seconds)),
+                    idle_timeout_seconds=None,
+                )
+            else:
+                runner.run_until_stopped(
+                    poll_timeout_seconds=max(0.0, float(boundary_control_poll_seconds)),
+                    idle_timeout_seconds=None,
+                )
             leaf_debug_log(
-                event="leaf.orchestrator.ingress_loop.finished",
+                event="leaf.orchestrator.runner_loop.finished",
+                service=debug_logging,
                 worker_id=worker_id,
             )
-        except Exception:
+        except Exception as exc:
             leaf_debug_log(
-                event="leaf.orchestrator.ingress_loop.error",
+                event="leaf.orchestrator.runner_loop.error",
+                service=debug_logging,
                 worker_id=worker_id,
+                error=exc.__class__.__name__,
+                message=str(exc),
             )
             try:
-                flush_leaf_debug_logging()
+                flush_leaf_debug_logging(service=debug_logging)
             except Exception:
                 pass
-            return
-
-
-@dataclass(slots=True)
-class _NoopLeafControlIngressService(LeafControlIngressService):
-    def run_until_stopped(
-        self,
-        *,
-        session: "LeafWorkerRuntimeSession",
-        control_pipe: object | None,
-        stop_event: object | None,
-        poll_interval_seconds: float,
-    ) -> str:
-        _ = (session, control_pipe, poll_interval_seconds)
-        _wait_for_stop_event(stop_event)
-        return "stop_event"
+            raise
+        finally:
+            try:
+                runner.on_run_end()
+            except Exception:
+                pass
+            runner_control.clear_runner_stop()
+            session_state.clear_session()
+            self.finalization_service.finalize(session=session)
 
 
 def leaf_worker_process_entry(
@@ -202,20 +206,6 @@ def leaf_worker_process_entry(
     _ = (boundary_control_poll_seconds, pipe_codec_mode)
     os.environ["STREAM_KERNEL_PROCESS_GROUP"] = group_name
     os.environ["STREAM_KERNEL_WORKER_ID"] = worker_id
-    initial_runtime = getattr(bundle, "runtime", None)
-    configure_leaf_debug_logging(
-        runtime=initial_runtime if isinstance(initial_runtime, dict) else None,
-        group_name=group_name,
-        worker_id=worker_id,
-    )
-    leaf_debug_log(
-        event="leaf.process.entry.started",
-        group_name=group_name,
-        worker_id=worker_id,
-        runner_profile_requested=runner_profile_requested,
-        boundary_control_poll_seconds=boundary_control_poll_seconds,
-        pipe_codec_mode=pipe_codec_mode,
-    )
     session = bootstrap_leaf_worker_runtime_from_bundle(
         bundle=bundle,
         worker_id=worker_id,
@@ -228,26 +218,37 @@ def leaf_worker_process_entry(
         group_name=group_name,
         runner_profile_requested=runner_profile_requested,
     )
+    debug_logging = resolve_leaf_debug_logging_service(session)
+    _bind_leaf_debug_runtime_sink(session, debug_logging=debug_logging)
     configure_leaf_debug_logging(
         runtime=leaf_runtime,
         group_name=group_name,
         worker_id=worker_id,
+        service=debug_logging,
+    )
+    leaf_debug_log(
+        event="leaf.process.entry.started",
+        service=debug_logging,
+        group_name=group_name,
+        worker_id=worker_id,
+        runner_profile_requested=runner_profile_requested,
+        boundary_control_poll_seconds=boundary_control_poll_seconds,
+        pipe_codec_mode=pipe_codec_mode,
     )
     leaf_debug_log(
         event="leaf.process.runtime_bootstrap.completed",
+        service=debug_logging,
         process_role=leaf_runtime.get("__process_role"),
         process_group=leaf_runtime.get("__process_group"),
     )
     orchestrator = resolve_leaf_process_entry_orchestration_service(session)
     if orchestrator is None:
-        ingress = resolve_leaf_control_ingress_service(session)
-        orchestrator = DefaultLeafProcessEntryOrchestrationService(
-            control_ingress_service=ingress or _NoopLeafControlIngressService()
-        )
         leaf_debug_log(
-            event="leaf.process.entry.orchestrator_fallback",
-            ingress_fallback=ingress is None,
+            event="leaf.process.entry.orchestrator_missing",
+            service=debug_logging,
+            ingress_fallback=False,
         )
+        raise RuntimeError("LeafProcessEntryOrchestrationService binding is required")
     orchestrator.run(
         session=session,
         control_pipe=control_pipe,
@@ -259,42 +260,14 @@ def leaf_worker_process_entry(
     )
     leaf_debug_log(
         event="leaf.process.entry.finished",
+        service=debug_logging,
         worker_id=worker_id,
         group_name=group_name,
     )
     try:
-        flush_leaf_debug_logging()
+        flush_leaf_debug_logging(service=debug_logging)
     except Exception:
         pass
-
-
-def _resolve_execution_ipc_service(
-    session: "LeafWorkerRuntimeSession",
-    *,
-    explicit: object | None = None,
-) -> ExecutionIpcTransportService | None:
-    candidate = explicit
-    if isinstance(candidate, ExecutionIpcTransportService):
-        return candidate
-    if callable(getattr(candidate, "send", None)) and callable(getattr(candidate, "recv", None)):
-        return candidate  # type: ignore[return-value]
-    child = getattr(session, "child", None)
-    scope = getattr(child, "scenario_scope", None)
-    if scope is None:
-        return None
-    resolve = getattr(scope, "resolve", None)
-    if not callable(resolve):
-        return None
-    try:
-        resolved = resolve("service", ExecutionIpcTransportService)
-    except Exception:
-        return None
-    if isinstance(resolved, ExecutionIpcTransportService):
-        return resolved
-    if callable(getattr(resolved, "send", None)) and callable(getattr(resolved, "recv", None)):
-        return resolved  # type: ignore[return-value]
-    return None
-
 
 def _bind_worker_control_endpoint(
     *,
@@ -354,30 +327,6 @@ def build_leaf_startup_runtime(
     return runtime
 
 
-def build_leaf_startup_events(
-    *,
-    runtime: dict[str, object],
-    pulse_payload: object | None = None,
-) -> list[object]:
-    from stream_kernel.execution.orchestration.control_plane.leaf.system_nodes import (
-        ControlPlaneLeafBootstrapNode,
-    )
-    from stream_kernel.platform.services.runtime.control_plane_events import (
-        ControlPlaneLeafPulse,
-    )
-
-    node = ControlPlaneLeafBootstrapNode()
-    payload = (
-        pulse_payload
-        if pulse_payload is not None
-        else ControlPlaneLeafPulse(runtime=runtime if isinstance(runtime, dict) else {})
-    )
-    produced = node(payload, None)
-    if isinstance(produced, list):
-        return list(produced)
-    return list(produced or ())
-
-
 def bootstrap_leaf_worker_runtime_from_bundle(*args: object, **kwargs: object):
     from stream_kernel.execution.orchestration.lifecycle.leaf.runtime.worker_runtime import (
         bootstrap_leaf_worker_runtime_from_bundle as impl,
@@ -405,144 +354,166 @@ def resolve_leaf_process_entry_orchestration_service(session: "LeafWorkerRuntime
         return None
     if isinstance(candidate, LeafProcessEntryOrchestrationService):
         return candidate
-    if callable(getattr(candidate, "run", None)):
-        return candidate
     return None
 
 
-def resolve_leaf_control_ingress_service(session: "LeafWorkerRuntimeSession"):
+def resolve_leaf_runtime_debug_buffer(
+    session: "LeafWorkerRuntimeSession",
+) -> RuntimeDebugBufferService | None:
     child = getattr(session, "child", None)
     scope = getattr(child, "scenario_scope", None)
     if scope is None:
         return None
     try:
-        from stream_kernel.execution.orchestration.lifecycle.leaf.command.control_ingress_service import (
-            LeafControlIngressService,
-        )
+        candidate = scope.resolve("service", RuntimeDebugBufferService)
     except Exception:
+        return None
+    if isinstance(candidate, RuntimeDebugBufferService):
+        return candidate
+    return None
+
+
+def _bind_leaf_debug_runtime_sink(
+    session: "LeafWorkerRuntimeSession",
+    *,
+    debug_logging: LeafLifecycleDebugLoggingService | None = None,
+) -> None:
+    bind_leaf_debug_sink(
+        resolve_leaf_runtime_debug_buffer(session),
+        service=debug_logging,
+    )
+
+
+def resolve_leaf_debug_logging_service(
+    session: "LeafWorkerRuntimeSession",
+) -> LeafLifecycleDebugLoggingService | None:
+    child = getattr(session, "child", None)
+    scope = getattr(child, "scenario_scope", None)
+    if scope is None:
         return None
     try:
-        candidate = scope.resolve("service", LeafControlIngressService)
+        candidate = scope.resolve("service", LeafLifecycleDebugLoggingService)
     except Exception:
         return None
-    if isinstance(candidate, LeafControlIngressService):
-        return candidate
-    if callable(getattr(candidate, "run_until_stopped", None)):
+    if isinstance(candidate, LeafLifecycleDebugLoggingService):
         return candidate
     return None
 
 
-def _resolve_ingress_contract(candidate: object) -> LeafControlIngressService | None:
-    if isinstance(candidate, LeafControlIngressService):
-        return candidate
-    if callable(getattr(candidate, "run_until_stopped", None)):
-        return candidate  # type: ignore[return-value]
-    return None
-
-
-def _wait_for_stop_event(stop_event: object | None) -> None:
-    if stop_event is None:
-        return
-    waiter = getattr(stop_event, "wait", None)
-    if callable(waiter):
-        waiter(0.0)
-        return
-    checker = getattr(stop_event, "is_set", None)
-    if callable(checker):
-        checker()
-
-
-def _send_startup_event_with_retry(
+def _build_leaf_runner(
     *,
-    ipc: object,
-    worker_id: str,
-    event: object,
-    stop_event: object | None,
-    timeout_seconds: float,
-) -> bool:
-    deadline = time.monotonic() + max(0.001, float(timeout_seconds))
-    attempts = 0
-    while True:
-        attempts += 1
-        try:
-            sender = getattr(ipc, "send", None)
-            if not callable(sender):
-                leaf_debug_log(
-                    event="leaf.startup_event.send.no_sender",
-                    worker_id=worker_id,
-                    startup_event=type(event).__name__,
-                )
-                return False
-            sender(
-                compose_execution_ipc_worker_target_id(
-                    worker_id,
-                    lane=EXECUTION_IPC_LANE_CONTROL,
-                ),
-                event,
-                no_reply=True,
-            )
-            leaf_debug_log(
-                event="leaf.startup_event.send.ok",
-                worker_id=worker_id,
-                startup_event=type(event).__name__,
-                attempts=attempts,
-            )
-            return True
-        except Exception as exc:
-            if _is_stop_set(stop_event):
-                leaf_debug_log(
-                    event="leaf.startup_event.send.stopped",
-                    worker_id=worker_id,
-                    startup_event=type(event).__name__,
-                    attempts=attempts,
-                )
-                return False
-            if time.monotonic() >= deadline:
-                leaf_debug_log(
-                    event="leaf.startup_event.send.timeout",
-                    worker_id=worker_id,
-                    startup_event=type(event).__name__,
-                    attempts=attempts,
-                    error=exc.__class__.__name__,
-                )
-                return False
-            waiter = getattr(stop_event, "wait", None)
-            if callable(waiter):
-                try:
-                    waiter(0.01)
-                except Exception:
-                    _STARTUP_RETRY_WAIT.wait(0.01)
-            else:
-                _STARTUP_RETRY_WAIT.wait(0.01)
+    session: "LeafWorkerRuntimeSession",
+    runtime: dict[str, object],
+) -> SyncRunner | AsyncRunner:
+    child = getattr(session, "child", None)
+    scenario_steps = getattr(child, "scenario_steps", None)
+    if not isinstance(scenario_steps, dict):
+        raise RuntimeError("leaf runtime requires scenario_steps mapping")
+    nodes = {
+        name: step
+        for name, step in scenario_steps.items()
+        if isinstance(name, str) and name and callable(step)
+    }
+    ingress_source_names = [
+        name
+        for name in nodes.keys()
+        if is_leaf_command_ingress_source_node_name(name)
+    ]
+    if not ingress_source_names:
+        raise RuntimeError(
+            "leaf runtime is missing command ingress source node"
+        )
+    scenario_id = getattr(child, "scenario_id", "scenario")
+    if not isinstance(scenario_id, str) or not scenario_id:
+        scenario_id = "scenario"
+    run_id = runtime.get("__run_id")
+    if not isinstance(run_id, str) or not run_id:
+        run_id = "run"
+    full_context_nodes = getattr(child, "full_context_nodes", set())
+    if not isinstance(full_context_nodes, set):
+        full_context_nodes = set()
+    ordering = runtime.get("ordering", {})
+    sink_mode = "completion"
+    if isinstance(ordering, dict):
+        configured = ordering.get("sink_mode")
+        if isinstance(configured, str) and configured:
+            sink_mode = configured
+    profile = session.runner_profile_effective or session.runner_profile_requested
+    if profile == "sync":
+        return SyncRunner(
+            nodes=nodes,
+            run_id=run_id,
+            scenario_id=scenario_id,
+            full_context_nodes=set(full_context_nodes),
+            ordered_sink_mode=sink_mode,
+        )
+    return AsyncRunner(
+        nodes=nodes,
+        run_id=run_id,
+        scenario_id=scenario_id,
+        full_context_nodes=set(full_context_nodes),
+        ordered_sink_mode=sink_mode,
+    )
 
 
-def _resolve_leaf_startup_send_timeout_seconds(runtime: dict[str, object]) -> float:
-    timeout_seconds = 5.0
-    platform = runtime.get("platform", {})
-    if not isinstance(platform, dict):
-        return timeout_seconds
-    readiness = platform.get("readiness", {})
-    if not isinstance(readiness, dict):
-        return timeout_seconds
-    configured = readiness.get("readiness_timeout_seconds")
-    if not isinstance(configured, (int, float)):
-        return timeout_seconds
-    value = float(configured)
-    if value <= 0:
-        return timeout_seconds
-    return max(0.25, min(10.0, value))
+def build_leaf_startup_init_input(
+    *,
+    runtime: dict[str, object],
+) -> Envelope:
+    return Envelope(
+        payload=ControlPlaneInitEvent(runtime=dict(runtime)),
+        target="system.cp.consumer_registry_bindings_bootstrap",
+    )
 
 
-def _is_stop_set(stop_event: object | None) -> bool:
-    if stop_event is None:
-        return False
-    checker = getattr(stop_event, "is_set", None)
-    if callable(checker):
-        try:
-            return bool(checker())
-        except Exception:
-            return False
-    return False
+def _enqueue_leaf_startup_init(
+    *,
+    runner: SyncRunner | AsyncRunner,
+    session: "LeafWorkerRuntimeSession",
+    runtime: dict[str, object],
+) -> None:
+    child = getattr(session, "child", None)
+    scenario_id = getattr(child, "scenario_id", "scenario")
+    if not isinstance(scenario_id, str) or not scenario_id:
+        scenario_id = "scenario"
+    run_id = getattr(runner, "run_id", None)
+    if not isinstance(run_id, str) or not run_id:
+        run_id = "run"
+    payload = build_leaf_startup_init_input(runtime=runtime)
+    if isinstance(runner, AsyncRunner):
+        enqueue_runner_input_async(
+            runner,
+            payload,
+            run_id=run_id,
+            scenario_id=scenario_id,
+            index=0,
+        )
+        return
+    enqueue_runner_input_sync(
+        runner,
+        payload,
+        run_id=run_id,
+        scenario_id=scenario_id,
+        index=0,
+    )
+
+
+# Backward-compatibility helpers retained for legacy tests/tools that monkeypatch
+# these symbols directly. Runtime path is DI-only and does not call them.
+def _resolve_execution_ipc_service(
+    session: "LeafWorkerRuntimeSession",
+    *,
+    explicit: object | None = None,
+) -> ExecutionIpcTransportService | None:
+    _ = session
+    if isinstance(explicit, ExecutionIpcTransportService):
+        return explicit
+    return None
+
+
+def resolve_leaf_control_ingress_service(session: "LeafWorkerRuntimeSession") -> object | None:
+    _ = session
+    return None
 
 
 __all__ = [
@@ -552,7 +523,8 @@ __all__ = [
     "DefaultLeafWorkerControlPlaneService",
     "leaf_worker_process_entry",
     "build_leaf_startup_runtime",
-    "build_leaf_startup_events",
+    "build_leaf_startup_init_input",
     "resolve_leaf_process_entry_orchestration_service",
-    "resolve_leaf_control_ingress_service",
+    "resolve_leaf_runtime_debug_buffer",
+    "resolve_leaf_debug_logging_service",
 ]

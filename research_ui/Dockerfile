@@ -8,11 +8,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN pip install --no-cache-dir \
-    fastapi==0.116.1 \
-    "uvicorn[standard]==0.35.0" \
-    pydantic==2.12.0 \
-    pyyaml==6.0.2 \
-    rich==14.0.0
+    fastapi==0.135.1 \
+    "uvicorn[standard]==0.41.0" \
+    pydantic==2.12.5 \
+    pyyaml==6.0.3 \
+    rich==14.0.0 \
+    psycopg[binary]==3.3.3 \
+    pymongo==4.16.0 \
+    mcp==1.26.0
 
 COPY src ./src
 COPY research_ui ./research_ui

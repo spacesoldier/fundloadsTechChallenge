@@ -1,0 +1,27 @@
+# Python/cache
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# Venv and local tooling
+.venv/
+.vscode/
+.obsidian/
+
+# Runtime artifacts
+run_archive/
+logs/
+metrics/
+traces/
+trace*.jsonl
+
+# Research UI runtime data (must not be part of Docker build context)
+research_ui/research_ui_mongodb/
+research_ui/research_ui_postgres/
+research_ui/reports/
+
+# VCS and misc
+.git/
+.gitignore
+.coverage

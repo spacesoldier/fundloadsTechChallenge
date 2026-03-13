@@ -4,6 +4,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 
 from stream_kernel.routing.envelope import Envelope
+from stream_kernel.routing.errors import RoutingError, RoutingErrorCode
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,13 +70,17 @@ class Router:
                     if target not in self._known_nodes:
                         # Unknown target is a strict‑mode error (Routing semantics §5.8).
                         if self.strict:
-                            raise ValueError(f"Unknown target '{target}'")
+                            raise RoutingError(
+                                code=RoutingErrorCode.UNKNOWN_TARGET,
+                                message=f"Unknown target '{target}'",
+                            )
                         continue
                     if target not in consumers:
                         # Target exists but does not consume this payload type (Routing semantics §5.9).
                         if self.strict:
-                            raise ValueError(
-                                f"Target '{target}' does not consume '{payload_type.__name__}'"
+                            raise RoutingError(
+                                code=RoutingErrorCode.TARGET_DOES_NOT_CONSUME,
+                                message=f"Target '{target}' does not consume '{payload_type.__name__}'",
                             )
                         continue
                     deliveries.append((target, payload))
@@ -84,7 +89,10 @@ class Router:
             if not consumers:
                 # No consumers: behavior is strict error vs drop (Routing roadmap, undecided).
                 if self.strict:
-                    raise ValueError(f"No consumers registered for '{payload_type.__name__}'")
+                    raise RoutingError(
+                        code=RoutingErrorCode.NO_CONSUMERS,
+                        message=f"No consumers registered for '{payload_type.__name__}'",
+                    )
                 continue
 
             if source is not None:
@@ -92,8 +100,9 @@ class Router:
                 filtered = [target for target in consumers if target != source]
                 if not filtered:
                     if self.strict:
-                        raise ValueError(
-                            f"Self-loop for '{payload_type.__name__}' requires explicit target"
+                        raise RoutingError(
+                            code=RoutingErrorCode.SELF_LOOP_REQUIRES_EXPLICIT_TARGET,
+                            message=f"Self-loop for '{payload_type.__name__}' requires explicit target",
                         )
                     continue
                 consumers = filtered

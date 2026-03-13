@@ -35,6 +35,27 @@ from stream_kernel.platform.services.runtime.control_plane_discovery_stream impo
     DefaultControlPlaneDiscoveryStreamService,
     InMemoryControlPlaneDiscoverySessionStore,
 )
+from stream_kernel.platform.services.runtime.control_plane_discovery_materialization import (
+    ControlPlaneDiscoveryMaterializationRegistry,
+    ControlPlaneDiscoveryMaterializationService,
+    ControlPlaneDiscoveredRuntimeEntity,
+    InMemoryControlPlaneDiscoveryMaterializationService,
+)
+from stream_kernel.platform.services.runtime.control_plane_consumer_registry import (
+    ControlPlaneConsumerRegistryStore,
+    ControlPlaneDynamicConsumerRoutingService,
+    InMemoryControlPlaneDynamicConsumerRoutingService,
+)
+from stream_kernel.platform.services.runtime.control_plane_deferred_message import (
+    ControlPlaneDeferredMessageStore,
+    ControlPlaneDeferredMessageService,
+    InMemoryControlPlaneDeferredMessageService,
+)
+from stream_kernel.platform.services.runtime.control_plane_startup_bindings import (
+    ControlPlaneStartupConsumerBindingsStore,
+    ControlPlaneStartupConsumerBindingsService,
+    InMemoryControlPlaneStartupConsumerBindingsService,
+)
 from stream_kernel.platform.services.runtime.control_plane_bootstrapper import (
     ControlPlaneBootstrapperService,
     ControlPlaneDiscoveryAdapter,
@@ -81,6 +102,12 @@ from stream_kernel.platform.services.runtime.control_plane_startup_barrier impor
     ControlPlaneStartupBarrierService,
     InMemoryControlPlaneStartupBarrierService,
 )
+from stream_kernel.platform.services.runtime.control_plane_node_initialization import (
+    ControlPlaneNodeInitializationStore,
+    ControlPlaneNodeInitializationProgress,
+    ControlPlaneNodeInitializationService,
+    InMemoryControlPlaneNodeInitializationService,
+)
 from stream_kernel.platform.services.runtime.control_plane_launch_plan import (
     ControlPlaneLaunchPlanService,
     DefaultControlPlaneLaunchPlanService,
@@ -100,6 +127,24 @@ from stream_kernel.platform.services.runtime.control_plane_shutdown_readiness im
 )
 from stream_kernel.platform.services.runtime.async_dispatch_loop import (
     AsyncDispatchLoop,
+)
+from stream_kernel.platform.services.runtime.platform_scheduler import (
+    PlatformSchedulerStore,
+    PlatformSchedulerTimerStore,
+    PlatformSchedulerUpsertCommand,
+    PlatformSchedulerCancelCommand,
+    PlatformSchedulerTickEvent,
+    PlatformSchedulerDispatch,
+    PlatformSchedulerJobSnapshot,
+    PlatformSchedulerSnapshot,
+    PlatformSchedulerTimerJobSnapshot,
+    PlatformSchedulerTimerSnapshot,
+    PlatformSchedulerService,
+    PlatformSchedulerTimerService,
+    AsyncioPlatformSchedulerTimerService,
+    PlatformSchedulerTickerService,
+    DefaultPlatformSchedulerTickerService,
+    InMemoryPlatformSchedulerService,
 )
 
 __all__ = [
@@ -129,6 +174,19 @@ __all__ = [
     "ControlPlaneDiscoveryStreamService",
     "DefaultControlPlaneDiscoveryStreamService",
     "InMemoryControlPlaneDiscoverySessionStore",
+    "ControlPlaneDiscoveryMaterializationRegistry",
+    "ControlPlaneDiscoveryMaterializationService",
+    "ControlPlaneDiscoveredRuntimeEntity",
+    "InMemoryControlPlaneDiscoveryMaterializationService",
+    "ControlPlaneConsumerRegistryStore",
+    "ControlPlaneDynamicConsumerRoutingService",
+    "InMemoryControlPlaneDynamicConsumerRoutingService",
+    "ControlPlaneDeferredMessageStore",
+    "ControlPlaneDeferredMessageService",
+    "InMemoryControlPlaneDeferredMessageService",
+    "ControlPlaneStartupConsumerBindingsStore",
+    "ControlPlaneStartupConsumerBindingsService",
+    "InMemoryControlPlaneStartupConsumerBindingsService",
     "ControlPlaneBootstrapperService",
     "ControlPlaneDiscoveryAdapter",
     "DefaultControlPlaneDiscoveryAdapter",
@@ -163,6 +221,10 @@ __all__ = [
     "DefaultControlPlaneReplyWaiterService",
     "ControlPlaneStartupBarrierService",
     "InMemoryControlPlaneStartupBarrierService",
+    "ControlPlaneNodeInitializationStore",
+    "ControlPlaneNodeInitializationProgress",
+    "ControlPlaneNodeInitializationService",
+    "InMemoryControlPlaneNodeInitializationService",
     "ControlPlaneLaunchPlanService",
     "DefaultControlPlaneLaunchPlanService",
     "ControlPlaneDagAssemblyService",
@@ -174,4 +236,20 @@ __all__ = [
     "ControlPlaneLeafShutdownReadinessService",
     "InMemoryControlPlaneShutdownReadinessService",
     "InMemoryControlPlaneLeafShutdownReadinessService",
+    "PlatformSchedulerStore",
+    "PlatformSchedulerTimerStore",
+    "PlatformSchedulerUpsertCommand",
+    "PlatformSchedulerCancelCommand",
+    "PlatformSchedulerTickEvent",
+    "PlatformSchedulerDispatch",
+    "PlatformSchedulerJobSnapshot",
+    "PlatformSchedulerSnapshot",
+    "PlatformSchedulerService",
+    "PlatformSchedulerTimerJobSnapshot",
+    "PlatformSchedulerTimerSnapshot",
+    "PlatformSchedulerTimerService",
+    "AsyncioPlatformSchedulerTimerService",
+    "PlatformSchedulerTickerService",
+    "DefaultPlatformSchedulerTickerService",
+    "InMemoryPlatformSchedulerService",
 ]

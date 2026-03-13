@@ -3,7 +3,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from stream_kernel.observability.domain.debug import DebugMessage
-from stream_kernel.platform.services.runtime.debug_buffer import InMemoryRuntimeDebugBufferService
+from stream_kernel.platform.services.runtime.debug_buffer import (
+    InMemoryRuntimeDebugBufferService,
+    debug_instrument_service_methods,
+)
 
 
 def _message() -> DebugMessage:
@@ -56,3 +59,34 @@ def test_runtime_debug_buffer_direct_dispatch_falls_back_to_buffer_on_error(monk
     assert len(drained) == 1
     assert drained[0] == message
 
+
+def test_debug_instrument_service_methods_emits_payload_fields(monkeypatch) -> None:
+    monkeypatch.setenv("STREAM_KERNEL_INJECT_PORT_DEBUG_ENABLED", "1")
+
+    class _Buffer:
+        def __init__(self) -> None:
+            self.items: list[DebugMessage] = []
+
+        def publish(self, message: DebugMessage) -> None:
+            self.items.append(message)
+
+    @debug_instrument_service_methods
+    class _Service:
+        runtime_debug_buffer: object
+
+        def process(self, payload: object) -> object:
+            return payload
+
+    buffer = _Buffer()
+    service = _Service()
+    service.runtime_debug_buffer = buffer
+
+    result = service.process({"id": 42, "kind": "demo"})
+
+    assert result == {"id": 42, "kind": "demo"}
+    assert len(buffer.items) == 1
+    message = buffer.items[0]
+    assert message.event == "runtime.service.call"
+    assert message.fields.get("method") == "process"
+    assert message.fields.get("payload_model") == "dict"
+    assert message.fields.get("payload") == {"id": 42, "kind": "demo"}

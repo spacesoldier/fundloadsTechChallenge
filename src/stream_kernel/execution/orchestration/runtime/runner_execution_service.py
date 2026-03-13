@@ -14,7 +14,6 @@ from stream_kernel.execution.runtime.runner_ingress import (
     enqueue_runner_input_async,
     enqueue_runner_input_sync,
 )
-from stream_kernel.execution.transport.handoff import replay as transport_handoff_replay
 from stream_kernel.routing.envelope import Envelope
 
 DEFAULT_EXECUTION_QUEUE_QUALIFIER = "execution.cpu"
@@ -41,6 +40,8 @@ class RunnerExecutionService:
         nodes = {spec.name: spec.step for spec in scenario.steps}
         runner = SyncRunner(
             nodes=nodes,
+            run_id=run_id,
+            scenario_id=scenario_id,
             full_context_nodes=set(full_context_nodes or ()),
             ordered_sink_mode=ordered_sink_mode,
         )
@@ -55,8 +56,6 @@ class RunnerExecutionService:
                 scenario_id=scenario_id,
                 scenario_scope=scenario_scope,
                 enqueue_runner_input=enqueue_runner_input_sync,
-                replay_root_boundary_outputs=transport_handoff_replay.replay_root_boundary_handoff_outputs_sync,
-                drain_root_boundary_outputs=transport_handoff_replay.drain_root_boundary_handoff,
             )
         finally:
             runner.on_run_end()
@@ -79,6 +78,8 @@ class RunnerExecutionService:
         nodes = {spec.name: spec.step for spec in scenario.steps}
         runner = AsyncRunner(
             nodes=nodes,
+            run_id=run_id,
+            scenario_id=scenario_id,
             full_context_nodes=set(full_context_nodes or ()),
             ordered_sink_mode=ordered_sink_mode,
         )
@@ -93,8 +94,6 @@ class RunnerExecutionService:
                 scenario_id=scenario_id,
                 scenario_scope=scenario_scope,
                 enqueue_runner_input=enqueue_runner_input_async,
-                replay_root_boundary_outputs=transport_handoff_replay.replay_root_boundary_handoff_outputs_async,
-                drain_root_boundary_outputs=transport_handoff_replay.drain_root_boundary_handoff,
             )
         finally:
             runner.on_run_end()

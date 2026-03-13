@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Runtime Debug Vitrine</title>
+  <style>
+    :root {
+      --bg: #08101c;
+      --panel: #0e1a2b;
+      --line: #2d4266;
+      --text: #dce8fa;
+      --muted: #8ea7cb;
+      --comm: #f8c537;
+      --event: #6ec6ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at 15% 15%, #0d1830 0%, #070d17 75%);
+      color: var(--text);
+      font: 13px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: 360px 1fr;
+      height: 100vh;
+      gap: 10px;
+      padding: 10px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px;
+      overflow: auto;
+    }
+    .controls label {
+      display: block;
+      color: var(--muted);
+      margin-top: 8px;
+    }
+    .controls input, .controls button {
+      width: 100%;
+      margin-top: 4px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #0a1220;
+      color: var(--text);
+      padding: 7px 8px;
+    }
+    .controls button { cursor: pointer; background: #173055; }
+    .controls button:hover { background: #21477a; }
+    .summary { margin-top: 10px; color: var(--muted); }
+    ul.run-list {
+      list-style: none;
+      padding: 0;
+      margin: 10px 0 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      max-height: 55vh;
+      overflow: auto;
+    }
+    .run-item {
+      border-bottom: 1px solid #213553;
+      padding: 7px 8px;
+      cursor: pointer;
+    }
+    .run-item:hover { background: #13233a; }
+    .run-item.active { background: #203659; }
+    .run-item:last-child { border-bottom: 0; }
+    .run-id { color: #9ec9ff; }
+    .run-meta { color: var(--muted); font-size: 12px; }
+
+    .timeline-wrap {
+      position: relative;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #0a1322;
+      min-height: 400px;
+    }
+    .timeline-grid {
+      display: grid;
+      grid-auto-rows: 1px;
+      min-width: 100%;
+      position: relative;
+      padding-bottom: 32px;
+    }
+    .col-header {
+      position: sticky;
+      top: 0;
+      z-index: 3;
+      background: #101e33;
+      border-bottom: 1px solid var(--line);
+      border-right: 1px solid #1f3251;
+      padding: 8px;
+      font-weight: 700;
+      font-size: 12px;
+      color: #b9d3fb;
+    }
+    .event {
+      position: absolute;
+      border-left: 2px solid var(--event);
+      padding: 3px 6px;
+      background: rgba(21, 35, 55, 0.92);
+      border-radius: 4px;
+      width: calc(100% - 10px);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      cursor: default;
+    }
+    .event.comm { border-left-color: var(--comm); }
+    .event-ts { color: var(--muted); margin-right: 6px; }
+    .event-name { color: #dbe9ff; }
+    .legend {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .dot {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-right: 4px;
+      transform: translateY(1px);
+    }
+    .dot.comm { background: var(--comm); }
+    .dot.event { background: var(--event); }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside class="panel controls">
+      <h2>Runtime Debug Vitrine</h2>
+      <div><a href="/" style="color:#9dc2ff">Open Topology</a></div>
+
+      <label for="cfg">Config path</label>
+      <input id="cfg" value="src/fund_load/experiment_config_newgen_multiprocess_jaeger.yml"/>
+
+      <label for="runId">Run ID (optional)</label>
+      <input id="runId" placeholder="latest if empty"/>
+
+      <label for="limitRuns">Limit runs</label>
+      <input id="limitRuns" value="20"/>
+
+      <label for="limitEvents">Max events per process</label>
+      <input id="limitEvents" value="100000"/>
+
+      <button id="reload">Reload Data From Redis</button>
+      <button id="refresh">Refresh Runs</button>
+
+      <label for="queryProcessId">Filter: process_id</label>
+      <input id="queryProcessId" placeholder="leaf:execution.ingress:w1"/>
+
+      <label for="queryEventName">Filter: event</label>
+      <input id="queryEventName" placeholder="runtime.inject.port_call"/>
+
+      <label for="queryPayloadModel">Filter: payload_model</label>
+      <input id="queryPayloadModel" placeholder="fund_load.domain.messages.LoadAttemptParsed"/>
+
+      <label for="queryTsFrom">Filter: timestamp_from (ISO)</label>
+      <input id="queryTsFrom" placeholder="2026-03-08T12:00:00.000Z"/>
+
+      <label for="queryTsTo">Filter: timestamp_to (ISO)</label>
+      <input id="queryTsTo" placeholder="2026-03-08T12:01:00.000Z"/>
+
+      <label for="queryLimit">Query limit</label>
+      <input id="queryLimit" value="500"/>
+
+      <label for="queryOffset">Query offset</label>
+      <input id="queryOffset" value="0"/>
+
+      <button id="applyQuery">Apply Event Filters</button>
+
+      <div class="summary" id="summary"></div>
+
+      <ul class="run-list" id="runs"></ul>
+    </aside>
+
+    <main class="panel">
+      <h3 id="title">Run events</h3>
+      <div class="legend">
+        <span class="dot event"></span> Event
+        <span style="margin-left:10px" class="dot comm"></span> Inter-process / transport event
+      </div>
+      <div class="timeline-wrap">
+        <div class="timeline-grid" id="timeline"></div>
+      </div>
+    </main>
+  </div>
+
+<script>
+(() => {
+  const cfgEl = document.getElementById('cfg');
+  const runIdEl = document.getElementById('runId');
+  const limitRunsEl = document.getElementById('limitRuns');
+  const limitEventsEl = document.getElementById('limitEvents');
+  const reloadBtn = document.getElementById('reload');
+  const refreshBtn = document.getElementById('refresh');
+  const applyQueryBtn = document.getElementById('applyQuery');
+  const queryProcessIdEl = document.getElementById('queryProcessId');
+  const queryEventNameEl = document.getElementById('queryEventName');
+  const queryPayloadModelEl = document.getElementById('queryPayloadModel');
+  const queryTsFromEl = document.getElementById('queryTsFrom');
+  const queryTsToEl = document.getElementById('queryTsTo');
+  const queryLimitEl = document.getElementById('queryLimit');
+  const queryOffsetEl = document.getElementById('queryOffset');
+  const runsEl = document.getElementById('runs');
+  const titleEl = document.getElementById('title');
+  const timelineEl = document.getElementById('timeline');
+  const summaryEl = document.getElementById('summary');
+
+  let activeRunId = null;
+
+  function toInt(value, fallback) {
+    const v = Number.parseInt(String(value || ''), 10);
+    return Number.isFinite(v) && v > 0 ? v : fallback;
+  }
+
+  function toIntOrZero(value, fallback) {
+    const v = Number.parseInt(String(value || ''), 10);
+    if (!Number.isFinite(v)) return fallback;
+    return v < 0 ? 0 : v;
+  }
+
+  function shortText(value, max = 220) {
+    const text = String(value ?? '');
+    if (text.length <= max) return text;
+    return text.slice(0, max - 3) + '...';
+  }
+
+  async function callJson(url, options = {}) {
+    const res = await fetch(url, options);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const message = body && body.detail ? body.detail : `${res.status} ${res.statusText}`;
+      throw new Error(message);
+    }
+    return body;
+  }
+
+  async function reloadFromRedis() {
+    const payload = {
+      run_id: (runIdEl.value || '').trim() || null,
+      limit_runs: toInt(limitRunsEl.value, 20),
+      max_events_per_process: toInt(limitEventsEl.value, 100000),
+    };
+    const body = await callJson('/api/debug/reload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    summaryEl.textContent = `loaded_runs=${body.loaded_runs}, loaded_events=${body.loaded_events}, loaded_processes=${body.loaded_processes}`;
+    if (Array.isArray(body.store_errors) && body.store_errors.length > 0) {
+      summaryEl.textContent += `, store_errors=${body.store_errors.length}`;
+    }
+  }
+
+  async function loadRuns() {
+    const body = await callJson(`/api/debug/runs?limit=${encodeURIComponent(String(toInt(limitRunsEl.value, 50)))}`);
+    const runs = Array.isArray(body.runs) ? body.runs : [];
+    runsEl.innerHTML = '';
+    for (const run of runs) {
+      const li = document.createElement('li');
+      li.className = 'run-item' + (run.run_id === activeRunId ? ' active' : '');
+      li.dataset.runId = run.run_id;
+      const processCount = Array.isArray(run.processes) ? run.processes.length : 0;
+      li.innerHTML = `
+        <div class="run-id">${shortText(run.run_id, 80)}</div>
+        <div class="run-meta">records=${run.total_records || 0}, processes=${processCount}</div>
+        <div class="run-meta">${run.first_ts || '-'} .. ${run.last_ts || '-'}</div>
+      `;
+      li.addEventListener('click', () => selectRun(run.run_id));
+      runsEl.appendChild(li);
+    }
+    if (!activeRunId && runs.length > 0) {
+      await selectRun(runs[0].run_id);
+    }
+  }
+
+  async function selectRun(runId) {
+    activeRunId = runId;
+    for (const el of runsEl.querySelectorAll('.run-item')) {
+      el.classList.toggle('active', el.dataset.runId === runId);
+    }
+    await loadRunEvents(runId);
+  }
+
+  async function loadRunEvents(runId) {
+    const configPath = (cfgEl.value || '').trim();
+    const payload = {
+      process_id: (queryProcessIdEl.value || '').trim() || null,
+      event_name: (queryEventNameEl.value || '').trim() || null,
+      payload_model: (queryPayloadModelEl.value || '').trim() || null,
+      timestamp_from: (queryTsFromEl.value || '').trim() || null,
+      timestamp_to: (queryTsToEl.value || '').trim() || null,
+      limit: toInt(queryLimitEl.value, 500),
+      offset: toIntOrZero(queryOffsetEl.value, 0),
+    };
+    const body = await callJson(
+      `/api/debug/runs/${encodeURIComponent(runId)}/events/query?config_path=${encodeURIComponent(configPath)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      },
+    );
+    renderTimeline(body);
+  }
+
+  function renderTimeline(data) {
+    const events = Array.isArray(data.events) ? data.events : [];
+    const cols = Array.isArray(data.column_order) ? data.column_order : [];
+    const pxPerMs = 0.8;
+    const minHeight = 800;
+    const maxTimelineMs = events.reduce((acc, event) => Math.max(acc, Number(event.timeline_ms || 0)), 0);
+    const bodyHeight = Math.max(minHeight, Math.ceil(maxTimelineMs * pxPerMs) + 120);
+
+    titleEl.textContent = `Run: ${data.run_id || '-'} | events: ${data.event_count || events.length} | matched: ${data.total_matched ?? events.length} | limit=${data.limit ?? '-'} offset=${data.offset ?? '-'}`;
+
+    timelineEl.innerHTML = '';
+    timelineEl.style.gridTemplateColumns = `repeat(${Math.max(cols.length, 1)}, minmax(260px, 1fr))`;
+    timelineEl.style.height = `${bodyHeight}px`;
+
+    const colWidthPct = cols.length > 0 ? (100 / cols.length) : 100;
+
+    cols.forEach((colId, idx) => {
+      const header = document.createElement('div');
+      header.className = 'col-header';
+      header.style.gridColumn = String(idx + 1);
+      header.style.gridRow = '1';
+      header.textContent = colId;
+      timelineEl.appendChild(header);
+
+      const separator = document.createElement('div');
+      separator.style.position = 'absolute';
+      separator.style.top = '30px';
+      separator.style.bottom = '0';
+      separator.style.left = `${idx * colWidthPct}%`;
+      separator.style.width = '1px';
+      separator.style.background = '#203250';
+      timelineEl.appendChild(separator);
+    });
+
+    const colIndex = new Map(cols.map((item, idx) => [item, idx]));
+
+    for (const event of events) {
+      const processId = String(event.process_id || 'unknown');
+      const idx = colIndex.has(processId) ? colIndex.get(processId) : 0;
+      const leftPct = idx * colWidthPct;
+      const topPx = 34 + Math.floor(Number(event.timeline_ms || 0) * pxPerMs);
+      const ev = document.createElement('div');
+      ev.className = 'event' + (event.is_communication ? ' comm' : '');
+      ev.style.left = `calc(${leftPct}% + 4px)`;
+      ev.style.top = `${topPx}px`;
+      ev.style.width = `calc(${colWidthPct}% - 8px)`;
+
+      const ts = shortText(event.timestamp || '-', 40);
+      const name = shortText(event.event || '-', 72);
+      const source = shortText(event.source || '-', 120);
+      const payloadModel = event.fields && event.fields.payload_model ? String(event.fields.payload_model) : '';
+      const payloadText = event.fields && Object.prototype.hasOwnProperty.call(event.fields, 'payload')
+        ? shortText(JSON.stringify(event.fields.payload), 220)
+        : '';
+      ev.innerHTML = `<span class="event-ts">${ts}</span><span class="event-name">${name}</span>`;
+      ev.title = `source=${source}\nmodel=${payloadModel || '-'}\npayload=${payloadText || '-'}`;
+      timelineEl.appendChild(ev);
+    }
+  }
+
+  reloadBtn.addEventListener('click', async () => {
+    try {
+      await reloadFromRedis();
+      await loadRuns();
+    } catch (err) {
+      alert(`reload failed: ${err.message}`);
+    }
+  });
+
+  refreshBtn.addEventListener('click', async () => {
+    try {
+      await loadRuns();
+    } catch (err) {
+      alert(`refresh failed: ${err.message}`);
+    }
+  });
+
+  applyQueryBtn.addEventListener('click', async () => {
+    if (!activeRunId) return;
+    try {
+      await loadRunEvents(activeRunId);
+    } catch (err) {
+      alert(`query failed: ${err.message}`);
+    }
+  });
+
+  (async () => {
+    try {
+      await loadRuns();
+    } catch (err) {
+      alert(`initial load failed: ${err.message}`);
+    }
+  })();
+})();
+</script>
+</body>
+</html>

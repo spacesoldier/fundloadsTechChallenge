@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import asyncio
 import multiprocessing as mp
 import time
@@ -191,6 +192,7 @@ class PipeExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
         self._sender_threads: dict[str, Thread] = {}
         self._writer_last_send: dict[str, float] = {}
         self._send_retry_backoff_seconds = 0.005
+        atexit.register(self.close)
 
     def build_port(
         self,
@@ -484,14 +486,16 @@ class PipeExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
     def close(self) -> None:
         # Graceful shutdown for the adapter-owned asyncio loop.
         # Stops periodic polling and terminates the loop thread.
-        self._stopping.set()
         with self._lock:
             sender_buffers = list(self._sender_buffers.values())
             sender_threads = list(self._sender_threads.values())
+        # Close outbound buffers first and give sender threads a chance to
+        # drain queued payloads before we stop adapter loops.
         for buffer in sender_buffers:
             buffer.close()
         for sender in sender_threads:
             sender.join(timeout=max(0.01, float(self._close_join_timeout_seconds)))
+        self._stopping.set()
         loop = self._loop
         thread = self._loop_thread
         if loop is not None:

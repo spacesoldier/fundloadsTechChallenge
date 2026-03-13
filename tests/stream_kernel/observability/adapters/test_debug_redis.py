@@ -47,7 +47,7 @@ def test_debug_redis_uses_root_group_and_worker_index_in_key() -> None:
     assert len(captured) == 1
     commands = captured[0]
     assert any(
-        cmd[:2] == ["RPUSH", "stream_kernel:debug:runs:run-42:debug:root:supervisor:w1"]
+        cmd[:2] == ["XADD", "stream_kernel:debug:runs:run-42:debug:root:supervisor:w1"]
         for cmd in commands
     )
     assert any(
@@ -66,7 +66,7 @@ def test_debug_redis_uses_leaf_group_and_worker_index_in_key() -> None:
     assert len(captured) == 1
     commands = captured[0]
     assert any(
-        cmd[:2] == ["RPUSH", "stream_kernel:debug:runs:run-42:debug:leaf:execution.features:w3"]
+        cmd[:2] == ["XADD", "stream_kernel:debug:runs:run-42:debug:leaf:execution.features:w3"]
         for cmd in commands
     )
     assert any(

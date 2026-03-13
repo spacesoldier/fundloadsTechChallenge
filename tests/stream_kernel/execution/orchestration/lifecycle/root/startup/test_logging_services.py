@@ -9,7 +9,7 @@ from stream_kernel.execution.orchestration.lifecycle.root.startup.console_log_di
 from stream_kernel.execution.orchestration.lifecycle.root.startup.log_factory_service import (
     DefaultRootLifecycleLogFactory,
 )
-from stream_kernel.execution.orchestration.control_plane.root.shutdown_service import (
+from stream_kernel.execution.orchestration.lifecycle.root.runtime.shutdown_result import (
     ControlPlaneRootShutdownResult,
 )
 from stream_kernel.platform.services.runtime.control_plane_events import (

@@ -9,10 +9,8 @@ from stream_kernel.execution.orchestration.control_plane import (
     ControlPlaneLeafSnapshotApplyNode,
 )
 from stream_kernel.integration.kv_store import InMemoryKvStore
-from stream_kernel.platform.services.runtime.control_plane_bootstrapper import (
-    ControlPlaneBootstrapperService,
-)
 from stream_kernel.platform.services.runtime.control_plane_discovery import (
+    ControlPlaneDiscoveryService,
     InMemoryControlPlaneDiscoveryService,
 )
 from stream_kernel.platform.services.runtime.control_plane_events import (
@@ -26,39 +24,30 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
 
 
 @dataclass(slots=True)
-class _Bootstrapper(ControlPlaneBootstrapperService):
-    items: list[ControlPlaneDiscoveryItemEvent] = field(default_factory=list)
-    discover_all_calls: list[dict[str, object]] = field(default_factory=list)
-    discover_subset_calls: list[tuple[dict[str, object], list[str]]] = field(default_factory=list)
-    fail_with: Exception | None = None
+class _FailingDiscovery(ControlPlaneDiscoveryService):
+    fail_with: Exception
 
-    def discover_all(self, runtime: dict[str, object]) -> list[ControlPlaneDiscoveryItemEvent]:
-        self.discover_all_calls.append(dict(runtime))
-        if self.fail_with is not None:
-            raise self.fail_with
-        return list(self.items)
+    def append_item(self, item: object) -> None:
+        _ = item
 
-    def discover_subset(
-        self,
-        *,
-        runtime: dict[str, object],
-        node_names: list[str],
-    ) -> list[ControlPlaneDiscoveryItemEvent]:
-        self.discover_subset_calls.append((dict(runtime), list(node_names)))
+    def items(self) -> list[object]:
         if self.fail_with is not None:
             raise self.fail_with
         return []
 
+    def clear(self) -> None:
+        return None
 
-def test_leaf_apply_config_discovers_full_registry_and_emits_ack() -> None:
-    bootstrapper = _Bootstrapper(
-        items=[
-            ControlPlaneDiscoveryItemEvent(item_kind="node", payload={"name": "node.a"}),
-            ControlPlaneDiscoveryItemEvent(item_kind="node", payload={"name": "node.b"}),
-        ]
-    )
+    def entity_records(self, *, kind: str | None = None):
+        _ = kind
+        return []
+
+
+def test_leaf_apply_config_uses_discovery_registry_and_emits_ack() -> None:
     discovery = InMemoryControlPlaneDiscoveryService(store=InMemoryKvStore())
-    node = ControlPlaneLeafApplyConfigNode(bootstrapper=bootstrapper, discovery=discovery)
+    discovery.append_item(ControlPlaneDiscoveryItemEvent(item_kind="node", payload={"name": "node.a"}))
+    discovery.append_item(ControlPlaneDiscoveryItemEvent(item_kind="node", payload={"name": "node.b"}))
+    node = ControlPlaneLeafApplyConfigNode(discovery=discovery)
     card = ControlPlaneLeafConfigCardEvent(
         target_group="execution.alpha",
         worker_id="execution.alpha#1",
@@ -81,15 +70,13 @@ def test_leaf_apply_config_discovers_full_registry_and_emits_ack() -> None:
     assert ack.config_id == "cfg-1"
     assert ack.resolved_nodes == ("node.a", "node.b")
     assert ack.error is None
-    assert bootstrapper.discover_all_calls == [{}]
-    assert bootstrapper.discover_subset_calls == []
-    assert discovery.items() == bootstrapper.items
+    assert len(discovery.items()) == 2
 
 
 def test_leaf_apply_config_emits_rejected_ack_when_discovery_fails() -> None:
-    bootstrapper = _Bootstrapper(fail_with=RuntimeError("subset discovery failed"))
-    discovery = InMemoryControlPlaneDiscoveryService(store=InMemoryKvStore())
-    node = ControlPlaneLeafApplyConfigNode(bootstrapper=bootstrapper, discovery=discovery)
+    node = ControlPlaneLeafApplyConfigNode(
+        discovery=_FailingDiscovery(fail_with=RuntimeError("subset discovery failed"))
+    )
     card = ControlPlaneLeafConfigCardEvent(
         target_group="execution.alpha",
         worker_id="execution.alpha#1",
@@ -109,15 +96,12 @@ def test_leaf_apply_config_emits_rejected_ack_when_discovery_fails() -> None:
     assert ack.error is not None
     assert "subset discovery failed" in ack.error
     assert ack.resolved_nodes == ()
-    assert discovery.items() == []
 
 
 def test_leaf_apply_config_emits_rejected_ack_when_requested_node_absent_in_discovery_registry() -> None:
-    bootstrapper = _Bootstrapper(
-        items=[ControlPlaneDiscoveryItemEvent(item_kind="node", payload={"name": "node.a"})]
-    )
     discovery = InMemoryControlPlaneDiscoveryService(store=InMemoryKvStore())
-    node = ControlPlaneLeafApplyConfigNode(bootstrapper=bootstrapper, discovery=discovery)
+    discovery.append_item(ControlPlaneDiscoveryItemEvent(item_kind="node", payload={"name": "node.a"}))
+    node = ControlPlaneLeafApplyConfigNode(discovery=discovery)
     card = ControlPlaneLeafConfigCardEvent(
         target_group="execution.alpha",
         worker_id="execution.alpha#1",
@@ -140,9 +124,8 @@ def test_leaf_apply_config_emits_rejected_ack_when_requested_node_absent_in_disc
 
 
 def test_leaf_apply_config_accepts_runtime_step_aliases_from_context() -> None:
-    bootstrapper = _Bootstrapper(items=[])
     discovery = InMemoryControlPlaneDiscoveryService(store=InMemoryKvStore())
-    node = ControlPlaneLeafApplyConfigNode(bootstrapper=bootstrapper, discovery=discovery)
+    node = ControlPlaneLeafApplyConfigNode(discovery=discovery)
     card = ControlPlaneLeafConfigCardEvent(
         target_group="execution.egress",
         worker_id="execution.egress#1",
@@ -169,15 +152,11 @@ def test_leaf_apply_config_accepts_runtime_step_aliases_from_context() -> None:
 
 
 def test_leaf_discovery_request_node_emits_accepted_ack_for_resolved_subset() -> None:
-    bootstrapper = _Bootstrapper(
-        items=[
-            ControlPlaneDiscoveryItemEvent(item_kind="node", payload={"name": "node.a"}),
-            ControlPlaneDiscoveryItemEvent(item_kind="node", payload={"name": "node.b"}),
-            ControlPlaneDiscoveryItemEvent(item_kind="service", payload={"name": "svc.x"}),
-        ]
-    )
     discovery = InMemoryControlPlaneDiscoveryService(store=InMemoryKvStore())
-    node = ControlPlaneLeafDiscoveryRequestNode(bootstrapper=bootstrapper, discovery=discovery)
+    discovery.append_item(ControlPlaneDiscoveryItemEvent(item_kind="node", payload={"name": "node.a"}))
+    discovery.append_item(ControlPlaneDiscoveryItemEvent(item_kind="node", payload={"name": "node.b"}))
+    discovery.append_item(ControlPlaneDiscoveryItemEvent(item_kind="service", payload={"name": "svc.x"}))
+    node = ControlPlaneLeafDiscoveryRequestNode(discovery=discovery)
     request = ControlPlaneLeafDiscoveryRequestEvent(
         target_group="execution.alpha",
         worker_id="execution.alpha#1",
@@ -197,11 +176,9 @@ def test_leaf_discovery_request_node_emits_accepted_ack_for_resolved_subset() ->
 
 
 def test_leaf_discovery_request_node_emits_rejected_ack_for_missing_nodes() -> None:
-    bootstrapper = _Bootstrapper(
-        items=[ControlPlaneDiscoveryItemEvent(item_kind="node", payload={"name": "node.a"})]
-    )
     discovery = InMemoryControlPlaneDiscoveryService(store=InMemoryKvStore())
-    node = ControlPlaneLeafDiscoveryRequestNode(bootstrapper=bootstrapper, discovery=discovery)
+    discovery.append_item(ControlPlaneDiscoveryItemEvent(item_kind="node", payload={"name": "node.a"}))
+    node = ControlPlaneLeafDiscoveryRequestNode(discovery=discovery)
     request = ControlPlaneLeafDiscoveryRequestEvent(
         target_group="execution.alpha",
         worker_id="execution.alpha#1",
@@ -221,12 +198,9 @@ def test_leaf_discovery_request_node_emits_rejected_ack_for_missing_nodes() -> N
     assert ack.missing_nodes == ("node.missing",)
 
 
-def test_leaf_discovery_request_node_uses_leaf_runtime_from_context() -> None:
-    bootstrapper = _Bootstrapper(
-        items=[ControlPlaneDiscoveryItemEvent(item_kind="node", payload={"name": "node.a"})]
-    )
+def test_leaf_discovery_request_node_uses_leaf_runtime_steps_from_context() -> None:
     discovery = InMemoryControlPlaneDiscoveryService(store=InMemoryKvStore())
-    node = ControlPlaneLeafDiscoveryRequestNode(bootstrapper=bootstrapper, discovery=discovery)
+    node = ControlPlaneLeafDiscoveryRequestNode(discovery=discovery)
     request = ControlPlaneLeafDiscoveryRequestEvent(
         target_group="execution.alpha",
         worker_id="execution.alpha#1",
@@ -235,7 +209,10 @@ def test_leaf_discovery_request_node_uses_leaf_runtime_from_context() -> None:
         protocol_revision=2,
     )
     leaf_session = SimpleNamespace(
-        child=SimpleNamespace(runtime={"discovery_modules": ["pkg.platform", "pkg.project"]})
+        child=SimpleNamespace(
+            runtime={"discovery_modules": ["pkg.platform", "pkg.project"]},
+            scenario_steps={"node.a": object()},
+        )
     )
 
     produced = node(request, {"__leaf_session": leaf_session})
@@ -244,7 +221,7 @@ def test_leaf_discovery_request_node_uses_leaf_runtime_from_context() -> None:
     ack = produced[0]
     assert isinstance(ack, ControlPlaneLeafDiscoveryAckEvent)
     assert ack.status == "accepted"
-    assert bootstrapper.discover_all_calls == [{"discovery_modules": ["pkg.platform", "pkg.project"]}]
+    assert ack.discovered_nodes == ("node.a",)
 
 
 def test_leaf_snapshot_apply_node_emits_discovery_ack_via_snapshot_service() -> None:

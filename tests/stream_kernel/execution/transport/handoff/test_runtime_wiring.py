@@ -84,12 +84,12 @@ def test_runtime_wiring_handoff_bindings_register_dispatch_and_route_table_servi
     dispatch = scope.resolve("service", ExecutionIpcHandoffDispatchService)
 
     assert isinstance(route_table, InMemoryExecutionIpcRouteTableService)
+    route_table.upsert_route(target="remote.node", target_id="execution.alpha#1")
     dispatched = dispatch.dispatch_envelope(
         Envelope(payload={"v": 1}, target="remote.node"),
         source_group="execution.root",
     )
     assert dispatched is True
-    assert route_table.resolve_route(target="remote.node") == "execution.alpha#1"
     assert ipc.sends == [
         {"target_id": "execution.alpha#1", "payload": {"v": 1}, "no_reply": True}
     ]

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 from stream_kernel.execution.orchestration.control_plane import (
     ControlPlaneRootLeafBoundaryDispatchNode,
     ControlPlaneRootLeafBoundaryResultNode,
@@ -20,9 +22,24 @@ from stream_kernel.platform.services.runtime.control_plane_state import (
 )
 
 
-def test_root_leaf_stop_dispatch_emits_typed_leaf_stop_command_and_appends_state() -> None:
+@dataclass(slots=True)
+class _ControlLanePort:
+    sends: list[dict[str, object]] = field(default_factory=list)
+
+    def send(self, target_id: str, payload: object, *, no_reply: bool = False):
+        self.sends.append(
+            {"target_id": target_id, "payload": payload, "no_reply": no_reply}
+        )
+        return None
+
+
+def test_root_leaf_stop_dispatch_sends_typed_leaf_stop_command_and_appends_state() -> None:
     state = InMemoryControlPlaneStateService(store=InMemoryKvStore())
-    node = ControlPlaneRootLeafStopDispatchNode(state=state)
+    lane_port = _ControlLanePort()
+    node = ControlPlaneRootLeafStopDispatchNode(
+        state=state,
+        control_lane_ipc=lane_port,  # type: ignore[arg-type]
+    )
     req = ControlPlaneRootLeafStopRequestEvent(
         target_group="execution.alpha",
         worker_id="execution.alpha#1",
@@ -32,12 +49,15 @@ def test_root_leaf_stop_dispatch_emits_typed_leaf_stop_command_and_appends_state
 
     out = node(req, None)
 
-    assert len(out) == 1
-    cmd = out[0]
+    assert out == []
+    assert len(lane_port.sends) == 1
+    cmd = lane_port.sends[0]["payload"]
     assert isinstance(cmd, ControlPlaneLeafStopCommand)
     assert cmd.target_group == "execution.alpha"
     assert cmd.worker_id == "execution.alpha#1"
     assert cmd.command_id == "stop-1"
+    assert lane_port.sends[0]["target_id"] == "execution.alpha#1"
+    assert lane_port.sends[0]["no_reply"] is True
     events = state.events()
     assert events[0] is req
     assert isinstance(events[1], ControlPlaneLeafStopCommand)

@@ -382,3 +382,16 @@ def test_trace_otel_otlp_rejects_invalid_queue_block_timeout() -> None:
                 },
             }
         )
+
+
+def test_trace_otel_otlp_accepts_block_forever_without_timeout() -> None:
+    sink = trace_otel_otlp(
+        {
+            "endpoint": "http://collector:4318/v1/traces",
+            "queue": {
+                "drop_policy": "block_forever",
+            },
+        }
+    )
+    assert isinstance(sink, OTelOtlpTraceSink)
+    assert sink._queue_drop_policy == "block_forever"

@@ -4,7 +4,7 @@ from stream_kernel.observability.adapters.logging import RedisDebugLogSink, log_
 from stream_kernel.observability.domain.logging import LogMessage
 
 
-def _sink(*, only_debug_channel: bool) -> RedisDebugLogSink:
+def _sink(*, only_debug_channel: bool, write_mode: str = "inline") -> RedisDebugLogSink:
     return RedisDebugLogSink(
         host="127.0.0.1",
         port=6379,
@@ -15,6 +15,7 @@ def _sink(*, only_debug_channel: bool) -> RedisDebugLogSink:
         connect_timeout_seconds=0.2,
         socket_timeout_seconds=1.0,
         only_debug_channel=only_debug_channel,
+        write_mode=write_mode,
     )
 
 
@@ -49,7 +50,7 @@ def test_redis_debug_log_sink_writes_run_and_process_indexes() -> None:
     )
     assert len(captured) == 1
     commands = captured[0]
-    assert any(cmd[:2] == ["RPUSH", "stream_kernel:debug:runs:run-123:logs:root:supervisor:w1"] for cmd in commands)
+    assert any(cmd[:2] == ["XADD", "stream_kernel:debug:runs:run-123:logs:root:supervisor:w1"] for cmd in commands)
     assert any(cmd == ["SADD", "stream_kernel:debug:runs:run-123:processes", "root:supervisor:w1"] for cmd in commands)
     assert any(cmd[:2] == ["ZADD", "stream_kernel:debug:runs:index:by_time"] and cmd[3] == "run-123" for cmd in commands)
     assert any(cmd[:3] == ["HSET", "stream_kernel:debug:runs:reports", "run-123"] for cmd in commands)
@@ -98,7 +99,7 @@ def test_redis_debug_log_sink_uses_shared_env_run_instance_for_default_run(monke
     )
     assert len(captured) == 1
     commands = captured[0]
-    assert any(cmd[:2] == ["RPUSH", "stream_kernel:debug:runs:run:launch-001:logs:root:supervisor:w1"] for cmd in commands)
+    assert any(cmd[:2] == ["XADD", "stream_kernel:debug:runs:run:launch-001:logs:root:supervisor:w1"] for cmd in commands)
     assert any(
         cmd[:3] == ["HSET", "stream_kernel:debug:runs:reports", "run:launch-001"]
         for cmd in commands
@@ -108,3 +109,28 @@ def test_redis_debug_log_sink_uses_shared_env_run_instance_for_default_run(monke
 def test_log_redis_debug_capture_all_events_overrides_debug_filter() -> None:
     sink = log_redis_debug({"capture_all_events": True})
     assert sink._only_debug_channel is False  # type: ignore[attr-defined]
+
+
+def test_log_redis_debug_defaults_to_background_write_mode() -> None:
+    sink = log_redis_debug({})
+    try:
+        assert sink._write_mode == "background"  # type: ignore[attr-defined]
+    finally:
+        sink.close()
+
+
+def test_log_redis_debug_respects_background_write_mode_setting() -> None:
+    sink = log_redis_debug({"write_mode": "background"})
+    try:
+        assert sink._write_mode == "background"  # type: ignore[attr-defined]
+    finally:
+        sink.close()
+
+
+def test_log_redis_debug_rejects_invalid_write_mode() -> None:
+    try:
+        _ = log_redis_debug({"write_mode": "unsupported"})
+    except ValueError as exc:
+        assert "write_mode" in str(exc)
+        return
+    raise AssertionError("Expected ValueError for invalid write_mode")

@@ -2,12 +2,7 @@ from __future__ import annotations
 
 from importlib import import_module
 
-_COMMAND_LOOP_EXPORTS = {
-    "LeafWorkerCommandLoopService",
-    "DefaultLeafWorkerCommandLoopService",
-    "LeafControlIngressService",
-    "DefaultLeafControlIngressService",
-}
+_COMMAND_LOOP_EXPORTS: set[str] = set()
 _CONTROL_PLANE_EXPORTS = {
     "LeafProcessEntryOrchestrationService",
     "DefaultLeafProcessEntryOrchestrationService",
@@ -15,7 +10,6 @@ _CONTROL_PLANE_EXPORTS = {
     "DefaultLeafWorkerControlPlaneService",
     "leaf_worker_process_entry",
     "resolve_leaf_process_entry_orchestration_service",
-    "resolve_leaf_control_ingress_service",
 }
 _ACTIVATION_EXPORTS = {
     "LeafRuntimeActivationService",
@@ -65,11 +59,7 @@ __all__ = sorted(
 
 
 def __getattr__(name: str) -> object:
-    if name in {"LeafWorkerCommandLoopService", "DefaultLeafWorkerCommandLoopService"}:
-        mod = import_module("stream_kernel.execution.orchestration.lifecycle.leaf.command.command_loop_service")
-    elif name in {"LeafControlIngressService", "DefaultLeafControlIngressService"}:
-        mod = import_module("stream_kernel.execution.orchestration.lifecycle.leaf.command.control_ingress_service")
-    elif name in _CONTROL_PLANE_EXPORTS:
+    if name in _CONTROL_PLANE_EXPORTS:
         mod = import_module("stream_kernel.execution.orchestration.lifecycle.leaf.command.control_plane_service")
     elif name in _ACTIVATION_EXPORTS:
         mod = import_module("stream_kernel.execution.orchestration.lifecycle.leaf.runtime.runtime_activation_service")

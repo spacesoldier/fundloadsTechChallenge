@@ -104,9 +104,14 @@ from stream_kernel.platform.services.runtime.transport import (
     TcpLocalRuntimeTransportService,
 )
 from stream_kernel.execution.transport.ipc.ipc_transport import ExecutionIpcEndpointRegistry
+from stream_kernel.observability.domain.debug import DebugMessage
 from stream_kernel.platform.services.runtime.control_plane_events import (
+    ControlPlaneInitEvent,
     ControlPlaneLeafPulse,
     ControlPlaneRootPulse,
+)
+from stream_kernel.platform.services.runtime.control_plane_startup_bindings import (
+    ControlPlaneStartupConsumerBindingsService,
 )
 from stream_kernel.platform.services.messaging.reply_waiter import (
     InMemoryReplyWaiterService,
@@ -161,6 +166,24 @@ class _RunnerAutoSyncNode:
 def _write_file(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+def _collect_startup_bindings(artifacts: RuntimeBuildArtifacts) -> tuple[ControlPlaneConsumerBindingRecord, ...]:
+    service = artifacts.scenario_scope.resolve("service", ControlPlaneStartupConsumerBindingsService)
+    collect_once = getattr(service, "collect_once", None)
+    if not callable(collect_once):
+        return ()
+    result = collect_once()
+    return tuple(result) if isinstance(result, tuple | list) else ()
+
+
+def _has_input_payload(inputs: list[object], token: type[object]) -> bool:
+    for item in inputs:
+        if isinstance(item, token):
+            return True
+        if isinstance(item, Envelope) and isinstance(item.payload, token):
+            return True
+    return False
 
 
 @adapter(name="source", kind="test.source", consumes=[], emits=[_Token], binds=[("stream", _StreamPort)])
@@ -898,7 +921,7 @@ def test_build_injection_registry_from_bindings_marks_async_roles() -> None:
 def test_ensure_platform_discovery_modules_appends_framework_modules() -> None:
     modules = ["fund_load.usecases.steps"]
     ensure_platform_discovery_modules(modules)
-    assert "stream_kernel.execution.orchestration.lifecycle.leaf.command.control_ingress_service" in modules
+    assert "stream_kernel.execution.orchestration.lifecycle.leaf.command.channel_services" in modules
     assert "stream_kernel.integration.work_queue" in modules
     assert "stream_kernel.routing.routing_service" in modules
     assert "stream_kernel.observability.adapters" in modules
@@ -908,17 +931,60 @@ def test_ensure_platform_discovery_modules_appends_framework_modules() -> None:
 def test_ensure_platform_discovery_modules_does_not_duplicate_entries() -> None:
     modules = [
         "fund_load.usecases.steps",
-        "stream_kernel.execution.orchestration.lifecycle.leaf.command.control_ingress_service",
+        "stream_kernel.execution.orchestration.lifecycle.leaf.command.channel_services",
         "stream_kernel.integration.work_queue",
         "stream_kernel.routing.routing_service",
         "stream_kernel.observability.adapters",
     ]
     ensure_platform_discovery_modules(modules)
-    assert modules.count("stream_kernel.execution.orchestration.lifecycle.leaf.command.control_ingress_service") == 1
+    assert modules.count("stream_kernel.execution.orchestration.lifecycle.leaf.command.channel_services") == 1
     assert modules.count("stream_kernel.integration.work_queue") == 1
     assert modules.count("stream_kernel.routing.routing_service") == 1
     assert modules.count("stream_kernel.observability.adapters") == 1
     assert "stream_kernel.observability.observers" not in modules
+
+
+def test_runtime_graph_discovery_modules_scopes_root_supervisor_to_framework_modules() -> None:
+    runtime = {
+        "platform": {
+            "bootstrap": {"mode": "process_supervisor"},
+            "process_groups": [{"name": "execution.alpha", "workers": 1, "nodes": []}],
+        }
+    }
+    modules = [
+        ModuleType("fund_load.nodes"),
+        ModuleType("stream_kernel.platform.services.runtime"),
+        ModuleType("stream_kernel.execution.orchestration.control_plane"),
+    ]
+
+    filtered = builder_module._runtime_graph_discovery_modules(runtime=runtime, modules=modules)
+
+    names = [module.__name__ for module in filtered]
+    assert names == [
+        "stream_kernel.platform.services.runtime",
+        "stream_kernel.execution.orchestration.control_plane",
+    ]
+
+
+def test_runtime_graph_discovery_modules_keeps_full_module_set_for_leaf_worker() -> None:
+    runtime = {
+        "__process_role": "worker",
+        "platform": {
+            "bootstrap": {"mode": "process_supervisor"},
+            "process_groups": [{"name": "execution.alpha", "workers": 1, "nodes": []}],
+        },
+    }
+    modules = [
+        ModuleType("fund_load.nodes"),
+        ModuleType("stream_kernel.platform.services.runtime"),
+    ]
+
+    filtered = builder_module._runtime_graph_discovery_modules(runtime=runtime, modules=modules)
+
+    assert [module.__name__ for module in filtered] == [
+        "fund_load.nodes",
+        "stream_kernel.platform.services.runtime",
+    ]
 
 
 def test_resolve_step_names_excludes_external_contract_nodes() -> None:
@@ -1121,11 +1187,53 @@ def test_build_source_ingress_plan_wraps_readable_adapters() -> None:
     first = node({}, {})
     second = node({}, {})
     third = node({}, {})
-    assert [item.trace_id for item in first if isinstance(item.payload, int)] == ["run:events_source:1"]
+    assert [item.trace_id for item in first if isinstance(item.payload, int)] == [None]
     assert [item.payload for item in first if isinstance(item.payload, int)] == [1]
-    assert [item.trace_id for item in second if isinstance(item.payload, int)] == ["run:events_source:2"]
+    assert [item.trace_id for item in second if isinstance(item.payload, int)] == [None]
     assert [item.payload for item in second if isinstance(item.payload, int)] == [2]
     assert third == []
+
+
+def test_build_source_ingress_plan_ignores_adapter_trace_id_and_preserves_reply_metadata() -> None:
+    # Source adapter envelopes may carry reply metadata, but trace_id is always assigned by framework rails.
+    registry = AdapterRegistry()
+    registry.register("events_source", "events_source", _source_factory)
+    adapters = {"events_source": {"settings": {}}}
+    adapter_instances = {
+        "events_source": type(
+            "I",
+            (),
+            {
+                "read": lambda *_a: [
+                    Envelope(
+                        payload={"request_id": 1},
+                        trace_id="adapter-trace-1",
+                        reply_to="conn-a",
+                        span_id="upstream-span-1",
+                    )
+                ]
+            },
+        )()
+    }
+
+    injection = InjectionRegistry()
+    injection.register_factory("service", ContextService, lambda: InMemoryKvContextService(InMemoryKvStore()))
+    scope = injection.instantiate_for_scenario("s1")
+
+    ingress = build_source_ingress_plan(
+        adapters=adapters,
+        adapter_instances=adapter_instances,
+        adapter_registry=registry,
+        scenario_scope=scope,
+        run_id="run",
+        scenario_id="scenario",
+    )
+    node = ingress.source_steps[0].step
+    outputs = node({}, {})
+    emitted = next(item for item in outputs if isinstance(item, Envelope) and isinstance(item.payload, dict))
+    assert emitted.trace_id is None
+    assert emitted.reply_to == "conn-a"
+    assert emitted.span_id == "upstream-span-1"
 
 
 def test_build_source_ingress_plan_supports_push_ingress_wrapper() -> None:
@@ -1537,6 +1645,98 @@ def test_run_with_sync_runner_executes_targeted_bootstrap_envelopes() -> None:
     assert seen == [1]
 
 
+def test_run_with_sync_runner_generates_source_trace_in_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Source bootstrap outputs are trace-seeded by runner, not by source wrapper node.
+    monkeypatch.delenv("STREAM_KERNEL_TRACE_SCOPE_ID", raising=False)
+    observed_before: list[tuple[str, str | None]] = []
+    ingress_traces: list[str | None] = []
+
+    class _Obs:
+        def before_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+        ) -> None:
+            _ = (payload, ctx)
+            observed_before.append((node_name, trace_id))
+            return None
+
+        def after_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            outputs: list[object],
+            state: object | None,
+        ) -> None:
+            _ = (node_name, payload, ctx, trace_id, outputs, state)
+            return None
+
+        def on_node_error(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            error: Exception,
+            state: object | None,
+        ) -> None:
+            _ = (node_name, payload, ctx, trace_id, error, state)
+            return None
+
+        def on_run_end(self) -> None:
+            return None
+
+        def on_ingress(self, *, trace_id: str | None, reply_to: str | None) -> None:
+            _ = reply_to
+            ingress_traces.append(trace_id)
+
+        def on_terminal_event(self, *, trace_id: str | None, terminal_event: object | None) -> None:
+            _ = (trace_id, terminal_event)
+
+    source_node = lambda _payload, _ctx: [1]  # noqa: E731
+
+    injection = InjectionRegistry()
+    injection.register_factory("queue", Envelope, lambda: InMemoryQueue(), qualifier="execution.cpu")
+    injection.register_factory(
+        "service",
+        RoutingService,
+        lambda: RoutingService(registry=InMemoryConsumerRegistry({int: ["sink"]}), strict=True),
+    )
+    injection.register_factory("service", ContextService, lambda: InMemoryKvContextService(InMemoryKvStore()))
+    injection.register_factory("service", ObservabilityService, _Obs)
+    scope = injection.instantiate_for_scenario("s1")
+
+    scenario = SimpleNamespace(
+        steps=[
+            StepSpec(name="source:events", step=source_node),
+            StepSpec(name="sink", step=lambda _p, _c: []),
+        ]
+    )
+
+    run_with_sync_runner(
+        scenario=scenario,
+        inputs=[Envelope(payload=BootstrapControl(target="source:events"), target="source:events")],
+        strict=True,
+        run_id="run",
+        scenario_id="scenario",
+        scenario_scope=scope,
+        full_context_nodes=set(),
+        ordered_sink_mode="completion",
+        queue_qualifier="execution.cpu",
+    )
+
+    sink_traces = [trace_id for node_name, trace_id in observed_before if node_name == "sink"]
+    assert sink_traces == ["run:events:1"]
+    assert "run:events:1" in ingress_traces
+
+
 def test_run_with_sync_runner_bootstrap_targets_use_clean_control_payload() -> None:
     # Bootstrap control message should not leak marker payload structure into source node API.
     seen_payloads: list[object] = []
@@ -1796,7 +1996,7 @@ def test_build_runtime_artifacts_accepts_tcp_local_profile_with_framework_lifecy
     execute_runtime_artifacts(artifacts)
 
 
-def test_build_runtime_artifacts_injects_root_pulse_for_process_supervisor_mode() -> None:
+def test_build_runtime_artifacts_injects_root_init_event_for_process_supervisor_mode() -> None:
     config = {
         "version": 1,
         "scenario": {"name": "baseline"},
@@ -1812,7 +2012,21 @@ def test_build_runtime_artifacts_injects_root_pulse_for_process_supervisor_mode(
     artifacts = build_runtime_artifacts(config)
 
     assert artifacts.inputs
-    assert isinstance(artifacts.inputs[0], ControlPlaneRootPulse)
+    assert _has_input_payload(artifacts.inputs, ControlPlaneInitEvent)
+    pulse_targets = [
+        item.target
+        for item in artifacts.inputs
+        if isinstance(item, Envelope) and isinstance(item.payload, ControlPlaneInitEvent)
+    ]
+    assert pulse_targets == ["system.cp.consumer_registry_bindings_bootstrap"]
+    init_events = [
+        item.payload
+        for item in artifacts.inputs
+        if isinstance(item, Envelope) and isinstance(item.payload, ControlPlaneInitEvent)
+    ]
+    assert len(init_events) == 1
+    assert isinstance(init_events[0].discovery, dict)
+    assert "root_runtime_prepare" in init_events[0].discovery
 
 
 def test_build_runtime_artifacts_skips_root_pulse_for_worker_process() -> None:
@@ -1831,10 +2045,31 @@ def test_build_runtime_artifacts_skips_root_pulse_for_worker_process() -> None:
 
     artifacts = build_runtime_artifacts(config)
 
-    assert not any(isinstance(item, ControlPlaneRootPulse) for item in artifacts.inputs)
+    assert not _has_input_payload(artifacts.inputs, ControlPlaneRootPulse)
 
 
-def test_build_runtime_artifacts_injects_leaf_pulse_for_worker_process() -> None:
+def test_build_runtime_artifacts_orders_root_bootstrap_after_consumer_bindings() -> None:
+    config = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {
+            "strict": True,
+            "discovery_modules": [],
+            "platform": {"process_groups": [{"name": "execution.cpu"}]},
+        },
+        "nodes": {},
+        "adapters": {},
+    }
+
+    artifacts = build_runtime_artifacts(config)
+
+    assert len(artifacts.inputs) >= 1
+    first = artifacts.inputs[0]
+    assert isinstance(first, Envelope)
+    assert first.target == "system.cp.consumer_registry_bindings_bootstrap"
+
+
+def test_build_runtime_artifacts_injects_leaf_init_event_for_worker_process() -> None:
     config = {
         "version": 1,
         "scenario": {"name": "baseline"},
@@ -1851,7 +2086,13 @@ def test_build_runtime_artifacts_injects_leaf_pulse_for_worker_process() -> None
     artifacts = build_runtime_artifacts(config)
 
     assert artifacts.inputs
-    assert isinstance(artifacts.inputs[0], ControlPlaneLeafPulse)
+    assert _has_input_payload(artifacts.inputs, ControlPlaneInitEvent)
+    assert any(
+        isinstance(item, Envelope)
+        and isinstance(item.payload, ControlPlaneInitEvent)
+        and item.target == "system.cp.consumer_registry_bindings_bootstrap"
+        for item in artifacts.inputs
+    )
 
 
 def test_build_runtime_artifacts_includes_control_plane_root_nodes() -> None:
@@ -1876,7 +2117,76 @@ def test_build_runtime_artifacts_includes_control_plane_root_nodes() -> None:
 
     registry = artifacts.consumer_registry
     assert registry is not None
-    assert "system.cp.root_bootstrap" in registry.get_consumers(ControlPlaneRootPulse)
+    startup_bindings = _collect_startup_bindings(artifacts)
+    assert startup_bindings
+    assert any(
+        record.token is ControlPlaneRootPulse
+        and "system.cp.root_bootstrap" in record.node_names
+        for record in startup_bindings
+    )
+
+
+@pytest.mark.parametrize(
+    ("process_role", "expected_bootstrap_node"),
+    [
+        (None, "system.cp.root_bootstrap"),
+        ("worker", "system.cp.leaf_bootstrap"),
+    ],
+)
+def test_build_runtime_artifacts_mounts_debug_dispatch_for_root_and_leaf(
+    process_role: str | None,
+    expected_bootstrap_node: str,
+) -> None:
+    runtime: dict[str, object] = {
+        "strict": True,
+        "discovery_modules": [],
+        "platform": {
+            "bootstrap": {"mode": "process_supervisor"},
+            "process_groups": [{"name": "execution.alpha", "workers": 1, "nodes": ["node.a"]}],
+        },
+        "observability": {
+            "logging": {
+                "exporters": [
+                    {
+                        "kind": "redis_debug",
+                        "enabled": True,
+                        "settings": {
+                            "host": "127.0.0.1",
+                            "port": 6379,
+                            "connect_timeout_seconds": 0.01,
+                            "socket_timeout_seconds": 0.01,
+                            "write_mode": "background",
+                        },
+                    }
+                ]
+            }
+        },
+    }
+    if isinstance(process_role, str):
+        runtime["__process_role"] = process_role
+
+    config = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": runtime,
+        "nodes": {},
+        "adapters": {},
+    }
+
+    artifacts = build_runtime_artifacts(config)
+    step_names = {spec.name for spec in artifacts.scenario.steps}
+
+    assert expected_bootstrap_node in step_names
+    assert "system.debug.message_dispatch" in step_names
+    startup_bindings = _collect_startup_bindings(artifacts)
+    assert startup_bindings
+    assert any(
+        record.token is DebugMessage
+        and "system.debug.message_dispatch" in record.node_names
+        for record in startup_bindings
+    )
+    debug_stream = artifacts.scenario_scope.resolve("stream", DebugMessage)
+    assert callable(getattr(debug_stream, "emit_async", None))
 
 
 def test_build_runtime_artifacts_process_supervisor_root_omits_business_nodes(tmp_path: Path) -> None:
@@ -1981,10 +2291,62 @@ def test_build_runtime_artifacts_process_supervisor_root_does_not_mount_source_i
     step_names = {spec.name for spec in artifacts.scenario.steps}
     assert "source:biz_source_adapter" not in step_names
     assert any(spec.name == "system.cp.start_work_dispatch" for spec in artifacts.scenario.steps)
-    assert any(isinstance(item, ControlPlaneRootPulse) for item in artifacts.inputs)
+    assert _has_input_payload(artifacts.inputs, ControlPlaneInitEvent)
     assert not any(
         isinstance(getattr(item, "payload", None), BootstrapControl)
         for item in artifacts.inputs
+    )
+
+
+def test_build_runtime_artifacts_seeds_startup_consumer_bindings_for_source_and_sink(
+    tmp_path: Path,
+) -> None:
+    pkg = tmp_path / "source_bindings_pkg"
+    _write_file(pkg / "__init__.py", "")
+    _write_file(
+        pkg / "adapters.py",
+        "\n".join(
+            [
+                "from stream_kernel.adapters.contracts import adapter",
+                "",
+                "class _Source:",
+                "    def read(self):",
+                "        yield {'value': 1}",
+                "",
+                "@adapter(name='events_source', kind='test.source', consumes=[], emits=[dict])",
+                "def events_source(settings):",
+                "    _ = settings",
+                "    return _Source()",
+            ]
+        ),
+    )
+    config = {
+        "version": 1,
+        "scenario": {"name": "baseline"},
+        "runtime": {
+            "strict": True,
+            "discovery_modules": ["source_bindings_pkg.adapters"],
+            "platform": {
+                "bootstrap": {"mode": "local"},
+            },
+        },
+        "nodes": {},
+        "adapters": {
+            "events_source": {"settings": {}},
+        },
+    }
+
+    sys.path.insert(0, str(tmp_path))
+    try:
+        artifacts = build_runtime_artifacts(config)
+    finally:
+        sys.path.remove(str(tmp_path))
+
+    bindings = _collect_startup_bindings(artifacts)
+    assert bindings
+    assert any(
+        record.token is BootstrapControl and "source:events_source" in record.node_names
+        for record in bindings
     )
 
 
@@ -2008,14 +2370,21 @@ def test_build_runtime_artifacts_includes_control_plane_leaf_node_for_workers() 
     assert "system.cp.leaf_bootstrap" in step_names
     assert "system.cp.root_bootstrap" not in step_names
 
-    registry = artifacts.consumer_registry
-    assert registry is not None
-    assert "system.cp.leaf_bootstrap" in registry.get_consumers(ControlPlaneLeafPulse)
+    startup_bindings = _collect_startup_bindings(artifacts)
+    assert startup_bindings
+    assert any(
+        record.token is ControlPlaneLeafPulse
+        and "system.cp.leaf_bootstrap" in record.node_names
+        for record in startup_bindings
+    )
 
 
 def test_build_runtime_artifacts_binds_control_plane_runtime_lifecycle_manager_for_process_supervisor() -> None:
     from stream_kernel.execution.orchestration.lifecycle.root.runtime.lifecycle_manager import (
         ControlPlaneRootRuntimeLifecycleManager,
+    )
+    from stream_kernel.execution.orchestration.control_plane.root.channel_services import (
+        ControlPlaneRootRunnerControlService,
     )
 
     config = {
@@ -2032,23 +2401,15 @@ def test_build_runtime_artifacts_binds_control_plane_runtime_lifecycle_manager_f
 
     artifacts = build_runtime_artifacts(config)
     lifecycle = artifacts.scenario_scope.resolve("service", RuntimeLifecycleManager)
-
-    assert isinstance(lifecycle, ControlPlaneRootRuntimeLifecycleManager)
-
-
-def test_run_with_sync_runner_drains_external_deliveries_via_root_boundary_handoff_for_root_pulse() -> None:
-    from stream_kernel.execution.orchestration.control_plane.root.boundary_handoff_service import (
-        ControlPlaneRootBoundaryHandoffService,
+    root_runner_control = artifacts.scenario_scope.resolve(
+        "service", ControlPlaneRootRunnerControlService
     )
 
-    class _Handoff:
-        def __init__(self) -> None:
-            self.calls: list[dict[str, object]] = []
+    assert isinstance(lifecycle, ControlPlaneRootRuntimeLifecycleManager)
+    assert isinstance(root_runner_control, ControlPlaneRootRunnerControlService)
 
-        def drain_external_deliveries(self, *, envelopes: list[Envelope], source_group: str | None = None) -> list[object]:
-            self.calls.append({"envelopes": list(envelopes), "source_group": source_group})
-            return []
 
+def test_run_with_sync_runner_root_pulse_path_ignores_non_root_inputs() -> None:
     registry = InjectionRegistry()
     queue = InMemoryQueue()
     registry.register_factory("queue", Envelope, lambda _q=queue: _q, qualifier="execution.cpu")
@@ -2067,12 +2428,6 @@ def test_run_with_sync_runner_drains_external_deliveries_via_root_boundary_hando
         lambda: InMemoryKvContextService(InMemoryKvStore()),
     )
     registry.register_factory("service", ObservabilityService, NoOpObservabilityService)
-    handoff = _Handoff()
-    registry.register_factory(
-        "service",
-        ControlPlaneRootBoundaryHandoffService,
-        lambda _h=handoff: _h,
-    )
     scope = registry.instantiate_for_scenario("scenario")
     scenario = type(
         "S",
@@ -2098,14 +2453,6 @@ def test_run_with_sync_runner_drains_external_deliveries_via_root_boundary_hando
         full_context_nodes={"system.cp.root_bootstrap"},
     )
 
-    assert len(handoff.calls) == 1
-    call = handoff.calls[0]
-    assert call["source_group"] is None
-    envelopes = call["envelopes"]
-    assert len(envelopes) == 1
-    assert isinstance(envelopes[0], Envelope)
-    assert envelopes[0].target == "remote.node"
-
 
 def test_run_with_sync_runner_uses_single_long_running_loop_for_control_plane_pulses(
     monkeypatch: pytest.MonkeyPatch,
@@ -2120,7 +2467,6 @@ def test_run_with_sync_runner_uses_single_long_running_loop_for_control_plane_pu
         calls.append("enqueue")
 
     monkeypatch.setattr(runner_execution_module, "enqueue_runner_input_sync", _enqueue)
-    monkeypatch.setattr(runner_execution_module.transport_handoff_replay, "enqueue_runner_input_sync", _enqueue)
 
     def _run(self) -> None:  # noqa: ANN001
         calls.append("run")
@@ -2193,7 +2539,7 @@ def test_run_with_sync_runner_reads_runner_loop_timeouts_from_root_pulse_runtime
     assert loop_args["idle_timeout_seconds"] == pytest.approx(0.25)
 
 
-def test_run_with_sync_runner_defers_non_root_inputs_until_after_root_startup_loop(
+def test_run_with_sync_runner_drops_non_root_inputs_in_root_control_plane_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
@@ -2211,7 +2557,6 @@ def test_run_with_sync_runner_defers_non_root_inputs_until_after_root_startup_lo
         calls.append(f"enqueue:{type(payload).__name__}")
 
     monkeypatch.setattr(runner_execution_module, "enqueue_runner_input_sync", _enqueue)
-    monkeypatch.setattr(runner_execution_module.transport_handoff_replay, "enqueue_runner_input_sync", _enqueue)
     monkeypatch.setattr(runner_execution_module.SyncRunner, "run", lambda self: calls.append("run"))  # noqa: ARG005
 
     def _run_until_stopped(self, *, poll_timeout_seconds: float, idle_timeout_seconds: float | None):  # noqa: ANN001
@@ -2240,87 +2585,7 @@ def test_run_with_sync_runner_defers_non_root_inputs_until_after_root_startup_lo
         full_context_nodes={"system.cp.root_bootstrap"},
     )
 
-    assert calls == [
-        "enqueue:root_pulse",
-        "run_until_stopped",
-        "enqueue:envelope:A",
-        "enqueue:envelope:A",
-        "run_until_stopped",
-    ]
-
-
-def test_run_with_sync_runner_skips_observability_requeue_from_root_boundary_handoff_outputs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[str] = []
-    run_count = {"value": 0}
-
-    monkeypatch.setattr(runner_execution_module, "apply_injection", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(runner_execution_module, "close_scenario_scope", lambda _scope: None)
-
-    def _enqueue(_runner: object, payload: object, **_kwargs: object) -> None:
-        if isinstance(payload, ControlPlaneRootPulse):
-            calls.append("enqueue:root_pulse")
-        elif isinstance(payload, Envelope):
-            calls.append(f"enqueue:envelope:{payload.target}")
-        else:
-            calls.append(f"enqueue:{type(payload).__name__}")
-
-    monkeypatch.setattr(runner_execution_module, "enqueue_runner_input_sync", _enqueue)
-    monkeypatch.setattr(runner_execution_module.transport_handoff_replay, "enqueue_runner_input_sync", _enqueue)
-
-    def _drain(*, scenario_scope: object, external_deliveries: list[Envelope]) -> list[object]:  # noqa: ARG001
-        calls.append(f"drain:{len(external_deliveries)}")
-        return [Envelope(payload={"obs": 1}, target="system.obs.log_dispatch", trace_id="t-ob")]  # replay into root
-
-    monkeypatch.setattr(runner_execution_module.transport_handoff_replay, "drain_root_boundary_handoff", _drain)
-
-    monkeypatch.setattr(runner_execution_module.SyncRunner, "run", lambda self: calls.append("run"))  # noqa: ARG005
-
-    def _run_until_stopped(self, *, poll_timeout_seconds: float, idle_timeout_seconds: float | None):  # noqa: ANN001
-        run_count["value"] += 1
-        calls.append(f"run_until_stopped:{run_count['value']}")
-        if run_count["value"] == 2:
-            self.external_deliveries = [
-                Envelope(payload={"x": 1}, target="remote.node", trace_id="t1")
-            ]
-        else:
-            self.external_deliveries = []
-
-    monkeypatch.setattr(runner_execution_module.SyncRunner, "run_until_stopped", _run_until_stopped)
-
-    scenario = type(
-        "S",
-        (),
-        {
-            "steps": [
-                StepSpec(name="system.cp.root_bootstrap", step=lambda _p, _c: []),
-                StepSpec(name="A", step=lambda _p, _c: []),
-                StepSpec(name="system.obs.log_dispatch", step=lambda _p, _c: []),
-            ]
-        },
-    )()
-    scope = InjectionRegistry().instantiate_for_scenario("s1")
-
-    builder_module.run_with_sync_runner(
-        scenario=scenario,
-        inputs=[
-            ControlPlaneRootPulse(runtime={"platform": {"process_groups": [{"name": "execution.alpha"}]}}),
-            Envelope(payload=1, target="A", trace_id="t1"),
-        ],
-        strict=True,
-        run_id="run",
-        scenario_id="scenario",
-        scenario_scope=scope,
-        full_context_nodes={"system.cp.root_bootstrap"},
-    )
-
-    assert "enqueue:root_pulse" in calls
-    assert "enqueue:envelope:A" in calls
-    assert "drain:1" in calls
-    assert "enqueue:envelope:system.obs.log_dispatch" not in calls
-    assert "run_until_stopped:1" in calls
-    assert "run_until_stopped:2" in calls
+    assert calls == ["enqueue:root_pulse", "run_until_stopped"]
 
 
 def test_runtime_tcp_local_rejects_invalid_signed_frame_before_enqueue() -> None:
@@ -2923,12 +3188,17 @@ def test_build_observability_system_plan_worker_process_role_registers_transport
         scenario_scope=scope,
     )
 
-    assert plan.system_steps == []
+    assert [step.name for step in plan.system_steps] == [
+        "system.transport.handoff.trace_dispatch",
+        "system.transport.handoff.log_dispatch",
+        "system.transport.handoff.monitor_dispatch",
+        "system.transport.handoff.monitoring_metrics_dispatch",
+    ]
     assert plan.system_consumers == {
-        TraceDispatchEvent: ["system.obs.trace_dispatch"],
-        LogDispatchEvent: ["system.obs.log_dispatch"],
-        MonitorDispatchEvent: ["system.obs.monitor_dispatch"],
-        MonitoringMetricsSnapshotEvent: ["system.obs.monitoring_metrics_dispatch"],
+        TraceDispatchEvent: ["system.transport.handoff.trace_dispatch"],
+        LogDispatchEvent: ["system.transport.handoff.log_dispatch"],
+        MonitorDispatchEvent: ["system.transport.handoff.monitor_dispatch"],
+        MonitoringMetricsSnapshotEvent: ["system.transport.handoff.monitoring_metrics_dispatch"],
     }
 
 
@@ -2959,19 +3229,15 @@ def test_build_observability_system_plan_root_transport_only_mounts_transport_ha
     )
 
     assert [step.name for step in plan.system_steps] == [
-        "system.transport.handoff.trace_bypass",
         "system.transport.handoff.trace_dispatch",
-        "system.transport.handoff.worker_queue_bypass",
         "system.transport.handoff.worker_queue_dispatch",
     ]
     assert plan.system_consumers == {
-        TraceDispatchEvent: ["system.transport.handoff.trace_bypass"],
-        WorkerQueueTelemetryEvent: ["system.transport.handoff.worker_queue_bypass"],
+        TraceDispatchEvent: ["system.transport.handoff.trace_dispatch"],
+        WorkerQueueTelemetryEvent: ["system.transport.handoff.worker_queue_dispatch"],
     }
     assert plan.system_node_names == {
-        "system.transport.handoff.trace_bypass",
         "system.transport.handoff.trace_dispatch",
-        "system.transport.handoff.worker_queue_bypass",
         "system.transport.handoff.worker_queue_dispatch",
     }
 
@@ -3183,7 +3449,12 @@ def test_execute_runtime_artifacts_ignores_sync_only_dependencies_and_uses_async
                 StepSpec(name="auto.sync", step=_RunnerAutoSyncNode()),
             ]
         ),
-        inputs=[],
+        inputs=[
+            Envelope(
+                payload=ControlPlaneRootPulse(runtime={"platform": {"process_groups": [{"name": "execution.group"}]}}),
+                target="system.cp.root_bootstrap",
+            )
+        ],
         strict=True,
         run_id="run",
         scenario_id="scenario",
@@ -3251,6 +3522,57 @@ def test_execute_runtime_artifacts_ignores_explicit_sync_runner_profile_and_uses
     assert sync_calls == []
     assert len(async_calls) == 1
     assert async_calls[0]["queue_qualifier"] == "execution.group"
+
+
+def test_execute_runtime_artifacts_uses_asyncio_queue_for_process_supervisor_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sync_calls: list[dict[str, object]] = []
+    async_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        "stream_kernel.execution.orchestration.builder.run_with_sync_runner",
+        lambda **kwargs: sync_calls.append(dict(kwargs)),
+    )
+    monkeypatch.setattr(
+        "stream_kernel.execution.orchestration.builder.run_with_async_runner",
+        lambda **kwargs: async_calls.append(dict(kwargs)),
+    )
+
+    artifacts = RuntimeBuildArtifacts(
+        scenario=SimpleNamespace(
+            steps=[
+                StepSpec(name="auto.sync", step=_RunnerAutoSyncNode()),
+            ]
+        ),
+        inputs=[
+            Envelope(
+                payload=ControlPlaneRootPulse(
+                    runtime={"platform": {"process_groups": [{"name": "execution.group"}]}}
+                ),
+                target="system.cp.root_bootstrap",
+            )
+        ],
+        strict=True,
+        run_id="run",
+        scenario_id="scenario",
+        scenario_scope=InjectionRegistry().instantiate_for_scenario("scenario"),
+        full_context_nodes=set(),
+        runtime={
+            "platform": {
+                "bootstrap": {"mode": "process_supervisor"},
+                "process_groups": [
+                    {"name": "execution.group"},
+                ],
+            }
+        },
+    )
+
+    execute_runtime_artifacts(artifacts)
+
+    assert sync_calls == []
+    assert len(async_calls) == 1
+    assert async_calls[0]["queue_qualifier"] == "execution.asyncio"
 
 
 def test_run_with_sync_runner_closes_scenario_scope_after_execution() -> None:
@@ -3498,10 +3820,6 @@ def test_execute_runtime_artifacts_uses_runtime_lifecycle_for_process_supervisor
             _ = drain_inflight
             events.append("stop")
 
-    class _RootBootstrap:
-        def prepare_root_runtime(self, **_kwargs: object) -> None:
-            events.append("root_bootstrap")
-
     monkeypatch.setattr(builder_module, "run_with_async_runner", lambda **_kwargs: events.append("runner"))
 
     injection = InjectionRegistry()
@@ -3509,15 +3827,6 @@ def test_execute_runtime_artifacts_uses_runtime_lifecycle_for_process_supervisor
         "service",
         RuntimeLifecycleManager,
         lambda: _Lifecycle(),
-    )
-    from stream_kernel.execution.orchestration.control_plane.root.runtime_bootstrap_service import (
-        ControlPlaneRootRuntimeBootstrapService,
-    )
-
-    injection.register_factory(
-        "service",
-        ControlPlaneRootRuntimeBootstrapService,
-        lambda: _RootBootstrap(),
     )
     artifacts = RuntimeBuildArtifacts(
         scenario=type("S", (), {"steps": []})(),
@@ -3541,4 +3850,4 @@ def test_execute_runtime_artifacts_uses_runtime_lifecycle_for_process_supervisor
 
     execute_runtime_artifacts(artifacts)
 
-    assert events == ["root_bootstrap", "start", "ready", "runner", "stop"]
+    assert events == ["start", "ready", "runner", "stop"]

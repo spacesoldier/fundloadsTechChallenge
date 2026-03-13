@@ -42,6 +42,14 @@ class DiscoveryConsumerRegistry(ConsumerRegistry):
         self._ensure_loaded()
         self._registry().register(token, consumers)
 
+    def unregister(self, token: type) -> None:
+        self._ensure_loaded()
+        self._registry().unregister(token)
+
+    def unregister_node(self, name: str) -> None:
+        self._ensure_loaded()
+        self._registry().unregister_node(name)
+
     def _ensure_loaded(self) -> None:
         if self._loaded:
             return

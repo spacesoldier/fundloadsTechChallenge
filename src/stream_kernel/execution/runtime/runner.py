@@ -8,7 +8,10 @@ from threading import Event
 from typing import Callable
 
 from stream_kernel.application_context.inject import inject
+from stream_kernel.application_context.debug_payload import payload_model_name, serialize_debug_value
 from stream_kernel.integration.work_queue import QueuePort
+from stream_kernel.execution.runtime.trace_scope import scoped_trace_id_for_index
+from stream_kernel.execution.runtime.trace_scope import scoped_trace_id_for_source
 from stream_kernel.platform.services.messaging.reply_waiter import TerminalEvent
 from stream_kernel.platform.services.observability import (
     ObservabilityPipelineService,
@@ -22,14 +25,24 @@ from stream_kernel.observability.events import (
     MonitorDispatchEvent,
     TraceDispatchEvent,
 )
+from stream_kernel.observability.domain.debug import DebugMessage
 from stream_kernel.platform.services.runtime.debug_buffer import RuntimeDebugBufferService
+from stream_kernel.platform.services.runtime.debug_buffer import publish_runtime_debug
 from stream_kernel.platform.services.state.context import ContextService
 from stream_kernel.routing.envelope import Envelope
+from stream_kernel.routing.errors import RoutingError, RoutingErrorCode
 from stream_kernel.routing.router import RoutingResult
 from stream_kernel.routing.routing_service import RoutingService
+from stream_kernel.platform.services.runtime.control_plane_events import (
+    ControlPlaneDeferredMessageHoldEvent,
+)
 
 _ORDERED_SINK_MODES = {"completion", "source_seq"}
 _SYNC_IDLE_WAIT = Event()
+_ROOT_LEAF_INGRESS_SOURCE_NODE_NAME = "source:system.cp.root_leaf_ingress"
+_ROOT_LEAF_INGRESS_SOURCE_PREFIX = "source:system.cp.root_leaf_ingress:"
+_LEAF_COMMAND_INGRESS_SOURCE_NODE_NAME = "source:system.cp.command_ingress"
+_LEAF_COMMAND_INGRESS_SOURCE_PREFIX = "source:system.cp.command_ingress:"
 
 
 @dataclass(slots=True)
@@ -52,6 +65,8 @@ class SyncRunner:
     # Framework-level observability gateway (tracing/metrics/logging hooks).
     observability: object = inject.service(ObservabilityService)
     runtime_debug_buffer: object | None = None
+    run_id: str = "run"
+    scenario_id: str = "scenario"
     # Service/system nodes can request full metadata, regular nodes receive filtered view.
     full_context_nodes: set[str] = field(default_factory=set)
     # Sink delivery ordering mode: `completion` (default) or `source_seq`.
@@ -70,6 +85,7 @@ class SyncRunner:
     drain_on_stop: bool = True
     _stop_requested: bool = field(default=False, init=False)
     _last_seen_by_trace: dict[str, float] = field(default_factory=dict, init=False)
+    _source_trace_seq_by_node: dict[str, int] = field(default_factory=dict, init=False)
 
     def request_stop(self) -> None:
         # Graceful stop signal: runner finishes inflight queue when drain_on_stop=True.
@@ -105,6 +121,12 @@ class SyncRunner:
                     self._collect_external_delivery(envelope)
                     continue
                 raise ValueError(f"Unknown node '{node_name}'")
+            self._publish_runner_debug_envelope(
+                event="runtime.runner.dequeued",
+                envelope=envelope,
+                source_node=node_name,
+                stage="run.loop",
+            )
 
             is_sink_node = node_name.startswith("sink:")
             full_ctx = context_service.metadata(envelope.trace_id, full=True)
@@ -129,7 +151,9 @@ class SyncRunner:
             # Pass a copy to the node so it cannot mutate persisted context in-place by accident.
             node_ctx = dict(raw_ctx)
             node = self.nodes[node_name]
-            observability_enabled = not self._is_observability_system_node(node_name)
+            observability_enabled = not (
+                self._is_observability_system_node(node_name)
+            )
             # Observability hooks can keep per-node temporary state (timers, snapshots, counters).
             observer_state = (
                 observability.before_node(
@@ -143,7 +167,7 @@ class SyncRunner:
             )
             try:
                 # Node contract is `(payload, ctx) -> iterable[output]`.
-                outputs = list(node(envelope.payload, node_ctx))
+                outputs = _run_async_blocking(_coerce_node_outputs(node(envelope.payload, node_ctx)))
             except Exception as exc:
                 # Error path is explicitly observable for diagnostics and metrics.
                 if observability_enabled:
@@ -209,10 +233,22 @@ class SyncRunner:
             # Router translates outputs to concrete `(target_node, payload)` deliveries.
             # Envelope trace_id emitted by node output overrides current trace_id if present.
             for output in outputs:
+                resolved_trace_id = self._resolve_output_trace_id(
+                    node_name=node_name,
+                    upstream=envelope,
+                    output=output,
+                )
+                self._seed_generated_source_ingress(
+                    node_name=node_name,
+                    upstream=envelope,
+                    output=output,
+                    trace_id=resolved_trace_id,
+                    context_service=context_service,
+                    work_queue=work_queue,
+                    router=router,
+                )
                 terminal = self._terminal_event_from_output(output)
                 if terminal is not None:
-                    terminal_trace_id = output.trace_id if isinstance(output, Envelope) else None
-                    resolved_trace_id = terminal_trace_id or envelope.trace_id
                     terminal_service_outputs = self._emit_terminal_event(
                         trace_id=resolved_trace_id,
                         terminal=terminal,
@@ -237,7 +273,6 @@ class SyncRunner:
                     )
                     continue
 
-                explicit_trace_id = output.trace_id if isinstance(output, Envelope) else None
                 explicit_reply_to = output.reply_to if isinstance(output, Envelope) else None
                 explicit_span_id = output.span_id if isinstance(output, Envelope) else None
                 explicit_tombstone = output.tombstone if isinstance(output, Envelope) else False
@@ -252,7 +287,7 @@ class SyncRunner:
                         envelope_out = Envelope(
                             payload=output.payload,
                             target=target_name,
-                            trace_id=explicit_trace_id or envelope.trace_id,
+                            trace_id=resolved_trace_id,
                             reply_to=explicit_reply_to or envelope.reply_to,
                             span_id=explicit_span_id or produced_span_id,
                             tombstone=downstream_tombstone,
@@ -260,24 +295,40 @@ class SyncRunner:
                         if self.allow_external_deliveries and target_name not in self.nodes:
                             self._collect_external_delivery(envelope_out)
                             continue
-                        work_queue.push(envelope_out)
+                        self._queue_push(
+                            work_queue=work_queue,
+                            envelope=envelope_out,
+                            source_node=node_name,
+                            stage="explicit_target",
+                        )
                     continue
                 try:
                     routing_result = router.route([output], source=node_name)
-                except ValueError as exc:
-                    if self.allow_external_deliveries and "No consumers registered" in str(exc):
+                except RoutingError as exc:
+                    if self.allow_external_deliveries and exc.code == RoutingErrorCode.NO_CONSUMERS:
                         self._collect_terminal_output(
                             Envelope(
                                 payload=output.payload if isinstance(output, Envelope) else output,
-                                trace_id=explicit_trace_id or envelope.trace_id,
+                                trace_id=resolved_trace_id,
                                 reply_to=explicit_reply_to or envelope.reply_to,
                                 span_id=explicit_span_id or produced_span_id,
                                 tombstone=bool(explicit_tombstone or envelope.tombstone),
                             )
                         )
                         continue
+                    if exc.code == RoutingErrorCode.NO_CONSUMERS and self._defer_unroutable_output(
+                        payload=output.payload if isinstance(output, Envelope) else output,
+                        source_node=node_name,
+                        trace_id=resolved_trace_id,
+                        reply_to=explicit_reply_to or envelope.reply_to,
+                        span_id=explicit_span_id or produced_span_id,
+                        tombstone=bool(explicit_tombstone or envelope.tombstone),
+                        work_queue=work_queue,
+                        router=router,
+                    ):
+                        continue
                     raise
-                downstream_trace_id = explicit_trace_id or envelope.trace_id
+                downstream_trace_id = resolved_trace_id
                 downstream_reply_to = explicit_reply_to or envelope.reply_to
                 downstream_span_id = explicit_span_id or produced_span_id
                 downstream_tombstone = bool(explicit_tombstone or envelope.tombstone)
@@ -293,7 +344,12 @@ class SyncRunner:
                     if self.allow_external_deliveries and target_name not in self.nodes:
                         self._collect_external_delivery(envelope_out)
                         continue
-                    work_queue.push(envelope_out)
+                    self._queue_push(
+                        work_queue=work_queue,
+                        envelope=envelope_out,
+                        source_node=node_name,
+                        stage="router.local_delivery",
+                    )
 
     def on_run_end(self) -> None:
         # Finalize observability lifecycle once run loop is completed.
@@ -344,6 +400,145 @@ class SyncRunner:
         if callable(getattr(candidate, "publish", None)) and callable(getattr(candidate, "drain", None)):
             return candidate  # type: ignore[return-value]
         return None
+
+    def _publish_runner_debug_envelope(
+        self,
+        *,
+        event: str,
+        envelope: Envelope,
+        source_node: str | None = None,
+        stage: str | None = None,
+    ) -> None:
+        if not self._should_emit_runner_debug_envelope(envelope=envelope, source_node=source_node):
+            return
+        target = envelope.target
+        target_label = ",".join(target) if isinstance(target, tuple) else target
+        fields: dict[str, object] = {
+            "event": event,
+            "target": target_label,
+            "trace_id": envelope.trace_id,
+            "reply_to": envelope.reply_to,
+            "span_id": envelope.span_id,
+            "tombstone": bool(envelope.tombstone),
+            "payload_model": payload_model_name(envelope.payload),
+            "payload": serialize_debug_value(envelope.payload),
+        }
+        if isinstance(source_node, str) and source_node:
+            fields["source_node"] = source_node
+            fields["node_role"] = SyncRunner._node_role(source_node)
+            source_worker_id, source_lane = SyncRunner._source_lane_meta(source_node)
+            if isinstance(source_worker_id, str) and source_worker_id:
+                fields["source_worker_id"] = source_worker_id
+            if isinstance(source_lane, str) and source_lane:
+                fields["source_lane"] = source_lane
+        target_role = SyncRunner._target_role(target)
+        if isinstance(target_role, str) and target_role:
+            fields["target_role"] = target_role
+        if isinstance(stage, str) and stage:
+            fields["stage"] = stage
+        queue_depth = self._queue_depth_safe()
+        if queue_depth is not None:
+            fields["queue_depth"] = queue_depth
+        buffer = self._runtime_debug_buffer()
+        if buffer is None:
+            return
+        publish_runtime_debug(
+            buffer=buffer,
+            event=event,
+            source="stream_kernel.execution.runtime.runner",
+            fields=fields,
+            trace_id=envelope.trace_id,
+        )
+
+    def _should_emit_runner_debug_envelope(
+        self,
+        *,
+        envelope: Envelope,
+        source_node: str | None,
+    ) -> bool:
+        payload = envelope.payload
+        if isinstance(payload, (DebugMessage, DebugDispatchEvent)):
+            return False
+        target = envelope.target
+        if isinstance(target, str) and target.startswith("system.debug."):
+            return False
+        if isinstance(source_node, str) and source_node.startswith("system.debug."):
+            return False
+        return True
+
+    def _queue_depth_safe(self) -> int | None:
+        try:
+            size_fn = getattr(self._work_queue(), "size", None)
+            if not callable(size_fn):
+                return None
+            depth = size_fn()
+            return int(depth) if isinstance(depth, int) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _node_role(node_name: str | None) -> str:
+        if not isinstance(node_name, str) or not node_name:
+            return "unknown"
+        if node_name.startswith("source:"):
+            return "source"
+        if node_name.startswith("sink:"):
+            return "sink"
+        if node_name.startswith("system."):
+            return "system"
+        return "business"
+
+    @staticmethod
+    def _target_role(target: str | tuple[str, ...] | None) -> str | None:
+        if isinstance(target, str):
+            return SyncRunner._node_role(target)
+        if isinstance(target, tuple) and target:
+            first = target[0]
+            if isinstance(first, str) and first:
+                return SyncRunner._node_role(first)
+        return None
+
+    @staticmethod
+    def _source_lane_meta(source_node: str | None) -> tuple[str | None, str | None]:
+        if not isinstance(source_node, str) or not source_node:
+            return (None, None)
+        if source_node.startswith(_ROOT_LEAF_INGRESS_SOURCE_PREFIX):
+            suffix = source_node[len(_ROOT_LEAF_INGRESS_SOURCE_PREFIX) :]
+            if not suffix:
+                return (None, None)
+            worker_id, sep, lane = suffix.rpartition(":")
+            if not sep:
+                lane_value = suffix.strip().lower()
+                if not lane_value:
+                    return (None, None)
+                return (None, lane_value)
+            worker = worker_id.strip()
+            lane_value = lane.strip().lower()
+            if not worker or not lane_value:
+                return (None, None)
+            return (worker, lane_value)
+        if source_node.startswith(_LEAF_COMMAND_INGRESS_SOURCE_PREFIX):
+            lane = source_node[len(_LEAF_COMMAND_INGRESS_SOURCE_PREFIX) :].strip().lower()
+            if not lane:
+                return (None, None)
+            return (None, lane)
+        return (None, None)
+
+    def _queue_push(
+        self,
+        *,
+        work_queue: QueuePort,
+        envelope: Envelope,
+        source_node: str | None,
+        stage: str | None,
+    ) -> None:
+        work_queue.push(envelope)
+        self._publish_runner_debug_envelope(
+            event="runtime.runner.enqueued",
+            envelope=envelope,
+            source_node=source_node,
+            stage=stage,
+        )
 
     @staticmethod
     def _local_deliveries(route_result: object) -> list[tuple[str, object]]:
@@ -397,8 +592,88 @@ class SyncRunner:
 
     @staticmethod
     def _trace_id(*, run_id: str, index: int) -> str:
-        # Stable trace id format for reproducible runs.
-        return f"{run_id}:{index}"
+        # Stable trace id format, scoped by process run instance when enabled.
+        return scoped_trace_id_for_index(run_id=run_id, index=index)
+
+    def _resolve_output_trace_id(
+        self,
+        *,
+        node_name: str,
+        upstream: Envelope,
+        output: object,
+    ) -> str | None:
+        explicit = output.trace_id if isinstance(output, Envelope) else None
+        if isinstance(explicit, str) and explicit:
+            return explicit
+        inherited = upstream.trace_id if isinstance(upstream.trace_id, str) and upstream.trace_id else None
+        if inherited is not None:
+            return inherited
+        if not node_name.startswith("source:"):
+            return None
+        if isinstance(output, Envelope):
+            target = output.target
+            if isinstance(target, str) and target == node_name:
+                # Source self-reschedule control envelopes do not open new traces.
+                return None
+        role = node_name.split("source:", 1)[1] if ":" in node_name else node_name
+        next_seq = self._source_trace_seq_by_node.get(node_name, 0) + 1
+        self._source_trace_seq_by_node[node_name] = next_seq
+        scoped_run_id = self.run_id if isinstance(self.run_id, str) and self.run_id else "run"
+        return scoped_trace_id_for_source(
+            run_id=scoped_run_id,
+            role=role,
+            sequence=next_seq,
+        )
+
+    def _seed_generated_source_ingress(
+        self,
+        *,
+        node_name: str,
+        upstream: Envelope,
+        output: object,
+        trace_id: str | None,
+        context_service: ContextService,
+        work_queue: QueuePort,
+        router: RoutingService,
+    ) -> None:
+        if not node_name.startswith("source:"):
+            return
+        if not isinstance(trace_id, str) or not trace_id:
+            return
+        if isinstance(upstream.trace_id, str) and upstream.trace_id:
+            return
+        if SyncRunner._terminal_event_from_output(output) is not None:
+            return
+        if isinstance(output, Envelope):
+            target = output.target
+            if isinstance(target, str) and target == node_name:
+                return
+        payload = output.payload if isinstance(output, Envelope) else output
+        output_reply_to = output.reply_to if isinstance(output, Envelope) else None
+        reply_to = output_reply_to if isinstance(output_reply_to, str) and output_reply_to else upstream.reply_to
+        SyncRunner._seed_context(
+            context_service=context_service,
+            trace_id=trace_id,
+            payload=payload,
+            run_id=self.run_id if isinstance(self.run_id, str) and self.run_id else "run",
+            scenario_id=self.scenario_id if isinstance(self.scenario_id, str) and self.scenario_id else "scenario",
+            reply_to=reply_to,
+        )
+        ingress_service_outputs = self._emit_ingress(
+            trace_id=trace_id,
+            reply_to=reply_to,
+        )
+        output_tombstone = output.tombstone if isinstance(output, Envelope) else False
+        self._route_observability_service_outputs(
+            service_outputs=ingress_service_outputs,
+            source_node="__ingress__",
+            trace_id=trace_id,
+            reply_to=reply_to,
+            span_id=None,
+            tombstone=bool(output_tombstone or upstream.tombstone),
+            work_queue=work_queue,
+            router=router,
+        )
 
     def _emit_ingress(
         self,
@@ -496,12 +771,39 @@ class SyncRunner:
                     if self.allow_external_deliveries and target_name not in self.nodes:
                         self._collect_external_delivery(envelope_out)
                         continue
-                    work_queue.push(envelope_out)
+                    self._queue_push(
+                        work_queue=work_queue,
+                        envelope=envelope_out,
+                        source_node=source_node,
+                        stage="observability.explicit_target",
+                    )
                 continue
             try:
                 routing_result = router.route([output], source=source_node)
-            except ValueError as exc:
-                if self.allow_external_deliveries and "No consumers registered" in str(exc):
+            except RoutingError as exc:
+                if self.allow_external_deliveries and exc.code == RoutingErrorCode.NO_CONSUMERS:
+                    self._collect_terminal_output(
+                        Envelope(
+                            payload=output.payload if isinstance(output, Envelope) else output,
+                            trace_id=explicit_trace_id or trace_id,
+                            reply_to=explicit_reply_to or reply_to,
+                            span_id=explicit_span_id or span_id,
+                            tombstone=bool(explicit_tombstone or tombstone),
+                        )
+                    )
+                    continue
+                if exc.code == RoutingErrorCode.NO_CONSUMERS and self._defer_unroutable_output(
+                    payload=output.payload if isinstance(output, Envelope) else output,
+                    source_node=source_node,
+                    trace_id=explicit_trace_id or trace_id,
+                    reply_to=explicit_reply_to or reply_to,
+                    span_id=explicit_span_id or span_id,
+                    tombstone=bool(explicit_tombstone or tombstone),
+                    work_queue=work_queue,
+                    router=router,
+                ):
+                    continue
+                if exc.code == RoutingErrorCode.NO_CONSUMERS:
                     self._collect_terminal_output(
                         Envelope(
                             payload=output.payload if isinstance(output, Envelope) else output,
@@ -529,7 +831,12 @@ class SyncRunner:
                 if self.allow_external_deliveries and target_name not in self.nodes:
                     self._collect_external_delivery(envelope_out)
                     continue
-                work_queue.push(envelope_out)
+                self._queue_push(
+                    work_queue=work_queue,
+                    envelope=envelope_out,
+                    source_node=source_node,
+                    stage="observability.router.local_delivery",
+                )
 
     def _route_runtime_debug_messages(
         self,
@@ -591,6 +898,47 @@ class SyncRunner:
             self.external_deliveries.append(envelope)
         if isinstance(self.boundary_outputs, list):
             self.boundary_outputs.append(envelope)
+
+    def _defer_unroutable_output(
+        self,
+        *,
+        payload: object,
+        source_node: str,
+        trace_id: str | None,
+        reply_to: str | None,
+        span_id: str | None,
+        tombstone: bool,
+        work_queue: QueuePort,
+        router: RoutingService,
+    ) -> bool:
+        hold_event = ControlPlaneDeferredMessageHoldEvent(
+            payload=payload,
+            source_node=source_node,
+        )
+        try:
+            routing_result = router.route([hold_event], source=source_node)
+        except RoutingError as exc:
+            if exc.code == RoutingErrorCode.NO_CONSUMERS:
+                return False
+            raise
+        deliveries = SyncRunner._local_deliveries(routing_result)
+        if not deliveries:
+            return False
+        for target_name, routed_payload in deliveries:
+            self._queue_push(
+                work_queue=work_queue,
+                envelope=Envelope(
+                    payload=routed_payload,
+                    target=target_name,
+                    trace_id=trace_id,
+                    reply_to=reply_to,
+                    span_id=span_id,
+                    tombstone=tombstone,
+                ),
+                source_node=source_node,
+                stage="router.defer.no_consumers",
+            )
+        return True
 
     def _collect_terminal_output(self, envelope: Envelope) -> None:
         if isinstance(self.terminal_outputs, list):
@@ -663,6 +1011,8 @@ class AsyncRunner:
     context_service: object = inject.service(ContextService)
     observability: object = inject.service(ObservabilityService)
     runtime_debug_buffer: object | None = None
+    run_id: str = "run"
+    scenario_id: str = "scenario"
     full_context_nodes: set[str] = field(default_factory=set)
     ordered_sink_mode: str = "completion"
     allow_external_deliveries: bool = False
@@ -673,6 +1023,7 @@ class AsyncRunner:
     drain_on_stop: bool = True
     _stop_requested: bool = field(default=False, init=False)
     _last_seen_by_trace: dict[str, float] = field(default_factory=dict, init=False)
+    _source_trace_seq_by_node: dict[str, int] = field(default_factory=dict, init=False)
 
     def run(self) -> None:
         _run_async_blocking(self.run_async())
@@ -714,6 +1065,12 @@ class AsyncRunner:
                     self._collect_external_delivery(envelope)
                     continue
                 raise ValueError(f"Unknown node '{node_name}'")
+            self._publish_runner_debug_envelope(
+                event="runtime.runner.dequeued",
+                envelope=envelope,
+                source_node=node_name,
+                stage="run_async.loop",
+            )
 
             is_sink_node = node_name.startswith("sink:")
             full_ctx = context_service.metadata(envelope.trace_id, full=True)
@@ -736,7 +1093,9 @@ class AsyncRunner:
             self._enrich_observability_ctx(envelope, observability_ctx)
             node_ctx = dict(raw_ctx)
             node = self.nodes[node_name]
-            observability_enabled = not SyncRunner._is_observability_system_node(node_name)
+            observability_enabled = not (
+                SyncRunner._is_observability_system_node(node_name)
+            )
             observer_state = (
                 await _maybe_await(
                     observability.before_node(
@@ -773,6 +1132,15 @@ class AsyncRunner:
                     work_queue=work_queue,
                     router=router,
                 )
+                await self._route_runtime_debug_messages_async(
+                    source_node=node_name,
+                    trace_id=envelope.trace_id,
+                    reply_to=envelope.reply_to,
+                    span_id=SyncRunner._span_id_from_observer_state(observer_state),
+                    tombstone=bool(envelope.tombstone),
+                    work_queue=work_queue,
+                    router=router,
+                )
                 raise
             produced_span_id = SyncRunner._span_id_from_observer_state(observer_state)
             if observability_enabled:
@@ -796,12 +1164,33 @@ class AsyncRunner:
                     work_queue=work_queue,
                     router=router,
                 )
+            await self._route_runtime_debug_messages_async(
+                source_node=node_name,
+                trace_id=envelope.trace_id,
+                reply_to=envelope.reply_to,
+                span_id=produced_span_id,
+                tombstone=bool(envelope.tombstone),
+                work_queue=work_queue,
+                router=router,
+            )
 
             for output in outputs:
+                resolved_trace_id = self._resolve_output_trace_id(
+                    node_name=node_name,
+                    upstream=envelope,
+                    output=output,
+                )
+                self._seed_generated_source_ingress(
+                    node_name=node_name,
+                    upstream=envelope,
+                    output=output,
+                    trace_id=resolved_trace_id,
+                    context_service=context_service,
+                    work_queue=work_queue,
+                    router=router,
+                )
                 terminal = SyncRunner._terminal_event_from_output(output)
                 if terminal is not None:
-                    terminal_trace_id = output.trace_id if isinstance(output, Envelope) else None
-                    resolved_trace_id = terminal_trace_id or envelope.trace_id
                     terminal_service_outputs = self._emit_terminal_event(
                         trace_id=resolved_trace_id,
                         terminal=terminal,
@@ -826,7 +1215,6 @@ class AsyncRunner:
                     )
                     continue
 
-                explicit_trace_id = output.trace_id if isinstance(output, Envelope) else None
                 explicit_reply_to = output.reply_to if isinstance(output, Envelope) else None
                 explicit_span_id = output.span_id if isinstance(output, Envelope) else None
                 explicit_tombstone = output.tombstone if isinstance(output, Envelope) else False
@@ -841,7 +1229,7 @@ class AsyncRunner:
                         envelope_out = Envelope(
                             payload=output.payload,
                             target=target_name,
-                            trace_id=explicit_trace_id or envelope.trace_id,
+                            trace_id=resolved_trace_id,
                             reply_to=explicit_reply_to or envelope.reply_to,
                             span_id=explicit_span_id or produced_span_id,
                             tombstone=downstream_tombstone,
@@ -849,24 +1237,40 @@ class AsyncRunner:
                         if self.allow_external_deliveries and target_name not in self.nodes:
                             self._collect_external_delivery(envelope_out)
                             continue
-                        work_queue.push(envelope_out)
+                        self._queue_push(
+                            work_queue=work_queue,
+                            envelope=envelope_out,
+                            source_node=node_name,
+                            stage="async.explicit_target",
+                        )
                     continue
                 try:
                     routing_result = router.route([output], source=node_name)
-                except ValueError as exc:
-                    if self.allow_external_deliveries and "No consumers registered" in str(exc):
+                except RoutingError as exc:
+                    if self.allow_external_deliveries and exc.code == RoutingErrorCode.NO_CONSUMERS:
                         self._collect_terminal_output(
                             Envelope(
                                 payload=output.payload if isinstance(output, Envelope) else output,
-                                trace_id=explicit_trace_id or envelope.trace_id,
+                                trace_id=resolved_trace_id,
                                 reply_to=explicit_reply_to or envelope.reply_to,
                                 span_id=explicit_span_id or produced_span_id,
                                 tombstone=bool(explicit_tombstone or envelope.tombstone),
                             )
                         )
                         continue
+                    if exc.code == RoutingErrorCode.NO_CONSUMERS and self._defer_unroutable_output(
+                        payload=output.payload if isinstance(output, Envelope) else output,
+                        source_node=node_name,
+                        trace_id=resolved_trace_id,
+                        reply_to=explicit_reply_to or envelope.reply_to,
+                        span_id=explicit_span_id or produced_span_id,
+                        tombstone=bool(explicit_tombstone or envelope.tombstone),
+                        work_queue=work_queue,
+                        router=router,
+                    ):
+                        continue
                     raise
-                downstream_trace_id = explicit_trace_id or envelope.trace_id
+                downstream_trace_id = resolved_trace_id
                 downstream_reply_to = explicit_reply_to or envelope.reply_to
                 downstream_span_id = explicit_span_id or produced_span_id
                 downstream_tombstone = bool(explicit_tombstone or envelope.tombstone)
@@ -882,7 +1286,12 @@ class AsyncRunner:
                     if self.allow_external_deliveries and target_name not in self.nodes:
                         self._collect_external_delivery(envelope_out)
                         continue
-                    work_queue.push(envelope_out)
+                    self._queue_push(
+                        work_queue=work_queue,
+                        envelope=envelope_out,
+                        source_node=node_name,
+                        stage="async.router.local_delivery",
+                    )
 
     async def run_until_stopped_async(
         self,
@@ -948,6 +1357,53 @@ class AsyncRunner:
     def _runtime_debug_buffer(self) -> RuntimeDebugBufferService | None:
         return SyncRunner._runtime_debug_buffer(self)  # type: ignore[misc]
 
+    def _publish_runner_debug_envelope(
+        self,
+        *,
+        event: str,
+        envelope: Envelope,
+        source_node: str | None = None,
+        stage: str | None = None,
+    ) -> None:
+        SyncRunner._publish_runner_debug_envelope(
+            self,
+            event=event,
+            envelope=envelope,
+            source_node=source_node,
+            stage=stage,
+        )
+
+    def _should_emit_runner_debug_envelope(
+        self,
+        *,
+        envelope: Envelope,
+        source_node: str | None,
+    ) -> bool:
+        return SyncRunner._should_emit_runner_debug_envelope(
+            self,
+            envelope=envelope,
+            source_node=source_node,
+        )
+
+    def _queue_depth_safe(self) -> int | None:
+        return SyncRunner._queue_depth_safe(self)
+
+    def _queue_push(
+        self,
+        *,
+        work_queue: QueuePort,
+        envelope: Envelope,
+        source_node: str | None,
+        stage: str | None,
+    ) -> None:
+        SyncRunner._queue_push(
+            self,
+            work_queue=work_queue,
+            envelope=envelope,
+            source_node=source_node,
+            stage=stage,
+        )
+
     def _emit_ingress(
         self,
         *,
@@ -963,6 +1419,42 @@ class AsyncRunner:
         terminal: TerminalEvent | None,
     ) -> object | None:
         return self._observability().on_terminal_event(trace_id=trace_id, terminal_event=terminal)
+
+    def _resolve_output_trace_id(
+        self,
+        *,
+        node_name: str,
+        upstream: Envelope,
+        output: object,
+    ) -> str | None:
+        return SyncRunner._resolve_output_trace_id(
+            self,
+            node_name=node_name,
+            upstream=upstream,
+            output=output,
+        )
+
+    def _seed_generated_source_ingress(
+        self,
+        *,
+        node_name: str,
+        upstream: Envelope,
+        output: object,
+        trace_id: str | None,
+        context_service: ContextService,
+        work_queue: QueuePort,
+        router: RoutingService,
+    ) -> None:
+        SyncRunner._seed_generated_source_ingress(
+            self,
+            node_name=node_name,
+            upstream=upstream,
+            output=output,
+            trace_id=trace_id,
+            context_service=context_service,
+            work_queue=work_queue,
+            router=router,
+        )
 
     def __post_init__(self) -> None:
         if self.ordered_sink_mode not in _ORDERED_SINK_MODES:
@@ -1049,6 +1541,30 @@ class AsyncRunner:
         if isinstance(self.boundary_outputs, list):
             self.boundary_outputs.append(envelope)
 
+    def _defer_unroutable_output(
+        self,
+        *,
+        payload: object,
+        source_node: str,
+        trace_id: str | None,
+        reply_to: str | None,
+        span_id: str | None,
+        tombstone: bool,
+        work_queue: QueuePort,
+        router: RoutingService,
+    ) -> bool:
+        return SyncRunner._defer_unroutable_output(
+            self,  # type: ignore[arg-type]
+            payload=payload,
+            source_node=source_node,
+            trace_id=trace_id,
+            reply_to=reply_to,
+            span_id=span_id,
+            tombstone=tombstone,
+            work_queue=work_queue,
+            router=router,
+        )
+
     def _collect_terminal_output(self, envelope: Envelope) -> None:
         if isinstance(self.terminal_outputs, list):
             self.terminal_outputs.append(envelope)
@@ -1073,7 +1589,6 @@ class AsyncRunner:
         if prev is None:
             return
         observability_ctx["__runner_gap_ms"] = (now - prev) * 1000.0
-
 
 async def _coerce_node_outputs(raw: object) -> list[object]:
     resolved = await _maybe_await(raw)

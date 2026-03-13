@@ -149,22 +149,21 @@ class LocalExecutionWorkerLifecycleService(ExecutionWorkerLifecycleService):
         if handle is None:
             return False
         process = handle.process
+        _ = terminate_timeout_seconds
+        if handle.stop_event is not None:
+            setter = getattr(handle.stop_event, "set", None)
+            if callable(setter):
+                setter()
+        if process.is_alive():
+            process.join(timeout=max(0.0, float(graceful_timeout_seconds)))
+        if process.is_alive():
+            return False
         try:
-            if handle.stop_event is not None:
-                setter = getattr(handle.stop_event, "set", None)
-                if callable(setter):
-                    setter()
-            if process.is_alive():
-                process.join(timeout=max(0.0, float(graceful_timeout_seconds)))
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=max(0.0, float(terminate_timeout_seconds)))
-            return True
-        finally:
-            # Always release process-local resources even when stop/join fails.
             _close_pipe(handle.control_parent)
             _close_optional(handle.stop_event)
+        finally:
             self._worker_store().delete(target_id)
+        return True
 
     def snapshot(self) -> dict[str, dict[str, object]]:
         snapshot: dict[str, dict[str, object]] = {}

@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Topology UI</title>
+  <style>
+    :root {
+      --bg: #0a0f19;
+      --panel: #0f1726;
+      --line: #2c3f60;
+      --fg: #d8e1f0;
+      --muted: #8ea0c1;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: linear-gradient(160deg, #060a14 0%, #0d1426 100%);
+      color: var(--fg);
+      font: 13px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: 380px 1fr;
+      gap: 10px;
+      height: 100vh;
+      padding: 10px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px;
+      overflow: auto;
+    }
+    input, button {
+      width: 100%;
+      margin-top: 6px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #0b1323;
+      color: var(--fg);
+      padding: 7px 8px;
+    }
+    button { cursor: pointer; background: #1b2c49; }
+    button:hover { background: #23406a; }
+    .meta { color: var(--muted); margin-top: 8px; }
+    .reports {
+      margin-top: 10px;
+      max-height: 36vh;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .reports li { padding: 6px 8px; border-bottom: 1px solid #20324d; }
+    .reports a { color: #9dc2ff; text-decoration: none; }
+    .canvas-wrap {
+      position: relative;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+      background: radial-gradient(circle at 20% 20%, #15213b, #0c1324 70%);
+      height: 100%;
+    }
+    svg { width: 100%; height: 100%; display: block; }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <div class="panel">
+      <h2>Topology UI</h2>
+      <div class="meta"><a href="/debug-vitrine" style="color:#9dc2ff">Open Runtime Debug Vitrine</a></div>
+      <label>Config path</label>
+      <input id="cfg" value="src/fund_load/experiment_config_newgen_multiprocess_jaeger.yml"/>
+      <button id="reload">Reload topology</button>
+      <div class="meta" id="meta"></div>
+      <h3>Run reports</h3>
+      <div class="meta" id="reportsDir"></div>
+      <ul class="reports" id="reports"></ul>
+    </div>
+    <div class="panel canvas-wrap">
+      <svg id="topo" viewBox="0 0 3000 1800">
+        <defs>
+          <marker id="arr" markerWidth="10" markerHeight="8" refX="8" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 z" fill="#7f95bc"></path>
+          </marker>
+        </defs>
+        <g id="vp"></g>
+      </svg>
+    </div>
+  </div>
+<script>
+(() => {
+  const cfgEl = document.getElementById("cfg");
+  const reloadBtn = document.getElementById("reload");
+  const metaEl = document.getElementById("meta");
+  const reportsDirEl = document.getElementById("reportsDir");
+  const reportsEl = document.getElementById("reports");
+  const svg = document.getElementById("topo");
+  const vp = document.getElementById("vp");
+
+  function clear() {
+    while (vp.firstChild) vp.removeChild(vp.firstChild);
+  }
+  function addBox(x, y, w, h, label) {
+    const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    const r = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+    const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    r.setAttribute("x", x); r.setAttribute("y", y);
+    r.setAttribute("width", w); r.setAttribute("height", h);
+    r.setAttribute("rx", 10); r.setAttribute("ry", 10);
+    r.setAttribute("fill", "#101a2c");
+    r.setAttribute("stroke", "#3a4f73");
+    t.setAttribute("x", x + 10); t.setAttribute("y", y + 20);
+    t.setAttribute("fill", "#dce7fb");
+    t.setAttribute("font-size", "12");
+    t.textContent = label;
+    g.appendChild(r); g.appendChild(t);
+    vp.appendChild(g);
+    return {x: x + w / 2, y: y + h / 2};
+  }
+  function addEdge(a, b, color="#8096bd") {
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", a.x); line.setAttribute("y1", a.y);
+    line.setAttribute("x2", b.x); line.setAttribute("y2", b.y);
+    line.setAttribute("stroke", color);
+    line.setAttribute("stroke-width", "1.1");
+    line.setAttribute("marker-end", "url(#arr)");
+    vp.insertBefore(line, vp.firstChild);
+  }
+
+  async function loadReports() {
+    const res = await fetch("/api/reports");
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.detail || "reports failed");
+    reportsDirEl.textContent = `dir: ${body.reports_dir || "-"}`;
+    reportsEl.innerHTML = "";
+    for (const rep of body.reports || []) {
+      const li = document.createElement("li");
+      li.innerHTML = `<a target="_blank" rel="noopener" href="/reports/${encodeURIComponent(rep.name)}">${rep.name}</a> <span style="color:#8ea0c1">(${rep.size_bytes} bytes)</span>`;
+      reportsEl.appendChild(li);
+    }
+  }
+
+  async function loadTopology() {
+    const cfg = cfgEl.value.trim();
+    const res = await fetch(`/api/topology?config_path=${encodeURIComponent(cfg)}`);
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.detail || "topology failed");
+    clear();
+    metaEl.textContent = `processes=${body.meta.process_count}, pipes=${body.meta.pipe_count}, transport=${body.meta.transport}`;
+
+    const positions = new Map();
+    const processes = body.processes || [];
+    const root = processes.find((p) => p.process_id === "root");
+    const leaves = processes.filter((p) => p.process_id !== "root");
+
+    if (root) {
+      positions.set(root.process_id, addBox(1260, 40, 480, 180, `${root.process_id} [${root.group_name}]`));
+    }
+    const cols = Math.max(1, Math.ceil(Math.sqrt(leaves.length || 1)));
+    leaves.forEach((proc, i) => {
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const x = 80 + col * 520;
+      const y = 300 + row * 250;
+      positions.set(proc.process_id, addBox(x, y, 480, 180, `${proc.process_id} [${proc.group_name}]`));
+    });
+    for (const pipe of body.pipes || []) {
+      const a = positions.get(pipe.from_process);
+      const b = positions.get(pipe.to_process);
+      if (!a || !b) continue;
+      addEdge(a, b, "#9da6ff");
+    }
+  }
+
+  reloadBtn.addEventListener("click", async () => {
+    try {
+      await loadTopology();
+      await loadReports();
+    } catch (err) {
+      alert(`load failed: ${err.message}`);
+    }
+  });
+
+  loadTopology().catch((err) => alert(`initial topology failed: ${err.message}`));
+  loadReports().catch((err) => alert(`initial reports failed: ${err.message}`));
+})();
+</script>
+</body>
+</html>
+

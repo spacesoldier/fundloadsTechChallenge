@@ -65,7 +65,7 @@ class _RootLeafCommands:
 
 
 @dataclass(slots=True)
-class _RootReplyIngress:
+class _RootLeafIngress:
     protocol_revision_calls: list[int] = field(default_factory=list)
 
     def configure_startup_protocol_revision(self, revision: int) -> None:
@@ -249,13 +249,13 @@ def test_root_runtime_bootstrap_service_configures_boundary_handoff_and_control_
     router = _ProcessGroupRouter()
     handoff = _RootBoundaryHandoff()
     commands = _RootLeafCommands()
-    reply_ingress = _RootReplyIngress()
+    leaf_ingress = _RootLeafIngress()
     service = DefaultControlPlaneRootRuntimeBootstrapService(
         lifecycle=lifecycle,
         process_group_router=router,
         root_boundary_handoff=handoff,
         root_leaf_commands=commands,
-        root_reply_ingress=reply_ingress,
+        root_leaf_ingress=leaf_ingress,
     )
     runtime = {
         "platform": {
@@ -288,7 +288,7 @@ def test_root_runtime_bootstrap_service_configures_boundary_handoff_and_control_
     ]
     assert commands.poll_calls
     assert abs(commands.poll_calls[-1] - 0.001) < 1e-9
-    assert reply_ingress.protocol_revision_calls == [2]
+    assert leaf_ingress.protocol_revision_calls == [2]
 
 
 def test_root_runtime_bootstrap_service_defaults_to_snapshot_protocol_v3() -> None:
@@ -298,11 +298,11 @@ def test_root_runtime_bootstrap_service_defaults_to_snapshot_protocol_v3() -> No
 
     lifecycle = _LifecycleService()
     router = _ProcessGroupRouter()
-    reply_ingress = _RootReplyIngress()
+    leaf_ingress = _RootLeafIngress()
     service = DefaultControlPlaneRootRuntimeBootstrapService(
         lifecycle=lifecycle,
         process_group_router=router,
-        root_reply_ingress=reply_ingress,
+        root_leaf_ingress=leaf_ingress,
     )
     runtime = {
         "platform": {
@@ -319,7 +319,7 @@ def test_root_runtime_bootstrap_service_defaults_to_snapshot_protocol_v3() -> No
         discovery_modules=["fund_load"],
     )
 
-    assert reply_ingress.protocol_revision_calls == [3]
+    assert leaf_ingress.protocol_revision_calls == [3]
 
 
 def test_root_runtime_bootstrap_service_preloads_route_table_snapshot_from_process_groups() -> None:

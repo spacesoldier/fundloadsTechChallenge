@@ -9,6 +9,23 @@ import pytest
 # docs/framework/initial_stage/Routing semantics.md
 from stream_kernel.platform.services.state.context import InMemoryKvContextService
 from stream_kernel.platform.services.observability import NoOpObservabilityService
+from stream_kernel.platform.services.runtime.control_plane_consumer_registry import (
+    InMemoryControlPlaneDynamicConsumerRoutingService,
+)
+from stream_kernel.platform.services.runtime.control_plane_deferred_message import (
+    InMemoryControlPlaneDeferredMessageService,
+)
+from stream_kernel.platform.services.runtime.control_plane_events import (
+    ControlPlaneConsumerBindingRecord,
+    ControlPlaneConsumerRegistryBindingsApplyEvent,
+    ControlPlaneDeferredMessageHoldEvent,
+    ControlPlaneDeferredMessageReplayRequestEvent,
+)
+from stream_kernel.execution.orchestration.control_plane.consumer_registry_nodes import (
+    ControlPlaneConsumerRegistryBindingsApplyNode,
+    ControlPlaneDeferredMessageHoldNode,
+    ControlPlaneDeferredMessageReplayNode,
+)
 from stream_kernel.execution.runtime.runner import SyncRunner
 from stream_kernel.integration.consumer_registry import InMemoryConsumerRegistry
 from stream_kernel.integration.kv_store import InMemoryKvStore
@@ -24,6 +41,11 @@ class X:
 
 @dataclass(frozen=True, slots=True)
 class Y:
+    value: str
+
+
+@dataclass(frozen=True, slots=True)
+class StartupMessage:
     value: str
 
 
@@ -243,3 +265,76 @@ def test_runner_requires_explicit_target_for_single_self_consumer_in_strict_mode
 
     with pytest.raises(ValueError):
         runner.run()
+
+
+def test_runner_replays_deferred_messages_after_consumer_binding_is_applied() -> None:
+    seen: list[StartupMessage] = []
+
+    def producer(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = (payload, ctx)
+        return [StartupMessage("startup")]
+
+    def sink(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = ctx
+        if isinstance(payload, StartupMessage):
+            seen.append(payload)
+        return []
+
+    registry = InMemoryConsumerRegistry(
+        {
+            ControlPlaneConsumerRegistryBindingsApplyEvent: [
+                "system.cp.consumer_registry_bindings_apply"
+            ],
+            ControlPlaneDeferredMessageHoldEvent: ["system.cp.deferred_message_hold"],
+            ControlPlaneDeferredMessageReplayRequestEvent: [
+                "system.cp.deferred_message_replay"
+            ],
+        }
+    )
+    kv_store = InMemoryKvStore()
+    dynamic_routing = InMemoryControlPlaneDynamicConsumerRoutingService(
+        registry=registry,
+        store=kv_store,
+    )
+    deferred_service = InMemoryControlPlaneDeferredMessageService(
+        registry=registry,
+        store=kv_store,
+    )
+    bindings_apply = ControlPlaneConsumerRegistryBindingsApplyNode(service=dynamic_routing)
+    deferred_hold = ControlPlaneDeferredMessageHoldNode(service=deferred_service)
+    deferred_replay = ControlPlaneDeferredMessageReplayNode(service=deferred_service)
+
+    work_queue = InMemoryQueue()
+    context_service = InMemoryKvContextService(InMemoryKvStore())
+    work_queue.push(Envelope(payload="seed", target="producer", trace_id="t1"))
+    work_queue.push(
+        Envelope(
+            payload=ControlPlaneConsumerRegistryBindingsApplyEvent(
+                bindings=(
+                    ControlPlaneConsumerBindingRecord(
+                        token=StartupMessage,
+                        node_names=("sink",),
+                    ),
+                )
+            ),
+            target="system.cp.consumer_registry_bindings_apply",
+            trace_id="t2",
+        )
+    )
+
+    runner = SyncRunner(
+        nodes={
+            "producer": producer,
+            "sink": sink,
+            "system.cp.consumer_registry_bindings_apply": bindings_apply,
+            "system.cp.deferred_message_hold": deferred_hold,
+            "system.cp.deferred_message_replay": deferred_replay,
+        },
+        work_queue=work_queue,
+        context_service=context_service,
+        router=RoutingService(registry=registry, strict=True),
+        observability=NoOpObservabilityService(),
+    )
+    runner.run()
+
+    assert seen == [StartupMessage("startup")]

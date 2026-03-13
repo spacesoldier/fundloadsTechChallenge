@@ -10,6 +10,12 @@ from stream_kernel.observability.domain.debug import DebugMessage
 
 
 @runtime_checkable
+class RuntimeDebugMessageSinkPort(Protocol):
+    def emit_async(self, message: DebugMessage) -> object:
+        raise NotImplementedError
+
+
+@runtime_checkable
 class RuntimeDebugMessageDispatchService(Protocol):
     def dispatch(self, *, message: DebugMessage) -> list[object]:
         raise NotImplementedError
@@ -18,26 +24,17 @@ class RuntimeDebugMessageDispatchService(Protocol):
 @service(name="runtime_debug_message_dispatch_service")
 @dataclass(slots=True)
 class DefaultRuntimeDebugMessageDispatchService(RuntimeDebugMessageDispatchService):
-    sink: object = inject.stream(DebugMessage)
+    sink: RuntimeDebugMessageSinkPort = inject.stream(DebugMessage)
 
     def dispatch(self, *, message: DebugMessage) -> list[object]:
         if not isinstance(message, DebugMessage):
             return []
-        emit_async = getattr(self.sink, "emit_async", None)
-        if callable(emit_async):
-            try:
-                result = emit_async(message)
-                if inspect.isawaitable(result):
-                    return [result]
-            except Exception:
-                return []
+        try:
+            result = self.sink.emit_async(message)
+        except Exception:
             return []
-        emit = getattr(self.sink, "emit", None)
-        if callable(emit):
-            try:
-                emit(message)
-            except Exception:
-                return []
+        if inspect.isawaitable(result):
+            return [result]
         return []
 
 
@@ -49,6 +46,7 @@ class NoOpRuntimeDebugMessageDispatchService(RuntimeDebugMessageDispatchService)
 
 
 __all__ = [
+    "RuntimeDebugMessageSinkPort",
     "RuntimeDebugMessageDispatchService",
     "DefaultRuntimeDebugMessageDispatchService",
     "NoOpRuntimeDebugMessageDispatchService",

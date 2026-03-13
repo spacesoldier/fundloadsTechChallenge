@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from types import SimpleNamespace
+import time
+
+import pytest
 
 from stream_kernel.execution.runtime.runner import AsyncRunner
 from stream_kernel.integration.consumer_registry import InMemoryConsumerRegistry
 from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.integration.work_queue import InMemoryQueue
+from stream_kernel.observability.domain.debug import DebugMessage
 from stream_kernel.platform.services.observability import NoOpObservabilityService
 from stream_kernel.platform.services.state.context import InMemoryKvContextService
 from stream_kernel.routing.envelope import Envelope
@@ -123,7 +128,9 @@ def test_async_runner_preserves_trace_continuity_across_sync_async_sync_chain() 
     )
     runner.run()
 
-    assert observer.trace_by_node == {"n1": "t1", "n2": "t1", "n3": "t1"}
+    assert observer.trace_by_node.get("n1") == "t1"
+    assert observer.trace_by_node.get("n2") == "t1"
+    assert observer.trace_by_node.get("n3") == "t1"
     assert observer.parent_by_node["n1"] == "upstream-parent"
     assert observer.parent_by_node["n2"] == "span-n1"
     assert observer.parent_by_node["n3"] == "span-n2"
@@ -156,3 +163,264 @@ def test_async_runner_stop_request_drains_inflight_queue_deterministically() -> 
 
     runner.run()
     assert seen == [1, 2]
+
+
+class _RuntimeDebugBuffer:
+    def __init__(self, messages: list[DebugMessage]) -> None:
+        self._messages = list(messages)
+        self.drain_calls = 0
+
+    def publish(self, message: DebugMessage) -> None:  # pragma: no cover - protocol completeness
+        self._messages.append(message)
+
+    def drain(self, *, max_items: int = 256) -> list[DebugMessage]:
+        self.drain_calls += 1
+        if not self._messages:
+            return []
+        limit = max(1, int(max_items))
+        drained = self._messages[:limit]
+        self._messages = self._messages[limit:]
+        return drained
+
+
+def test_async_runner_routes_runtime_debug_messages_on_success_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STREAM_KERNEL_INJECT_PORT_DEBUG_ENABLED", "1")
+    captured: list[DebugMessage] = []
+
+    async def worker(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = (payload, ctx)
+        return []
+
+    async def debug_dispatch(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = ctx
+        if isinstance(payload, DebugMessage):
+            captured.append(payload)
+        return []
+
+    registry = InMemoryConsumerRegistry({DebugMessage: ["system.debug.message_dispatch"]})
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="seed", target="worker", trace_id="t1"))
+    debug_buffer = _RuntimeDebugBuffer(
+        [
+            DebugMessage(
+                timestamp=datetime.now(tz=UTC),
+                event="runtime.inject.port_call",
+                source="tests.async_runner",
+                fields={"method": "send", "payload_model": "X"},
+                trace_id="t1",
+            )
+        ]
+    )
+    runner = AsyncRunner(
+        nodes={
+            "worker": worker,
+            "system.debug.message_dispatch": debug_dispatch,
+        },
+        work_queue=queue,
+        context_service=_context_service(),
+        router=RoutingService(registry=registry, strict=True),
+        observability=NoOpObservabilityService(),
+        runtime_debug_buffer=debug_buffer,
+    )
+
+    runner.run()
+
+    assert debug_buffer.drain_calls >= 1
+    events = [item.event for item in captured]
+    assert "runtime.inject.port_call" in events
+    assert "runtime.runner.dequeued" in events
+    runner_event = next(
+        item
+        for item in captured
+        if item.event == "runtime.runner.dequeued"
+        and item.fields.get("source_node") == "worker"
+    )
+    assert runner_event.fields.get("payload_model") == "str"
+    assert runner_event.fields.get("payload") == "seed"
+    assert runner_event.fields.get("stage") == "run_async.loop"
+
+
+def test_async_runner_routes_runtime_debug_messages_on_error_path() -> None:
+    captured: list[DebugMessage] = []
+
+    async def worker(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = (payload, ctx)
+        raise RuntimeError("boom")
+
+    async def debug_dispatch(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = ctx
+        if isinstance(payload, DebugMessage):
+            captured.append(payload)
+        return []
+
+    registry = InMemoryConsumerRegistry({DebugMessage: ["system.debug.message_dispatch"]})
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="seed", target="worker", trace_id="t1"))
+    debug_buffer = _RuntimeDebugBuffer(
+        [
+            DebugMessage(
+                timestamp=datetime.now(tz=UTC),
+                event="runtime.service.call",
+                source="tests.async_runner",
+                fields={"method": "recv", "payload_model": "Y"},
+                trace_id="t1",
+            )
+        ]
+    )
+    runner = AsyncRunner(
+        nodes={
+            "worker": worker,
+            "system.debug.message_dispatch": debug_dispatch,
+        },
+        work_queue=queue,
+        context_service=_context_service(),
+        router=RoutingService(registry=registry, strict=True),
+        observability=NoOpObservabilityService(),
+        runtime_debug_buffer=debug_buffer,
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        runner.run()
+
+    assert debug_buffer.drain_calls >= 1
+    assert captured == []
+    queued = queue.pop()
+    assert isinstance(queued, Envelope)
+    assert queued.target == "system.debug.message_dispatch"
+    assert isinstance(queued.payload, DebugMessage)
+    assert queued.payload.event == "runtime.service.call"
+
+
+def test_async_runner_emits_source_worker_and_lane_for_leaf_ingress_source_nodes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STREAM_KERNEL_INJECT_PORT_DEBUG_ENABLED", "1")
+    captured: list[DebugMessage] = []
+    source_node = "source:system.cp.root_leaf_ingress:execution.ingress#1:data"
+
+    async def source_worker(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = (payload, ctx)
+        return []
+
+    async def debug_dispatch(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = ctx
+        if isinstance(payload, DebugMessage):
+            captured.append(payload)
+        return []
+
+    registry = InMemoryConsumerRegistry({DebugMessage: ["system.debug.message_dispatch"]})
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="seed", target=source_node, trace_id="t1"))
+    runner = AsyncRunner(
+        nodes={
+            source_node: source_worker,
+            "system.debug.message_dispatch": debug_dispatch,
+        },
+        work_queue=queue,
+        context_service=_context_service(),
+        router=RoutingService(registry=registry, strict=True),
+        observability=NoOpObservabilityService(),
+        runtime_debug_buffer=_RuntimeDebugBuffer([]),
+    )
+
+    runner.run()
+
+    runner_event = next(
+        item
+        for item in captured
+        if item.event == "runtime.runner.dequeued"
+        and item.fields.get("source_node") == source_node
+    )
+    assert runner_event.fields.get("node_role") == "source"
+    assert runner_event.fields.get("source_worker_id") == "execution.ingress#1"
+    assert runner_event.fields.get("source_lane") == "data"
+
+
+def test_async_runner_stops_on_idle_timeout_without_scheduler_tick_injection() -> None:
+    runner = AsyncRunner(
+        nodes={},
+        work_queue=InMemoryQueue(),
+        context_service=_context_service(),
+        router=RoutingService(registry=InMemoryConsumerRegistry({}), strict=True),
+        observability=NoOpObservabilityService(),
+    )
+    started = time.monotonic()
+    runner.run_until_stopped(poll_timeout_seconds=0.001, idle_timeout_seconds=1.0)
+    assert time.monotonic() >= started
+
+
+def test_async_runner_does_not_call_node_initialize_implicitly() -> None:
+    class _Node:
+        def __init__(self) -> None:
+            self.init_calls = 0
+            self.call_calls = 0
+
+        async def initialize(self) -> None:
+            self.init_calls += 1
+
+        async def __call__(self, payload: object, _ctx: dict[str, object]) -> list[object]:
+            _ = payload
+            self.call_calls += 1
+            return []
+
+    node = _Node()
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="a", target="n", trace_id="t1"))
+    queue.push(Envelope(payload="b", target="n", trace_id="t2"))
+    runner = AsyncRunner(
+        nodes={"n": node},
+        work_queue=queue,
+        context_service=_context_service(),
+        router=RoutingService(registry=InMemoryConsumerRegistry({}), strict=True),
+        observability=NoOpObservabilityService(),
+    )
+
+    runner.run()
+
+    assert node.init_calls == 0
+    assert node.call_calls == 2
+
+
+def test_async_runner_emits_source_lane_for_leaf_command_ingress_source_node(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STREAM_KERNEL_INJECT_PORT_DEBUG_ENABLED", "1")
+    captured: list[DebugMessage] = []
+    source_node = "source:system.cp.command_ingress:trace"
+
+    async def source_worker(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = (payload, ctx)
+        return []
+
+    async def debug_dispatch(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = ctx
+        if isinstance(payload, DebugMessage):
+            captured.append(payload)
+        return []
+
+    registry = InMemoryConsumerRegistry({DebugMessage: ["system.debug.message_dispatch"]})
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="seed", target=source_node, trace_id="t1"))
+    runner = AsyncRunner(
+        nodes={
+            source_node: source_worker,
+            "system.debug.message_dispatch": debug_dispatch,
+        },
+        work_queue=queue,
+        context_service=_context_service(),
+        router=RoutingService(registry=registry, strict=True),
+        observability=NoOpObservabilityService(),
+        runtime_debug_buffer=_RuntimeDebugBuffer([]),
+    )
+
+    runner.run()
+
+    runner_event = next(
+        item
+        for item in captured
+        if item.event == "runtime.runner.dequeued"
+        and item.fields.get("source_node") == source_node
+    )
+    assert runner_event.fields.get("node_role") == "source"
+    assert runner_event.fields.get("source_worker_id") is None
+    assert runner_event.fields.get("source_lane") == "trace"

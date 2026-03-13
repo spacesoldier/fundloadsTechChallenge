@@ -82,11 +82,8 @@ Fallback knobs:
 - `runtime.platform.control_plane.discovery_request_fallback: bool`  
   Default: `false`.  
   When `true`, root may fallback from rev3 snapshot to rev2 discovery request if snapshot is unavailable.
-- `runtime.platform.control_plane.leaf_local_discovery_fallback: bool`  
-  Default: `false`.  
-  When `true`, leaf runtime activation may do a local `discover_all()` only if discovery registry is empty.
 
-This keeps snapshot protocol as the default fast path and leaves older behavior as explicit emergency fallback.
+Leaf runtime local discovery fallback is removed: activation now relies only on control-plane snapshot/discovery data.
 
 ## Non-goals (phase 1)
 

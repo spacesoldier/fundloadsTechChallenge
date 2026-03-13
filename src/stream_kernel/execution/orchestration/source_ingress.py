@@ -61,15 +61,14 @@ class PullIngressSourceNode:
         raw_item = self._next_payload
         self._prime_next()
         self._sequence += 1
-        payload, trace_hint, reply_to, span_id = self._normalize_ingress_item(raw_item)
-        trace_id = trace_hint or f"{self.run_id}:{self.role}:{self._sequence}"
+        payload, _trace_hint, reply_to, span_id = self._normalize_ingress_item(raw_item)
 
         limiter = self._ingress_limiter()
         if limiter is not None:
-            limiter_key = reply_to or trace_id
+            limiter_key = reply_to or f"source:{self.node_name}:{self._sequence}"
             allowed = bool(limiter.allow(key=limiter_key))
             self._emit_limiter_decision(
-                trace_id=trace_id,
+                trace_id=None,
                 allowed=allowed,
             )
             if not allowed:
@@ -80,7 +79,6 @@ class PullIngressSourceNode:
                             payload={"code": "rate_limited", "status_code": 429},
                             error="rate_limited",
                         ),
-                        trace_id=trace_id,
                         reply_to=reply_to,
                         span_id=span_id,
                     )
@@ -94,20 +92,9 @@ class PullIngressSourceNode:
                     )
                 return outputs
 
-        self._seed_context(
-            trace_id=trace_id,
-            payload=payload,
-            reply_to=reply_to,
-        )
-        self._emit_ingress(
-            trace_id=trace_id,
-            reply_to=reply_to,
-        )
-
         outputs = [
             Envelope(
                 payload=payload,
-                trace_id=trace_id,
                 reply_to=reply_to,
                 span_id=span_id,
                 tombstone=bool(self.exhausted and self.emit_tombstone),
@@ -126,7 +113,8 @@ class PullIngressSourceNode:
     @staticmethod
     def _normalize_ingress_item(raw_item: object) -> tuple[object, str | None, str | None, str | None]:
         if isinstance(raw_item, Envelope):
-            trace_id = raw_item.trace_id if isinstance(raw_item.trace_id, str) and raw_item.trace_id else None
+            # Source adapters must not control trace identity. Framework runtime owns trace_id generation.
+            trace_id = None
             reply_to = raw_item.reply_to if isinstance(raw_item.reply_to, str) and raw_item.reply_to else None
             span_id = raw_item.span_id if isinstance(raw_item.span_id, str) and raw_item.span_id else None
             return raw_item.payload, trace_id, reply_to, span_id
@@ -211,15 +199,14 @@ class PushIngressSourceNode(PullIngressSourceNode):
             return []
 
         self._sequence += 1
-        payload, trace_hint, reply_to, span_id = self._normalize_ingress_item(raw_item)
-        trace_id = trace_hint or f"{self.run_id}:{self.role}:{self._sequence}"
+        payload, _trace_hint, reply_to, span_id = self._normalize_ingress_item(raw_item)
 
         limiter = self._ingress_limiter()
         if limiter is not None:
-            limiter_key = reply_to or trace_id
+            limiter_key = reply_to or f"source:{self.node_name}:{self._sequence}"
             allowed = bool(limiter.allow(key=limiter_key))
             self._emit_limiter_decision(
-                trace_id=trace_id,
+                trace_id=None,
                 allowed=allowed,
             )
             if not allowed:
@@ -230,25 +217,14 @@ class PushIngressSourceNode(PullIngressSourceNode):
                             payload={"code": "rate_limited", "status_code": 429},
                             error="rate_limited",
                         ),
-                        trace_id=trace_id,
                         reply_to=reply_to,
                         span_id=span_id,
                     )
                 ]
 
-        self._seed_context(
-            trace_id=trace_id,
-            payload=payload,
-            reply_to=reply_to,
-        )
-        self._emit_ingress(
-            trace_id=trace_id,
-            reply_to=reply_to,
-        )
         return [
             Envelope(
                 payload=payload,
-                trace_id=trace_id,
                 reply_to=reply_to,
                 span_id=span_id,
             )

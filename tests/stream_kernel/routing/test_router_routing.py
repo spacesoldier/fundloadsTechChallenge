@@ -4,6 +4,7 @@ import pytest
 
 # Routing rules are defined in docs/framework/initial_stage/Routing semantics.md.
 from stream_kernel.routing.envelope import Envelope
+from stream_kernel.routing.errors import RoutingError, RoutingErrorCode
 from stream_kernel.routing.router import Router
 
 
@@ -66,8 +67,9 @@ def test_router_raises_on_unknown_target_in_strict_mode() -> None:
     # Unknown target should fail fast in strict mode (§5.8).
     router = _router()
     payload = X("x")
-    with pytest.raises(ValueError):
+    with pytest.raises(RoutingError) as exc_info:
         router.route([Envelope(payload=payload, target="Missing")])
+    assert exc_info.value.code == RoutingErrorCode.UNKNOWN_TARGET
 
 
 def test_router_excludes_source_from_default_fanout() -> None:
@@ -89,8 +91,9 @@ def test_router_allows_explicit_self_target_even_with_source_filter() -> None:
 def test_router_requires_explicit_target_for_self_loop_in_strict_mode() -> None:
     # If source-filter removes the only consumer, strict mode should fail and require explicit target.
     router = Router(consumers={X: ["B"]}, strict=True)
-    with pytest.raises(ValueError):
+    with pytest.raises(RoutingError) as exc_info:
         router.route([X("x")], source="B")
+    assert exc_info.value.code == RoutingErrorCode.SELF_LOOP_REQUIRES_EXPLICIT_TARGET
 
 
 def test_router_drops_self_loop_without_target_in_non_strict_mode() -> None:
@@ -98,3 +101,10 @@ def test_router_drops_self_loop_without_target_in_non_strict_mode() -> None:
     router = Router(consumers={X: ["B"]}, strict=False)
     deliveries = router.route([X("x")], source="B")
     assert deliveries == []
+
+
+def test_router_raises_no_consumers_with_typed_error_code() -> None:
+    router = Router(consumers={}, strict=True)
+    with pytest.raises(RoutingError) as exc_info:
+        router.route([X("x")])
+    assert exc_info.value.code == RoutingErrorCode.NO_CONSUMERS

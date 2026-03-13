@@ -56,6 +56,14 @@ class _ReplyIngress:
         return 1
 
 
+def _preload_routes(
+    route_table: InMemoryExecutionIpcRouteTableService,
+    groups: dict[str, str],
+) -> None:
+    for target, group in groups.items():
+        route_table.upsert_route(target=target, target_id=f"{group}#1")
+
+
 def test_root_boundary_handoff_service_translates_external_envelopes_to_boundary_dispatch_inputs() -> None:
     from stream_kernel.execution.orchestration.control_plane.root.boundary_handoff_service import (
         DefaultControlPlaneRootBoundaryHandoffService,
@@ -65,6 +73,7 @@ def test_root_boundary_handoff_service_translates_external_envelopes_to_boundary
     router = _ProcessGroupRouter(groups={"remote.node": "execution.alpha"})
     boundary = _BoundaryExec()
     route_table = InMemoryExecutionIpcRouteTableService(store=InMemoryKvStore())
+    _preload_routes(route_table, router.groups)
     service = DefaultControlPlaneRootBoundaryHandoffService(
         process_group_router=router,
         root_boundary=boundary,
@@ -89,7 +98,7 @@ def test_root_boundary_handoff_service_translates_external_envelopes_to_boundary
     assert terminal[0]["worker_id"] == "execution.alpha#1"
     assert isinstance(terminal[0]["request_id"], str)
     assert terminal[0]["request_id"].startswith("boundary:t-1:0:remote.node:")
-    assert router.calls == [{"target": "remote.node", "source_group": "execution.root"}]
+    assert router.calls == []
     assert route_table.resolve_route(target="remote.node") == "execution.alpha#1"
     assert len(boundary.calls) == 1
     call = boundary.calls[0]
@@ -117,6 +126,7 @@ def test_root_boundary_handoff_service_dispatches_observability_batches_as_fire_
     router = _ProcessGroupRouter(groups={"system.obs.trace_dispatch": "system.observability"})
     boundary = _BoundaryExec()
     route_table = InMemoryExecutionIpcRouteTableService(store=InMemoryKvStore())
+    _preload_routes(route_table, router.groups)
     service = DefaultControlPlaneRootBoundaryHandoffService(
         process_group_router=router,
         root_boundary=boundary,
@@ -145,6 +155,7 @@ def test_root_boundary_handoff_service_batches_observability_dispatches_into_sin
     router = _ProcessGroupRouter(groups={"system.obs.trace_dispatch": "system.observability"})
     boundary = _BoundaryExec()
     route_table = InMemoryExecutionIpcRouteTableService(store=InMemoryKvStore())
+    _preload_routes(route_table, router.groups)
     service = DefaultControlPlaneRootBoundaryHandoffService(
         process_group_router=router,
         root_boundary=boundary,
@@ -180,6 +191,7 @@ def test_root_boundary_handoff_service_batches_non_observability_dispatches_by_s
     router = _ProcessGroupRouter(groups={"remote.node": "execution.alpha"})
     boundary = _BoundaryExec()
     route_table = InMemoryExecutionIpcRouteTableService(store=InMemoryKvStore())
+    _preload_routes(route_table, router.groups)
     service = DefaultControlPlaneRootBoundaryHandoffService(
         process_group_router=router,
         root_boundary=boundary,
@@ -218,6 +230,7 @@ def test_root_boundary_handoff_service_chunks_observability_dispatches_by_observ
     router = _ProcessGroupRouter(groups={"system.obs.trace_dispatch": "system.observability"})
     boundary = _BoundaryExec()
     route_table = InMemoryExecutionIpcRouteTableService(store=InMemoryKvStore())
+    _preload_routes(route_table, router.groups)
     service = DefaultControlPlaneRootBoundaryHandoffService(
         process_group_router=router,
         root_boundary=boundary,
@@ -271,11 +284,11 @@ def test_root_boundary_handoff_service_drains_completed_boundary_results_from_st
 
     router = _ProcessGroupRouter(groups={"system.obs.trace_dispatch": "system.observability"})
     route_table = InMemoryExecutionIpcRouteTableService(store=InMemoryKvStore())
+    _preload_routes(route_table, router.groups)
     service = DefaultControlPlaneRootBoundaryHandoffService(
         process_group_router=router,
         root_boundary=boundary,
         route_table=route_table,
-        reply_ingress=_ReplyIngress(on_drain=_append_reply),
         state=state,
         timeout_seconds=1.0,
     )
@@ -312,11 +325,11 @@ def test_root_boundary_handoff_service_does_not_track_observability_inflight_req
 
     router = _ProcessGroupRouter(groups={"system.obs.trace_dispatch": "system.observability"})
     route_table = InMemoryExecutionIpcRouteTableService(store=InMemoryKvStore())
+    _preload_routes(route_table, router.groups)
     service = DefaultControlPlaneRootBoundaryHandoffService(
         process_group_router=router,
         root_boundary=boundary,
         route_table=route_table,
-        reply_ingress=_ReplyIngress(on_drain=_append_reply),
         state=state,
         timeout_seconds=1.0,
     )
@@ -341,6 +354,7 @@ def test_root_boundary_handoff_service_keeps_inflight_for_stream_status_until_co
     boundary = _BoundaryExec()
     router = _ProcessGroupRouter(groups={"remote.node": "execution.alpha"})
     route_table = InMemoryExecutionIpcRouteTableService(store=InMemoryKvStore())
+    _preload_routes(route_table, router.groups)
 
     service = DefaultControlPlaneRootBoundaryHandoffService(
         process_group_router=router,
@@ -419,6 +433,7 @@ def test_root_boundary_handoff_service_marks_observability_inflight_as_non_block
     router = _ProcessGroupRouter(groups={"system.obs.trace_dispatch": "system.observability"})
     boundary = _BoundaryExec()
     route_table = InMemoryExecutionIpcRouteTableService(store=InMemoryKvStore())
+    _preload_routes(route_table, router.groups)
     service = DefaultControlPlaneRootBoundaryHandoffService(
         process_group_router=router,
         root_boundary=boundary,
@@ -445,6 +460,7 @@ def test_root_boundary_handoff_service_does_not_create_stale_inflight_requests_f
     router = _ProcessGroupRouter(groups={"system.obs.trace_dispatch": "system.observability"})
     boundary = _BoundaryExec()
     route_table = InMemoryExecutionIpcRouteTableService(store=InMemoryKvStore())
+    _preload_routes(route_table, router.groups)
     service = DefaultControlPlaneRootBoundaryHandoffService(
         process_group_router=router,
         root_boundary=boundary,
@@ -480,6 +496,7 @@ def test_root_boundary_handoff_service_generates_unique_request_ids_across_calls
     router = _ProcessGroupRouter(groups={"remote.node": "execution.alpha"})
     boundary = _BoundaryExec()
     route_table = InMemoryExecutionIpcRouteTableService(store=InMemoryKvStore())
+    _preload_routes(route_table, router.groups)
     service = DefaultControlPlaneRootBoundaryHandoffService(
         process_group_router=router,
         root_boundary=boundary,
@@ -499,3 +516,109 @@ def test_root_boundary_handoff_service_generates_unique_request_ids_across_calls
     assert request_ids[0] != request_ids[1]
     assert request_ids[0].startswith("boundary:t-1:0:remote.node:")
     assert request_ids[1].startswith("boundary:t-1:0:remote.node:")
+
+
+def test_root_boundary_handoff_service_cascades_completed_envelopes_without_waiting_for_replay() -> None:
+    from stream_kernel.execution.orchestration.control_plane.root.boundary_handoff_service import (
+        DefaultControlPlaneRootBoundaryHandoffService,
+    )
+
+    state = InMemoryControlPlaneStateService(store=InMemoryKvStore())
+    router = _ProcessGroupRouter(
+        groups={
+            "compute_time_keys": "execution.features",
+            "evaluate_policies": "execution.policy",
+        }
+    )
+    boundary = _BoundaryExec()
+    route_table = InMemoryExecutionIpcRouteTableService(store=InMemoryKvStore())
+    _preload_routes(route_table, router.groups)
+
+    def _append_reply(worker_id: str) -> None:
+        request_id: str | None = None
+        for call in reversed(boundary.calls):
+            if str(call.get("worker_id")) == worker_id:
+                request_id = str(call["request_id"])
+                break
+        if not isinstance(request_id, str) or not request_id:
+            return
+        if worker_id == "execution.features#1":
+            state.append_event(
+                ControlPlaneLeafBoundaryResultEvent(
+                    target_group="execution.features",
+                    worker_id=worker_id,
+                    request_id=request_id,
+                    status="completed",
+                    outputs=(
+                        Envelope(
+                            payload={"stage": "policy"},
+                            trace_id="t-cascade",
+                            target="evaluate_policies",
+                        ),
+                    ),
+                )
+            )
+            return
+        if worker_id == "execution.policy#1":
+            state.append_event(
+                ControlPlaneLeafBoundaryResultEvent(
+                    target_group="execution.policy",
+                    worker_id=worker_id,
+                    request_id=request_id,
+                    status="completed",
+                    outputs=("done",),
+                )
+            )
+
+    service = DefaultControlPlaneRootBoundaryHandoffService(
+        process_group_router=router,
+        root_boundary=boundary,
+        route_table=route_table,
+        state=state,
+        timeout_seconds=1.0,
+    )
+
+    _ = service.drain_external_deliveries(
+        envelopes=[
+            Envelope(
+                payload={"stage": "features"},
+                trace_id="t-cascade",
+                target="compute_time_keys",
+            )
+        ],
+        source_group="execution.ingress",
+    )
+    first_request_id = str(boundary.calls[0]["request_id"])
+    state.append_event(
+        ControlPlaneLeafBoundaryResultEvent(
+            target_group="execution.features",
+            worker_id="execution.features#1",
+            request_id=first_request_id,
+            status="completed",
+            outputs=(
+                Envelope(
+                    payload={"stage": "policy"},
+                    trace_id="t-cascade",
+                    target="evaluate_policies",
+                ),
+            ),
+        )
+    )
+
+    _ = service.drain_pending_dispatch()
+    second_request_id = str(boundary.calls[1]["request_id"])
+    state.append_event(
+        ControlPlaneLeafBoundaryResultEvent(
+            target_group="execution.policy",
+            worker_id="execution.policy#1",
+            request_id=second_request_id,
+            status="completed",
+            outputs=("done",),
+        )
+    )
+    terminal = service.drain_pending_dispatch()
+
+    assert len(boundary.calls) == 2
+    assert boundary.calls[0]["worker_id"] == "execution.features#1"
+    assert boundary.calls[1]["worker_id"] == "execution.policy#1"
+    assert "done" in terminal

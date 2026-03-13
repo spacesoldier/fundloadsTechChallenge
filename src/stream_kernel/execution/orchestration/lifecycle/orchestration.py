@@ -328,7 +328,7 @@ def _configure_runtime_lifecycle_shutdown_policy(
     base_stop_timeout_value = (
         float(base_stop_timeout_seconds)
         if isinstance(base_stop_timeout_seconds, (int, float))
-        and float(base_stop_timeout_seconds) > 0
+        and float(base_stop_timeout_seconds) >= 0
         else None
     )
     group_name, stop_timeout_seconds = _resolve_observability_shutdown_settings(
@@ -370,8 +370,8 @@ def _resolve_observability_shutdown_settings(
     default_group = "system.observability"
     resolved_default_timeout_seconds = (
         float(default_timeout_seconds)
-        if isinstance(default_timeout_seconds, (int, float)) and float(default_timeout_seconds) > 0
-        else 5.0
+        if isinstance(default_timeout_seconds, (int, float)) and float(default_timeout_seconds) >= 0
+        else 0.0
     )
     observability = runtime.get("observability", {})
     if not isinstance(observability, dict):
@@ -385,7 +385,7 @@ def _resolve_observability_shutdown_settings(
     if not isinstance(group_name, str) or not group_name:
         group_name = default_group
     stop_command_timeout_seconds = service_process.get("stop_command_timeout_seconds")
-    if isinstance(stop_command_timeout_seconds, (int, float)) and float(stop_command_timeout_seconds) > 0:
+    if isinstance(stop_command_timeout_seconds, (int, float)) and float(stop_command_timeout_seconds) >= 0:
         return (group_name, float(stop_command_timeout_seconds))
     return (group_name, resolved_default_timeout_seconds)
 

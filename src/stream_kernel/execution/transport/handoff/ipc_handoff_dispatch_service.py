@@ -17,7 +17,6 @@ from stream_kernel.execution.transport.ipc.ipc_transport import (
 from stream_kernel.execution.transport.ipc.ipc_lane_routing_service import (
     ExecutionIpcLaneRoutingService,
 )
-from stream_kernel.platform.services.runtime import ProcessGroupRouterService
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLaunchPlanEvent,
     ControlPlaneLeafConfigAckEvent,
@@ -75,7 +74,7 @@ class ExecutionIpcHandoffDispatchService(Protocol):
 @dataclass(slots=True)
 class DefaultExecutionIpcHandoffDispatchService(ExecutionIpcHandoffDispatchService):
     execution_ipc: ExecutionIpcTransportService = inject.service(ExecutionIpcTransportService)
-    process_group_router: ProcessGroupRouterService = inject.service(ProcessGroupRouterService)
+    process_group_router: object | None = None
     route_table: ExecutionIpcRouteTableService = inject.service(ExecutionIpcRouteTableService)
     control_plane_state: ControlPlaneStateService = inject.service(ControlPlaneStateService)
     lane_routing: object | None = inject.service(ExecutionIpcLaneRoutingService)
@@ -89,17 +88,13 @@ class DefaultExecutionIpcHandoffDispatchService(ExecutionIpcHandoffDispatchServi
         *,
         source_group: str | None = None,
     ) -> bool:
+        _ = source_group
         target = envelope.target
         if not isinstance(target, str) or not target:
             return False
         target_id = self._route_table().resolve_route(target=target)
         if not isinstance(target_id, str) or not target_id:
-            target_group = self._router().resolve_group_for_target(
-                target=target,
-                source_group=source_group,
-            )
-            target_id = f"{target_group}#1"
-            self._route_table().upsert_route(target=target, target_id=target_id)
+            return False
         lane = self._resolve_lane(target=target, payload=envelope.payload)
         resolved_target_id = _lane_target_id(target_id=target_id, lane=lane)
         self._ipc().send(resolved_target_id, envelope.payload, no_reply=True)
@@ -255,14 +250,6 @@ class DefaultExecutionIpcHandoffDispatchService(ExecutionIpcHandoffDispatchServi
         if callable(getattr(candidate, "send", None)):
             return candidate  # type: ignore[return-value]
         raise ValueError("ExecutionIpcTransportService binding is required")
-
-    def _router(self) -> ProcessGroupRouterService:
-        candidate = self.process_group_router
-        if isinstance(candidate, ProcessGroupRouterService):
-            return candidate
-        if callable(getattr(candidate, "resolve_group_for_target", None)):
-            return candidate  # type: ignore[return-value]
-        raise ValueError("ProcessGroupRouterService binding is required")
 
     def _route_table(self) -> ExecutionIpcRouteTableService:
         candidate = self.route_table

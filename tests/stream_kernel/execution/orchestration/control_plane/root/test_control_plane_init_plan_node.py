@@ -6,7 +6,7 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneDagAssembledEvent,
     ControlPlaneDagAssemblyRequestedEvent,
     ControlPlaneGroupSpec,
-    ControlPlaneInitEvent,
+    ControlPlaneInitializationRequestedEvent,
     ControlPlaneLaunchPlan,
     ControlPlaneLaunchPlanEvent,
     ControlPlaneSpawnRequestedEvent,
@@ -34,7 +34,7 @@ def test_control_plane_init_plan_emits_init_launch_and_spawn_from_dag_assembled(
 
     assert produced
     assert isinstance(produced[0], ControlPlaneLaunchPlanEvent)
-    assert isinstance(produced[1], ControlPlaneInitEvent)
+    assert isinstance(produced[1], ControlPlaneInitializationRequestedEvent)
     spawn_events = [event for event in produced if isinstance(event, ControlPlaneSpawnRequestedEvent)]
     assert len(spawn_events) == 2
     assert {event.group_name for event in spawn_events} == {"execution.alpha", "execution.beta"}

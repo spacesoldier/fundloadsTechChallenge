@@ -3,11 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from types import SimpleNamespace
 
-from stream_kernel.execution.orchestration.control_plane import (
-    control_plane_bootstrap_inputs,
+from stream_kernel.execution.orchestration.runtime.startup_mode import (
+    is_process_supervisor_mode,
     should_include_business_steps,
 )
 from stream_kernel.kernel.scenario import Scenario, StepSpec
+from stream_kernel.platform.services.runtime.control_plane_events import ControlPlaneInitEvent
+from stream_kernel.routing.envelope import Envelope
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +28,7 @@ def assemble_runtime_startup_scenario(
     observability_steps: list[StepSpec],
     sink_steps: list[StepSpec],
     source_inputs: list[object],
+    init_discovery: dict[str, object] | None = None,
 ) -> RuntimeStartupAssemblyResult:
     existing_steps = list(getattr(scenario, "steps", []))
     if not should_include_business_steps(runtime):
@@ -47,14 +50,37 @@ def assemble_runtime_startup_scenario(
     else:
         merged_scenario = SimpleNamespace(steps=list(merged_steps))
 
-    inputs = control_plane_bootstrap_inputs(
+    inputs = _append_control_plane_init_input(
         runtime=runtime,
         inputs=source_inputs,
+        init_discovery=init_discovery,
     )
     return RuntimeStartupAssemblyResult(
         scenario=merged_scenario,
         inputs=inputs,
     )
+
+
+def _append_control_plane_init_input(
+    *,
+    runtime: dict[str, object] | None,
+    inputs: list[object] | tuple[object, ...],
+    init_discovery: dict[str, object] | None,
+) -> list[object]:
+    resolved = list(inputs)
+    if not is_process_supervisor_mode(runtime):
+        return resolved
+    payload_runtime = runtime if isinstance(runtime, dict) else {}
+    # Root and leaf both start through the same graph entrypoint.
+    # Process role filtering is handled by system.cp.bootstrap_dispatch node.
+    init_envelope = Envelope(
+        payload=ControlPlaneInitEvent(
+            runtime=payload_runtime,
+            discovery=dict(init_discovery) if isinstance(init_discovery, dict) else None,
+        ),
+        target="system.cp.consumer_registry_bindings_bootstrap",
+    )
+    return [init_envelope, *resolved]
 
 
 __all__ = [

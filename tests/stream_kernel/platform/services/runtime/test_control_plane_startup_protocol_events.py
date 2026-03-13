@@ -3,6 +3,8 @@ from __future__ import annotations
 import pytest
 
 from stream_kernel.platform.services.runtime.control_plane_events import (
+    ControlPlaneDeferredMessageHoldEvent,
+    ControlPlaneDeferredMessageReplayRequestEvent,
     ControlPlaneDiscoveryEntityRecord,
     ControlPlaneLeafDiscoveryAckEvent,
     ControlPlaneLeafDiscoveryRequestEvent,
@@ -160,3 +162,20 @@ def test_leaf_discovery_ack_event_rejects_error_with_accepted_status() -> None:
             discovered_nodes=("compute_features",),
             error="must not be set",
         )
+
+
+def test_control_plane_deferred_message_events_accept_valid_values() -> None:
+    hold = ControlPlaneDeferredMessageHoldEvent(payload={"x": 1}, source_node="source:test")
+    replay = ControlPlaneDeferredMessageReplayRequestEvent(reason="bindings_applied")
+    assert hold.source_node == "source:test"
+    assert replay.reason == "bindings_applied"
+
+
+def test_control_plane_deferred_message_hold_event_rejects_empty_source_node() -> None:
+    with pytest.raises(ValueError, match="source_node"):
+        ControlPlaneDeferredMessageHoldEvent(payload={"x": 1}, source_node="")
+
+
+def test_control_plane_deferred_message_replay_event_rejects_empty_reason() -> None:
+    with pytest.raises(ValueError, match="reason"):
+        ControlPlaneDeferredMessageReplayRequestEvent(reason="")

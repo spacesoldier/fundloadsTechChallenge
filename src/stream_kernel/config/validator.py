@@ -24,6 +24,7 @@ _SUPPORTED_RUNNER_LOOP_KEYS = {
     "poll_timeout_ms",
     "idle_timeout_ms",
     "startup_barrier_timeout_ms",
+    "reply_drain_max_items",
     "post_start_settle_enabled",
     "post_start_settle_max_wait_seconds",
     "post_start_settle_quiet_window_seconds",
@@ -38,6 +39,7 @@ _SUPPORTED_PLATFORM_DEBUG_KEYS = {
     "leaf_verbose_logging",
     "leaf_debug_logs_dir",
     "leaf_debug_write_to_file",
+    "runtime_debug_enabled",
     "runtime_debug_direct_dispatch",
 }
 _SUPPORTED_WEB_INTERFACE_KINDS = {"http", "http_stream", "websocket", "graphql"}
@@ -78,7 +80,7 @@ _SUPPORTED_OBSERVABILITY_PROMETHEUS_MODES = {"http_pull", "textfile"}
 _SUPPORTED_OBSERVABILITY_OTEL_BACKENDS = {"urllib", "requests", "httpx", "aiohttp", "urllib3", "grpcio", "otel_sdk"}
 _OBSERVABILITY_ASYNC_ONLY_BACKENDS = {"aiohttp"}
 _OBSERVABILITY_SYNC_ONLY_BACKENDS = {"urllib", "requests", "urllib3", "grpcio", "otel_sdk"}
-_SUPPORTED_OBSERVABILITY_QUEUE_DROP_POLICIES = {"drop_newest", "drop_oldest", "block_with_timeout"}
+_SUPPORTED_OBSERVABILITY_QUEUE_DROP_POLICIES = {"drop_newest", "drop_oldest", "block_with_timeout", "block_forever"}
 _SUPPORTED_OBSERVABILITY_PIPELINE_MODES = {"tracing_only", "full_multi_stream"}
 _SUPPORTED_OBSERVABILITY_PIPELINE_STREAMS = {"tracing", "logging", "telemetry", "monitoring"}
 _SUPPORTED_OBSERVABILITY_PIPELINE_SYSTEM_NODE_KINDS = {
@@ -585,7 +587,13 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
         if not isinstance(leaf_debug_write_to_file, bool):
             raise ConfigError("runtime.platform.debug.leaf_debug_write_to_file must be a boolean when provided")
         debug["leaf_debug_write_to_file"] = leaf_debug_write_to_file
-        runtime_debug_direct_dispatch = debug.get("runtime_debug_direct_dispatch", True)
+        runtime_debug_enabled = debug.get("runtime_debug_enabled", leaf_debug_enabled)
+        if not isinstance(runtime_debug_enabled, bool):
+            raise ConfigError(
+                "runtime.platform.debug.runtime_debug_enabled must be a boolean when provided"
+            )
+        debug["runtime_debug_enabled"] = runtime_debug_enabled
+        runtime_debug_direct_dispatch = debug.get("runtime_debug_direct_dispatch", False)
         if not isinstance(runtime_debug_direct_dispatch, bool):
             raise ConfigError(
                 "runtime.platform.debug.runtime_debug_direct_dispatch must be a boolean when provided"
@@ -650,6 +658,17 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
                 )
             runner_loop["startup_barrier_timeout_ms"] = float(startup_barrier_timeout_ms)
 
+        reply_drain_max_items = runner_loop.get("reply_drain_max_items", 16)
+        if not isinstance(reply_drain_max_items, int):
+            raise ConfigError(
+                "runtime.platform.runner_loop.reply_drain_max_items must be an integer when provided"
+            )
+        if int(reply_drain_max_items) <= 0:
+            raise ConfigError(
+                "runtime.platform.runner_loop.reply_drain_max_items must be > 0 when provided"
+            )
+        runner_loop["reply_drain_max_items"] = int(reply_drain_max_items)
+
         post_start_settle_enabled = runner_loop.get("post_start_settle_enabled", True)
         if not isinstance(post_start_settle_enabled, bool):
             raise ConfigError(
@@ -662,9 +681,9 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
             raise ConfigError(
                 "runtime.platform.runner_loop.post_start_settle_max_wait_seconds must be a number when provided"
             )
-        if float(post_start_settle_max_wait_seconds) <= 0:
+        if float(post_start_settle_max_wait_seconds) < 0:
             raise ConfigError(
-                "runtime.platform.runner_loop.post_start_settle_max_wait_seconds must be > 0 when provided"
+                "runtime.platform.runner_loop.post_start_settle_max_wait_seconds must be >= 0 when provided"
             )
         runner_loop["post_start_settle_max_wait_seconds"] = float(post_start_settle_max_wait_seconds)
 
@@ -1383,6 +1402,13 @@ def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
                     "runtime.observability.logging.exporters["
                     f"{index}].settings.capture_all_events must be a boolean when provided"
                 )
+            write_mode = settings.get("write_mode", "background")
+            if not isinstance(write_mode, str) or write_mode not in {"background", "inline"}:
+                raise ConfigError(
+                    "runtime.observability.logging.exporters["
+                    f"{index}].settings.write_mode must be one of: ['background', 'inline']"
+                )
+            settings["write_mode"] = write_mode
         exporter["settings"] = settings
 
     lifecycle_events = logging.get("lifecycle_events", {})
@@ -1574,9 +1600,13 @@ def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
     service_worker["drop_policy"] = drop_policy
 
     block_timeout_ms = service_worker.get("block_timeout_ms", 100)
-    if not isinstance(block_timeout_ms, int) or block_timeout_ms <= 0:
-        raise ConfigError("runtime.observability.service_worker.block_timeout_ms must be an integer > 0")
-    service_worker["block_timeout_ms"] = block_timeout_ms
+    if drop_policy == "block_with_timeout":
+        if not isinstance(block_timeout_ms, int) or block_timeout_ms <= 0:
+            raise ConfigError("runtime.observability.service_worker.block_timeout_ms must be an integer > 0")
+        service_worker["block_timeout_ms"] = block_timeout_ms
+    elif "block_timeout_ms" in service_worker:
+        if not isinstance(block_timeout_ms, int) or block_timeout_ms <= 0:
+            raise ConfigError("runtime.observability.service_worker.block_timeout_ms must be an integer > 0")
     drain_timeout_seconds = service_worker.get("drain_timeout_seconds", 30)
     if not isinstance(drain_timeout_seconds, (int, float)) or float(drain_timeout_seconds) <= 0:
         raise ConfigError("runtime.observability.service_worker.drain_timeout_seconds must be > 0")
@@ -2052,9 +2082,13 @@ def _normalize_observability_otel_exporter_settings(
         )
     queue["drop_policy"] = drop_policy
     block_timeout_ms = queue.get("block_timeout_ms", 100)
-    if not isinstance(block_timeout_ms, int) or block_timeout_ms <= 0:
-        raise ConfigError(f"{prefix}.queue.block_timeout_ms must be an integer > 0 when provided")
-    queue["block_timeout_ms"] = block_timeout_ms
+    if drop_policy == "block_with_timeout":
+        if not isinstance(block_timeout_ms, int) or block_timeout_ms <= 0:
+            raise ConfigError(f"{prefix}.queue.block_timeout_ms must be an integer > 0 when provided")
+        queue["block_timeout_ms"] = block_timeout_ms
+    elif "block_timeout_ms" in queue:
+        if not isinstance(block_timeout_ms, int) or block_timeout_ms <= 0:
+            raise ConfigError(f"{prefix}.queue.block_timeout_ms must be an integer > 0 when provided")
     settings["queue"] = queue
 
     retry = settings.get("retry", {})

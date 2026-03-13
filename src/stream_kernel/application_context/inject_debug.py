@@ -6,6 +6,10 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from stream_kernel.application_context.debug_payload import (
+    build_call_payload_fields,
+    build_result_payload_fields,
+)
 from stream_kernel.observability.domain.debug import DebugMessage
 from stream_kernel.observability.domain.logging import LogMessage
 
@@ -74,16 +78,19 @@ class _InjectedPortDebugProxy:
                 result = attr(*args, **kwargs)
             except Exception as exc:
                 if _should_emit_error_debug(method=name, error=exc):
-                    _emit_port_debug(
-                        emit=self._emit,
-                        meta=self._meta,
-                        method=name,
-                        status="error",
-                        duration_ms=(time.perf_counter() - started_at) * 1000.0,
-                        args=args,
-                        kwargs=kwargs,
-                        error=exc,
-                    )
+                    try:
+                        _emit_port_debug(
+                            emit=self._emit,
+                            meta=self._meta,
+                            method=name,
+                            status="error",
+                            duration_ms=(time.perf_counter() - started_at) * 1000.0,
+                            args=args,
+                            kwargs=kwargs,
+                            error=exc,
+                        )
+                    except Exception:
+                        pass
                 raise
             if inspect.isawaitable(result):
                 return self._await_and_emit(
@@ -94,16 +101,20 @@ class _InjectedPortDebugProxy:
                     kwargs=kwargs,
                 )
             if _should_emit_success_debug(method=name, result=result):
-                _emit_port_debug(
-                    emit=self._emit,
-                    meta=self._meta,
-                    method=name,
-                    status="ok",
-                    duration_ms=(time.perf_counter() - started_at) * 1000.0,
-                    args=args,
-                    kwargs=kwargs,
-                    error=None,
-                )
+                try:
+                    _emit_port_debug(
+                        emit=self._emit,
+                        meta=self._meta,
+                        method=name,
+                        status="ok",
+                        duration_ms=(time.perf_counter() - started_at) * 1000.0,
+                        args=args,
+                        kwargs=kwargs,
+                        error=None,
+                        result=result,
+                    )
+                except Exception:
+                    pass
             return result
 
         return _wrapped
@@ -121,28 +132,35 @@ class _InjectedPortDebugProxy:
             resolved = await result  # type: ignore[misc]
         except Exception as exc:
             if _should_emit_error_debug(method=method, error=exc):
+                try:
+                    _emit_port_debug(
+                        emit=self._emit,
+                        meta=self._meta,
+                        method=method,
+                        status="error",
+                        duration_ms=(time.perf_counter() - started_at) * 1000.0,
+                        args=args,
+                        kwargs=kwargs,
+                        error=exc,
+                    )
+                except Exception:
+                    pass
+            raise
+        if _should_emit_success_debug(method=method, result=resolved):
+            try:
                 _emit_port_debug(
                     emit=self._emit,
                     meta=self._meta,
                     method=method,
-                    status="error",
+                    status="ok",
                     duration_ms=(time.perf_counter() - started_at) * 1000.0,
                     args=args,
                     kwargs=kwargs,
-                    error=exc,
+                    error=None,
+                    result=resolved,
                 )
-            raise
-        if _should_emit_success_debug(method=method, result=resolved):
-            _emit_port_debug(
-                emit=self._emit,
-                meta=self._meta,
-                method=method,
-                status="ok",
-                duration_ms=(time.perf_counter() - started_at) * 1000.0,
-                args=args,
-                kwargs=kwargs,
-                error=None,
-            )
+            except Exception:
+                pass
         return resolved
 
 
@@ -258,38 +276,51 @@ def _emit_port_debug(
     args: tuple[object, ...],
     kwargs: dict[str, object],
     error: Exception | None,
+    result: object | None = None,
 ) -> None:
     from stream_kernel.platform.services.runtime.debug_buffer import publish_runtime_debug
 
-    caller_module, caller_function = _resolve_caller()
-    fields: dict[str, object] = {
-        "process_name": _resolve_process_name(),
-        "owner_type": meta.owner_type,
-        "owner_module": meta.owner_module,
-        "owner_field": meta.owner_field,
-        "port_type": meta.port_type,
-        "port_data_type": meta.port_data_type,
-        "port_impl_type": meta.port_impl_type,
-        "qualifier": meta.qualifier,
-        "method": method,
-        "status": status,
-        "duration_ms": round(max(0.0, float(duration_ms)), 3),
-        "args_count": len(args),
-        "kwargs_keys": sorted(str(key) for key in kwargs.keys())[:12],
-        "arg_types": [type(value).__name__ for value in args[:8]],
-        "caller_module": caller_module,
-        "caller_function": caller_function,
-    }
-    if isinstance(error, Exception):
-        fields["error_type"] = type(error).__name__
-        fields["error_message"] = str(error)
-    publish_runtime_debug(
-        buffer=emit,
-        event="runtime.inject.port_call",
-        source=f"{meta.owner_module}.{meta.owner_type}",
-        fields=fields,
-        trace_id=None,
-    )
+    try:
+        caller_module, caller_function = _resolve_caller()
+        fields: dict[str, object] = {
+            "process_name": _resolve_process_name(),
+            "owner_type": meta.owner_type,
+            "owner_module": meta.owner_module,
+            "owner_field": meta.owner_field,
+            "port_type": meta.port_type,
+            "port_data_type": meta.port_data_type,
+            "port_impl_type": meta.port_impl_type,
+            "qualifier": meta.qualifier,
+            "method": method,
+            "status": status,
+            "duration_ms": round(max(0.0, float(duration_ms)), 3),
+            "args_count": len(args),
+            "kwargs_keys": sorted(str(key) for key in kwargs.keys())[:12],
+            "arg_types": [type(value).__name__ for value in args[:8]],
+            "caller_module": caller_module,
+            "caller_function": caller_function,
+        }
+        fields.update(
+            build_call_payload_fields(
+                method=method,
+                args=args,
+                kwargs=kwargs,
+            )
+        )
+        if not isinstance(error, Exception):
+            fields.update(build_result_payload_fields(result=result))
+        if isinstance(error, Exception):
+            fields["error_type"] = type(error).__name__
+            fields["error_message"] = str(error)
+        publish_runtime_debug(
+            buffer=emit,
+            event="runtime.inject.port_call",
+            source=f"{meta.owner_module}.{meta.owner_type}",
+            fields=fields,
+            trace_id=None,
+        )
+    except Exception:
+        return
 
 
 def _resolve_process_name() -> str:

@@ -3,12 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from stream_kernel.application_context import apply_injection
 from stream_kernel.application_context.inject import inject
 from stream_kernel.kernel.node_annotation import node
 from stream_kernel.kernel.scenario import StepSpec
 from stream_kernel.observability.domain.debug import DebugMessage
 from stream_kernel.platform.services.runtime.debug_message_dispatch import (
-    NoOpRuntimeDebugMessageDispatchService,
     RuntimeDebugMessageDispatchService,
 )
 from stream_kernel.routing.envelope import Envelope
@@ -45,9 +45,16 @@ def build_debug_system_plan(
 ) -> DebugSystemPlan:
     if not _is_runtime_debug_exporter_enabled(runtime):
         return DebugSystemPlan()
-    service = _resolve_runtime_debug_dispatch_service(scenario_scope)
+    if scenario_scope is None:
+        raise RuntimeError("runtime debug dispatch requires scenario_scope for DI injection")
     node_name = "system.debug.message_dispatch"
-    dispatch_node = RuntimeDebugMessageDispatchNode(service=service, qualifier=None)
+    dispatch_node = RuntimeDebugMessageDispatchNode(
+        service=inject.service(RuntimeDebugMessageDispatchService),
+        qualifier=None,
+    )
+    apply_injection(dispatch_node, scenario_scope, True)
+    # Keep async planning marker after DI resolves runtime fields.
+    dispatch_node._marker = inject.service(RuntimeDebugMessageDispatchService, qualifier=None)
     return DebugSystemPlan(
         system_steps=[StepSpec(name=node_name, step=dispatch_node)],
         system_consumers={DebugMessage: [node_name]},
@@ -71,25 +78,6 @@ def _is_runtime_debug_exporter_enabled(runtime: dict[str, object]) -> bool:
         and item.get("enabled", True) is not False
         for item in exporters
     )
-
-
-def _resolve_runtime_debug_dispatch_service(
-    scenario_scope: object | None,
-) -> RuntimeDebugMessageDispatchService:
-    if scenario_scope is None:
-        return NoOpRuntimeDebugMessageDispatchService()
-    resolve = getattr(scenario_scope, "resolve", None)
-    if not callable(resolve):
-        return NoOpRuntimeDebugMessageDispatchService()
-    try:
-        resolved = resolve("service", RuntimeDebugMessageDispatchService)
-    except Exception:
-        return NoOpRuntimeDebugMessageDispatchService()
-    if isinstance(resolved, RuntimeDebugMessageDispatchService):
-        return resolved
-    if callable(getattr(resolved, "dispatch", None)):
-        return resolved  # type: ignore[return-value]
-    return NoOpRuntimeDebugMessageDispatchService()
 
 
 def _coerce_outputs(value: object) -> list[object]:

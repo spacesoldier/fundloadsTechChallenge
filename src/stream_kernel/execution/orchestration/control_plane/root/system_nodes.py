@@ -4,10 +4,19 @@ import time
 from dataclasses import dataclass
 
 from stream_kernel.application_context.inject import inject
-from stream_kernel.execution.transport.handoff.ipc_handoff_dispatch_service import (
-    ExecutionIpcHandoffDispatchService,
+from stream_kernel.execution.orchestration.control_plane.root.channel_services import (
+    ControlPlaneRootRunnerControlService,
+)
+from stream_kernel.execution.orchestration.control_plane.root.runtime_bootstrap_contract import (
+    ControlPlaneRootRuntimeBootstrapService,
+)
+from stream_kernel.execution.transport.ipc.ipc_transport import (
+    EXECUTION_IPC_LANE_CONTROL,
+    ExecutionIpcKvStreamPort,
+    compose_execution_ipc_worker_target_id,
 )
 from stream_kernel.observability.domain.logging import LogMessage
+from stream_kernel.observability.events import LogDispatchEvent
 from stream_kernel.kernel.node_annotation import node
 from stream_kernel.platform.services.runtime.control_plane_config_stream import (
     ControlPlaneConfigStreamService,
@@ -29,7 +38,11 @@ from stream_kernel.platform.services.runtime.control_plane_dag_assembly import (
 from stream_kernel.platform.services.runtime.control_plane_discovery_stream import (
     ControlPlaneDiscoveryStreamService,
 )
+from stream_kernel.platform.services.runtime.control_plane_discovery_materialization import (
+    ControlPlaneDiscoveryMaterializationService,
+)
 from stream_kernel.platform.services.runtime.control_plane_events import (
+    ControlPlaneConsumerRegistryRemoveNodesEvent,
     ControlPlaneDagAssembledEvent,
     ControlPlaneDagAssemblyRequestedEvent,
     ControlPlaneDiscoveryBatchReadyEvent,
@@ -43,15 +56,16 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ExecutionGroupConfigRecord,
     ControlPlaneGroupSpec,
     ControlPlaneInitEvent,
+    ControlPlaneInitializationRequestedEvent,
     ControlPlaneLaunchPlan,
     ControlPlaneLaunchPlanEvent,
     ControlPlaneStartWorkEvent,
     ControlPlaneLeafBoundaryExecuteCommand,
     ControlPlaneLeafBoundaryResultEvent,
-    ControlPlaneLeafShutdownPrepareCommand,
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafConfigCardEvent,
     ControlPlaneLeafHelloEvent,
+    ControlPlaneRootLeafStartWorkCommand,
     ControlPlaneLeafStartWorkEvent,
     ControlPlaneLeafStopAckEvent,
     ControlPlaneLeafStopCommand,
@@ -92,7 +106,10 @@ class ControlPlaneDagAssemblyNode:
         payload = msg.payload if isinstance(msg, Envelope) else msg
         if not isinstance(payload, ControlPlaneDagAssemblyRequestedEvent):
             return []
-        plan = self.assembly.assemble(runtime=payload.runtime)
+        plan = None
+        assemble = getattr(self.assembly, "assemble", None)
+        if callable(assemble):
+            plan = assemble(runtime=payload.runtime)
         if not isinstance(plan, ControlPlaneLaunchPlan) or not plan.groups:
             return []
         return [ControlPlaneDagAssembledEvent(runtime=payload.runtime, plan=plan)]
@@ -101,7 +118,11 @@ class ControlPlaneDagAssemblyNode:
 @node(
     name="system.cp.init_plan",
     consumes=[ControlPlaneDagAssembledEvent],
-    emits=[ControlPlaneInitEvent, ControlPlaneLaunchPlanEvent, ControlPlaneSpawnRequestedEvent],
+    emits=[
+        ControlPlaneInitializationRequestedEvent,
+        ControlPlaneLaunchPlanEvent,
+        ControlPlaneSpawnRequestedEvent,
+    ],
 )
 @dataclass
 class ControlPlaneInitPlanNode:
@@ -128,19 +149,21 @@ class ControlPlaneInitPlanNode:
             )
             for group in payload.plan.groups
         ]
-        return [plan_event, ControlPlaneInitEvent(runtime=payload.runtime), *spawn_events]
+        return [
+            plan_event,
+            ControlPlaneInitializationRequestedEvent(runtime=payload.runtime),
+            *spawn_events,
+        ]
 
 
 @node(
     name="system.cp.start_work_dispatch",
     consumes=[ControlPlaneStartWorkEvent],
-    emits=[LogMessage],
+    emits=[LogMessage, ControlPlaneRootLeafStartWorkCommand],
 )
 @dataclass
 class ControlPlaneStartWorkDispatchNode:
     state: ControlPlaneStateService = inject.service(ControlPlaneStateService)
-    boundary_execution: object | None = None
-    handoff_dispatch: object | None = None
 
     def __call__(self, msg: object, _ctx: object | None) -> list[object]:
         payload = msg.payload if isinstance(msg, Envelope) else msg
@@ -154,80 +177,352 @@ class ControlPlaneStartWorkDispatchNode:
             )
         )
         launch_plan = _latest_launch_plan_from_state(self.state.events())
-        handoff = self._handoff_dispatch()
-        if handoff is not None and launch_plan is not None:
-            requested = set(payload.source_targets) if payload.source_targets else None
-            broadcast_seed = f"start-work:{int(time.time() * 1000)}"
-            total = 0
-            accepted = 0
-            failed = 0
-            failed_workers: list[str] = []
-            for group in launch_plan.groups:
-                group_sources = tuple(
-                    node_name
-                    for node_name in group.nodes
-                    if isinstance(node_name, str) and node_name.startswith("source:")
-                )
-                if requested is not None:
-                    group_sources = tuple(node for node in group_sources if node in requested)
-                if not group_sources:
-                    continue
-                result = handoff.dispatch_broadcast(
-                    Envelope(
-                        payload=ControlPlaneLeafStartWorkEvent(source_targets=group_sources),
-                        target="system.cp.leaf_start_work",
-                    ),
-                    target_group=group.group_name,
-                    include_observability=False,
-                    policy="best_effort",
-                    broadcast_id=f"{broadcast_seed}:{group.group_name}",
-                )
-                self.state.append_event(result)
-                total += int(result.total)
-                accepted += int(result.accepted)
-                failed += int(result.failed)
-                failed_workers.extend(list(result.failed_workers))
-            self.state.append_event(_StartWorkDispatchedMarker(worker_count=max(0, total)))
-            level = "info"
-            if total == 0 or failed > 0:
-                level = "warning"
+        if launch_plan is None:
+            self.state.append_event(_StartWorkDispatchedMarker(worker_count=0))
             return [
                 LogMessage(
-                    level=level,
-                    message="control-plane start-work broadcast dispatched",
+                    level="warning",
+                    message="control-plane start-work dispatch unavailable",
                     fields={
-                        "event": "control_plane.runtime.start_work_broadcast_dispatched",
-                        "broadcast_id": broadcast_seed,
-                        "policy": "best_effort",
-                        "total": total,
-                        "accepted": accepted,
-                        "failed": failed,
-                        "failed_workers": failed_workers,
+                        "event": "control_plane.runtime.start_work_dispatch_unavailable",
                         "source_targets": list(source_targets),
+                        "launch_plan_available": False,
+                        "worker_command_count": 0,
                     },
                 )
             ]
-        self.state.append_event(_StartWorkDispatchedMarker(worker_count=0))
+        requested = set(payload.source_targets) if payload.source_targets else None
+        command_seed = f"start-work:{int(time.time() * 1000)}"
+        commands: list[ControlPlaneRootLeafStartWorkCommand] = []
+        targeted_workers: list[str] = []
+        for group in launch_plan.groups:
+            group_sources = tuple(
+                node_name
+                for node_name in group.nodes
+                if isinstance(node_name, str) and node_name.startswith("source:")
+            )
+            if requested is not None:
+                group_sources = tuple(node for node in group_sources if node in requested)
+            if not group_sources:
+                continue
+            worker_count = max(1, int(group.workers))
+            for worker_slot in range(1, worker_count + 1):
+                worker_id = f"{group.group_name}#{worker_slot}"
+                targeted_workers.append(worker_id)
+                commands.append(
+                    ControlPlaneRootLeafStartWorkCommand(
+                        target_group=group.group_name,
+                        worker_id=worker_id,
+                        source_targets=group_sources,
+                        command_id=f"{command_seed}:{worker_id}",
+                    )
+                )
+        self.state.append_event(_StartWorkDispatchedMarker(worker_count=len(commands)))
+        level = "info" if commands else "warning"
         return [
             LogMessage(
-                level="warning",
-                message="control-plane start-work dispatch unavailable",
+                level=level,
+                message="control-plane start-work commands enqueued",
                 fields={
-                    "event": "control_plane.runtime.start_work_dispatch_unavailable",
+                    "event": "control_plane.runtime.start_work_commands_enqueued",
+                    "command_seed": command_seed,
+                    "worker_command_count": len(commands),
+                    "target_workers": list(targeted_workers),
                     "source_targets": list(source_targets),
-                    "launch_plan_available": launch_plan is not None,
-                    "handoff_available": handoff is not None,
                 },
+            )
+        ] + commands
+
+
+@node(
+    name="system.cp.start_work_readiness",
+    consumes=[ControlPlaneLeafConfigAckEvent],
+    emits=[ControlPlaneStartWorkEvent],
+)
+@dataclass
+class ControlPlaneStartWorkReadinessNode:
+    state: ControlPlaneStateService = inject.service(ControlPlaneStateService)
+    config_store: ControlPlaneStartupConfigStore = inject.service(ControlPlaneStartupConfigStore)
+
+    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
+        payload = msg.payload if isinstance(msg, Envelope) else msg
+        if not isinstance(payload, ControlPlaneLeafConfigAckEvent):
+            return []
+        if not _is_start_work_on_all_ready_enabled(self.config_store):
+            return []
+        events = self.state.events()
+        if any(isinstance(event, _StartWorkDispatchedMarker) for event in events):
+            return []
+        expected_worker_ids = _expected_worker_ids_for_start_work(events)
+        if not expected_worker_ids:
+            return []
+        latest_status = _latest_worker_statuses_for_start_work(
+            events=events,
+            expected_worker_ids=expected_worker_ids,
+        )
+        latest_status[payload.worker_id] = payload.status
+        if any(latest_status.get(worker_id) == "rejected" for worker_id in expected_worker_ids):
+            return []
+        if not all(latest_status.get(worker_id) == "applied" for worker_id in expected_worker_ids):
+            return []
+        source_targets = _source_node_targets_from_state(events)
+        if not source_targets:
+            source_targets = _source_node_targets_from_runtime_config(self.config_store)
+        return [ControlPlaneStartWorkEvent(source_targets=tuple(dict.fromkeys(source_targets)))]
+
+
+@node(
+    name="system.cp.start_work_command_dispatch",
+    consumes=[ControlPlaneRootLeafStartWorkCommand],
+    emits=[],
+)
+@dataclass
+class ControlPlaneRootLeafStartWorkDispatchNode:
+    control_lane_ipc: ExecutionIpcKvStreamPort = inject.kv_stream(
+        ExecutionIpcKvStreamPort,
+        qualifier=EXECUTION_IPC_LANE_CONTROL,
+    )
+
+    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
+        payload = msg.payload if isinstance(msg, Envelope) else msg
+        if not isinstance(payload, ControlPlaneRootLeafStartWorkCommand):
+            return []
+        event = ControlPlaneLeafStartWorkEvent(
+            source_targets=payload.source_targets,
+            command_id=payload.command_id,
+        )
+        self.control_lane_ipc.send(
+            compose_execution_ipc_worker_target_id(
+                payload.worker_id,
+                lane=EXECUTION_IPC_LANE_CONTROL,
+            ),
+            event,
+            no_reply=True,
+        )
+        return []
+
+
+@dataclass(frozen=True, slots=True)
+class _ControlPlaneGroupStartupReadyMarker:
+    group_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ControlPlaneGroupStartupFailedMarker:
+    group_name: str
+
+
+@node(
+    name="system.cp.spawn_dispatch",
+    consumes=[ControlPlaneSpawnRequestedEvent],
+    emits=[LogMessage],
+)
+@dataclass
+class ControlPlaneSpawnDispatchNode:
+    lifecycle: object | None = None
+    log_factory: object | None = None
+
+    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
+        payload = msg.payload if isinstance(msg, Envelope) else msg
+        if not isinstance(payload, ControlPlaneSpawnRequestedEvent):
+            return []
+        lifecycle = self.lifecycle
+        if callable(getattr(lifecycle, "on_spawn_requested", None)):
+            lifecycle.on_spawn_requested(payload)
+        factory = self.log_factory
+        if hasattr(factory, "spawn_requested"):
+            return [factory.spawn_requested(payload)]
+        return []
+
+
+@node(
+    name="system.cp.group_startup_wait",
+    consumes=[ControlPlaneSpawnRequestedEvent, ControlPlaneLeafConfigAckEvent],
+    emits=[LogMessage],
+)
+@dataclass
+class ControlPlaneGroupStartupWaitNode:
+    state: ControlPlaneStateService = inject.service(ControlPlaneStateService)
+    log_factory: object | None = None
+
+    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
+        payload = msg.payload if isinstance(msg, Envelope) else msg
+        if isinstance(payload, ControlPlaneSpawnRequestedEvent):
+            self.state.append_event(payload)
+            return []
+        if not isinstance(payload, ControlPlaneLeafConfigAckEvent):
+            return []
+        self.state.append_event(payload)
+        latest_spawn = _latest_group_spawn_for_startup(self.state.events(), payload.target_group)
+        if latest_spawn is None:
+            return []
+        worker_ids = tuple(
+            f"{latest_spawn.group_name}#{index + 1}" for index in range(latest_spawn.workers)
+        )
+        if payload.worker_id not in worker_ids:
+            return []
+
+        latest_acks = _latest_group_acks_for_startup(
+            self.state.events(), latest_spawn.group_name, worker_ids
+        )
+        factory = self.log_factory
+        if any(ack.status == "rejected" for ack in latest_acks.values()):
+            if _group_failed_already_reported_for_startup(self.state.events(), latest_spawn.group_name):
+                return []
+            self.state.append_event(
+                _ControlPlaneGroupStartupFailedMarker(group_name=latest_spawn.group_name)
+            )
+            if hasattr(factory, "group_startup_failed"):
+                failing = next(
+                    (ack for ack in latest_acks.values() if ack.status == "rejected"),
+                    payload,
+                )
+                error_message = (
+                    failing.error
+                    if isinstance(failing.error, str) and failing.error
+                    else "leaf startup rejected"
+                )
+                return [
+                    factory.group_startup_failed(
+                        event=latest_spawn,
+                        worker_ids=worker_ids,
+                        error=RuntimeError(error_message),
+                    )
+                ]
+            return []
+        if not all(
+            isinstance(latest_acks.get(worker_id), ControlPlaneLeafConfigAckEvent)
+            and latest_acks[worker_id].status == "applied"
+            for worker_id in worker_ids
+        ):
+            return []
+        if _group_ready_already_reported_for_startup(self.state.events(), latest_spawn.group_name):
+            return []
+        self.state.append_event(
+            _ControlPlaneGroupStartupReadyMarker(group_name=latest_spawn.group_name)
+        )
+        if hasattr(factory, "group_startup_ready"):
+            return [factory.group_startup_ready(event=latest_spawn, worker_ids=worker_ids)]
+        return []
+
+
+@node(
+    name="system.cp.log_dispatch",
+    consumes=[LogMessage],
+    emits=[LogDispatchEvent],
+)
+@dataclass
+class ControlPlaneLogDispatchNode:
+    console_dispatch: object | None = None
+
+    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
+        payload = msg.payload if isinstance(msg, Envelope) else msg
+        if not isinstance(payload, LogMessage):
+            return []
+        return [
+            LogDispatchEvent(
+                payload=payload,
+                attributes={"origin_node": "system.cp.log_dispatch"},
             )
         ]
 
-    def _handoff_dispatch(self) -> ExecutionIpcHandoffDispatchService | None:
-        candidate = self.handoff_dispatch
-        if isinstance(candidate, ExecutionIpcHandoffDispatchService):
-            return candidate
-        if callable(getattr(candidate, "dispatch_broadcast", None)):
-            return candidate  # type: ignore[return-value]
-        return None
+
+@node(
+    name="system.cp.log_dispatch_sink",
+    consumes=[LogDispatchEvent],
+    emits=[],
+)
+@dataclass
+class ControlPlaneLogDispatchSinkNode:
+    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
+        _ = msg
+        return []
+
+
+@node(
+    name="system.cp.root_payload_sink",
+    consumes=[dict, list, tuple, str, int, float, bool, bytes],
+    emits=[],
+)
+@dataclass
+class ControlPlaneRootPayloadSinkNode:
+    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
+        _ = msg
+        return []
+
+
+@node(
+    name="system.cp.shutdown_expected_groups",
+    consumes=[ControlPlaneLaunchPlanEvent],
+    emits=[],
+)
+@dataclass
+class ControlPlaneShutdownExpectedGroupsNode:
+    shutdown_readiness: ControlPlaneShutdownReadinessService = inject.service(
+        ControlPlaneShutdownReadinessService
+    )
+
+    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
+        payload = msg.payload if isinstance(msg, Envelope) else msg
+        if not isinstance(payload, ControlPlaneLaunchPlanEvent):
+            return []
+        expected_groups = tuple(
+            sorted(
+                {
+                    group.group_name
+                    for group in payload.plan.groups
+                    if isinstance(group.group_name, str)
+                    and group.group_name
+                    and isinstance(group.workers, int)
+                    and group.workers > 0
+                }
+            )
+        )
+        if not expected_groups:
+            return []
+        self.shutdown_readiness.configure_expected_groups(expected_groups)
+        return []
+
+
+@node(
+    name="system.cp.consumer_registry_group_prune",
+    consumes=[ControlPlaneLaunchPlanEvent],
+    emits=[ControlPlaneConsumerRegistryRemoveNodesEvent],
+)
+@dataclass
+class ControlPlaneConsumerRegistryGroupPruneNode:
+    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
+        payload = msg.payload if isinstance(msg, Envelope) else msg
+        if not isinstance(payload, ControlPlaneLaunchPlanEvent):
+            return []
+        node_names = _launch_plan_group_node_names(payload.plan)
+        if not node_names:
+            return []
+        return [ControlPlaneConsumerRegistryRemoveNodesEvent(node_names=node_names)]
+
+
+@node(
+    name="system.cp.bootstrap_dispatch",
+    consumes=[ControlPlaneInitEvent],
+    emits=[ControlPlaneRootPulse],
+)
+@dataclass
+class ControlPlaneRootBootstrapDispatchNode:
+    runtime_bootstrap: object | None = inject.service(ControlPlaneRootRuntimeBootstrapService)
+
+    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
+        payload = msg.payload if isinstance(msg, Envelope) else msg
+        if not isinstance(payload, ControlPlaneInitEvent):
+            return []
+        runtime = payload.runtime if isinstance(payload.runtime, dict) else {}
+        process_role = runtime.get("__process_role")
+        if isinstance(process_role, str) and process_role in {"worker", "observability_worker"}:
+            return []
+        _prepare_root_runtime_on_init_event(
+            payload=payload,
+            runtime_bootstrap=self.runtime_bootstrap,
+        )
+        return [ControlPlaneRootPulse(runtime=runtime)]
 
 
 @node(
@@ -432,6 +727,32 @@ class ControlPlaneDiscoveryApplyNode:
 
 
 @node(
+    name="system.cp.discovery_materialize",
+    consumes=[ControlPlaneDiscoveryBatchReadyEvent],
+    emits=[],
+)
+@dataclass
+class ControlPlaneDiscoveryMaterializeNode:
+    materializer: ControlPlaneDiscoveryMaterializationService = inject.service(
+        ControlPlaneDiscoveryMaterializationService
+    )
+
+    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
+        payload = msg.payload if isinstance(msg, Envelope) else msg
+        if not isinstance(payload, ControlPlaneDiscoveryBatchReadyEvent):
+            return []
+        records = tuple(
+            item
+            for item in payload.entities
+            if isinstance(item, ControlPlaneDiscoveryEntityRecord)
+        )
+        if not records:
+            return []
+        self.materializer.materialize(records)
+        return []
+
+
+@node(
     name="system.cp.discovery_finalize",
     consumes=[ControlPlaneDiscoverySourceCompletedEvent],
     emits=[],
@@ -447,7 +768,11 @@ class ControlPlaneDiscoveryFinalizeNode:
 
 @node(
     name="system.cp.startup_barrier",
-    consumes=[ControlPlaneDiscoveryCompletedEvent, ControlPlaneConfigApplyCompletedEvent],
+    consumes=[
+        ControlPlaneDiscoveryCompletedEvent,
+        ControlPlaneConfigApplyCompletedEvent,
+        ControlPlaneConfigStreamCompletedEvent,
+    ],
     emits=[ControlPlaneDagAssemblyRequestedEvent],
 )
 @dataclass
@@ -461,7 +786,7 @@ class ControlPlaneStartupBarrierNode:
         if isinstance(payload, ControlPlaneDiscoveryCompletedEvent):
             runtime = payload.runtime
             opened_now = self.barrier.mark_discovery_completed(runtime=runtime)
-        elif isinstance(payload, ControlPlaneConfigApplyCompletedEvent):
+        elif isinstance(payload, (ControlPlaneConfigApplyCompletedEvent, ControlPlaneConfigStreamCompletedEvent)):
             runtime = payload.runtime
             opened_now = self.barrier.mark_config_completed(runtime=runtime)
         if opened_now and isinstance(runtime, dict):
@@ -511,9 +836,18 @@ class ControlPlaneRootLeafConfigAckNode:
         return []
 
 
+@node(
+    name="system.cp.root_stop_dispatch",
+    consumes=[ControlPlaneRootLeafStopRequestEvent],
+    emits=[],
+)
 @dataclass
 class ControlPlaneRootLeafStopDispatchNode:
     state: ControlPlaneStateService = inject.service(ControlPlaneStateService)
+    control_lane_ipc: ExecutionIpcKvStreamPort = inject.kv_stream(
+        ExecutionIpcKvStreamPort,
+        qualifier=EXECUTION_IPC_LANE_CONTROL,
+    )
 
     def __call__(self, msg: object, _ctx: object | None) -> list[object]:
         payload = msg.payload if isinstance(msg, Envelope) else msg
@@ -527,7 +861,15 @@ class ControlPlaneRootLeafStopDispatchNode:
             reason=payload.reason,
         )
         self.state.append_event(command)
-        return [command]
+        self.control_lane_ipc.send(
+            compose_execution_ipc_worker_target_id(
+                payload.worker_id,
+                lane=EXECUTION_IPC_LANE_CONTROL,
+            ),
+            command,
+            no_reply=True,
+        )
+        return []
 
 
 @dataclass
@@ -573,83 +915,6 @@ class ControlPlaneRootLeafBoundaryResultNode:
         self.state.append_event(payload)
         return []
 
-
-@dataclass
-class ControlPlaneRootTombstoneObservedNode:
-    state: ControlPlaneStateService = inject.service(ControlPlaneStateService)
-    shutdown_readiness: ControlPlaneShutdownReadinessService = inject.service(
-        ControlPlaneShutdownReadinessService
-    )
-
-    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
-        payload = msg.payload if isinstance(msg, Envelope) else msg
-        if not isinstance(payload, ControlPlaneLeafBoundaryResultEvent):
-            return []
-        if payload.status.strip().lower() != "completed" or not (payload.tombstone_input or payload.tombstone_output):
-            return []
-        emit_prepare, snapshot = self.shutdown_readiness.observe_tombstone(payload)
-        self.state.append_event(
-            {
-                "kind": "control_plane.shutdown.tombstone_observed",
-                "target_group": payload.target_group,
-                "worker_id": payload.worker_id,
-                "request_id": payload.request_id,
-                "tombstone_output": payload.tombstone_output,
-                "observed_groups": list(snapshot.tombstone_groups),
-                "expected_groups": list(snapshot.expected_groups),
-                "prepare_emitted": bool(snapshot.prepare_emitted),
-            }
-        )
-        if not emit_prepare:
-            return []
-        commands = self._prepare_commands(snapshot=snapshot)
-        if not commands:
-            return []
-        self.state.append_event(
-            {
-                "kind": "control_plane.shutdown.prepare_dispatched",
-                "command_count": len(commands),
-                "expected_groups": list(snapshot.expected_groups),
-                "targets": [item.worker_id for item in commands],
-            }
-        )
-        return commands
-
-    def _prepare_commands(
-        self,
-        *,
-        snapshot: object,
-    ) -> list[ControlPlaneLeafShutdownPrepareCommand]:
-        expected_groups = tuple(
-            sorted(
-                {
-                    item
-                    for item in getattr(snapshot, "expected_groups", ())
-                    if isinstance(item, str) and item
-                }
-            )
-        )
-        if not expected_groups:
-            return []
-        worker_ids = _worker_ids_for_groups(
-            events=self.state.events(),
-            groups=set(expected_groups),
-        )
-        if not worker_ids:
-            return []
-        command_id = f"shutdown-prepare:{int(time.time() * 1000)}"
-        commands: list[ControlPlaneLeafShutdownPrepareCommand] = []
-        for worker_id, group_name in worker_ids:
-            commands.append(
-                ControlPlaneLeafShutdownPrepareCommand(
-                    target_group=group_name,
-                    worker_id=worker_id,
-                    command_id=f"{command_id}:{worker_id}",
-                )
-            )
-        return commands
-
-
 @dataclass
 class ControlPlaneRootLeafDrainReadyNode:
     state: ControlPlaneStateService = inject.service(ControlPlaneStateService)
@@ -682,7 +947,7 @@ class ControlPlaneRootLeafDrainReadyNode:
         event = ControlPlaneShutdownReadyEvent(
             expected_groups=snapshot.expected_groups,
             ready_groups=snapshot.ready_groups,
-            tombstone_groups=snapshot.tombstone_groups,
+            tombstone_groups=(),
         )
         self.state.append_event(event)
         self.state.append_event(
@@ -690,10 +955,47 @@ class ControlPlaneRootLeafDrainReadyNode:
                 "kind": "control_plane.shutdown.all_ready",
                 "expected_groups": list(snapshot.expected_groups),
                 "ready_groups": list(snapshot.ready_groups),
-                "tombstone_groups": list(snapshot.tombstone_groups),
+                "tombstone_groups": [],
             }
         )
         return [event]
+
+
+@node(
+    name="system.cp.root_stop",
+    consumes=[ControlPlaneShutdownReadyEvent],
+    emits=[ControlPlaneRootLeafStopRequestEvent],
+)
+@dataclass
+class ControlPlaneRootStopNode:
+    state: ControlPlaneStateService = inject.service(ControlPlaneStateService)
+    runner_control: ControlPlaneRootRunnerControlService = inject.service(
+        ControlPlaneRootRunnerControlService
+    )
+
+    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
+        payload = msg.payload if isinstance(msg, Envelope) else msg
+        if not isinstance(payload, ControlPlaneShutdownReadyEvent):
+            return []
+        requests: list[ControlPlaneRootLeafStopRequestEvent] = []
+        seen: set[str] = set()
+        for group_name, worker_id in _spawned_workers_for_shutdown(
+            events=self.state.events(),
+            expected_groups=payload.expected_groups,
+        ):
+            if worker_id in seen:
+                continue
+            seen.add(worker_id)
+            requests.append(
+                ControlPlaneRootLeafStopRequestEvent(
+                    target_group=group_name,
+                    worker_id=worker_id,
+                    command_id=f"runtime-stop:{worker_id}",
+                    reason="control_plane.shutdown_ready",
+                )
+            )
+        self.runner_control.request_stop()
+        return requests
 
 
 def resolve_group_specs(
@@ -893,53 +1195,253 @@ def _latest_launch_plan_from_state(events: list[object]) -> ControlPlaneLaunchPl
     return None
 
 
-def _worker_ids_for_groups(
-    *,
-    events: list[object],
-    groups: set[str],
-) -> list[tuple[str, str]]:
-    if not groups:
-        return []
-    resolved: list[tuple[str, str]] = []
+def _expected_worker_ids_for_start_work(events: list[object]) -> list[str]:
+    worker_ids: list[str] = []
     seen: set[str] = set()
     for event in events:
-        group_name: str | None = None
-        worker_id: str | None = None
-        if isinstance(event, dict):
-            if event.get("kind") == "control_plane.lifecycle.worker_spawned":
-                group_name = event.get("group_name")
-                worker_id = event.get("worker_id")
-            else:
-                group_name = event.get("target_group")
-                worker_id = event.get("worker_id")
-        else:
-            target_group = getattr(event, "target_group", None)
-            target_worker = getattr(event, "worker_id", None)
-            if isinstance(target_group, str) and target_group:
-                group_name = target_group
-            if isinstance(target_worker, str) and target_worker:
-                worker_id = target_worker
+        worker_id = event.worker_id if isinstance(event, ControlPlaneLeafConfigCardEvent) else None
         if (
-            not isinstance(group_name, str)
-            or group_name not in groups
-            or not isinstance(worker_id, str)
-            or not worker_id
-            or worker_id in seen
+            isinstance(worker_id, str)
+            and worker_id
+            and not _is_readiness_exempt_worker_id(worker_id)
+            and worker_id not in seen
         ):
+            seen.add(worker_id)
+            worker_ids.append(worker_id)
+    if worker_ids:
+        return worker_ids
+    plan = _latest_launch_plan_from_state(events)
+    if not isinstance(plan, ControlPlaneLaunchPlan):
+        return worker_ids
+    for group in plan.groups:
+        if _is_readiness_exempt_group_name(group.group_name):
+            continue
+        for index in range(max(1, int(group.workers))):
+            worker_id = f"{group.group_name}#{index + 1}"
+            if worker_id in seen:
+                continue
+            seen.add(worker_id)
+            worker_ids.append(worker_id)
+    return worker_ids
+
+
+def _latest_worker_statuses_for_start_work(
+    *,
+    events: list[object],
+    expected_worker_ids: list[str],
+) -> dict[str, str]:
+    statuses: dict[str, str] = {}
+    expected = set(expected_worker_ids)
+    for event in events:
+        if not isinstance(event, ControlPlaneLeafConfigAckEvent):
+            continue
+        worker_id = event.worker_id
+        if worker_id not in expected:
+            continue
+        statuses[worker_id] = event.status
+    return statuses
+
+
+def _spawned_workers_for_shutdown(
+    *,
+    events: list[object],
+    expected_groups: tuple[str, ...],
+) -> list[tuple[str, str]]:
+    expected = set(expected_groups) if expected_groups else None
+    seen: set[str] = set()
+    pairs: list[tuple[str, str]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("kind") != "control_plane.lifecycle.worker_spawned":
+            continue
+        group_name = event.get("group_name")
+        worker_id = event.get("worker_id")
+        if not isinstance(group_name, str) or not group_name:
+            continue
+        if not isinstance(worker_id, str) or not worker_id:
+            continue
+        if expected is not None and group_name not in expected:
+            continue
+        if worker_id in seen:
             continue
         seen.add(worker_id)
-        resolved.append((worker_id, group_name))
-    return resolved
+        pairs.append((group_name, worker_id))
+    return pairs
+
+
+def _is_start_work_on_all_ready_enabled(config_store: ControlPlaneStartupConfigStore) -> bool:
+    records = list(config_store.records(section="system_runtime"))
+    if not records:
+        return True
+    latest = records[-1]
+    payload = latest.payload if isinstance(latest.payload, dict) else {}
+    platform = payload.get("platform")
+    if not isinstance(platform, dict):
+        return True
+    readiness = platform.get("readiness")
+    if not isinstance(readiness, dict):
+        return True
+    enabled = readiness.get("enabled", True)
+    if isinstance(enabled, bool) and not enabled:
+        return False
+    start_on_all_ready = readiness.get("start_work_on_all_groups_ready", True)
+    return bool(start_on_all_ready) if isinstance(start_on_all_ready, bool) else True
+
+
+def _source_node_targets_from_runtime_config(
+    config_store: ControlPlaneStartupConfigStore,
+) -> tuple[str, ...]:
+    records = list(config_store.records(section="system_runtime"))
+    if not records:
+        return ()
+    latest = records[-1]
+    payload = latest.payload if isinstance(latest.payload, dict) else {}
+    platform = payload.get("platform")
+    if not isinstance(platform, dict):
+        return ()
+    raw_groups = platform.get("process_groups")
+    if not isinstance(raw_groups, list):
+        return ()
+    targets: list[str] = []
+    for group in raw_groups:
+        if not isinstance(group, dict):
+            continue
+        nodes = group.get("nodes")
+        if not isinstance(nodes, list):
+            continue
+        for node_name in nodes:
+            if isinstance(node_name, str) and node_name.startswith("source:"):
+                targets.append(node_name)
+    return tuple(targets)
+
+
+def _latest_group_spawn_for_startup(
+    events: list[object],
+    group_name: str,
+) -> ControlPlaneSpawnRequestedEvent | None:
+    for event in reversed(events):
+        if isinstance(event, ControlPlaneSpawnRequestedEvent) and event.group_name == group_name:
+            return event
+    return None
+
+
+def _latest_group_acks_for_startup(
+    events: list[object],
+    group_name: str,
+    worker_ids: tuple[str, ...],
+) -> dict[str, ControlPlaneLeafConfigAckEvent]:
+    remaining = set(worker_ids)
+    latest: dict[str, ControlPlaneLeafConfigAckEvent] = {}
+    for event in reversed(events):
+        if not isinstance(event, ControlPlaneLeafConfigAckEvent):
+            continue
+        if event.target_group != group_name:
+            continue
+        if event.worker_id not in remaining:
+            continue
+        latest[event.worker_id] = event
+        remaining.remove(event.worker_id)
+        if not remaining:
+            break
+    return latest
+
+
+def _group_ready_already_reported_for_startup(
+    events: list[object],
+    group_name: str,
+) -> bool:
+    return any(
+        isinstance(event, _ControlPlaneGroupStartupReadyMarker)
+        and event.group_name == group_name
+        for event in events
+    )
+
+
+def _group_failed_already_reported_for_startup(
+    events: list[object],
+    group_name: str,
+) -> bool:
+    return any(
+        isinstance(event, _ControlPlaneGroupStartupFailedMarker)
+        and event.group_name == group_name
+        for event in events
+    )
+
+
+def _is_readiness_exempt_group_name(group_name: str) -> bool:
+    lowered = group_name.strip().lower()
+    return lowered.startswith("system.observability")
+
+
+def _is_readiness_exempt_worker_id(worker_id: str) -> bool:
+    lowered = worker_id.strip().lower()
+    return lowered.startswith("system.observability#")
+
+
+def _launch_plan_group_node_names(plan: ControlPlaneLaunchPlan) -> tuple[str, ...]:
+    node_names: set[str] = set()
+    for group in plan.groups:
+        if not isinstance(group, ControlPlaneGroupSpec):
+            continue
+        for node_name in group.nodes:
+            if isinstance(node_name, str) and node_name:
+                node_names.add(node_name)
+    return tuple(sorted(node_names))
+
+
+def _prepare_root_runtime_on_init_event(
+    *,
+    payload: ControlPlaneInitEvent,
+    runtime_bootstrap: object | None,
+) -> None:
+    prepare = getattr(runtime_bootstrap, "prepare_root_runtime", None)
+    if not callable(prepare):
+        return
+    discovery = payload.discovery if isinstance(payload.discovery, dict) else None
+    if not isinstance(discovery, dict):
+        return
+    raw = discovery.get("root_runtime_prepare")
+    if not isinstance(raw, dict):
+        return
+    run_id = raw.get("run_id")
+    scenario_id = raw.get("scenario_id")
+    if not isinstance(run_id, str) or not run_id:
+        return
+    if not isinstance(scenario_id, str) or not scenario_id:
+        return
+    config = raw.get("config")
+    adapters = raw.get("adapters")
+    discovery_modules_raw = raw.get("discovery_modules")
+    discovery_modules = (
+        [item for item in discovery_modules_raw if isinstance(item, str) and item]
+        if isinstance(discovery_modules_raw, (list, tuple))
+        else []
+    )
+    prepare(
+        runtime=payload.runtime if isinstance(payload.runtime, dict) else {},
+        config=dict(config) if isinstance(config, dict) else {},
+        adapters=dict(adapters) if isinstance(adapters, dict) else {},
+        run_id=run_id,
+        scenario_id=scenario_id,
+        discovery_modules=discovery_modules,
+    )
 
 
 __all__ = [
     "ControlPlaneConfigApplyBarrierNode",
     "ControlPlaneDagAssemblyNode",
     "ControlPlaneDiscoveryApplyNode",
+    "ControlPlaneDiscoveryMaterializeNode",
     "ControlPlaneDiscoveryFinalizeNode",
     "ControlPlaneDiscoveryPumpNode",
+    "ControlPlaneGroupStartupWaitNode",
     "ControlPlaneInitPlanNode",
+    "ControlPlaneLogDispatchNode",
+    "ControlPlaneSpawnDispatchNode",
+    "ControlPlaneStartWorkReadinessNode",
     "ControlPlaneStartWorkDispatchNode",
+    "ControlPlaneRootLeafStartWorkDispatchNode",
     "ControlPlaneNodeConfigApplyNode",
     "ControlPlaneObservabilityConfigApplyNode",
     "ControlPlaneRootLeafBoundaryDispatchNode",
@@ -950,8 +1452,11 @@ __all__ = [
     "ControlPlaneRootLeafConfigAssignNode",
     "ControlPlaneRootLeafStopAckNode",
     "ControlPlaneRootLeafStopDispatchNode",
-    "ControlPlaneRootTombstoneObservedNode",
     "ControlPlaneRootLeafDrainReadyNode",
+    "ControlPlaneRootBootstrapDispatchNode",
     "ControlPlaneRootBootstrapNode",
+    "ControlPlaneConsumerRegistryGroupPruneNode",
+    "ControlPlaneShutdownExpectedGroupsNode",
+    "ControlPlaneRootStopNode",
     "ControlPlaneSystemConfigApplyNode",
 ]

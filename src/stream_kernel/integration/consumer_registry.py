@@ -34,6 +34,12 @@ class ConsumerRegistry:
     def register(self, token: type, consumers: Iterable[str]) -> None:
         raise NotImplementedError("ConsumerRegistry.register must be implemented")
 
+    def unregister(self, token: type) -> None:
+        raise NotImplementedError("ConsumerRegistry.unregister must be implemented")
+
+    def unregister_node(self, name: str) -> None:
+        raise NotImplementedError("ConsumerRegistry.unregister_node must be implemented")
+
 
 @dataclass(slots=True)
 class InMemoryConsumerRegistry(ConsumerRegistry):
@@ -87,6 +93,53 @@ class InMemoryConsumerRegistry(ConsumerRegistry):
             if isinstance(names, list):
                 nodes.update(name for name in names if isinstance(name, str))
 
+        self.store.set(_REGISTRY_MAP_KEY, mapping)
+        self.store.set(_REGISTRY_ORDER_KEY, order)
+        self.store.set(_REGISTRY_NODES_KEY, sorted(nodes))
+        self.store.set(_REGISTRY_VERSION_KEY, self.version() + 1)
+
+    def unregister(self, token: type) -> None:
+        token_key = _token_key(token)
+        mapping = self._mapping()
+        order = self._order()
+        if token_key not in mapping:
+            return
+        mapping.pop(token_key, None)
+        order = [key for key in order if key != token_key]
+        self._token_refs.pop(token_key, None)
+        nodes: set[str] = set()
+        for names in mapping.values():
+            if isinstance(names, list):
+                nodes.update(name for name in names if isinstance(name, str))
+        self.store.set(_REGISTRY_MAP_KEY, mapping)
+        self.store.set(_REGISTRY_ORDER_KEY, order)
+        self.store.set(_REGISTRY_NODES_KEY, sorted(nodes))
+        self.store.set(_REGISTRY_VERSION_KEY, self.version() + 1)
+
+    def unregister_node(self, name: str) -> None:
+        if not isinstance(name, str) or not name:
+            return
+        mapping = self._mapping()
+        order = self._order()
+        changed = False
+        empty_keys: list[str] = []
+        for token_key, consumers in mapping.items():
+            updated = [consumer for consumer in consumers if consumer != name]
+            if len(updated) != len(consumers):
+                changed = True
+            mapping[token_key] = updated
+            if not updated:
+                empty_keys.append(token_key)
+        for token_key in empty_keys:
+            mapping.pop(token_key, None)
+            order = [key for key in order if key != token_key]
+            self._token_refs.pop(token_key, None)
+        if not changed and not empty_keys:
+            return
+        nodes: set[str] = set()
+        for names in mapping.values():
+            if isinstance(names, list):
+                nodes.update(node for node in names if isinstance(node, str))
         self.store.set(_REGISTRY_MAP_KEY, mapping)
         self.store.set(_REGISTRY_ORDER_KEY, order)
         self.store.set(_REGISTRY_NODES_KEY, sorted(nodes))

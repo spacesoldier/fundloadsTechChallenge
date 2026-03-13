@@ -596,6 +596,65 @@ class ControlPlaneLaunchPlanEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class ControlPlaneInitializationRequestedEvent:
+    runtime: dict[str, object]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.runtime, dict):
+            raise ValueError("ControlPlaneInitializationRequestedEvent.runtime must be a mapping")
+
+
+@dataclass(frozen=True, slots=True)
+class ControlPlaneNodeInitializeCommand:
+    node_name: str
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str(self.node_name, "ControlPlaneNodeInitializeCommand.node_name")
+
+
+@dataclass(frozen=True, slots=True)
+class ControlPlaneNodeInitializedEvent:
+    node_name: str
+    initialized_count: int
+    total_count: int
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str(self.node_name, "ControlPlaneNodeInitializedEvent.node_name")
+        if not isinstance(self.initialized_count, int) or self.initialized_count < 0:
+            raise ValueError("ControlPlaneNodeInitializedEvent.initialized_count must be an integer >= 0")
+        if not isinstance(self.total_count, int) or self.total_count < 0:
+            raise ValueError("ControlPlaneNodeInitializedEvent.total_count must be an integer >= 0")
+
+
+@dataclass(frozen=True, slots=True)
+class ControlPlaneInitializationCompletedEvent:
+    runtime: dict[str, object]
+    initialized_nodes: tuple[str, ...] = field(default_factory=tuple)
+    expected_nodes: tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.runtime, dict):
+            raise ValueError("ControlPlaneInitializationCompletedEvent.runtime must be a mapping")
+        if any(not isinstance(name, str) or not name for name in self.initialized_nodes):
+            raise ValueError(
+                "ControlPlaneInitializationCompletedEvent.initialized_nodes must contain non-empty strings"
+            )
+        if any(not isinstance(name, str) or not name for name in self.expected_nodes):
+            raise ValueError(
+                "ControlPlaneInitializationCompletedEvent.expected_nodes must contain non-empty strings"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ControlPlaneReadyForWorkEvent:
+    runtime: dict[str, object]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.runtime, dict):
+            raise ValueError("ControlPlaneReadyForWorkEvent.runtime must be a mapping")
+
+
+@dataclass(frozen=True, slots=True)
 class ControlPlaneStartWorkEvent:
     source_targets: tuple[str, ...] = field(default_factory=tuple)
 
@@ -609,11 +668,40 @@ class ControlPlaneStartWorkEvent:
 @dataclass(frozen=True, slots=True)
 class ControlPlaneLeafStartWorkEvent:
     source_targets: tuple[str, ...] = field(default_factory=tuple)
+    command_id: str | None = None
 
     def __post_init__(self) -> None:
         if any(not isinstance(target, str) or not target for target in self.source_targets):
             raise ValueError(
                 "ControlPlaneLeafStartWorkEvent.source_targets must contain non-empty strings"
+            )
+        if self.command_id is not None and (
+            not isinstance(self.command_id, str) or not self.command_id
+        ):
+            raise ValueError(
+                "ControlPlaneLeafStartWorkEvent.command_id must be a non-empty string when provided"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ControlPlaneRootLeafStartWorkCommand:
+    target_group: str
+    worker_id: str
+    source_targets: tuple[str, ...] = field(default_factory=tuple)
+    command_id: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str(self.target_group, "ControlPlaneRootLeafStartWorkCommand.target_group")
+        _require_non_empty_str(self.worker_id, "ControlPlaneRootLeafStartWorkCommand.worker_id")
+        if any(not isinstance(target, str) or not target for target in self.source_targets):
+            raise ValueError(
+                "ControlPlaneRootLeafStartWorkCommand.source_targets must contain non-empty strings"
+            )
+        if self.command_id is not None and (
+            not isinstance(self.command_id, str) or not self.command_id
+        ):
+            raise ValueError(
+                "ControlPlaneRootLeafStartWorkCommand.command_id must be a non-empty string when provided"
             )
 
 
@@ -686,6 +774,66 @@ class ControlPlaneRootLeafBoundaryExecuteRequestEvent:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class ControlPlaneConsumerRegistryRemoveNodesEvent:
+    node_names: tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(name, str) or not name for name in self.node_names):
+            raise ValueError(
+                "ControlPlaneConsumerRegistryRemoveNodesEvent.node_names must contain non-empty strings"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ControlPlaneConsumerBindingRecord:
+    token: type[object]
+    node_names: tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.token, type):
+            raise ValueError("ControlPlaneConsumerBindingRecord.token must be a type")
+        if any(not isinstance(name, str) or not name for name in self.node_names):
+            raise ValueError(
+                "ControlPlaneConsumerBindingRecord.node_names must contain non-empty strings"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ControlPlaneConsumerRegistryBindingsApplyEvent:
+    bindings: tuple[ControlPlaneConsumerBindingRecord, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(item, ControlPlaneConsumerBindingRecord) for item in self.bindings):
+            raise ValueError(
+                "ControlPlaneConsumerRegistryBindingsApplyEvent.bindings must contain ControlPlaneConsumerBindingRecord"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ControlPlaneDeferredMessageHoldEvent:
+    payload: object
+    source_node: str | None = None
+    emitted_at_epoch_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+
+    def __post_init__(self) -> None:
+        if self.source_node is not None and (
+            not isinstance(self.source_node, str) or not self.source_node
+        ):
+            raise ValueError(
+                "ControlPlaneDeferredMessageHoldEvent.source_node must be a non-empty string when provided"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ControlPlaneDeferredMessageReplayRequestEvent:
+    reason: str = "consumer_registry_updated"
+    emitted_at_epoch_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str(self.reason, "ControlPlaneDeferredMessageReplayRequestEvent.reason")
+
+
 def _require_non_empty_str(value: object, field_name: str) -> None:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{field_name} must be a non-empty string")
@@ -725,8 +873,14 @@ __all__ = [
     "ControlPlaneInitEvent",
     "ControlPlaneLaunchPlan",
     "ControlPlaneLaunchPlanEvent",
+    "ControlPlaneInitializationRequestedEvent",
+    "ControlPlaneNodeInitializeCommand",
+    "ControlPlaneNodeInitializedEvent",
+    "ControlPlaneInitializationCompletedEvent",
+    "ControlPlaneReadyForWorkEvent",
     "ControlPlaneStartWorkEvent",
     "ControlPlaneLeafStartWorkEvent",
+    "ControlPlaneRootLeafStartWorkCommand",
     "ControlPlaneDagAssembledEvent",
     "ControlPlaneLeafPulse",
     "ControlPlaneLeafHelloEvent",
@@ -746,4 +900,9 @@ __all__ = [
     "ControlPlaneSpawnRequestedEvent",
     "ControlPlaneRootLeafStopRequestEvent",
     "ControlPlaneRootLeafBoundaryExecuteRequestEvent",
+    "ControlPlaneConsumerRegistryRemoveNodesEvent",
+    "ControlPlaneConsumerBindingRecord",
+    "ControlPlaneConsumerRegistryBindingsApplyEvent",
+    "ControlPlaneDeferredMessageHoldEvent",
+    "ControlPlaneDeferredMessageReplayRequestEvent",
 ]

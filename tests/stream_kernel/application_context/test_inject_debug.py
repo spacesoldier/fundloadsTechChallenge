@@ -60,6 +60,12 @@ class _PollingPort:
         return None
 
 
+class _PollingPortWithData:
+    def recv(self, timeout: float | None = None) -> object:
+        _ = timeout
+        return {"event": "ipc.recv", "payload": {"x": 1}}
+
+
 def test_inject_debug_wraps_stream_ports_and_emits_runtime_debug_logs(monkeypatch) -> None:
     monkeypatch.setenv("STREAM_KERNEL_INJECT_PORT_DEBUG_ENABLED", "1")
     monkeypatch.setenv("STREAM_KERNEL_LOGICAL_RUN_ID", "run")
@@ -96,6 +102,8 @@ def test_inject_debug_wraps_stream_ports_and_emits_runtime_debug_logs(monkeypatc
     assert message.fields.get("process_group") == "execution.ingress"
     assert message.fields.get("worker_id") == "execution.ingress#1"
     assert message.fields.get("__run_instance_id") == "launch-xyz"
+    assert message.fields.get("payload_model") == "dict"
+    assert message.fields.get("payload") == {"x": 1}
     assert isinstance(message.fields.get("caller_function"), str)
 
 
@@ -128,6 +136,8 @@ def test_inject_debug_wraps_service_ports_and_preserves_isinstance(monkeypatch) 
     assert message.fields.get("event") == "runtime.inject.port_call"
     assert message.fields.get("port_type") == "service"
     assert message.fields.get("method") == "ping"
+    assert message.fields.get("payload_model") == "dict"
+    assert message.fields.get("payload") == {"x": 1}
     assert isinstance(message.fields.get("caller_function"), str)
 
 
@@ -167,3 +177,28 @@ def test_inject_debug_suppresses_empty_poll_calls(monkeypatch) -> None:
     _apply_injection(holder, scope, strict=True)
     assert holder.dep.recv(timeout=0.01) is None
     assert pipeline.records == []
+
+
+def test_inject_debug_emits_non_empty_poll_result_payload(monkeypatch) -> None:
+    monkeypatch.setenv("STREAM_KERNEL_INJECT_PORT_DEBUG_ENABLED", "1")
+    registry = InjectionRegistry()
+    pipeline = _Pipeline()
+    poll_port = _PollingPortWithData()
+    registry.register_factory("ipc", _Token, lambda: poll_port)
+    registry.register_factory("service", ObservabilityPipelineService, lambda: pipeline)
+    scope = registry.instantiate_for_scenario("s1")
+
+    class _Holder:
+        dep = inject.ipc(_Token)
+
+    holder = _Holder()
+    _apply_injection(holder, scope, strict=True)
+    result = holder.dep.recv(timeout=0.01)
+    assert result == {"event": "ipc.recv", "payload": {"x": 1}}
+    assert len(pipeline.records) == 1
+    message, trace_id, attrs = pipeline.records[0]
+    assert trace_id is None
+    assert attrs == {"channel": "runtime_debug"}
+    assert message.fields.get("method") == "recv"
+    assert message.fields.get("result_model") == "dict"
+    assert message.fields.get("result") == {"event": "ipc.recv", "payload": {"x": 1}}

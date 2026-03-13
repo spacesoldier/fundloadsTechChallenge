@@ -11,6 +11,10 @@ from datetime import UTC, datetime
 from threading import Lock
 from typing import Any, Protocol, runtime_checkable
 
+from stream_kernel.application_context.debug_payload import (
+    build_call_payload_fields,
+    build_result_payload_fields,
+)
 from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.service import service
 from stream_kernel.observability.domain.debug import DebugMessage
@@ -144,6 +148,20 @@ def _wrap_service_method(*, cls: type[Any], method_name: str, func: Callable[...
             try:
                 result = await func(self, *args, **kwargs)
             except Exception as exc:
+                try:
+                    _emit_service_call_debug(
+                        owner=self,
+                        owner_cls=cls,
+                        method_name=method_name,
+                        duration_ms=(time.perf_counter() - started) * 1000.0,
+                        args=args,
+                        kwargs=kwargs,
+                        error=exc,
+                    )
+                except Exception:
+                    pass
+                raise
+            try:
                 _emit_service_call_debug(
                     owner=self,
                     owner_cls=cls,
@@ -151,18 +169,11 @@ def _wrap_service_method(*, cls: type[Any], method_name: str, func: Callable[...
                     duration_ms=(time.perf_counter() - started) * 1000.0,
                     args=args,
                     kwargs=kwargs,
-                    error=exc,
+                    error=None,
+                    result=result,
                 )
-                raise
-            _emit_service_call_debug(
-                owner=self,
-                owner_cls=cls,
-                method_name=method_name,
-                duration_ms=(time.perf_counter() - started) * 1000.0,
-                args=args,
-                kwargs=kwargs,
-                error=None,
-            )
+            except Exception:
+                pass
             return result
 
         _wrapped.__name__ = func.__name__
@@ -175,6 +186,20 @@ def _wrap_service_method(*, cls: type[Any], method_name: str, func: Callable[...
         try:
             result = func(self, *args, **kwargs)
         except Exception as exc:
+            try:
+                _emit_service_call_debug(
+                    owner=self,
+                    owner_cls=cls,
+                    method_name=method_name,
+                    duration_ms=(time.perf_counter() - started) * 1000.0,
+                    args=args,
+                    kwargs=kwargs,
+                    error=exc,
+                )
+            except Exception:
+                pass
+            raise
+        try:
             _emit_service_call_debug(
                 owner=self,
                 owner_cls=cls,
@@ -182,18 +207,11 @@ def _wrap_service_method(*, cls: type[Any], method_name: str, func: Callable[...
                 duration_ms=(time.perf_counter() - started) * 1000.0,
                 args=args,
                 kwargs=kwargs,
-                error=exc,
+                error=None,
+                result=result,
             )
-            raise
-        _emit_service_call_debug(
-            owner=self,
-            owner_cls=cls,
-            method_name=method_name,
-            duration_ms=(time.perf_counter() - started) * 1000.0,
-            args=args,
-            kwargs=kwargs,
-            error=None,
-        )
+        except Exception:
+            pass
         return result
 
     _wrapped.__name__ = func.__name__
@@ -211,6 +229,7 @@ def _emit_service_call_debug(
     args: tuple[object, ...],
     kwargs: dict[str, object],
     error: Exception | None,
+    result: object | None = None,
 ) -> None:
     if not runtime_debug_enabled():
         return
@@ -229,6 +248,15 @@ def _emit_service_call_debug(
         "caller_function": caller_function,
         "status": "error" if isinstance(error, Exception) else "ok",
     }
+    fields.update(
+        build_call_payload_fields(
+            method=method_name,
+            args=args,
+            kwargs=kwargs,
+        )
+    )
+    if not isinstance(error, Exception):
+        fields.update(build_result_payload_fields(result=result))
     if isinstance(error, Exception):
         fields["error_type"] = type(error).__name__
         fields["error_message"] = str(error)

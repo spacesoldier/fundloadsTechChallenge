@@ -71,11 +71,20 @@ def test_execute_leaf_boundary_batch_delegates_with_existing_child_runtime(
         runner_profile_requested="auto",
         runner_profile_effective="sync",
     )
-    seen: list[tuple[object, list[object]]] = []
+    seen: list[tuple[object, list[object], object | None, int]] = []
 
     class _BoundaryService:
-        def execute_boundary_batch(self, *, child: object, inputs: list[object]) -> list[object]:
-            seen.append((child, list(inputs)))
+        def execute_boundary_batch(
+            self,
+            *,
+            child: object,
+            inputs: list[object],
+            stream_callback: object | None = None,
+            stream_batch_max_items: int = 1,
+            finalize_runtime: bool = False,
+        ) -> list[object]:
+            _ = finalize_runtime
+            seen.append((child, list(inputs), stream_callback, stream_batch_max_items))
             return ["ok"]
 
     monkeypatch.setattr(mod, "resolve_leaf_runtime_boundary_service", lambda: _BoundaryService())
@@ -83,4 +92,4 @@ def test_execute_leaf_boundary_batch_delegates_with_existing_child_runtime(
     outputs = mod.execute_leaf_boundary_batch(session=session, inputs=[{"x": 1}])
 
     assert outputs == ["ok"]
-    assert seen == [(session.child, [{"x": 1}])]
+    assert seen == [(session.child, [{"x": 1}], None, 1)]

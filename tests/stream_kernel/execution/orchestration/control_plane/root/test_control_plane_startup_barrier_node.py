@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.execution.orchestration.control_plane.root.system_nodes import (
-    ControlPlaneDagAssemblyNode,
+    ControlPlaneConfigApplyBarrierNode,
     ControlPlaneDiscoveryApplyNode,
     ControlPlaneDiscoveryFinalizeNode,
     ControlPlaneDiscoveryPumpNode,
-    ControlPlaneInitPlanNode,
+    ControlPlaneNodeConfigApplyNode,
+    ControlPlaneObservabilityConfigApplyNode,
     ControlPlaneRootConfigStreamNode,
     ControlPlaneRootBootstrapNode,
     ControlPlaneStartupBarrierNode,
+    ControlPlaneSystemConfigApplyNode,
 )
 from stream_kernel.platform.services.runtime.control_plane_discovery_stream import (
     ControlPlaneDiscoveryStreamService,
@@ -23,7 +25,7 @@ from stream_kernel.platform.services.runtime.control_plane_discovery import (
     InMemoryControlPlaneDiscoveryService,
 )
 from stream_kernel.platform.services.runtime.control_plane_events import (
-    ControlPlaneDagAssembledEvent,
+    ControlPlaneConfigApplyCompletedEvent,
     ControlPlaneDagAssemblyRequestedEvent,
     ControlPlaneDiscoveryBatchReadyEvent,
     ControlPlaneDiscoveryBatchRequestedEvent,
@@ -32,15 +34,17 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneDiscoveryEntityRecord,
     ControlPlaneDiscoveryStartRequestedEvent,
     ControlPlaneDiscoverySourceCompletedEvent,
-    ControlPlaneInitEvent,
     ControlPlaneRootPulse,
-    ControlPlaneSpawnRequestedEvent,
+)
+from stream_kernel.platform.services.runtime.control_plane_config_apply import (
+    DefaultControlPlaneNodeConfigApplyService,
+    DefaultControlPlaneObservabilityConfigApplyService,
+    DefaultControlPlaneSystemConfigApplyService,
+    InMemoryControlPlaneAppliedConfigStore,
+    InMemoryControlPlaneConfigApplyTrackerService,
 )
 from stream_kernel.platform.services.runtime.control_plane_startup_barrier import (
     InMemoryControlPlaneStartupBarrierService,
-)
-from stream_kernel.platform.services.runtime.control_plane_state import (
-    InMemoryControlPlaneStateService,
 )
 
 
@@ -99,7 +103,7 @@ def test_startup_barrier_node_emits_dag_assembly_request_only_after_both_complet
 
     out_after_discovery = node(ControlPlaneDiscoveryCompletedEvent(runtime=runtime), None)
     out_after_config = node(
-        ControlPlaneConfigStreamCompletedEvent(runtime=runtime, record_count=1),
+        ControlPlaneConfigApplyCompletedEvent(runtime=runtime, expected_counts={}, applied_counts={}),
         None,
     )
 
@@ -108,7 +112,11 @@ def test_startup_barrier_node_emits_dag_assembly_request_only_after_both_complet
 
     # Duplicates must not emit new init events.
     assert (
-        node(ControlPlaneConfigStreamCompletedEvent(runtime=runtime, record_count=1), None) == []
+        node(
+            ControlPlaneConfigApplyCompletedEvent(runtime=runtime, expected_counts={}, applied_counts={}),
+            None,
+        )
+        == []
     )
     assert node(ControlPlaneDiscoveryCompletedEvent(runtime=runtime), None) == []
 
@@ -126,17 +134,30 @@ def test_root_pulse_chain_waits_for_startup_barrier_before_spawn_events() -> Non
         discovery=InMemoryControlPlaneDiscoveryService(store=InMemoryKvStore())
     )
     root_finalize = ControlPlaneDiscoveryFinalizeNode()
+    config_store = InMemoryControlPlaneStartupConfigStore(store=InMemoryKvStore())
     root_config_stream = ControlPlaneRootConfigStreamNode(
         config_stream=DefaultControlPlaneConfigStreamService(
             adapter=YamlControlPlaneConfigStreamAdapter(),
-            store=InMemoryControlPlaneStartupConfigStore(store=InMemoryKvStore()),
+            store=config_store,
         )
+    )
+    config_apply_barrier = ControlPlaneConfigApplyBarrierNode(
+        tracker=InMemoryControlPlaneConfigApplyTrackerService(),
+        config_store=config_store,
+    )
+    applied_config_store = InMemoryControlPlaneAppliedConfigStore(store=InMemoryKvStore())
+    system_config_apply = ControlPlaneSystemConfigApplyNode(
+        applier=DefaultControlPlaneSystemConfigApplyService(store=applied_config_store)
+    )
+    observability_config_apply = ControlPlaneObservabilityConfigApplyNode(
+        applier=DefaultControlPlaneObservabilityConfigApplyService(store=applied_config_store)
+    )
+    node_config_apply = ControlPlaneNodeConfigApplyNode(
+        applier=DefaultControlPlaneNodeConfigApplyService(store=applied_config_store)
     )
     startup_barrier = ControlPlaneStartupBarrierNode(
         barrier=InMemoryControlPlaneStartupBarrierService()
     )
-    dag_assembly = ControlPlaneDagAssemblyNode()
-    init_plan = ControlPlaneInitPlanNode(state=InMemoryControlPlaneStateService(store=InMemoryKvStore()))
 
     bootstrap_events = root_bootstrap(ControlPlaneRootPulse(runtime=runtime), None)
     root_events: list[object] = []
@@ -154,21 +175,17 @@ def test_root_pulse_chain_waits_for_startup_barrier_before_spawn_events() -> Non
         dag_requests_before_open.extend(startup_barrier(event, None))
     assert dag_requests_before_open == []
 
-    dag_requests_after_open: list[object] = []
+    config_apply_events: list[object] = []
     for event in config_events:
+        config_apply_events.extend(system_config_apply(event, None))
+        config_apply_events.extend(observability_config_apply(event, None))
+        config_apply_events.extend(node_config_apply(event, None))
+        config_apply_events.extend(config_apply_barrier(event, None))
+    for event in list(config_apply_events):
+        config_apply_events.extend(config_apply_barrier(event, None))
+
+    dag_requests_after_open: list[object] = []
+    for event in config_apply_events:
         dag_requests_after_open.extend(startup_barrier(event, None))
     assert len(dag_requests_after_open) == 1
     assert isinstance(dag_requests_after_open[0], ControlPlaneDagAssemblyRequestedEvent)
-
-    assembled_events: list[ControlPlaneDagAssembledEvent] = []
-    for event in dag_requests_after_open:
-        for emitted in dag_assembly(event, None):
-            if isinstance(emitted, ControlPlaneDagAssembledEvent):
-                assembled_events.append(emitted)
-    assert len(assembled_events) == 1
-
-    launch_events = init_plan(assembled_events[0], None)
-    assert any(isinstance(event, ControlPlaneInitEvent) for event in launch_events)
-    spawn_events = [event for event in launch_events if isinstance(event, ControlPlaneSpawnRequestedEvent)]
-    assert len(spawn_events) == 1
-    assert spawn_events[0].group_name == "execution.alpha"

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from stream_kernel.application_context.service import service
 from stream_kernel.platform.services.observability import ObservabilityService
 from stream_kernel.execution.orchestration.lifecycle.leaf.debug_logging import (
+    LeafLifecycleDebugLoggingService,
     flush_leaf_debug_logging,
 )
 
@@ -27,12 +28,18 @@ class LeafSessionFinalizationService(Protocol):
 @dataclass(slots=True)
 class DefaultLeafSessionFinalizationService(LeafSessionFinalizationService):
     def finalize(self, *, session: "LeafWorkerRuntimeSession") -> None:
-        try:
-            flush_leaf_debug_logging()
-        except Exception:
-            pass
         child = getattr(session, "child", None)
         scope = getattr(child, "scenario_scope", None)
+        debug_service = None
+        if scope is not None:
+            try:
+                debug_service = scope.resolve("service", LeafLifecycleDebugLoggingService)
+            except Exception:
+                debug_service = None
+        try:
+            flush_leaf_debug_logging(service=debug_service)
+        except Exception:
+            pass
         if scope is None:
             return
         try:

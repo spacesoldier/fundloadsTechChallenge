@@ -60,10 +60,6 @@ opentelemetry-exporter-otlp-proto-http = "^1.38"
 [tool.poetry.group.research-ui]
 optional = true
 
-[tool.poetry.group.research-ui.dependencies]
-fastapi = "^0.116"
-uvicorn = {version = "^0.35", extras = ["standard"]}
-
 [tool.pytest.ini_options]
 testpaths = ["tests", "research_ui/tests"]
 addopts = [

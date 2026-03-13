@@ -5,6 +5,7 @@ from typing import Any
 
 _EXPORTS = {
     'ControlPlaneLeafBootstrapNode': 'system_nodes',
+    'ControlPlaneLeafCommandIngressSourceNode': 'system_nodes',
     'ControlPlaneLeafApplyConfigNode': 'system_nodes',
     'ControlPlaneLeafDiscoveryRequestNode': 'system_nodes',
     'ControlPlaneLeafSnapshotApplyNode': 'system_nodes',

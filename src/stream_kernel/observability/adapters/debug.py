@@ -1,26 +1,26 @@
 from __future__ import annotations
 
 import atexit
-from collections import deque
 import json
 import os
 import socket
 from datetime import UTC, datetime
-from threading import Event, Lock, Thread
+from queue import Empty, SimpleQueue
+from threading import Event, Thread
 from typing import Any
 
 from stream_kernel.adapters.contracts import adapter
-from stream_kernel.observability.domain.debug import DebugMessage
 from stream_kernel.observability.adapters.logging import (
     _encode_redis_command,
     _read_redis_reply,
     _resolve_run_identity,
     _to_redis_string,
 )
+from stream_kernel.observability.domain.debug import DebugMessage
 
 
 class RedisDebugSink:
-    # Redis-backed sink for DebugMessage stream.
+    # Redis-backed sink for DebugMessage stream (writes to Redis Streams).
     def __init__(
         self,
         *,
@@ -50,10 +50,9 @@ class RedisDebugSink:
         self._queue_max_items = max(1, int(queue_max_items))
         self._batch_max_items = max(1, int(batch_max_items))
         self._batch_flush_interval_ms = max(1, int(batch_flush_interval_ms))
-        self._bg_queue: deque[list[list[object]]] = deque()
-        self._bg_lock = Lock()
+        self._bg_queue: SimpleQueue[list[list[object]]] = SimpleQueue()
         self._bg_wake = Event()
-        self._bg_closed = False
+        self._bg_closed = Event()
         self._bg_thread: Thread | None = None
         if self._write_mode == "background":
             self._bg_thread = Thread(
@@ -109,7 +108,7 @@ class RedisDebugSink:
             ensure_ascii=False,
         )
         commands: list[list[object]] = [
-            ["RPUSH", record_key, payload],
+            ["XADD", record_key, "*", "payload", payload],
             ["SADD", run_processes_key, process_id],
             ["ZADD", run_processes_by_time_key, ts_epoch_ms, process_id],
             ["HSETNX", run_meta_key, "logical_run_id", logical_run_id],
@@ -152,10 +151,9 @@ class RedisDebugSink:
     def close(self) -> None:
         if self._write_mode != "background":
             return
-        with self._bg_lock:
-            if self._bg_closed:
-                return
-            self._bg_closed = True
+        if self._bg_closed.is_set():
+            return
+        self._bg_closed.set()
         self._bg_wake.set()
         if isinstance(self._bg_thread, Thread) and self._bg_thread.is_alive():
             self._bg_thread.join(timeout=max(0.1, self._socket_timeout_seconds * 2.0))
@@ -181,36 +179,30 @@ class RedisDebugSink:
     def _enqueue_background(self, commands: list[list[object]]) -> None:
         if not commands:
             return
-        with self._bg_lock:
-            if self._bg_closed:
-                return
-            if len(self._bg_queue) >= self._queue_max_items:
-                self._bg_queue.popleft()
-            self._bg_queue.append(commands)
+        if self._bg_closed.is_set():
+            return
+        self._bg_queue.put(commands)
         self._bg_wake.set()
 
     def _run_background_writer(self) -> None:
         wait_seconds = max(0.001, float(self._batch_flush_interval_ms) / 1000.0)
         while True:
             self._bg_wake.wait(wait_seconds)
+            self._bg_wake.clear()
             batch: list[list[object]] = []
-            closed = False
-            with self._bg_lock:
-                while self._bg_queue and len(batch) < self._batch_max_items:
-                    batch.extend(self._bg_queue.popleft())
-                closed = self._bg_closed
-                if not self._bg_queue:
-                    self._bg_wake.clear()
+            while len(batch) < self._batch_max_items:
+                try:
+                    batch.extend(self._bg_queue.get_nowait())
+                except Empty:
+                    break
             if batch:
                 try:
                     self._execute(batch)
                 except Exception:
                     # Debug sink must be best-effort and never break runtime loop.
                     pass
-            if closed:
-                with self._bg_lock:
-                    if not self._bg_queue:
-                        break
+            if self._bg_closed.is_set() and self._bg_queue.empty():
+                break
 
 
 @adapter(

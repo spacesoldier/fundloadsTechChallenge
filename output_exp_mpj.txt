@@ -1,5 +1,0 @@
-{"id":"15887","customer_id":"528","accepted":true}
-{"id":"30081","customer_id":"154","accepted":true}
-{"id":"26540","customer_id":"426","accepted":true}
-{"id":"8789","customer_id":"205","accepted":true}
-{"id":"28713","customer_id":"358","accepted":true}

@@ -14,8 +14,8 @@ from stream_kernel.execution.orchestration.control_plane.root.boundary_execution
 from stream_kernel.execution.orchestration.control_plane.root.leaf_command_service import (
     DefaultControlPlaneRootLeafCommandService,
 )
-from stream_kernel.execution.orchestration.control_plane.root.reply_ingress_service import (
-    DefaultControlPlaneRootReplyIngressService,
+from stream_kernel.execution.orchestration.control_plane.root.leaf_ingress_service import (
+    DefaultControlPlaneRootLeafIngressService,
 )
 from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.execution.transport.carriers.ipc.ipc_adapters import PipeExecutionIpcTransportAdapter
@@ -37,12 +37,15 @@ from stream_kernel.platform.services.runtime.control_plane_state import (
 from stream_kernel.platform.services.runtime.lifecycle import (
     LocalExecutionWorkerLifecycleService,
 )
+from tests.stream_kernel.execution.orchestration.control_plane.leaf_ingress_helpers import (
+    drain_worker_replies,
+)
 
 
 def _wait_group_config_applied(
     *,
     state: InMemoryControlPlaneStateService,
-    ingress: DefaultControlPlaneRootReplyIngressService,
+    ingress: DefaultControlPlaneRootLeafIngressService,
     target_group: str,
     worker_ids: tuple[str, ...],
     timeout_seconds: float,
@@ -56,7 +59,7 @@ def _wait_group_config_applied(
     while pending:
         remaining = max(0.0, deadline - time.monotonic())
         for worker_id in list(pending):
-            ingress.drain_worker_replies(
+            drain_worker_replies(ingress, 
                 worker_id=worker_id,
                 timeout_seconds=min(remaining, max(0.0, float(poll_interval_seconds))),
                 max_items=64,
@@ -127,7 +130,7 @@ def test_real_spawn_ipc_handshake_repeats_stably_for_multiple_rounds() -> None:
             execution_ipc=ipc,
             context=mp.get_context("spawn"),
         )
-        ingress = DefaultControlPlaneRootReplyIngressService(state=state, execution_ipc=ipc)
+        ingress = DefaultControlPlaneRootLeafIngressService(state=state, execution_ipc=ipc)
         handle = lifecycle.spawn_worker(
             target_id="execution.alpha#1",
             target=leaf_handshake_worker,
@@ -172,11 +175,10 @@ def test_real_spawn_ipc_boundary_roundtrip_respects_latency_guard() -> None:
         execution_ipc=ipc,
         context=mp.get_context("spawn"),
     )
-    ingress = DefaultControlPlaneRootReplyIngressService(state=state, execution_ipc=ipc)
+    ingress = DefaultControlPlaneRootLeafIngressService(state=state, execution_ipc=ipc)
     reply_waiter = DefaultControlPlaneReplyWaiterService(state=state)
     root_leaf_commands = DefaultControlPlaneRootLeafCommandService(
         reply_waiter=reply_waiter,
-        reply_ingress=ingress,
         poll_interval_seconds=0.002,
     )
     root_boundary = DefaultControlPlaneRootBoundaryExecutionService(
@@ -211,10 +213,29 @@ def test_real_spawn_ipc_boundary_roundtrip_respects_latency_guard() -> None:
             inputs=({"payload": 1}, {"payload": 2}),
             timeout_seconds=2.0,
             finalize=True,
+            wait_for_result=False,
         )
+        result = None
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            drain_worker_replies(ingress, 
+                worker_id="execution.alpha#1",
+                timeout_seconds=0.002,
+                max_items=64,
+            )
+            result = reply_waiter.wait_for_leaf_boundary_result(
+                target_group="execution.alpha",
+                worker_id="execution.alpha#1",
+                request_id="phasef-latency-req",
+                timeout_seconds=0.0,
+            )
+            if result is not None:
+                break
+            time.sleep(0.002)
+        assert result is not None
         elapsed = time.monotonic() - started
 
-        assert routing.terminal_outputs == [{"count": 2, "worker_id": "execution.alpha#1"}]
+        assert routing.terminal_outputs == []
         assert elapsed <= max_latency_seconds
     finally:
         lifecycle.stop_worker(handle.target_id, graceful_timeout_seconds=0.1, terminate_timeout_seconds=0.5)

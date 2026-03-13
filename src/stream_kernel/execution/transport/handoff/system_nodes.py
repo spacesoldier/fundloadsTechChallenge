@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from stream_kernel.application_context import apply_injection
 from stream_kernel.application_context.inject import inject
 from stream_kernel.kernel.scenario import StepSpec
 from stream_kernel.kernel.node_annotation import node
@@ -147,7 +148,6 @@ def build_transport_observability_handoff_plan(
     scenario_scope: object | None = None,
     enabled_tokens: list[type[object]] | tuple[type[object], ...] | None = None,
 ) -> tuple[list[StepSpec], dict[type[object], list[str]], set[str]]:
-    dispatch_service = _resolve_dispatch_service_from_scope(scenario_scope)
     tokens = _resolve_enabled_observability_tokens(enabled_tokens)
     steps: list[StepSpec] = []
     consumers: dict[type[object], list[str]] = {}
@@ -155,39 +155,26 @@ def build_transport_observability_handoff_plan(
     for token in tokens:
         target = _OBSERVABILITY_EVENT_TARGETS.get(token)
         node_name = _OBSERVABILITY_EVENT_NODE_NAMES.get(token)
-        bypass_node_name = _OBSERVABILITY_EVENT_BYPASS_NODE_NAMES.get(token)
         if not isinstance(target, str) or not target:
             continue
         if not isinstance(node_name, str) or not node_name:
             continue
-        if not isinstance(bypass_node_name, str) or not bypass_node_name:
-            continue
-        bypass = IpcTypedObservabilityHandoffBypassNode(
-            token=token,
-            dispatch_node_target=node_name,
-        )
-        node = (
-            IpcTypedObservabilityHandoffDispatchNode(
-                token=token,
-                target=target,
-                dispatch_service=dispatch_service,
-            )
-            if dispatch_service is not None
-            else IpcTypedObservabilityHandoffDispatchNode(token=token, target=target)
-        )
-        steps.append(StepSpec(name=bypass_node_name, step=bypass))
+        node = IpcTypedObservabilityHandoffDispatchNode(token=token, target=target)
+        if scenario_scope is not None:
+            apply_injection(node, scenario_scope, False)
+            if node.dispatch_service is None:
+                node.dispatch_service = inject.service(DefaultExecutionIpcHandoffDispatchService)
         steps.append(StepSpec(name=node_name, step=node))
-        consumers[token] = [bypass_node_name]
-        node_names.add(bypass_node_name)
+        consumers[token] = [node_name]
         node_names.add(node_name)
     # Backward compatibility: when no explicit token set was requested,
     # keep legacy node name addressable by discovery.
     if not steps and enabled_tokens is None:
-        legacy_node = (
-            IpcObservabilityHandoffDispatchNode(dispatch_service=dispatch_service)
-            if dispatch_service is not None
-            else IpcObservabilityHandoffDispatchNode()
-        )
+        legacy_node = IpcObservabilityHandoffDispatchNode()
+        if scenario_scope is not None:
+            apply_injection(legacy_node, scenario_scope, False)
+            if legacy_node.dispatch_service is None:
+                legacy_node.dispatch_service = inject.service(DefaultExecutionIpcHandoffDispatchService)
         return (
             [StepSpec(name=OBSERVABILITY_HANDOFF_NODE_NAME, step=legacy_node)],
             {token: [OBSERVABILITY_HANDOFF_NODE_NAME] for token in _OBSERVABILITY_EVENT_TARGETS},
@@ -226,25 +213,6 @@ def _source_group_from_ctx(ctx: object | None) -> str | None:
     source_group = ctx.get("__process_group")
     if isinstance(source_group, str) and source_group:
         return source_group
-    return None
-
-
-def _resolve_dispatch_service_from_scope(
-    scenario_scope: object | None,
-) -> DefaultExecutionIpcHandoffDispatchService | None:
-    if scenario_scope is None:
-        return None
-    resolve = getattr(scenario_scope, "resolve", None)
-    if not callable(resolve):
-        return None
-    try:
-        resolved = resolve("service", DefaultExecutionIpcHandoffDispatchService)
-    except Exception:
-        return None
-    if isinstance(resolved, DefaultExecutionIpcHandoffDispatchService):
-        return resolved
-    if callable(getattr(resolved, "dispatch_envelope", None)):
-        return resolved  # type: ignore[return-value]
     return None
 
 

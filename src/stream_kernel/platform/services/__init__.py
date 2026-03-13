@@ -56,26 +56,6 @@ from stream_kernel.platform.services.runtime.transport import (
     RuntimeTransportService,
     TcpLocalRuntimeTransportService,
 )
-from stream_kernel.execution.transport.ipc import (
-    ExecutionIpcCodec,
-    ExecutionIpcCodecError,
-    ExecutionIpcControlSignal,
-    ExecutionIpcEndpointRegistry,
-    ExecutionIpcFlowControlPolicy,
-    ExecutionIpcKvStreamPort,
-    ExecutionIpcMessage,
-    ExecutionIpcPort,
-    ExecutionIpcReceivePolicy,
-    ExecutionIpcTransportService,
-    ExecutionIpcTransportCoordinatorService,
-    CreditWindowFlowControlPolicy,
-    HybridFlowControlPolicy,
-    InMemoryExecutionIpcTransportAdapter,
-    NoopFlowControlPolicy,
-    PipeExecutionIpcTransportAdapter,
-    TokenBucketFlowControlPolicy,
-    resolve_execution_ipc_flow_control,
-)
 from stream_kernel.platform.services.runtime.async_dispatch_loop import AsyncDispatchLoop
 from stream_kernel.platform.services.runtime.process_group_router import (
     InMemoryProcessGroupRouterService,
@@ -140,6 +120,50 @@ from stream_kernel.platform.services.runtime.control_plane_dag_assembly import (
     ControlPlaneDagAssemblyService,
     DefaultControlPlaneDagAssemblyService,
 )
+
+
+_IPC_EXPORT_NAMES = (
+    "ExecutionIpcCodec",
+    "ExecutionIpcCodecError",
+    "ExecutionIpcControlSignal",
+    "ExecutionIpcEndpointRegistry",
+    "ExecutionIpcFlowControlPolicy",
+    "ExecutionIpcKvStreamPort",
+    "ExecutionIpcMessage",
+    "ExecutionIpcPort",
+    "ExecutionIpcReceivePolicy",
+    "ExecutionIpcTransportService",
+    "ExecutionIpcTransportCoordinatorService",
+    "CreditWindowFlowControlPolicy",
+    "HybridFlowControlPolicy",
+    "InMemoryExecutionIpcTransportAdapter",
+    "NoopFlowControlPolicy",
+    "PipeExecutionIpcTransportAdapter",
+    "TokenBucketFlowControlPolicy",
+    "resolve_execution_ipc_flow_control",
+)
+
+
+def _try_load_ipc_exports() -> None:
+    try:
+        from stream_kernel.execution.transport import ipc as ipc_mod
+    except Exception:
+        return
+    for name in _IPC_EXPORT_NAMES:
+        if name in globals():
+            continue
+        try:
+            globals()[name] = getattr(ipc_mod, name)
+        except Exception:
+            continue
+
+
+def __getattr__(name: str):
+    if name in _IPC_EXPORT_NAMES:
+        _try_load_ipc_exports()
+        if name in globals():
+            return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "ConsumerRegistry",

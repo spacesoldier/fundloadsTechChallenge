@@ -41,3 +41,22 @@ def test_control_plane_dag_assembly_node_drops_empty_plan() -> None:
     produced = node(ControlPlaneDagAssemblyRequestedEvent(runtime={"platform": {}}), None)
 
     assert produced == []
+
+
+def test_control_plane_dag_assembly_node_does_not_fallback_to_runtime_groups() -> None:
+    node = ControlPlaneDagAssemblyNode(assembly=_Assembly(plan=None))
+    runtime = {
+        "platform": {
+            "process_groups": [
+                {
+                    "name": "execution.alpha",
+                    "workers": 1,
+                    "nodes": ["node.a"],
+                }
+            ]
+        }
+    }
+
+    produced = node(ControlPlaneDagAssemblyRequestedEvent(runtime=runtime), None)
+
+    assert produced == []

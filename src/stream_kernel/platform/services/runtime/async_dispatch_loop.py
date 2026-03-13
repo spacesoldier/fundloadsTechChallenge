@@ -10,7 +10,7 @@ from typing import Generic, TypeVar
 
 TItem = TypeVar("TItem")
 _SENTINEL = object()
-_SUPPORTED_DROP_POLICIES = {"drop_newest", "drop_oldest", "block_with_timeout"}
+_SUPPORTED_DROP_POLICIES = {"drop_newest", "drop_oldest", "block_with_timeout", "block_forever"}
 
 
 class AsyncDispatchLoop(Generic[TItem]):
@@ -71,6 +71,8 @@ class AsyncDispatchLoop(Generic[TItem]):
             return self._submit_drop_newest(item)
         if self._drop_policy == "drop_oldest":
             return self._submit_drop_oldest(item)
+        if self._drop_policy == "block_forever":
+            return self._submit_block_forever(item)
         return self._submit_block_with_timeout(item, timeout_seconds=timeout_seconds)
 
     def drain(self, *, timeout_seconds: float = 2.0) -> bool:
@@ -188,6 +190,21 @@ class AsyncDispatchLoop(Generic[TItem]):
                     self._submit_block_wait_ms_total += max(0, waited_ms)
                     self._dropped += 1
                 return False
+            waited_ms = int((time.perf_counter() - started) * 1000)
+            with self._state_lock:
+                self._submit_block_wait_ms_total += max(0, waited_ms)
+        with self._state_lock:
+            self._submitted += 1
+        return True
+
+    def _submit_block_forever(self, item: TItem) -> bool:
+        try:
+            self._queue.put_nowait(item)
+        except queue.Full:
+            started = time.perf_counter()
+            with self._state_lock:
+                self._submit_block_count += 1
+            self._queue.put(item)
             waited_ms = int((time.perf_counter() - started) * 1000)
             with self._state_lock:
                 self._submit_block_wait_ms_total += max(0, waited_ms)

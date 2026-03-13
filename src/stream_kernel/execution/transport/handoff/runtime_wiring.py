@@ -9,10 +9,16 @@ from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
 from stream_kernel.execution.transport.ipc.flow_control import resolve_execution_ipc_flow_control
 from stream_kernel.execution.transport.carriers.ipc.ipc_adapters import PipeExecutionIpcTransportAdapter
 from stream_kernel.execution.transport.ipc.ipc_transport import (
+    EXECUTION_IPC_LANE_CONTROL,
+    EXECUTION_IPC_LANE_DATA,
+    EXECUTION_IPC_LANE_TRACE,
+    EXECUTION_IPC_LANE_LOG,
+    EXECUTION_IPC_LANE_METRIC,
     ExecutionIpcEndpointRegistry,
     ExecutionIpcKvStreamPort,
     ExecutionIpcPort,
     ExecutionIpcReceivePolicy,
+    ExecutionIpcMessage,
     ExecutionIpcTransportService,
     resolve_execution_ipc_target_id,
 )
@@ -24,6 +30,11 @@ from stream_kernel.execution.transport.ipc.ipc_lane_routing_service import (
 from stream_kernel.execution.transport.ipc.ipc_transport_service import (
     ExecutionIpcTransportCoordinatorService,
     InMemoryExecutionIpcTransportAdapter,
+)
+from stream_kernel.platform.services.runtime.control_plane_state import (
+    ControlPlaneEventStore,
+    ControlPlaneStateService,
+    InMemoryControlPlaneStateService,
 )
 
 from .ipc_handoff_dispatch_service import (
@@ -93,6 +104,23 @@ def ensure_runtime_ipc_bindings(
     except InjectionRegistryError:
         pass
 
+    for lane in (
+        EXECUTION_IPC_LANE_CONTROL,
+        EXECUTION_IPC_LANE_DATA,
+        EXECUTION_IPC_LANE_TRACE,
+        EXECUTION_IPC_LANE_LOG,
+        EXECUTION_IPC_LANE_METRIC,
+    ):
+        try:
+            injection_registry.register_factory(
+                "kv_stream",
+                ExecutionIpcKvStreamPort,
+                lambda _adapter=service.adapter: _adapter,
+                qualifier=lane,
+            )
+        except InjectionRegistryError:
+            continue
+
     try:
         injection_registry.register_factory(
             "ipc",
@@ -155,6 +183,9 @@ def ensure_runtime_ipc_handoff_bindings(
     *,
     injection_registry: InjectionRegistry,
 ) -> None:
+    _ensure_execution_ipc_transport_service_binding(injection_registry=injection_registry)
+    _ensure_control_plane_state_service_binding(injection_registry=injection_registry)
+
     store = InMemoryKvStore()
     try:
         injection_registry.register_factory(
@@ -212,6 +243,142 @@ def ensure_runtime_ipc_handoff_bindings(
         )
     except InjectionRegistryError:
         pass
+
+
+def _ensure_execution_ipc_transport_service_binding(
+    *,
+    injection_registry: InjectionRegistry,
+) -> None:
+    bindings = getattr(injection_registry, "_bindings", None)
+    if not isinstance(bindings, dict):
+        return
+    if ("service", ExecutionIpcTransportService, None) in bindings:
+        return
+    kv_stream_binding = bindings.get(("kv_stream", ExecutionIpcKvStreamPort, None))
+    if kv_stream_binding is None:
+        return
+    adapter_factory = getattr(kv_stream_binding, "factory", None)
+    if not callable(adapter_factory):
+        return
+    try:
+        adapter = adapter_factory()
+    except Exception:
+        return
+    if isinstance(adapter, ExecutionIpcKvStreamPort):
+        endpoint_registry_store = InMemoryKvStore()
+        flow_control = resolve_execution_ipc_flow_control({})
+        try:
+            injection_registry.register_factory(
+                "kv",
+                ExecutionIpcEndpointRegistry,
+                lambda _store=endpoint_registry_store: _store,
+            )
+        except InjectionRegistryError:
+            pass
+        try:
+            injection_registry.register_factory(
+                "service",
+                ExecutionIpcTransportService,
+                lambda _adapter=adapter, _store=endpoint_registry_store, _flow=flow_control: ExecutionIpcTransportCoordinatorService(
+                    adapter=_adapter,
+                    endpoint_registry=_store,
+                    flow_control=_flow,
+                ),
+            )
+        except InjectionRegistryError:
+            return
+        return
+    if callable(getattr(adapter, "send", None)):
+        try:
+            injection_registry.register_factory(
+                "service",
+                ExecutionIpcTransportService,
+                lambda _adapter=adapter: _SendOnlyExecutionIpcTransportService(raw_adapter=_adapter),
+            )
+        except InjectionRegistryError:
+            return
+
+
+class _SendOnlyExecutionIpcTransportService(ExecutionIpcTransportService):
+    def __init__(self, *, raw_adapter: object) -> None:
+        self._raw_adapter = raw_adapter
+
+    def send(
+        self,
+        target_id: str,
+        payload: object,
+        *,
+        no_reply: bool = False,
+    ):
+        send = getattr(self._raw_adapter, "send", None)
+        if not callable(send):
+            raise ConnectionError("send-only ipc adapter is unavailable")
+        legacy_target = target_id
+        if isinstance(legacy_target, str) and "::" in legacy_target:
+            base, _sep, lane = legacy_target.partition("::")
+            if lane == EXECUTION_IPC_LANE_DATA and base:
+                legacy_target = base
+        return send(legacy_target, payload, no_reply=no_reply)
+
+    def recv(self, target_id: str, *, timeout: float | None = None) -> ExecutionIpcMessage | None:
+        _ = target_id
+        _ = timeout
+        return None
+
+    def metrics(self, target_id: str) -> dict[str, object]:
+        _ = target_id
+        return {}
+
+    def flush_pending(self, target_id: str) -> int:
+        _ = target_id
+        return 0
+
+    def build_port(
+        self,
+        *,
+        target_id: str | None = None,
+        receive_policy: ExecutionIpcReceivePolicy | None = None,
+    ) -> ExecutionIpcPort:
+        _ = receive_policy
+        return ExecutionIpcPort(service=self, target_id=target_id)
+
+    def allocate_local_endpoints(self, target_id: str) -> tuple[object, object]:
+        _ = target_id
+        raise ValueError("send-only ipc transport service does not allocate local endpoints")
+
+    def bind_local_endpoint(self, target_id: str, endpoint: object) -> None:
+        _ = target_id
+        _ = endpoint
+
+
+def _ensure_control_plane_state_service_binding(
+    *,
+    injection_registry: InjectionRegistry,
+) -> None:
+    bindings = getattr(injection_registry, "_bindings", None)
+    if not isinstance(bindings, dict):
+        return
+    if ("service", ControlPlaneStateService, None) in bindings:
+        return
+    state_store = InMemoryKvStore()
+    try:
+        injection_registry.register_factory(
+            "kv",
+            ControlPlaneEventStore,
+            lambda _store=state_store: _store,
+        )
+    except InjectionRegistryError:
+        pass
+    state_service = InMemoryControlPlaneStateService(store=state_store)
+    for contract in {ControlPlaneStateService, InMemoryControlPlaneStateService}:
+        try:
+            injection_registry.register_factory(
+                "service",
+                contract,
+                lambda _service=state_service: _service,
+            )
+        except InjectionRegistryError:
+            continue
 
 
 def resolve_execution_ipc_adapter_from_adapters(

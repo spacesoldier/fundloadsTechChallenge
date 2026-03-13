@@ -3,8 +3,8 @@ from __future__ import annotations
 import multiprocessing as mp
 import time
 
-from stream_kernel.execution.orchestration.control_plane.root.reply_ingress_service import (
-    DefaultControlPlaneRootReplyIngressService,
+from stream_kernel.execution.orchestration.control_plane.root.leaf_ingress_service import (
+    DefaultControlPlaneRootLeafIngressService,
 )
 from stream_kernel.execution.orchestration.control_plane.e2e_workers import (
     leaf_handshake_worker,
@@ -28,12 +28,15 @@ from stream_kernel.platform.services.runtime.control_plane_state import (
 from stream_kernel.platform.services.runtime.lifecycle import (
     LocalExecutionWorkerLifecycleService,
 )
+from tests.stream_kernel.execution.orchestration.control_plane.leaf_ingress_helpers import (
+    drain_worker_replies,
+)
 
 
 def wait_group_config_applied(
     *,
     state: InMemoryControlPlaneStateService,
-    ingress: DefaultControlPlaneRootReplyIngressService,
+    ingress: DefaultControlPlaneRootLeafIngressService,
     target_group: str,
     worker_ids: tuple[str, ...],
     timeout_seconds: float,
@@ -47,7 +50,7 @@ def wait_group_config_applied(
     while pending:
         remaining = max(0.0, deadline - time.monotonic())
         for worker_id in list(pending):
-            ingress.drain_worker_replies(
+            drain_worker_replies(ingress, 
                 worker_id=worker_id,
                 timeout_seconds=min(remaining, max(0.0, float(poll_interval_seconds))),
                 max_items=64,
@@ -110,7 +113,7 @@ def test_real_spawn_ipc_handshake_root_to_leaf_hello_config_ack() -> None:
         execution_ipc=ipc,
         context=mp.get_context("spawn"),
     )
-    ingress = DefaultControlPlaneRootReplyIngressService(state=state, execution_ipc=ipc)
+    ingress = DefaultControlPlaneRootLeafIngressService(state=state, execution_ipc=ipc)
 
     handle = lifecycle.spawn_worker(
         target_id="execution.alpha#1",

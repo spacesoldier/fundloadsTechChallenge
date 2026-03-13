@@ -4,9 +4,7 @@ from dataclasses import dataclass, field
 
 from stream_kernel.execution.transport.handoff.system_nodes import (
     OBSERVABILITY_LOG_HANDOFF_NODE_NAME,
-    OBSERVABILITY_LOG_HANDOFF_BYPASS_NODE_NAME,
     OBSERVABILITY_TRACE_HANDOFF_NODE_NAME,
-    OBSERVABILITY_TRACE_HANDOFF_BYPASS_NODE_NAME,
     IpcHandoffDispatchNode,
     IpcObservabilityHandoffDispatchNode,
     build_transport_observability_handoff_plan,
@@ -95,18 +93,14 @@ def test_build_transport_observability_handoff_plan_creates_channel_specific_nod
     )
 
     assert [step.name for step in steps] == [
-        OBSERVABILITY_TRACE_HANDOFF_BYPASS_NODE_NAME,
         OBSERVABILITY_TRACE_HANDOFF_NODE_NAME,
-        OBSERVABILITY_LOG_HANDOFF_BYPASS_NODE_NAME,
         OBSERVABILITY_LOG_HANDOFF_NODE_NAME,
     ]
     assert consumers == {
-        TraceDispatchEvent: [OBSERVABILITY_TRACE_HANDOFF_BYPASS_NODE_NAME],
-        LogDispatchEvent: [OBSERVABILITY_LOG_HANDOFF_BYPASS_NODE_NAME],
+        TraceDispatchEvent: [OBSERVABILITY_TRACE_HANDOFF_NODE_NAME],
+        LogDispatchEvent: [OBSERVABILITY_LOG_HANDOFF_NODE_NAME],
     }
     assert node_names == {
-        OBSERVABILITY_TRACE_HANDOFF_BYPASS_NODE_NAME,
         OBSERVABILITY_TRACE_HANDOFF_NODE_NAME,
-        OBSERVABILITY_LOG_HANDOFF_BYPASS_NODE_NAME,
         OBSERVABILITY_LOG_HANDOFF_NODE_NAME,
     }

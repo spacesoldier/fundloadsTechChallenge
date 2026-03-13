@@ -401,6 +401,17 @@ class OTelOtlpTraceSink:
             self._dropped += 1
             self._span_buffer.append(span)
             return True
+        if self._queue_drop_policy == "block_forever":
+            started_at = self._time_fn()
+            while len(self._span_buffer) >= self._queue_max_items:
+                self._flush_batch()
+                if len(self._span_buffer) < self._queue_max_items:
+                    break
+                self._sleep_fn(0.001)
+            waited_ms = max(0, int((self._time_fn() - started_at) * 1000))
+            self._block_wait_ms_total += waited_ms
+            self._span_buffer.append(span)
+            return True
         if self._queue_drop_policy != "block_with_timeout":
             self._dropped += 1
             return False
@@ -436,6 +447,17 @@ class OTelOtlpTraceSink:
         if self._queue_drop_policy == "drop_oldest":
             self._span_buffer.pop(0)
             self._dropped += 1
+            self._span_buffer.append(span)
+            return True
+        if self._queue_drop_policy == "block_forever":
+            started_at = self._time_fn()
+            while len(self._span_buffer) >= self._queue_max_items:
+                await self._flush_batch_async()
+                if len(self._span_buffer) < self._queue_max_items:
+                    break
+                await asyncio.sleep(0.001)
+            waited_ms = max(0, int((self._time_fn() - started_at) * 1000))
+            self._block_wait_ms_total += waited_ms
             self._span_buffer.append(span)
             return True
         if self._queue_drop_policy != "block_with_timeout":
@@ -531,7 +553,9 @@ class OTelOtlpTraceSink:
         try:
             self._post_http(batch)
         except Exception:
-            self._dropped += len(batch)
+            self._span_buffer = batch + self._span_buffer
+            if self._batch_started_at is None:
+                self._batch_started_at = self._time_fn()
             return
         self._exported += len(batch)
 
@@ -574,7 +598,9 @@ class OTelOtlpTraceSink:
             else:
                 self._post_http(batch)
         except Exception:
-            self._dropped += len(batch)
+            self._span_buffer = batch + self._span_buffer
+            if self._batch_started_at is None:
+                self._batch_started_at = self._time_fn()
             return
         self._exported += len(batch)
 

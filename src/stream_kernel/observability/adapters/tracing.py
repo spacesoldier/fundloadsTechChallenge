@@ -246,13 +246,19 @@ def trace_otel_otlp(settings: dict[str, object]) -> OTelOtlpTraceSink | NoOpTrac
         "drop_newest",
         "drop_oldest",
         "block_with_timeout",
+        "block_forever",
     }:
         raise ValueError(
             "trace_otel_otlp.settings.queue.drop_policy must be one of: "
-            "['drop_newest', 'drop_oldest', 'block_with_timeout']"
+            "['drop_newest', 'drop_oldest', 'block_with_timeout', 'block_forever']"
         )
     queue_block_timeout_ms = queue.get("block_timeout_ms", 100)
-    if not isinstance(queue_block_timeout_ms, int) or queue_block_timeout_ms <= 0:
+    if queue_drop_policy == "block_with_timeout":
+        if not isinstance(queue_block_timeout_ms, int) or queue_block_timeout_ms <= 0:
+            raise ValueError("trace_otel_otlp.settings.queue.block_timeout_ms must be an integer > 0 when provided")
+    elif queue_block_timeout_ms is not None and (
+        not isinstance(queue_block_timeout_ms, int) or queue_block_timeout_ms <= 0
+    ):
         raise ValueError("trace_otel_otlp.settings.queue.block_timeout_ms must be an integer > 0 when provided")
     retry = settings.get("retry", {})
     if not isinstance(retry, dict):

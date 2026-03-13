@@ -23,8 +23,6 @@ _SERVICE_EXPORTS = {
     "ControlPlaneRootRuntimeLifecycleManager",
     "LeafWorkerControlPlaneService",
     "DefaultLeafWorkerControlPlaneService",
-    "LeafWorkerCommandLoopService",
-    "DefaultLeafWorkerCommandLoopService",
     "LeafRuntimeActivationService",
     "DefaultLeafRuntimeActivationService",
     "LeafBoundaryExecutionService",
@@ -62,8 +60,6 @@ def __getattr__(name: str) -> object:
     if name in _SERVICE_EXPORTS:
         if name in {"LeafWorkerControlPlaneService", "DefaultLeafWorkerControlPlaneService"}:
             mod = import_module("stream_kernel.execution.orchestration.lifecycle.leaf.command.control_plane_service")
-        elif name in {"LeafWorkerCommandLoopService", "DefaultLeafWorkerCommandLoopService"}:
-            mod = import_module("stream_kernel.execution.orchestration.lifecycle.leaf.command.command_loop_service")
         elif name in {"LeafRuntimeActivationService", "DefaultLeafRuntimeActivationService"}:
             mod = import_module("stream_kernel.execution.orchestration.lifecycle.leaf.runtime.runtime_activation_service")
         elif name in {"LeafBoundaryExecutionService", "DefaultLeafBoundaryExecutionService"}:

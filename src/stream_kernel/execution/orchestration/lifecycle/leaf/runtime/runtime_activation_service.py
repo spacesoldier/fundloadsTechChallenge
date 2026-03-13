@@ -5,7 +5,10 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.service import service
-from stream_kernel.execution.orchestration.lifecycle.leaf.debug_logging import leaf_debug_log
+from stream_kernel.execution.orchestration.lifecycle.leaf.debug_logging import (
+    LeafLifecycleDebugLoggingService,
+    leaf_debug_log,
+)
 from stream_kernel.platform.services.runtime.control_plane_bootstrapper import (
     ControlPlaneBootstrapperService,
 )
@@ -44,8 +47,8 @@ class LeafRuntimeActivationService(Protocol):
 class DefaultLeafRuntimeActivationService(LeafRuntimeActivationService):
     discovery: ControlPlaneDiscoveryService = inject.service(ControlPlaneDiscoveryService)
     config_store: ControlPlaneStartupConfigStore = inject.service(ControlPlaneStartupConfigStore)
-    bootstrapper: ControlPlaneBootstrapperService = inject.service(ControlPlaneBootstrapperService)
-    allow_local_discovery_fallback: bool = False
+    bootstrapper: object | None = inject.service(ControlPlaneBootstrapperService)
+    debug_logging: object | None = inject.service(LeafLifecycleDebugLoggingService)
 
     def apply_config(
         self,
@@ -55,6 +58,7 @@ class DefaultLeafRuntimeActivationService(LeafRuntimeActivationService):
     ) -> ControlPlaneLeafConfigAckEvent:
         leaf_debug_log(
             event="leaf.runtime_activation.apply_config.started",
+            service=self._debug_service(),
             worker_id=session.worker_id,
             config_id=card.config_id,
             node_count=len(card.nodes),
@@ -96,6 +100,7 @@ class DefaultLeafRuntimeActivationService(LeafRuntimeActivationService):
             )
             leaf_debug_log(
                 event="leaf.runtime_activation.apply_config.completed",
+                service=self._debug_service(),
                 worker_id=session.worker_id,
                 config_id=card.config_id,
                 status=ack.status,
@@ -105,6 +110,7 @@ class DefaultLeafRuntimeActivationService(LeafRuntimeActivationService):
         except Exception as exc:  # noqa: BLE001 - deterministic typed ack
             leaf_debug_log(
                 event="leaf.runtime_activation.apply_config.failed",
+                service=self._debug_service(),
                 worker_id=session.worker_id,
                 config_id=card.config_id,
                 error=exc.__class__.__name__,
@@ -118,6 +124,7 @@ class DefaultLeafRuntimeActivationService(LeafRuntimeActivationService):
             )
 
     def _ensure_discovery_populated(self, *, session: "LeafWorkerRuntimeSession") -> None:
+        _ = session
         items_reader = getattr(self.discovery, "items", None)
         if callable(items_reader):
             try:
@@ -126,21 +133,7 @@ class DefaultLeafRuntimeActivationService(LeafRuntimeActivationService):
                     return
             except Exception:
                 pass
-        if not self._local_discovery_fallback_enabled(session):
-            return
-        bootstrapper = self.bootstrapper
-        discover_all = getattr(bootstrapper, "discover_all", None)
-        if not callable(discover_all):
-            return
-        runtime = self._runtime_from_session(session)
-        discovered = list(discover_all(runtime=runtime))
-        if not discovered:
-            return
-        appender = getattr(self.discovery, "append_item", None)
-        if not callable(appender):
-            return
-        for item in discovered:
-            appender(item)
+        return
 
     def _discovered_node_names(self) -> set[str]:
         records = list(self.discovery.entity_records(kind="node"))
@@ -196,25 +189,6 @@ class DefaultLeafRuntimeActivationService(LeafRuntimeActivationService):
         return names
 
     @staticmethod
-    def _runtime_from_session(session: "LeafWorkerRuntimeSession") -> dict[str, object]:
-        child = getattr(session, "child", None)
-        runtime = getattr(child, "runtime", None)
-        if isinstance(runtime, dict):
-            return dict(runtime)
-        return {}
-
-    def _local_discovery_fallback_enabled(self, session: "LeafWorkerRuntimeSession") -> bool:
-        runtime = self._runtime_from_session(session)
-        platform = runtime.get("platform", {})
-        if isinstance(platform, dict):
-            control_plane = platform.get("control_plane", {})
-            if isinstance(control_plane, dict):
-                configured = control_plane.get("leaf_local_discovery_fallback")
-                if isinstance(configured, bool):
-                    return configured
-        return bool(self.allow_local_discovery_fallback)
-
-    @staticmethod
     def _is_transport_alias(node_name: str) -> bool:
         if not isinstance(node_name, str) or not node_name:
             return False
@@ -248,6 +222,12 @@ class DefaultLeafRuntimeActivationService(LeafRuntimeActivationService):
                 if base:
                     aliases.add(base)
         return aliases
+
+    def _debug_service(self) -> LeafLifecycleDebugLoggingService | None:
+        candidate = self.debug_logging
+        if isinstance(candidate, LeafLifecycleDebugLoggingService):
+            return candidate
+        return None
 
 
 __all__ = [

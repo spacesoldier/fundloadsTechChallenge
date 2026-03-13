@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from stream_kernel.execution.orchestration.control_plane.root.system_nodes import (
     ControlPlaneDiscoveryApplyNode,
     ControlPlaneDiscoveryFinalizeNode,
+    ControlPlaneDiscoveryMaterializeNode,
     ControlPlaneDiscoveryPumpNode,
 )
 from stream_kernel.integration.kv_store import InMemoryKvStore
@@ -22,6 +23,10 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneDiscoverySourceCompletedEvent,
     ControlPlaneDiscoveryStartRequestedEvent,
 )
+from stream_kernel.platform.services.runtime.control_plane_discovery_materialization import (
+    ControlPlaneDiscoveredRuntimeEntity,
+    ControlPlaneDiscoveryMaterializationService,
+)
 from stream_kernel.routing.envelope import Envelope
 
 
@@ -37,6 +42,25 @@ class _DiscoveryStreamService(ControlPlaneDiscoveryStreamService):
     def request_batch(self, event: ControlPlaneDiscoveryBatchRequestedEvent) -> list[object]:
         _ = event
         return list(self.request_events)
+
+
+@dataclass(slots=True)
+class _MaterializationService(ControlPlaneDiscoveryMaterializationService):
+    calls: list[tuple[ControlPlaneDiscoveryEntityRecord, ...]]
+
+    def materialize(
+        self,
+        records: tuple[ControlPlaneDiscoveryEntityRecord, ...] | list[ControlPlaneDiscoveryEntityRecord],
+    ) -> tuple[ControlPlaneDiscoveredRuntimeEntity, ...]:
+        self.calls.append(tuple(records))
+        return ()
+
+    def all_entities(self) -> tuple[ControlPlaneDiscoveredRuntimeEntity, ...]:
+        return ()
+
+    def by_node_name(self, node_name: str) -> ControlPlaneDiscoveredRuntimeEntity | None:
+        _ = node_name
+        return None
 
 
 def test_discovery_pump_delegates_start_and_batch_requests_to_stream_service() -> None:
@@ -101,3 +125,29 @@ def test_discovery_finalize_absorbs_source_completed_event() -> None:
     )
 
     assert produced == []
+
+
+def test_discovery_materialize_passes_discovered_entities_to_materializer() -> None:
+    entity = ControlPlaneDiscoveryEntityRecord(
+        entity_kind="service",
+        entity_id="types:SimpleNamespace",
+        source_scope="platform",
+        module="types",
+        qualname="SimpleNamespace",
+        meta={"name": "service.simple"},
+    )
+    batch = ControlPlaneDiscoveryBatchReadyEvent(
+        session_id="s-1",
+        source_scope="platform",
+        cursor=0,
+        entities=(entity,),
+        has_more=False,
+        next_cursor=None,
+    )
+    materialization = _MaterializationService(calls=[])
+    node = ControlPlaneDiscoveryMaterializeNode(materializer=materialization)
+
+    produced = node(batch, None)
+
+    assert produced == []
+    assert materialization.calls == [(entity,)]

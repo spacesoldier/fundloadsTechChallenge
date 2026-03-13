@@ -8,9 +8,6 @@ from .startup_scenario_assembly import (
     RuntimeStartupAssemblyResult,
     assemble_runtime_startup_scenario,
 )
-from .root_runtime_preparation import (
-    prepare_process_supervisor_root_runtime,
-)
 
 __all__ = [
     "RootRunnerLoopOrchestrationService",
@@ -19,5 +16,4 @@ __all__ = [
     "run_with_async_runner",
     "RuntimeStartupAssemblyResult",
     "assemble_runtime_startup_scenario",
-    "prepare_process_supervisor_root_runtime",
 ]

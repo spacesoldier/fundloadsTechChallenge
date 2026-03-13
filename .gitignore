@@ -98,3 +98,7 @@ run_archive/*
 logs/leaf_debug_run2/*
 research_ui/reports/*
 !research_ui/reports/.gitkeep
+
+research_ui/research_ui_postgres/*
+research_ui/research_ui_mongodb/*
+research_ui/.venv/*

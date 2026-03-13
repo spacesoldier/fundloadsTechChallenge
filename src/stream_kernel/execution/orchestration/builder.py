@@ -22,7 +22,6 @@ from stream_kernel.application_context.injection_registry import (
 )
 from stream_kernel.execution.orchestration.control_plane import (
     build_control_plane_system_plan,
-    should_include_business_steps,
 )
 from stream_kernel.execution.orchestration.control_plane.bootstrap_keys import (
     BootstrapKeyBundle,
@@ -32,26 +31,39 @@ from stream_kernel.execution.orchestration.lifecycle.orchestration import (
     execute_with_runtime_lifecycle,
     runtime_bootstrap_mode,
 )
-from stream_kernel.execution.orchestration.lifecycle.root.startup.planning import (
-    build_lifecycle_system_plan,
-)
 from stream_kernel.execution.orchestration.observability_system_nodes import (
     build_observability_system_plan,
 )
 from stream_kernel.execution.orchestration.debug_system_nodes import (
     build_debug_system_plan,
 )
+from stream_kernel.execution.orchestration.lifecycle.leaf.debug_logging import (
+    DefaultLeafLifecycleDebugLoggingService,
+    InMemoryLeafLifecycleDebugStore,
+    LeafLifecycleDebugLoggingService,
+    LeafLifecycleDebugStore,
+)
+from stream_kernel.execution.orchestration.lifecycle.leaf.startup.runtime_step_assembly_service import (
+    DefaultLeafRuntimeIngressEgressPlanningService,
+    LeafRuntimeIngressEgressPlanningService,
+)
 from stream_kernel.execution.orchestration.runtime import (
     assemble_runtime_startup_scenario,
-    prepare_process_supervisor_root_runtime,
     run_with_async_runner,
     run_with_sync_runner,
+)
+from stream_kernel.execution.orchestration.runtime.startup_mode import (
+    should_include_business_steps as should_include_runtime_business_steps,
 )
 from stream_kernel.execution.orchestration.source_ingress import (
     WEB_INGRESS_LIMITER_QUALIFIER,
     BootstrapControl,
     SourceIngressPlan,
     build_source_ingress_plan,
+)
+from stream_kernel.execution.orchestration.startup_bindings import (
+    merge_consumer_maps,
+    seed_startup_consumer_bindings,
 )
 from stream_kernel.execution.runtime.planning import build_execution_plan
 from stream_kernel.execution.transport.handoff.runtime_wiring import (
@@ -82,6 +94,7 @@ from stream_kernel.integration.consumer_registry import (
     InMemoryConsumerRegistry,
 )
 from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
+from stream_kernel.integration.work_queue import InMemoryQueue
 from stream_kernel.kernel.dag import NodeContract
 from stream_kernel.kernel.scenario import StepSpec
 from stream_kernel.platform.services.api.outbound import (
@@ -112,6 +125,30 @@ from stream_kernel.platform.services.runtime.control_plane_discovery_adapters im
 from stream_kernel.platform.services.runtime.control_plane_discovery_stream import (
     ControlPlaneDiscoverySourceAdapter,
 )
+from stream_kernel.platform.services.runtime.control_plane_discovery_materialization import (
+    ControlPlaneDiscoveryMaterializationRegistry,
+    ControlPlaneDiscoveryMaterializationService,
+    InMemoryControlPlaneDiscoveryMaterializationService,
+)
+from stream_kernel.platform.services.runtime.control_plane_events import (
+    ControlPlaneInitEvent,
+    ControlPlaneRootPulse,
+)
+from stream_kernel.platform.services.runtime.control_plane_consumer_registry import (
+    ControlPlaneConsumerRegistryStore,
+    ControlPlaneDynamicConsumerRoutingService,
+    InMemoryControlPlaneDynamicConsumerRoutingService,
+)
+from stream_kernel.platform.services.runtime.control_plane_startup_bindings import (
+    ControlPlaneStartupConsumerBindingsService,
+    ControlPlaneStartupConsumerBindingsStore,
+    InMemoryControlPlaneStartupConsumerBindingsService,
+)
+from stream_kernel.platform.services.runtime.control_plane_deferred_message import (
+    ControlPlaneDeferredMessageService,
+    ControlPlaneDeferredMessageStore,
+    InMemoryControlPlaneDeferredMessageService,
+)
 from stream_kernel.platform.services.runtime.lifecycle import RuntimeLifecycleManager
 from stream_kernel.platform.services.runtime.process_group_router import (
     ProcessGroupRouterStore,
@@ -127,6 +164,7 @@ from stream_kernel.platform.services.runtime.debug_buffer import (
     RuntimeDebugBufferService,
 )
 from stream_kernel.routing.envelope import Envelope
+from stream_kernel.routing.routing_service import RoutingService
 
 BUILD_TIME_REGISTRY_TYPES = (AdapterRegistry, InjectionRegistry)
 RUNTIME_SERVICE_REGISTRY_CONTRACTS = (ApplicationContext,)
@@ -191,6 +229,61 @@ def load_discovery_modules(discovery_modules: list[str]) -> list[ModuleType]:
     return modules
 
 
+def _runtime_graph_discovery_modules(
+    *,
+    runtime: dict[str, object],
+    modules: list[ModuleType],
+) -> list[ModuleType]:
+    # Root supervisor runtime is control-plane driven.
+    # Keep graph bootstrap module discovery scoped to framework modules and
+    # avoid project off-graph node discovery there.
+    if not _is_root_process_supervisor_runtime(runtime):
+        return list(modules)
+    filtered = [
+        module
+        for module in modules
+        if isinstance(getattr(module, "__name__", None), str)
+        and module.__name__.startswith("stream_kernel")
+    ]
+    return filtered
+
+
+def _is_root_process_supervisor_runtime(runtime: dict[str, object]) -> bool:
+    try:
+        if runtime_bootstrap_mode(runtime) != "process_supervisor":
+            return False
+    except Exception:
+        return False
+    process_role = runtime.get("__process_role")
+    return not (isinstance(process_role, str) and process_role in {"worker", "observability_worker"})
+
+
+def _build_control_plane_init_discovery(
+    *,
+    runtime: dict[str, object],
+    config: dict[str, object],
+    adapters: dict[str, object],
+    run_id: str,
+    scenario_id: str,
+    modules: list[ModuleType],
+) -> dict[str, object] | None:
+    if not _is_root_process_supervisor_runtime(runtime):
+        return None
+    return {
+        "root_runtime_prepare": {
+            "run_id": run_id,
+            "scenario_id": scenario_id,
+            "config": dict(config),
+            "adapters": dict(adapters),
+            "discovery_modules": tuple(
+                module.__name__
+                for module in modules
+                if isinstance(getattr(module, "__name__", None), str)
+            ),
+        }
+    }
+
+
 def register_discovered_services(registry: InjectionRegistry, modules: list[object]) -> None:
     # Register services discovered in framework/user modules into DI unless overridden.
     discovered = [
@@ -231,8 +324,6 @@ def execute_runtime_artifacts(artifacts: RuntimeBuildArtifacts) -> None:
     if profile not in _LIFECYCLE_MANAGED_TRANSPORT_PROFILES:
         _execute_runner(artifacts)
         return
-    if runtime_bootstrap_mode(artifacts.runtime) == "process_supervisor":
-        prepare_process_supervisor_root_runtime(artifacts)
     execute_with_runtime_lifecycle(
         runtime=artifacts.runtime,
         scenario_scope=artifacts.scenario_scope,
@@ -317,7 +408,8 @@ def build_runtime_artifacts(
 
     ctx = ApplicationContext()
     modules = load_discovery_modules(discovery_modules)
-    ctx.discover(modules)
+    graph_modules = _runtime_graph_discovery_modules(runtime=runtime, modules=modules)
+    ctx.discover(graph_modules)
     adapter_contracts = build_adapter_contracts(adapters, adapter_registry=adapter_registry)
     strict = bool(runtime.get("strict", True))
     dag = ctx.preflight(strict=strict, extra_contracts=adapter_contracts)
@@ -333,7 +425,7 @@ def build_runtime_artifacts(
         and issubclass(service_cls, ObservabilityService)
         and service_cls.__module__ != "stream_kernel.platform.services.observability"
         and service_cls.__module__ != "stream_kernel.platform.services.observability_dispatch"
-        for service_cls in discover_services(modules)
+        for service_cls in discover_services(graph_modules)
     )
     if not custom_observability_declared:
         ensure_runtime_observability_binding(
@@ -342,7 +434,7 @@ def build_runtime_artifacts(
             adapter_instances=adapter_instances,
             replace=not custom_observability_declared,
         )
-    register_discovered_services(injection_registry, modules)
+    register_discovered_services(injection_registry, graph_modules)
     ensure_runtime_api_policy_bindings(
         injection_registry=injection_registry,
         runtime=runtime,
@@ -396,13 +488,6 @@ def build_runtime_artifacts(
             scenario_id=scenario_id,
             runtime=runtime,
         )
-    for token, node_names in source_ingress.source_consumers.items():
-        get_consumers = getattr(consumer_registry, "get_consumers", None)
-        register = getattr(consumer_registry, "register", None)
-        if not callable(get_consumers) or not callable(register):
-            continue
-        existing = list(get_consumers(token))
-        register(token, [*existing, *node_names])
     in_graph_consumes = {
         token
         for node_def in ctx.nodes
@@ -415,72 +500,53 @@ def build_runtime_artifacts(
         adapter_registry=adapter_registry,
         in_graph_consumes=in_graph_consumes,
     )
-    for token, node_names in sink_consumers.items():
-        get_consumers = getattr(consumer_registry, "get_consumers", None)
-        register = getattr(consumer_registry, "register", None)
-        if not callable(get_consumers) or not callable(register):
-            continue
-        existing = list(get_consumers(token))
-        register(token, [*existing, *node_names])
 
     observability_system = build_observability_system_plan(
         runtime=runtime,
         scenario_scope=scenario_scope,
     )
-    for token, node_names in observability_system.system_consumers.items():
-        get_consumers = getattr(consumer_registry, "get_consumers", None)
-        register = getattr(consumer_registry, "register", None)
-        if not callable(get_consumers) or not callable(register):
-            continue
-        existing = list(get_consumers(token))
-        register(token, [*existing, *node_names])
 
     debug_system = build_debug_system_plan(
         runtime=runtime,
         scenario_scope=scenario_scope,
     )
-    for token, node_names in debug_system.system_consumers.items():
-        get_consumers = getattr(consumer_registry, "get_consumers", None)
-        register = getattr(consumer_registry, "register", None)
-        if not callable(get_consumers) or not callable(register):
-            continue
-        existing = list(get_consumers(token))
-        register(token, [*existing, *node_names])
 
     control_plane_system = build_control_plane_system_plan(
         runtime=runtime,
         scenario_scope=scenario_scope,
     )
-    for token, node_names in control_plane_system.system_consumers.items():
-        get_consumers = getattr(consumer_registry, "get_consumers", None)
-        register = getattr(consumer_registry, "register", None)
-        if not callable(get_consumers) or not callable(register):
-            continue
-        existing = list(get_consumers(token))
-        register(token, [*existing, *node_names])
 
-    lifecycle_system = build_lifecycle_system_plan(
-        runtime=runtime,
-        scenario_scope=scenario_scope,
+    system_bindings = merge_consumer_maps(
+        control_plane_system.system_consumers,
+        observability_system.system_consumers,
+        debug_system.system_consumers,
     )
-    for token, node_names in lifecycle_system.system_consumers.items():
-        get_consumers = getattr(consumer_registry, "get_consumers", None)
-        register = getattr(consumer_registry, "register", None)
-        if not callable(get_consumers) or not callable(register):
-            continue
-        existing = list(get_consumers(token))
-        register(token, [*existing, *node_names])
-
+    ingress_sink_bindings = merge_consumer_maps(
+        source_ingress.source_consumers,
+        sink_consumers,
+    )
+    seed_startup_consumer_bindings(
+        scenario_scope=scenario_scope,
+        consumers=merge_consumer_maps(system_bindings, ingress_sink_bindings),
+    )
     sink_steps = [StepSpec(name=name, step=step) for name, step in sink_nodes.items()]
     startup_assembly = assemble_runtime_startup_scenario(
         runtime=runtime,
         scenario=scenario,
         source_steps=list(source_ingress.source_steps),
         control_plane_steps=list(control_plane_system.system_steps),
-        lifecycle_steps=list(lifecycle_system.system_steps),
+        lifecycle_steps=[],
         observability_steps=[*list(observability_system.system_steps), *list(debug_system.system_steps)],
         sink_steps=sink_steps,
-        source_inputs=list(source_ingress.bootstrap_inputs),
+        source_inputs=[*list(source_ingress.bootstrap_inputs)],
+        init_discovery=_build_control_plane_init_discovery(
+            runtime=runtime,
+            config=config,
+            adapters=adapters,
+            run_id=run_id,
+            scenario_id=scenario_id,
+            modules=modules,
+        ),
     )
 
     return RuntimeBuildArtifacts(
@@ -497,7 +563,6 @@ def build_runtime_artifacts(
         }
         | set(source_ingress.source_node_names)
         | set(control_plane_system.system_node_names)
-        | set(lifecycle_system.system_node_names)
         | set(observability_system.system_node_names)
         | set(debug_system.system_node_names),
         adapter_registry=adapter_registry,
@@ -1124,7 +1189,7 @@ def _web_ingress_rate_limit_policy(runtime: dict[str, object]) -> dict[str, obje
 def _should_mount_source_ingress_in_current_process(runtime: dict[str, object]) -> bool:
     # Root process-supervisor with explicit worker groups should not execute source
     # locally; start-work command is sent to leaf workers after readiness.
-    if should_include_business_steps(runtime):
+    if should_include_runtime_business_steps(runtime):
         return True
     platform = runtime.get("platform", {})
     if not isinstance(platform, dict):
@@ -1226,6 +1291,30 @@ def ensure_runtime_registry_bindings(
         pass
     try:
         injection_registry.register_factory(
+            "service",
+            LeafLifecycleDebugStore,
+            lambda: InMemoryLeafLifecycleDebugStore(),
+        )
+    except InjectionRegistryError:
+        pass
+    try:
+        injection_registry.register_factory(
+            "service",
+            LeafLifecycleDebugLoggingService,
+            lambda: DefaultLeafLifecycleDebugLoggingService(),
+        )
+    except InjectionRegistryError:
+        pass
+    try:
+        injection_registry.register_factory(
+            "service",
+            LeafRuntimeIngressEgressPlanningService,
+            lambda: DefaultLeafRuntimeIngressEgressPlanningService(),
+        )
+    except InjectionRegistryError:
+        pass
+    try:
+        injection_registry.register_factory(
             "stream",
             DebugMessage,
             lambda: _NoOpDebugStreamSink(),
@@ -1233,6 +1322,16 @@ def ensure_runtime_registry_bindings(
         )
     except InjectionRegistryError:
         pass
+    for qualifier in {"execution.asyncio"}:
+        try:
+            injection_registry.register_factory(
+                "queue",
+                Envelope,
+                lambda: InMemoryQueue(),
+                qualifier=qualifier,
+            )
+        except InjectionRegistryError:
+            pass
     fallback_endpoint_registry = InMemoryKvStore()
     fallback_ipc_transport = ExecutionIpcTransportCoordinatorService(
         adapter=InMemoryExecutionIpcTransportAdapter(),
@@ -1274,8 +1373,82 @@ def ensure_runtime_registry_bindings(
         )
     except InjectionRegistryError:
         pass
+    try:
+        injection_registry.register_factory(
+            "kv",
+            ControlPlaneDiscoveryMaterializationRegistry,
+            lambda: InMemoryKvStore(),
+        )
+    except InjectionRegistryError:
+        pass
+    try:
+        injection_registry.register_factory(
+            "service",
+            ControlPlaneDiscoveryMaterializationService,
+            lambda: InMemoryControlPlaneDiscoveryMaterializationService(),
+        )
+    except InjectionRegistryError:
+        pass
+    try:
+        injection_registry.register_factory(
+            "kv",
+            ControlPlaneConsumerRegistryStore,
+            lambda: InMemoryKvStore(),
+        )
+    except InjectionRegistryError:
+        pass
+    try:
+        injection_registry.register_factory(
+            "service",
+            ControlPlaneDynamicConsumerRoutingService,
+            lambda: InMemoryControlPlaneDynamicConsumerRoutingService(),
+        )
+    except InjectionRegistryError:
+        pass
+    try:
+        injection_registry.register_factory(
+            "kv",
+            ControlPlaneDeferredMessageStore,
+            lambda: InMemoryKvStore(),
+        )
+    except InjectionRegistryError:
+        pass
+    try:
+        injection_registry.register_factory(
+            "service",
+            ControlPlaneDeferredMessageService,
+            lambda: InMemoryControlPlaneDeferredMessageService(),
+        )
+    except InjectionRegistryError:
+        pass
+    try:
+        injection_registry.register_factory(
+            "kv",
+            ControlPlaneStartupConsumerBindingsStore,
+            lambda: InMemoryKvStore(),
+        )
+    except InjectionRegistryError:
+        pass
+    try:
+        injection_registry.register_factory(
+            "service",
+            ControlPlaneStartupConsumerBindingsService,
+            lambda: InMemoryControlPlaneStartupConsumerBindingsService(),
+        )
+    except InjectionRegistryError:
+        pass
 
     if consumer_registry is None:
+        fallback_consumer_registry = InMemoryConsumerRegistry()
+        injection_registry.register_factory(
+            "service",
+            RoutingService,
+            lambda _registry=fallback_consumer_registry: RoutingService(
+                registry=_registry,
+                strict=True,
+            ),
+            replace=True,
+        )
         injection_registry.register_factory(
             "kv",
             ConsumerRegistryStore,
@@ -1290,6 +1463,12 @@ def ensure_runtime_registry_bindings(
             lambda _registry=consumer_registry: _registry,
             replace=True,
         )
+    injection_registry.register_factory(
+        "service",
+        RoutingService,
+        lambda _registry=consumer_registry: RoutingService(registry=_registry, strict=True),
+        replace=True,
+    )
 
     store = _resolve_consumer_registry_store(consumer_registry)
     injection_registry.register_factory(
@@ -1438,6 +1617,10 @@ def ensure_runtime_lifecycle_bindings(
     from stream_kernel.execution.orchestration.lifecycle.root.runtime.lifecycle_manager import (
         ControlPlaneRootRuntimeLifecycleManager,
     )
+    from stream_kernel.execution.orchestration.control_plane.root.channel_services import (
+        ControlPlaneRootRunnerControlService,
+        DefaultControlPlaneRootRunnerControlService,
+    )
 
     try:
         injection_registry.register_factory(
@@ -1447,7 +1630,15 @@ def ensure_runtime_lifecycle_bindings(
             replace=True,
         )
     except InjectionRegistryError:
-        return
+        pass
+    try:
+        injection_registry.register_factory(
+            "service",
+            ControlPlaneRootRunnerControlService,
+            lambda: DefaultControlPlaneRootRunnerControlService(),
+        )
+    except InjectionRegistryError:
+        pass
 
 
 def resolve_execution_ipc_adapter_from_adapters(
@@ -1482,6 +1673,13 @@ def _runtime_queue_qualifiers(runtime: dict[str, object]) -> list[str]:
 def _resolve_async_runner_queue_qualifier(artifacts: RuntimeBuildArtifacts) -> str:
     runtime = artifacts.runtime
     platform = runtime.get("platform", {})
+    if isinstance(platform, dict):
+        bootstrap = platform.get("bootstrap", {})
+        mode = bootstrap.get("mode") if isinstance(bootstrap, dict) else None
+        if mode == "process_supervisor" and _contains_root_pulse_input(artifacts.inputs):
+            # Root control-plane runtime relies on platform scheduler ticker, which
+            # emits ticks into the default async queue.
+            return DEFAULT_ASYNC_QUEUE_QUALIFIER
     if not isinstance(platform, dict):
         return DEFAULT_ASYNC_QUEUE_QUALIFIER
     process_groups = platform.get("process_groups", [])
@@ -1503,6 +1701,19 @@ def _resolve_async_runner_queue_qualifier(artifacts: RuntimeBuildArtifacts) -> s
     if not isinstance(queue_qualifier, str) or not queue_qualifier:
         queue_qualifier = DEFAULT_ASYNC_QUEUE_QUALIFIER
     return queue_qualifier
+
+
+def _contains_root_pulse_input(inputs: list[object] | tuple[object, ...]) -> bool:
+    for item in inputs:
+        payload = item.payload if isinstance(item, Envelope) else item
+        if isinstance(payload, ControlPlaneRootPulse):
+            return True
+        if isinstance(payload, ControlPlaneInitEvent):
+            runtime = payload.runtime if isinstance(payload.runtime, dict) else {}
+            process_role = runtime.get("__process_role")
+            if not (isinstance(process_role, str) and process_role in {"worker", "observability_worker"}):
+                return True
+    return False
 
 
 def _build_runtime_transport_service(

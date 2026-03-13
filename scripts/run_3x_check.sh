@@ -241,8 +241,9 @@ make_debug_cfg() {
   perl -0777 -i -pe 's/leaf_debug_enabled:\s*false/leaf_debug_enabled: true/g' "${dst}"
   perl -0777 -i -pe 's/leaf_verbose_logging:\s*false/leaf_verbose_logging: true/g' "${dst}"
   perl -0777 -i -pe 's/leaf_debug_write_to_file:\s*false/leaf_debug_write_to_file: true/g' "${dst}"
-  perl -0777 -i -pe 's/runtime_debug_direct_dispatch:\s*false/runtime_debug_direct_dispatch: true/g' "${dst}"
-  perl -0777 -i -pe 's/write_mode:\s*background/write_mode: inline/g' "${dst}"
+  perl -0777 -i -pe 's/runtime_debug_enabled:\s*false/runtime_debug_enabled: true/g' "${dst}"
+  perl -0777 -i -pe 's/runtime_debug_direct_dispatch:\s*true/runtime_debug_direct_dispatch: false/g' "${dst}"
+  perl -0777 -i -pe 's/write_mode:\s*inline/write_mode: background/g' "${dst}"
   perl -0777 -i -pe 's|leaf_debug_logs_dir:\s*logs/leaf_debug|leaf_debug_logs_dir: logs/leaf_debug_run2|g' "${dst}"
 }
 
@@ -276,11 +277,17 @@ for ((i=1; i<=RUNS; i++)); do
     log "run ${i}: debug config enabled -> ${run_cfg}"
   fi
 
+  : > logs/run_log_root.log
+  tail -n +1 -f logs/run_log_root.log &
+  tail_pid=$!
   set +e
   timeout --foreground --signal=TERM --kill-after=5s "${TIMEOUT_SECONDS}s" \
-    env PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m fund_load --config "${run_cfg}" 2>&1 | tee logs/run_log_root.log
+    env PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m fund_load --config "${run_cfg}" >> logs/run_log_root.log 2>&1
   rc=$?
   set -e
+  kill "${tail_pid}" 2>/dev/null || true
+  wait "${tail_pid}" 2>/dev/null || true
+  kill_repo_runtime_processes
 
   out_lines=0
   [[ -f output_exp_mpj.txt ]] && out_lines="$(wc -l < output_exp_mpj.txt)"

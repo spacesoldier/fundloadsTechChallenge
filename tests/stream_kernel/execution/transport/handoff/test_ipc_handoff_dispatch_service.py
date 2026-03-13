@@ -146,7 +146,7 @@ def test_ipc_handoff_dispatch_service_uses_route_table_when_present() -> None:
     ]
 
 
-def test_ipc_handoff_dispatch_service_populates_route_table_when_missing() -> None:
+def test_ipc_handoff_dispatch_service_rejects_envelope_when_route_is_missing() -> None:
     route_table = InMemoryExecutionIpcRouteTableService(store=InMemoryKvStore())
     router = _Router(groups={"remote.node": "execution.beta"})
     ipc = _IpcPort()
@@ -163,19 +163,10 @@ def test_ipc_handoff_dispatch_service_populates_route_table_when_missing() -> No
         source_group="execution.root",
     )
 
-    assert dispatched is True
-    assert router.calls == [{"target": "remote.node", "source_group": "execution.root"}]
-    assert route_table.resolve_route(target="remote.node") == "execution.beta#1"
-    assert ipc.sends == [
-        {
-            "target_id": compose_execution_ipc_worker_target_id(
-                "execution.beta#1",
-                lane=EXECUTION_IPC_LANE_DATA,
-            ),
-            "payload": {"v": 2},
-            "no_reply": True,
-        }
-    ]
+    assert dispatched is False
+    assert router.calls == []
+    assert route_table.resolve_route(target="remote.node") is None
+    assert ipc.sends == []
 
 
 def test_ipc_handoff_dispatch_service_skips_non_targeted_envelope() -> None:

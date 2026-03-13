@@ -9,6 +9,9 @@ _EXPORTS = {
     "ChildBoundaryInput",
     "build_child_bootstrap_bundle",
     "LeafRuntimeBootstrapService",
+    "LeafRuntimeBootstrapAssemblyResult",
+    "LeafRuntimeBootstrapAssemblyService",
+    "DefaultLeafRuntimeBootstrapAssemblyService",
     "DefaultLeafRuntimeBootstrapService",
     "LeafRuntimeStepAssemblyService",
     "DefaultLeafRuntimeStepAssemblyService",
@@ -23,7 +26,13 @@ def __getattr__(name: str) -> object:
         mod = import_module("stream_kernel.execution.orchestration.lifecycle.leaf.startup.bootstrap_models")
     elif name in {"build_child_bootstrap_bundle"}:
         mod = import_module("stream_kernel.execution.orchestration.lifecycle.leaf.startup.bootstrap_bundle")
-    elif name in {"LeafRuntimeBootstrapService", "DefaultLeafRuntimeBootstrapService"}:
+    elif name in {
+        "LeafRuntimeBootstrapService",
+        "LeafRuntimeBootstrapAssemblyResult",
+        "LeafRuntimeBootstrapAssemblyService",
+        "DefaultLeafRuntimeBootstrapAssemblyService",
+        "DefaultLeafRuntimeBootstrapService",
+    }:
         mod = import_module("stream_kernel.execution.orchestration.lifecycle.leaf.startup.runtime_bootstrap_service")
     elif name in {
         "LeafRuntimeStepAssemblyService",

@@ -125,6 +125,23 @@ Reference:
 - `src/stream_kernel/platform/services/runtime/debug_message_dispatch.py`
 - `src/stream_kernel/execution/orchestration/builder.py`
 
+## 3.4 Leaf lifecycle debug path
+
+Leaf lifecycle debug (`leaf_debug_log`) must not maintain an isolated in-memory
+list with manual locking as a separate transport path.
+
+Current contract target:
+
+- lifecycle emits structured `DebugMessage` records;
+- records are published one-way into process-local runtime debug buffer service;
+- runner drains buffer and routes records through `system.debug.message_dispatch`
+  to the configured debug adapter (`debug_redis` stream sink);
+- optional file output remains a secondary sink controlled by
+  `runtime.platform.debug.leaf_debug_write_to_file`.
+
+This keeps leaf startup/runtime debug on the same platform rails as the rest of
+runtime debug instrumentation.
+
 ---
 
 ## 4) Redis adapter status: platform vs specialized
@@ -209,4 +226,3 @@ Keep `debug_redis` as domain-specific adapter on top of those carriers.
 
 This preserves current debug behavior while opening Redis for broader platform
 state and transport backends.
-

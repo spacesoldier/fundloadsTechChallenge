@@ -18,7 +18,11 @@ from stream_kernel.integration.work_queue import InMemoryQueue, QueuePort
 from stream_kernel.integration.consumer_registry import InMemoryConsumerRegistry
 from stream_kernel.routing.envelope import Envelope
 from stream_kernel.platform.services.messaging.reply_waiter import TerminalEvent
+from stream_kernel.platform.services.runtime.control_plane_events import (
+    ControlPlaneDeferredMessageHoldEvent,
+)
 from stream_kernel.execution.runtime.runner_ingress import enqueue_runner_input_sync
+from stream_kernel.execution.orchestration.source_ingress import BootstrapControl
 import threading
 import time
 
@@ -123,6 +127,118 @@ def test_sync_runner_run_until_stopped_returns_on_idle_timeout() -> None:
     runner.run_until_stopped(poll_timeout_seconds=0.01, idle_timeout_seconds=0.05)
     elapsed = time.monotonic() - started
     assert elapsed >= 0.03
+
+
+def test_sync_runner_does_not_call_node_initialize_implicitly() -> None:
+    class _Node:
+        def __init__(self) -> None:
+            self.init_calls = 0
+            self.call_calls = 0
+
+        def initialize(self) -> None:
+            self.init_calls += 1
+
+        def __call__(self, payload: object, _ctx: dict[str, object]) -> list[object]:
+            _ = payload
+            self.call_calls += 1
+            return []
+
+    node = _Node()
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="a", target="n", trace_id="t1"))
+    queue.push(Envelope(payload="b", target="n", trace_id="t2"))
+    runner = SyncRunner(
+        nodes={"n": node},
+        work_queue=queue,
+        context_service=InMemoryKvContextService(InMemoryKvStore()),
+        router=RoutingService(registry=InMemoryConsumerRegistry({}), strict=True),
+        observability=NoOpObservabilityService(),
+    )
+
+    runner.run()
+
+    assert node.init_calls == 0
+    assert node.call_calls == 2
+
+
+def test_runner_ingress_keeps_source_bootstrap_trace_empty_and_runner_generates_source_trace() -> None:
+    class _Obs:
+        def __init__(self) -> None:
+            self.before: list[tuple[str, str | None]] = []
+
+        def before_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+        ) -> None:
+            _ = (payload, ctx)
+            self.before.append((node_name, trace_id))
+            return None
+
+        def after_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            outputs: list[object],
+            state: object | None,
+        ) -> None:
+            _ = (node_name, payload, ctx, trace_id, outputs, state)
+            return None
+
+        def on_node_error(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            error: Exception,
+            state: object | None,
+        ) -> None:
+            _ = (node_name, payload, ctx, trace_id, error, state)
+            return None
+
+        def on_run_end(self) -> None:
+            return None
+
+        def on_ingress(self, *, trace_id: str | None, reply_to: str | None) -> None:
+            _ = (trace_id, reply_to)
+
+        def on_terminal_event(self, *, trace_id: str | None, terminal_event: object | None) -> None:
+            _ = (trace_id, terminal_event)
+
+    queue = InMemoryQueue()
+    registry = InMemoryConsumerRegistry({int: ["sink"]})
+    routing = RoutingService(registry=registry, strict=True)
+    obs = _Obs()
+    runner = SyncRunner(
+        nodes={
+            "source:events": (lambda _payload, _ctx: [1]),
+            "sink": (lambda _payload, _ctx: []),
+        },
+        run_id="run",
+        scenario_id="scenario",
+        work_queue=queue,
+        context_service=InMemoryKvContextService(InMemoryKvStore()),
+        router=routing,
+        observability=obs,
+    )
+    enqueue_runner_input_sync(
+        runner,
+        Envelope(payload=BootstrapControl(target="source:events"), target="source:events"),
+        run_id="run",
+        scenario_id="scenario",
+        index=1,
+    )
+    runner.run()
+    assert ("source:events", None) in obs.before
+    assert ("sink", "run:events:1") in obs.before
 
 
 def test_inmemory_kv_context_service_implements_context_service_contract() -> None:
@@ -330,6 +446,47 @@ def test_sync_runner_boundary_mode_treats_no_consumer_output_as_terminal() -> No
     )
     runner.run()
 
+    assert len(terminal_outputs) == 1
+    assert terminal_outputs[0].payload == "orphan-value"
+    assert terminal_outputs[0].trace_id == "t1"
+
+
+def test_sync_runner_boundary_mode_collects_terminal_for_unroutable_outputs() -> None:
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="seed", target="n1", trace_id="t1"))
+    terminal_outputs: list[Envelope] = []
+    held: list[ControlPlaneDeferredMessageHoldEvent] = []
+
+    def n1(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = (payload, ctx)
+        return ["orphan-value"]
+
+    def hold_node(payload: object, ctx: dict[str, object]) -> list[object]:
+        _ = ctx
+        if isinstance(payload, ControlPlaneDeferredMessageHoldEvent):
+            held.append(payload)
+        return []
+
+    registry = InMemoryConsumerRegistry(
+        {
+            ControlPlaneDeferredMessageHoldEvent: ["system.cp.deferred_message_hold"],
+        }
+    )
+    runner = SyncRunner(
+        nodes={
+            "n1": n1,
+            "system.cp.deferred_message_hold": hold_node,
+        },
+        work_queue=queue,
+        context_service=InMemoryKvContextService(InMemoryKvStore()),
+        router=RoutingService(registry=registry, strict=True),
+        observability=NoOpObservabilityService(),
+        allow_external_deliveries=True,
+        terminal_outputs=terminal_outputs,
+    )
+    runner.run()
+
+    assert held == []
     assert len(terminal_outputs) == 1
     assert terminal_outputs[0].payload == "orphan-value"
     assert terminal_outputs[0].trace_id == "t1"

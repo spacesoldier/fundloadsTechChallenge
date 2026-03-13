@@ -23,9 +23,6 @@ from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.platform.services.runtime.control_plane_discovery_stream import (
     ControlPlaneDiscoveryStreamService,
 )
-from stream_kernel.platform.services.runtime.control_plane_bootstrapper import (
-    ControlPlaneBootstrapperService,
-)
 from stream_kernel.platform.services.runtime.control_plane_discovery import (
     InMemoryControlPlaneDiscoveryService,
 )
@@ -45,7 +42,9 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneDiscoveryEntityRecord,
     ControlPlaneDiscoveryStartRequestedEvent,
     ControlPlaneDiscoverySourceCompletedEvent,
-    ControlPlaneInitEvent,
+    ControlPlaneGroupSpec,
+    ControlPlaneLaunchPlan,
+    ControlPlaneInitializationRequestedEvent,
     ControlPlaneLaunchPlanEvent,
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafConfigCardEvent,
@@ -60,24 +59,6 @@ from stream_kernel.platform.services.runtime.control_plane_state import (
 from stream_kernel.platform.services.runtime.control_plane_startup_barrier import (
     InMemoryControlPlaneStartupBarrierService,
 )
-
-
-@dataclass(slots=True)
-class _Bootstrapper(ControlPlaneBootstrapperService):
-    all_items: list[ControlPlaneDiscoveryItemEvent] = field(default_factory=list)
-
-    def discover_all(self, runtime: dict[str, object]) -> list[ControlPlaneDiscoveryItemEvent]:
-        _ = runtime
-        return list(self.all_items)
-
-    def discover_subset(
-        self,
-        *,
-        runtime: dict[str, object],
-        node_names: list[str],
-    ) -> list[ControlPlaneDiscoveryItemEvent]:
-        _ = (runtime, node_names)
-        return []
 
 
 @dataclass(slots=True)
@@ -129,6 +110,28 @@ class _DiscoveryStream(ControlPlaneDiscoveryStreamService):
         ]
 
 
+@dataclass(slots=True)
+class _DagAssemblyService:
+    def assemble(self, *, runtime: dict[str, object]) -> ControlPlaneLaunchPlan | None:
+        platform = runtime.get("platform", {}) if isinstance(runtime, dict) else {}
+        groups_raw = platform.get("process_groups", []) if isinstance(platform, dict) else []
+        if not isinstance(groups_raw, list):
+            return None
+        groups: list[ControlPlaneGroupSpec] = []
+        for group in groups_raw:
+            if not isinstance(group, dict):
+                continue
+            name = group.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            workers = group.get("workers", 1)
+            worker_count = workers if isinstance(workers, int) and workers > 0 else 1
+            nodes_raw = group.get("nodes", [])
+            nodes = tuple(node for node in nodes_raw if isinstance(node, str) and node) if isinstance(nodes_raw, list) else ()
+            groups.append(ControlPlaneGroupSpec(group_name=name, workers=worker_count, nodes=nodes))
+        return ControlPlaneLaunchPlan(groups=tuple(groups)) if groups else None
+
+
 def test_control_plane_handshake_sequence_reaches_root_state_update() -> None:
     root_runtime = {
         "platform": {
@@ -141,12 +144,6 @@ def test_control_plane_handshake_sequence_reaches_root_state_update() -> None:
         "__worker_id": "execution.alpha#1",
         "__runner_profile_requested": "auto",
     }
-    bootstrapper = _Bootstrapper(
-        all_items=[
-            ControlPlaneDiscoveryItemEvent(item_kind="node", payload={"name": "node.a"}),
-            ControlPlaneDiscoveryItemEvent(item_kind="node", payload={"name": "node.b"}),
-        ],
-    )
     stream = _DiscoveryStream(
         runtime=root_runtime,
         entities=(
@@ -170,6 +167,8 @@ def test_control_plane_handshake_sequence_reaches_root_state_update() -> None:
     )
     root_discovery = InMemoryControlPlaneDiscoveryService(store=InMemoryKvStore())
     leaf_discovery = InMemoryControlPlaneDiscoveryService(store=InMemoryKvStore())
+    leaf_discovery.append_item(ControlPlaneDiscoveryItemEvent(item_kind="node", payload={"name": "node.a"}))
+    leaf_discovery.append_item(ControlPlaneDiscoveryItemEvent(item_kind="node", payload={"name": "node.b"}))
     root_state = InMemoryControlPlaneStateService(store=InMemoryKvStore())
     lifecycle = _LifecycleService()
 
@@ -186,13 +185,13 @@ def test_control_plane_handshake_sequence_reaches_root_state_update() -> None:
     root_barrier = ControlPlaneStartupBarrierNode(
         barrier=InMemoryControlPlaneStartupBarrierService()
     )
-    root_dag_assembly = ControlPlaneDagAssemblyNode()
+    root_dag_assembly = ControlPlaneDagAssemblyNode(assembly=_DagAssemblyService())
     root_init_plan = ControlPlaneInitPlanNode(state=root_state)
     root_spawn_dispatch = ControlPlaneSpawnDispatchNode(lifecycle=lifecycle)
     root_assign = ControlPlaneRootLeafConfigAssignNode(state=root_state)
     root_ack = ControlPlaneRootLeafConfigAckNode(state=root_state)
     leaf_bootstrap = ControlPlaneLeafBootstrapNode()
-    leaf_apply = ControlPlaneLeafApplyConfigNode(bootstrapper=bootstrapper, discovery=leaf_discovery)
+    leaf_apply = ControlPlaneLeafApplyConfigNode(discovery=leaf_discovery)
 
     # Root pulse -> discovery stream progression -> completed
     root_bootstrap_out = root_bootstrap(ControlPlaneRootPulse(runtime=root_runtime), None)
@@ -228,7 +227,7 @@ def test_control_plane_handshake_sequence_reaches_root_state_update() -> None:
 
     # Dag assembled -> init signal + launch plan + spawn requests
     plan_out = root_init_plan(assembled_events[0], None)
-    assert any(isinstance(e, ControlPlaneInitEvent) for e in plan_out)
+    assert any(isinstance(e, ControlPlaneInitializationRequestedEvent) for e in plan_out)
     assert any(isinstance(e, ControlPlaneLaunchPlanEvent) for e in plan_out)
     spawn_events = [e for e in plan_out if isinstance(e, ControlPlaneSpawnRequestedEvent)]
     assert len(spawn_events) == 1

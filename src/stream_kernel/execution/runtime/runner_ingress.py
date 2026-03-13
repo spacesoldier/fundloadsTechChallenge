@@ -4,6 +4,12 @@ from stream_kernel.execution.runtime.runner import AsyncRunner, SyncRunner
 from stream_kernel.routing.envelope import Envelope
 
 
+def _is_source_bootstrap_envelope(payload: Envelope) -> bool:
+    target = payload.target
+    control_target = getattr(payload.payload, "target", None)
+    return isinstance(target, str) and target.startswith("source:") and control_target == target
+
+
 def enqueue_runner_input_sync(
     runner: SyncRunner,
     payload: object,
@@ -17,24 +23,27 @@ def enqueue_runner_input_sync(
     router = runner._router()
     if isinstance(payload, Envelope):
         trace_id = payload.trace_id or runner._trace_id(run_id=run_id, index=index)
-        runner._seed_context(
-            context_service=context_service,
-            trace_id=trace_id,
-            payload=payload.payload,
-            run_id=run_id,
-            scenario_id=scenario_id,
-            reply_to=payload.reply_to,
-        )
-        ingress_service_outputs = runner._emit_ingress(trace_id=trace_id, reply_to=payload.reply_to)
-        runner._route_observability_service_outputs(
-            service_outputs=ingress_service_outputs,
-            source_node="__ingress__",
-            trace_id=trace_id,
-            reply_to=payload.reply_to,
-            span_id=payload.span_id,
-            work_queue=work_queue,
-            router=router,
-        )
+        if payload.trace_id is None and _is_source_bootstrap_envelope(payload):
+            trace_id = None
+        if trace_id is not None:
+            runner._seed_context(
+                context_service=context_service,
+                trace_id=trace_id,
+                payload=payload.payload,
+                run_id=run_id,
+                scenario_id=scenario_id,
+                reply_to=payload.reply_to,
+            )
+            ingress_service_outputs = runner._emit_ingress(trace_id=trace_id, reply_to=payload.reply_to)
+            runner._route_observability_service_outputs(
+                service_outputs=ingress_service_outputs,
+                source_node="__ingress__",
+                trace_id=trace_id,
+                reply_to=payload.reply_to,
+                span_id=payload.span_id,
+                work_queue=work_queue,
+                router=router,
+            )
         if payload.target is not None:
             work_queue.push(
                 Envelope(
@@ -95,24 +104,27 @@ def enqueue_runner_input_async(
     router = runner._router()
     if isinstance(payload, Envelope):
         trace_id = payload.trace_id or SyncRunner._trace_id(run_id=run_id, index=index)
-        SyncRunner._seed_context(
-            context_service=context_service,
-            trace_id=trace_id,
-            payload=payload.payload,
-            run_id=run_id,
-            scenario_id=scenario_id,
-            reply_to=payload.reply_to,
-        )
-        ingress_service_outputs = runner._emit_ingress(trace_id=trace_id, reply_to=payload.reply_to)
-        runner._route_observability_service_outputs(
-            service_outputs=ingress_service_outputs,
-            source_node="__ingress__",
-            trace_id=trace_id,
-            reply_to=payload.reply_to,
-            span_id=payload.span_id,
-            work_queue=work_queue,
-            router=router,
-        )
+        if payload.trace_id is None and _is_source_bootstrap_envelope(payload):
+            trace_id = None
+        if trace_id is not None:
+            SyncRunner._seed_context(
+                context_service=context_service,
+                trace_id=trace_id,
+                payload=payload.payload,
+                run_id=run_id,
+                scenario_id=scenario_id,
+                reply_to=payload.reply_to,
+            )
+            ingress_service_outputs = runner._emit_ingress(trace_id=trace_id, reply_to=payload.reply_to)
+            runner._route_observability_service_outputs(
+                service_outputs=ingress_service_outputs,
+                source_node="__ingress__",
+                trace_id=trace_id,
+                reply_to=payload.reply_to,
+                span_id=payload.span_id,
+                work_queue=work_queue,
+                router=router,
+            )
         if payload.target is not None:
             work_queue.push(
                 Envelope(
@@ -164,4 +176,3 @@ __all__ = [
     "enqueue_runner_input_sync",
     "enqueue_runner_input_async",
 ]
-

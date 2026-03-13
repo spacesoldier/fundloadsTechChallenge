@@ -1208,6 +1208,26 @@ def test_validate_newgen_config_accepts_runtime_platform_debug_leaf_logging_sett
     assert debug.get("runtime_debug_direct_dispatch") is True
 
 
+def test_validate_newgen_config_defaults_runtime_debug_enabled_to_leaf_debug_enabled() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "debug": {
+            "leaf_debug_enabled": True,
+        }
+    }
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    debug = platform.get("debug")
+    assert isinstance(debug, dict)
+    assert debug.get("runtime_debug_enabled") is True
+    assert debug.get("runtime_debug_direct_dispatch") is False
+
+
 def test_validate_newgen_config_rejects_invalid_runtime_platform_debug_leaf_debug_logs_dir() -> None:
     raw = _phase0_base_config()
     runtime = raw["runtime"]
@@ -1460,7 +1480,7 @@ def test_validate_newgen_config_rejects_observability_service_worker_invalid_dro
     runtime["observability"] = {
         "service_worker": {
             "enabled": True,
-            "drop_policy": "block_forever",
+            "drop_policy": "drop_everything",
         }
     }
 
@@ -1491,6 +1511,41 @@ def test_validate_newgen_config_rejects_invalid_otel_exporter_queue_block_timeou
     }
     with pytest.raises(ConfigError, match="queue\\.block_timeout_ms must be an integer > 0"):
         validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_accepts_otel_exporter_queue_block_forever_without_timeout() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "settings": {
+                        "endpoint": "http://collector:4318/v1/traces",
+                        "queue": {
+                            "drop_policy": "block_forever",
+                        },
+                    },
+                }
+            ]
+        }
+    }
+    validated = validate_newgen_config(raw)
+    vruntime = validated.get("runtime")
+    assert isinstance(vruntime, dict)
+    observability = vruntime.get("observability")
+    assert isinstance(observability, dict)
+    tracing = observability.get("tracing")
+    assert isinstance(tracing, dict)
+    exporters = tracing.get("exporters")
+    assert isinstance(exporters, list)
+    settings = exporters[0].get("settings")
+    assert isinstance(settings, dict)
+    queue = settings.get("queue")
+    assert isinstance(queue, dict)
+    assert queue.get("drop_policy") == "block_forever"
 
 
 def test_validate_newgen_config_rejects_unknown_observability_logging_lifecycle_level() -> None:
@@ -1638,6 +1693,11 @@ def test_validate_newgen_config_accepts_observability_logging_redis_debug_export
     exporters = logging.get("exporters")
     assert isinstance(exporters, list)
     assert exporters and exporters[0].get("kind") == "redis_debug"
+    exporter0 = exporters[0]
+    assert isinstance(exporter0, dict)
+    settings = exporter0.get("settings")
+    assert isinstance(settings, dict)
+    assert settings.get("write_mode") == "background"
 
 
 def test_validate_newgen_config_rejects_observability_logging_redis_debug_invalid_port() -> None:
@@ -3113,6 +3173,22 @@ def test_validate_newgen_config_applies_runtime_platform_runner_loop_defaults() 
     assert runner_loop.get("post_start_settle_max_wait_seconds") == 30.0
     assert runner_loop.get("post_start_settle_quiet_window_seconds") == 5.0
     assert runner_loop.get("require_source_tombstones") is False
+
+
+def test_validate_newgen_config_accepts_runtime_platform_runner_loop_zero_post_start_settle_max_wait() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {"runner_loop": {"post_start_settle_max_wait_seconds": 0.0}}
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    runner_loop = platform.get("runner_loop")
+    assert isinstance(runner_loop, dict)
+    assert runner_loop.get("post_start_settle_max_wait_seconds") == 0.0
 
 
 def test_validate_newgen_config_accepts_runtime_platform_source_ingress_contract() -> None:

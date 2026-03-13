@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
 
 from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.service import service
@@ -25,28 +24,16 @@ from stream_kernel.execution.orchestration.control_plane.root.boundary_handoff_s
 from stream_kernel.execution.orchestration.control_plane.root.leaf_command_service import (
     ControlPlaneRootLeafCommandService,
 )
-from stream_kernel.execution.orchestration.control_plane.root.reply_ingress_service import (
-    ControlPlaneRootReplyIngressService,
+from stream_kernel.execution.orchestration.control_plane.root.leaf_ingress_service import (
+    ControlPlaneRootLeafIngressService,
+)
+from stream_kernel.execution.orchestration.control_plane.root.runtime_bootstrap_contract import (
+    ControlPlaneRootRuntimeBootstrapService,
 )
 from stream_kernel.execution.transport.handoff.ipc_route_table_service import (
     ExecutionIpcRouteTableService,
 )
 from stream_kernel.platform.services.runtime import ProcessGroupRouterService
-
-
-@runtime_checkable
-class ControlPlaneRootRuntimeBootstrapService(Protocol):
-    def prepare_root_runtime(
-        self,
-        *,
-        runtime: dict[str, object],
-        config: dict[str, object],
-        adapters: dict[str, object],
-        run_id: str,
-        scenario_id: str,
-        discovery_modules: list[str],
-    ) -> None:
-        raise NotImplementedError
 
 
 @service(name="control_plane_root_runtime_bootstrap_service")
@@ -58,7 +45,9 @@ class DefaultControlPlaneRootRuntimeBootstrapService(ControlPlaneRootRuntimeBoot
     process_group_router: ProcessGroupRouterService = inject.service(ProcessGroupRouterService)
     root_boundary_handoff: object = inject.service(ControlPlaneRootBoundaryHandoffService)
     root_leaf_commands: object = inject.service(ControlPlaneRootLeafCommandService)
-    root_reply_ingress: object = inject.service(ControlPlaneRootReplyIngressService)
+    root_leaf_ingress: object = inject.service(ControlPlaneRootLeafIngressService)
+    # Backward-compatible alias for legacy constructor keyword.
+    root_leaf_ingress: object | None = None
     route_table: object | None = inject.service(ExecutionIpcRouteTableService)
 
     def prepare_root_runtime(
@@ -95,7 +84,7 @@ class DefaultControlPlaneRootRuntimeBootstrapService(ControlPlaneRootRuntimeBoot
         self._preload_route_table_snapshot(configured_groups)
         self._configure_root_boundary_handoff(runtime_map)
         self._configure_root_leaf_command_poll(runtime_map)
-        self._configure_root_reply_ingress(runtime_map)
+        self._configure_root_leaf_ingress(runtime_map)
 
     def _lifecycle(self) -> ControlPlaneLifecycleOrchestrationService:
         candidate = self.lifecycle
@@ -175,8 +164,17 @@ class DefaultControlPlaneRootRuntimeBootstrapService(ControlPlaneRootRuntimeBoot
             return
         configure(_boundary_control_poll_seconds(runtime))
 
-    def _configure_root_reply_ingress(self, runtime: dict[str, object]) -> None:
-        candidate = self.root_reply_ingress
+    def _configure_root_leaf_ingress(self, runtime: dict[str, object]) -> None:
+        candidate = self.root_leaf_ingress
+        if not (
+            hasattr(candidate, "root_boundary_handoff")
+            or callable(getattr(candidate, "configure_startup_protocol_revision", None))
+            or callable(getattr(candidate, "configure_verbose_logging", None))
+        ):
+            if self.root_leaf_ingress is not None:
+                candidate = self.root_leaf_ingress
+        elif candidate is None and self.root_leaf_ingress is not None:
+            candidate = self.root_leaf_ingress
         if hasattr(candidate, "root_boundary_handoff"):
             try:
                 setattr(candidate, "root_boundary_handoff", self.root_boundary_handoff)
@@ -421,6 +419,8 @@ def _route_table_snapshot_from_groups(groups: list[dict[str, object]]) -> dict[s
         group_name = group.get("name")
         if not isinstance(group_name, str) or not group_name:
             continue
+        workers = group.get("workers")
+        worker_count = int(workers) if isinstance(workers, int) and workers > 0 else 1
         nodes = group.get("nodes", [])
         if not isinstance(nodes, list):
             continue

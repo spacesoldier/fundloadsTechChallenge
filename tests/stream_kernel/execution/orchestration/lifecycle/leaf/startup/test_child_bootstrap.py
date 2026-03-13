@@ -713,7 +713,7 @@ def test_child_boundary_loop_emits_observability_traces_from_runtime_exporters(t
     assert exported[0].get("trace_id") == "t1"
 
 
-def test_child_boundary_loop_worker_transport_only_emits_trace_dispatch_envelope(tmp_path: Path) -> None:
+def test_child_boundary_loop_worker_transport_mode_keeps_business_terminal_output(tmp_path: Path) -> None:
     pkg = tmp_path / "child_pkg_obs_worker_transport"
     _write_file(pkg / "__init__.py", "")
     _write_file(
@@ -768,9 +768,15 @@ def test_child_boundary_loop_worker_transport_only_emits_trace_dispatch_envelope
     finally:
         sys.path.remove(str(tmp_path))
 
+    # In process-supervisor worker mode, observability is relayed through transport handoff rails.
+    # Isolated boundary execution keeps business payload as terminal output and does not expose
+    # trace-dispatch envelopes as direct boundary outputs.
     assert any(
+        getattr(item, "target", None) is None and getattr(item, "payload", None) == {"v": 1}
+        for item in outputs
+    ), outputs
+    assert not any(
         isinstance(getattr(item, "payload", None), TraceDispatchEvent)
-        and getattr(item, "target", None) == "system.obs.trace_dispatch"
         for item in outputs
     ), outputs
 
@@ -969,7 +975,7 @@ def test_child_boundary_loop_executes_local_chain_inside_group_before_emitting(t
         sys.path.remove(str(tmp_path))
 
     assert len(outputs) == 1
-    assert outputs[0].target is None
+    assert outputs[0].target == "system.cp.root_payload_sink"
     assert outputs[0].trace_id == "t-phase-c-1"
     assert outputs[0].payload == "done:7"
 
