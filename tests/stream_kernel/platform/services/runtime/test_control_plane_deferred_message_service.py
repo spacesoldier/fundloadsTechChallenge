@@ -7,6 +7,7 @@ from stream_kernel.platform.services.runtime.control_plane_deferred_message impo
 )
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneDeferredMessageHoldEvent,
+    ControlPlaneLeafSinkDispatchAckEvent,
 )
 
 
@@ -45,4 +46,26 @@ def test_deferred_message_service_ignores_non_event_inputs() -> None:
         store=InMemoryKvStore(),
     )
     service.hold(object())
+    assert service.pending_count() == 0
+
+
+def test_deferred_message_service_drops_transient_sink_ack_tails() -> None:
+    service = InMemoryControlPlaneDeferredMessageService(
+        registry=InMemoryConsumerRegistry(),
+        store=InMemoryKvStore(),
+    )
+    service.hold(
+        ControlPlaneDeferredMessageHoldEvent(
+            payload=ControlPlaneLeafSinkDispatchAckEvent(
+                target_group="execution.ingress",
+                worker_id="execution.ingress#1",
+                request_id="req-1",
+                source_target="source:source",
+                payload_class="dict",
+                tombstone_output=False,
+            ),
+            source_node="system.cp.leaf_reply_dispatch",
+        )
+    )
+
     assert service.pending_count() == 0

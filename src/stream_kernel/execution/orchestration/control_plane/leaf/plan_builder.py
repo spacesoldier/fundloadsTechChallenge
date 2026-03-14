@@ -32,7 +32,8 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneInitializationCompletedEvent,
     ControlPlaneInitializationRequestedEvent,
     ControlPlaneLeafBoundaryExecuteCommand,
-    ControlPlaneLeafBoundaryResultEvent,
+    ControlPlaneLeafBoundaryOutputsEvent,
+    ControlPlaneLeafSinkDispatchAckEvent,
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafConfigCardEvent,
     ControlPlaneLeafDiscoveryAckEvent,
@@ -77,6 +78,7 @@ from .system_nodes import (
     ControlPlaneLeafConfigApplyRuntimeNode,
     ControlPlaneLeafDiscoveryRequestNode,
     ControlPlaneLeafReplyDispatchNode,
+    ControlPlaneLeafSourcePollFromSinkAckNode,
     ControlPlaneLeafSnapshotApplyNode,
     ControlPlaneLeafStartWorkNode,
     ControlPlaneLeafStopNode,
@@ -129,6 +131,7 @@ def build_leaf_control_plane_system_plan(
     ]
     leaf_command_source_names = [spec.name for spec in leaf_command_source_steps]
     leaf_reply_dispatch = ControlPlaneLeafReplyDispatchNode()
+    leaf_source_poll_from_sink_ack = ControlPlaneLeafSourcePollFromSinkAckNode()
     leaf_apply = ControlPlaneLeafConfigApplyRuntimeNode(
         activation=resolve_required_service(
             scope=scenario_scope,
@@ -158,7 +161,7 @@ def build_leaf_control_plane_system_plan(
     leaf_shutdown_readiness = resolve_optional_service(
         scope=scenario_scope,
         contract=leaf_shutdown_readiness_contract(),
-        method_name="observe_boundary_result",
+        method_name="observe_boundary_outputs",
     ) or noop_leaf_shutdown_readiness_service()
     leaf_boundary = ControlPlaneLeafBoundaryExecuteNode(
         boundary_execution=resolve_required_service(
@@ -185,6 +188,7 @@ def build_leaf_control_plane_system_plan(
             deferred_message_hold=deferred_message_hold,
             deferred_message_replay=deferred_message_replay,
             leaf_reply_dispatch=leaf_reply_dispatch,
+            leaf_source_poll_from_sink_ack=leaf_source_poll_from_sink_ack,
             consumer_registry_discovery_apply=consumer_registry_discovery_apply,
             consumer_registry_remove=consumer_registry_remove,
             leaf_discovery=leaf_discovery,
@@ -244,9 +248,12 @@ def build_leaf_control_plane_system_plan(
             ControlPlaneLeafBoundaryExecuteCommand: [
                 "system.cp.leaf_boundary_execute",
             ],
-            ControlPlaneLeafBoundaryResultEvent: [
+            ControlPlaneLeafBoundaryOutputsEvent: [
                 "system.cp.leaf_tombstone_finalize",
                 "system.cp.leaf_reply_dispatch",
+            ],
+            ControlPlaneLeafSinkDispatchAckEvent: [
+                "system.cp.leaf_source_poll_from_sink_ack",
             ],
             ControlPlaneLeafStopCommand: ["system.cp.leaf_stop"],
             ControlPlaneLeafHelloEvent: ["system.cp.leaf_reply_dispatch"],

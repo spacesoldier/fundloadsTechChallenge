@@ -1335,6 +1335,34 @@ def test_build_source_ingress_plan_marks_last_payload_with_tombstone_when_enable
     assert second == []
 
 
+def test_pull_source_single_shot_bootstrap_does_not_self_rearm() -> None:
+    registry = AdapterRegistry()
+    registry.register("events_source", "events_source", _source_factory)
+    adapters = {"events_source": {"settings": {}}}
+    adapter_instances = {"events_source": type("I", (), {"read": lambda *_a: [1, 2]})()}
+
+    injection = InjectionRegistry()
+    injection.register_factory("service", ContextService, lambda: InMemoryKvContextService(InMemoryKvStore()))
+    scope = injection.instantiate_for_scenario("s1")
+
+    ingress = build_source_ingress_plan(
+        adapters=adapters,
+        adapter_instances=adapter_instances,
+        adapter_registry=registry,
+        scenario_scope=scope,
+        run_id="run",
+        scenario_id="scenario",
+    )
+
+    node = ingress.source_steps[0].step
+    assert isinstance(node, PullIngressSourceNode)
+    first = node(BootstrapControl(target="source:events_source", single_shot=True), {})
+    payloads = [item for item in first if isinstance(item, Envelope) and isinstance(item.payload, int)]
+    bootstraps = [item for item in first if isinstance(item, Envelope) and isinstance(item.payload, BootstrapControl)]
+    assert [item.payload for item in payloads] == [1]
+    assert bootstraps == []
+
+
 def test_build_source_ingress_plan_rejects_push_mode_without_poll_contract() -> None:
     # Explicit push mode must fail fast when adapter has no non-blocking poll contract.
     registry = AdapterRegistry()

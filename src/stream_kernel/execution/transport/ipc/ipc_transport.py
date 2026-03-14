@@ -45,6 +45,7 @@ class ExecutionIpcReceivePolicy:
 class ExecutionIpcControlSignal:
     kind: str
     count: int = 0
+    target_id: str | None = None
 
 
 def normalize_execution_ipc_lane(lane: str | None) -> str:
@@ -146,6 +147,14 @@ class ExecutionIpcPort:
             raise ValueError("ExecutionIpcPort.recv requires a bound target_id")
         return self._service.recv(self._target_id, timeout=timeout)
 
+    def recv_buffered(self, timeout: float | None = None) -> ExecutionIpcMessage | None:
+        if not isinstance(self._target_id, str) or not self._target_id:
+            raise ValueError("ExecutionIpcPort.recv_buffered requires a bound target_id")
+        recv_buffered = getattr(self._service, "recv_buffered", None)
+        if callable(recv_buffered):
+            return recv_buffered(self._target_id, timeout=timeout)
+        return self._service.recv(self._target_id, timeout=timeout)
+
     def metrics(self) -> dict[str, object]:
         if not isinstance(self._target_id, str) or not self._target_id:
             raise ValueError("ExecutionIpcPort.metrics requires a bound target_id")
@@ -164,6 +173,11 @@ class ExecutionIpcTransportService:
 
     def recv(self, target_id: str, *, timeout: float | None = None) -> ExecutionIpcMessage | None:
         raise NotImplementedError("ExecutionIpcTransportService.recv must be implemented")
+
+    def recv_buffered(self, target_id: str, *, timeout: float | None = None) -> ExecutionIpcMessage | None:
+        # Buffered-only receive: should not perform direct channel drain.
+        # Default compatibility path falls back to recv().
+        return self.recv(target_id, timeout=timeout)
 
     def metrics(self, target_id: str) -> dict[str, object]:
         raise NotImplementedError("ExecutionIpcTransportService.metrics must be implemented")
@@ -207,6 +221,13 @@ class ExecutionIpcKvStreamPort(Protocol):
     ) -> ExecutionIpcAck | None: ...
 
     def recv(self, target_id: str, *, timeout: float | None = None) -> ExecutionIpcMessage | None: ...
+
+    def recv_buffered(
+        self,
+        target_id: str,
+        *,
+        timeout: float | None = None,
+    ) -> ExecutionIpcMessage | None: ...
 
     def metrics(self, target_id: str) -> dict[str, object]: ...
 

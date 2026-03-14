@@ -135,6 +135,7 @@ class DefaultLeafRuntimeBootstrapAssemblyService(LeafRuntimeBootstrapAssemblySer
         )
         execution_builder.ensure_runtime_ipc_handoff_bindings_via_transport(
             injection_registry=injection_registry,
+            runtime=bundle_typed.runtime,
         )
         step_names = [node_def.meta.name for node_def in app_context.nodes]
         custom_observability_declared = any(

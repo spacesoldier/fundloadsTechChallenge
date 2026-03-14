@@ -238,9 +238,10 @@ make_debug_cfg() {
   local src="$1"
   local dst="$2"
   cp "${src}" "${dst}"
-  perl -0777 -i -pe 's/leaf_debug_enabled:\s*false/leaf_debug_enabled: true/g' "${dst}"
-  perl -0777 -i -pe 's/leaf_verbose_logging:\s*false/leaf_verbose_logging: true/g' "${dst}"
-  perl -0777 -i -pe 's/leaf_debug_write_to_file:\s*false/leaf_debug_write_to_file: true/g' "${dst}"
+  # Keep leaf lifecycle file logging disabled for throughput-focused debug runs.
+  perl -0777 -i -pe 's/leaf_debug_enabled:\s*true/leaf_debug_enabled: false/g' "${dst}"
+  perl -0777 -i -pe 's/leaf_verbose_logging:\s*true/leaf_verbose_logging: false/g' "${dst}"
+  perl -0777 -i -pe 's/leaf_debug_write_to_file:\s*true/leaf_debug_write_to_file: false/g' "${dst}"
   perl -0777 -i -pe 's/runtime_debug_enabled:\s*false/runtime_debug_enabled: true/g' "${dst}"
   perl -0777 -i -pe 's/runtime_debug_direct_dispatch:\s*true/runtime_debug_direct_dispatch: false/g' "${dst}"
   perl -0777 -i -pe 's/write_mode:\s*inline/write_mode: background/g' "${dst}"

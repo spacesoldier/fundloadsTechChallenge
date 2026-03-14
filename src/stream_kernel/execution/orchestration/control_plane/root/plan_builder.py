@@ -67,7 +67,6 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneInitializationCompletedEvent,
     ControlPlaneInitializationRequestedEvent,
     ControlPlaneLaunchPlanEvent,
-    ControlPlaneLeafBoundaryResultEvent,
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafDiscoveryAckEvent,
     ControlPlaneLeafDrainReadyEvent,
@@ -108,6 +107,7 @@ from stream_kernel.platform.services.runtime.platform_scheduler import (
 from .leaf_ingress_nodes import (
     ROOT_BOUNDARY_HANDOFF_SINK_NODE_NAME,
     ROOT_LEAF_CONTROL_DISPATCH_SINK_NODE_NAME,
+    ControlPlaneRootLeafIngressEnvelopeEvent,
     ControlPlaneRootBoundaryHandoffSinkNode,
     ControlPlaneRootLeafControlDispatchSinkNode,
     ControlPlaneRootLeafIngressSourceNode,
@@ -133,7 +133,6 @@ from .system_nodes import (
     ControlPlaneObservabilityConfigApplyNode,
     ControlPlaneRootBootstrapNode,
     ControlPlaneRootConfigStreamNode,
-    ControlPlaneRootLeafBoundaryResultNode,
     ControlPlaneConsumerRegistryGroupPruneNode,
     ControlPlaneRootLeafDrainReadyNode,
     ControlPlaneRootLeafStartWorkDispatchNode,
@@ -306,13 +305,6 @@ def build_root_control_plane_system_plan(
             method_name="drain_external_deliveries",
         )
     )
-    root_boundary_result_state = ControlPlaneRootLeafBoundaryResultNode(
-        state=resolve_required_service(
-            scope=scenario_scope,
-            contract=ControlPlaneStateService,
-            method_name="append_event",
-        ),
-    )
     root_stop_ack_state = ControlPlaneRootLeafStopAckNode(
         state=resolve_required_service(
             scope=scenario_scope,
@@ -407,7 +399,6 @@ def build_root_control_plane_system_plan(
             deferred_message_replay=deferred_message_replay,
             root_config_stream=root_config_stream,
             root_reply_dispatch_sink=root_reply_dispatch_sink,
-            root_boundary_result_state=root_boundary_result_state,
             root_stop_ack_state=root_stop_ack_state,
             root_boundary_handoff_sink=root_boundary_handoff_sink,
             consumer_registry_discovery_apply=consumer_registry_discovery_apply,
@@ -518,10 +509,7 @@ def build_root_control_plane_system_plan(
         bytes: ["system.cp.root_payload_sink"],
         ControlPlaneLeafDrainReadyEvent: ["system.cp.shutdown_leaf_ready"],
         ControlPlaneShutdownReadyEvent: ["system.cp.root_stop"],
-        ControlPlaneLeafBoundaryResultEvent: [
-            "system.cp.root_boundary_result_state",
-            ROOT_BOUNDARY_HANDOFF_SINK_NODE_NAME,
-        ],
+        ControlPlaneRootLeafIngressEnvelopeEvent: [ROOT_BOUNDARY_HANDOFF_SINK_NODE_NAME],
     }
     launch_plan_consumers = system_consumers.setdefault(ControlPlaneLaunchPlanEvent, [])
     if "system.cp.shutdown_expected_groups" not in launch_plan_consumers:

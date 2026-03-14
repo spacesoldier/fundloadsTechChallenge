@@ -104,10 +104,6 @@ from stream_kernel.platform.services.runtime.control_plane_config_apply import (
     InMemoryControlPlaneConfigApplyTrackerService,
     resolve_expected_config_apply_counts,
 )
-from stream_kernel.platform.services.runtime.control_plane_reply_waiter import (
-    ControlPlaneReplyWaiterService,
-    DefaultControlPlaneReplyWaiterService,
-)
 from stream_kernel.platform.services.runtime.control_plane_startup_barrier import (
     ControlPlaneStartupBarrierService,
     InMemoryControlPlaneStartupBarrierService,
@@ -244,8 +240,6 @@ __all__ = [
     "InMemoryControlPlaneAppliedConfigStore",
     "InMemoryControlPlaneConfigApplyTrackerService",
     "resolve_expected_config_apply_counts",
-    "ControlPlaneReplyWaiterService",
-    "DefaultControlPlaneReplyWaiterService",
     "ControlPlaneStartupBarrierService",
     "InMemoryControlPlaneStartupBarrierService",
     "ControlPlaneLaunchPlanService",

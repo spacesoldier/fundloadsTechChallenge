@@ -20,9 +20,9 @@ from stream_kernel.execution.transport.ipc.ipc_transport import (
     compose_execution_ipc_worker_target_id,
 )
 from stream_kernel.platform.services.runtime.control_plane_events import (
-    ControlPlaneLeafBoundaryResultEvent,
     ControlPlaneLeafDrainReadyEvent,
 )
+from stream_kernel.routing.envelope import Envelope
 
 
 @runtime_checkable
@@ -242,7 +242,11 @@ def _recv_from_lane(
 ) -> object | None:
     lane_target = compose_execution_ipc_worker_target_id(worker_id, lane=lane)
     try:
-        return ipc.recv(lane_target, timeout=max(0.0, float(timeout_seconds)))
+        recv_buffered = getattr(ipc, "recv_buffered", None)
+        timeout = max(0.0, float(timeout_seconds))
+        if callable(recv_buffered):
+            return recv_buffered(lane_target, timeout=timeout)
+        return ipc.recv(lane_target, timeout=timeout)
     except Exception:
         return None
 
@@ -286,7 +290,7 @@ def _lane_adapter_ingress(
 
 
 def _fallback_reply_lane(*, payload: object) -> str:
-    if isinstance(payload, ControlPlaneLeafBoundaryResultEvent):
+    if isinstance(payload, Envelope):
         return EXECUTION_IPC_LANE_DATA
     if isinstance(payload, ControlPlaneLeafDrainReadyEvent):
         return EXECUTION_IPC_LANE_CONTROL

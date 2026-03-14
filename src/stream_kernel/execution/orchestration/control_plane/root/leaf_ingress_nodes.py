@@ -18,14 +18,11 @@ from stream_kernel.execution.transport.ipc.ipc_transport import (
     EXECUTION_IPC_LANE_CONTROL,
 )
 from stream_kernel.platform.services.runtime.platform_scheduler import (
-    PlatformSchedulerService,
-    PlatformSchedulerTimerService,
     PlatformSchedulerUpsertCommand,
 )
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafDiscoveryAckEvent,
-    ControlPlaneLeafBoundaryResultEvent,
     ControlPlaneLeafDrainReadyEvent,
     ControlPlaneLeafHelloEvent,
     ControlPlaneLeafStopAckEvent,
@@ -45,6 +42,13 @@ ROOT_LEAF_INGRESS_SOURCE_NODE_NAME = "source:system.cp.root_leaf_ingress"
 ROOT_LEAF_INGRESS_SOURCE_NODE_PREFIX = f"{ROOT_LEAF_INGRESS_SOURCE_NODE_NAME}:"
 ROOT_BOUNDARY_HANDOFF_SINK_NODE_NAME = "system.cp.root_boundary_handoff_sink"
 ROOT_LEAF_CONTROL_DISPATCH_SINK_NODE_NAME = "system.cp.root_leaf_control_dispatch_sink"
+
+
+@dataclass(frozen=True, slots=True)
+class ControlPlaneRootLeafIngressEnvelopeEvent:
+    worker_id: str
+    lane: str
+    envelope: Envelope
 
 
 def root_leaf_ingress_source_node_name(*, worker_id: str, lane: str) -> str:
@@ -69,7 +73,7 @@ def is_root_leaf_ingress_source_node_name(node_name: object) -> bool:
         ControlPlaneLeafDiscoveryAckEvent,
         ControlPlaneLeafConfigAckEvent,
         ControlPlaneLeafStopAckEvent,
-        ControlPlaneLeafBoundaryResultEvent,
+        Envelope,
         ControlPlaneLeafDrainReadyEvent,
         TraceDispatchEvent,
         LogDispatchEvent,
@@ -86,24 +90,23 @@ class ControlPlaneRootLeafIngressSourceNode:
     runner_control: ControlPlaneRootRunnerControlService = inject.service(
         ControlPlaneRootRunnerControlService
     )
-    scheduler: PlatformSchedulerService = inject.service(PlatformSchedulerService)
-    timer: PlatformSchedulerTimerService | None = inject.service(PlatformSchedulerTimerService)
     worker_id: str | None = None
     lane: str = EXECUTION_IPC_LANE_CONTROL
     source_name: str = ROOT_LEAF_INGRESS_SOURCE_NODE_NAME
     poll_interval_seconds: float = 0.01
     _scheduler_registered: bool = field(default=False, init=False, repr=False)
 
-    def initialize(self) -> None:
+    def initialize(self) -> list[object]:
         if self._scheduler_registered:
-            return
+            return []
         interval = max(0.001, float(self.poll_interval_seconds))
         source_name = (
             self.source_name
             if isinstance(self.source_name, str) and self.source_name
             else ROOT_LEAF_INGRESS_SOURCE_NODE_NAME
         )
-        self.scheduler.apply_command(
+        self._scheduler_registered = True
+        return [
             PlatformSchedulerUpsertCommand(
                 job_id=f"cp.root.leaf_ingress:{source_name}",
                 target=source_name,
@@ -111,19 +114,7 @@ class ControlPlaneRootLeafIngressSourceNode:
                 run_immediately=True,
                 payload=BootstrapControl(target=source_name),
             )
-        )
-        apply_timer_command = getattr(self.timer, "apply_command", None)
-        if callable(apply_timer_command):
-            apply_timer_command(
-                PlatformSchedulerUpsertCommand(
-                    job_id=f"cp.root.leaf_ingress:{source_name}",
-                    target=source_name,
-                    interval_seconds=interval,
-                    run_immediately=True,
-                    payload=BootstrapControl(target=source_name),
-                )
-            )
-        self._scheduler_registered = True
+        ]
 
     async def __call__(self, msg: object, _ctx: object | None) -> list[object]:
         payload = msg.payload if isinstance(msg, Envelope) else msg
@@ -156,6 +147,14 @@ class ControlPlaneRootLeafIngressSourceNode:
             return []
         if polled_payload is None:
             return []
+        if isinstance(polled_payload, Envelope):
+            return [
+                ControlPlaneRootLeafIngressEnvelopeEvent(
+                    worker_id=self.worker_id,
+                    lane=self.lane,
+                    envelope=polled_payload,
+                )
+            ]
         if not isinstance(polled_payload, _ROOT_LEAF_INGRESS_ALLOWED_PAYLOAD_TYPES):
             return []
         return [polled_payload]
@@ -198,7 +197,7 @@ class ControlPlaneRootLeafControlDispatchSinkNode:
 
 @node(
     name=ROOT_BOUNDARY_HANDOFF_SINK_NODE_NAME,
-    consumes=[ControlPlaneLeafBoundaryResultEvent],
+    consumes=[ControlPlaneRootLeafIngressEnvelopeEvent],
     emits=[],
 )
 @dataclass
@@ -207,35 +206,33 @@ class ControlPlaneRootBoundaryHandoffSinkNode:
 
     def __call__(self, msg: object, _ctx: object | None) -> list[object]:
         payload = msg.payload if isinstance(msg, Envelope) else msg
-        if not isinstance(payload, ControlPlaneLeafBoundaryResultEvent):
+        if not isinstance(payload, ControlPlaneRootLeafIngressEnvelopeEvent):
             return []
         drain_external = getattr(self.handoff, "drain_external_deliveries", None)
         if not callable(drain_external):
             return []
-        if not isinstance(payload.outputs, tuple) or not payload.outputs:
+        envelope = payload.envelope
+        if not isinstance(envelope.target, str) or not envelope.target:
             return []
-        envelopes: list[Envelope] = []
-        for item in payload.outputs:
-            if not isinstance(item, Envelope):
-                continue
-            if not isinstance(item.target, str) or not item.target:
-                continue
-            envelopes.append(item)
-        if not envelopes:
-            return []
+        envelopes = [envelope]
         envelopes, _, _ = _normalize_observability_relay_envelopes(envelopes)
         if not envelopes:
             return []
+        source_group = (
+            payload.worker_id.rsplit("#", 1)[0]
+            if isinstance(payload.worker_id, str) and "#" in payload.worker_id
+            else None
+        )
         try:
             drain_external(
                 envelopes=envelopes,
-                source_group=payload.target_group,
+                source_group=source_group,
                 pump_replies=False,
             )
         except TypeError:
             drain_external(
                 envelopes=envelopes,
-                source_group=payload.target_group,
+                source_group=source_group,
             )
         return []
 
@@ -254,7 +251,6 @@ _ROOT_LEAF_INGRESS_ALLOWED_PAYLOAD_TYPES: tuple[type[object], ...] = (
     ControlPlaneLeafDiscoveryAckEvent,
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafStopAckEvent,
-    ControlPlaneLeafBoundaryResultEvent,
     ControlPlaneLeafDrainReadyEvent,
     TraceDispatchEvent,
     LogDispatchEvent,
@@ -309,6 +305,7 @@ __all__ = [
     "ControlPlaneRootLeafIngressSourceNode",
     "ControlPlaneRootLeafControlDispatchSinkNode",
     "ControlPlaneRootBoundaryHandoffSinkNode",
+    "ControlPlaneRootLeafIngressEnvelopeEvent",
     "root_leaf_ingress_source_node_name",
     "is_root_leaf_ingress_source_node_name",
 ]

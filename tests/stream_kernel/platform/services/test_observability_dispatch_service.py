@@ -327,3 +327,40 @@ def test_dispatching_observability_service_emit_trace_event_async_uses_async_sin
         assert sink.emit_calls == 0
 
     asyncio.run(_run())
+
+
+def test_dispatching_observability_service_emit_trace_event_async_runs_sinks_concurrently() -> None:
+    async def _run() -> None:
+        second_started = asyncio.Event()
+
+        class _WaitForSecondSink:
+            async def emit_async(self, _payload: object) -> None:
+                await second_started.wait()
+
+        class _TriggerSink:
+            async def emit_async(self, _payload: object) -> None:
+                second_started.set()
+
+        service = DispatchingObservabilityService(
+            runtime={
+                "__process_role": "observability_worker",
+                "platform": {"bootstrap": {"mode": "process_supervisor"}},
+                "observability": {
+                    "service_worker": {"enabled": True},
+                    "tracing": {"exporters": [{"kind": "jsonl", "enabled": True}]},
+                    "logging": {"exporters": [{"kind": "jsonl", "enabled": True}]},
+                },
+            },
+            trace_sinks=[_WaitForSecondSink(), _TriggerSink()],
+        )
+        produced = await asyncio.wait_for(
+            service.emit_trace_event_async(
+                event={"span": "s1"},
+                trace_id="t-obs",
+                attributes={"source_node": "system.obs.trace_dispatch"},
+            ),
+            timeout=0.1,
+        )
+        assert produced == []
+
+    asyncio.run(_run())

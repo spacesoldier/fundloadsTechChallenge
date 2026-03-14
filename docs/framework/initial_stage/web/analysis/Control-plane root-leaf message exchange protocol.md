@@ -144,6 +144,33 @@ Transitions:
 6. Leaf applies config and replies `LeafConfigAck(applied)`.
 7. Root marks worker `ready` and opens execution start barrier.
 
+## Execution start and source pacing (runtime path)
+
+After startup barrier opens, runtime execution follows these rules:
+
+1. Root emits start-work command once per ready leaf worker.
+2. Root does not synchronously wait for per-item boundary replies during normal data flow.
+3. Leaf business traffic flows to root as boundary output stream.
+4. Tombstone remains the authoritative completion signal for shutdown-readiness quorum.
+
+### Source read advancement policy (leaf)
+
+For pull-file sources in leaf workers:
+
+1. Source pacing is controlled by `runtime.platform.source_ingress`:
+   - `pacing_mode: batch` with `batch_size >= 1`, or
+   - `pacing_mode: all`.
+2. For `pacing_mode=batch`, start-work/bootstrap uses `single_shot=true` and emits exactly `batch_size`
+   source pulls per trigger.
+3. Next source pull trigger is emitted only on platform signal `sink_dispatch_ack`
+   (successful outbound dispatch from leaf to root).
+4. If sink-dispatch ack carries `tombstone_output=true`, no next-read trigger is emitted.
+5. For `pacing_mode=all`, start-work/bootstrap uses `single_shot=false` and source self-rearms locally;
+   ack-driven next-read is disabled.
+
+This keeps source pacing event-driven and bounded by outbound flow, instead of draining
+the entire file in one boundary invocation.
+
 ## Error and retry policy
 
 1. Timeouts

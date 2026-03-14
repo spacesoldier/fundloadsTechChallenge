@@ -10,6 +10,9 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneRootLeafStopRequestEvent,
     ControlPlaneShutdownReadyEvent,
 )
+from stream_kernel.platform.services.runtime.platform_scheduler import (
+    PlatformSchedulerCancelCommand,
+)
 from stream_kernel.platform.services.runtime.control_plane_state import (
     InMemoryControlPlaneStateService,
 )
@@ -53,8 +56,14 @@ def test_root_stop_node_emits_leaf_stop_requests_and_requests_runner_stop() -> N
 
     produced = node(Envelope(payload=payload, target="system.cp.root_stop"), None)
 
-    assert len(produced) == 1
-    assert isinstance(produced[0], ControlPlaneRootLeafStopRequestEvent)
-    assert produced[0].worker_id == "execution.ingress#1"
-    assert produced[0].command_id == "runtime-stop:execution.ingress#1"
+    stop_requests = [item for item in produced if isinstance(item, ControlPlaneRootLeafStopRequestEvent)]
+    cancel_commands = [item for item in produced if isinstance(item, PlatformSchedulerCancelCommand)]
+    assert len(stop_requests) == 1
+    assert stop_requests[0].worker_id == "execution.ingress#1"
+    assert stop_requests[0].command_id == "runtime-stop:execution.ingress#1"
+    assert len(cancel_commands) == 5
+    assert all(
+        command.job_id.startswith("cp.root.leaf_ingress:source:system.cp.root_leaf_ingress:execution.ingress#1:")
+        for command in cancel_commands
+    )
     assert runner_control.requests == 1

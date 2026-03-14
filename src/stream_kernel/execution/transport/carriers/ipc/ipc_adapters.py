@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import atexit
-import asyncio
 import multiprocessing as mp
 import time
 from collections import deque
@@ -15,6 +14,8 @@ from stream_kernel.execution.transport.ipc.ipc_codec import (
     ExecutionIpcCodecError,
 )
 from stream_kernel.execution.transport.ipc.ipc_transport import (
+    EXECUTION_IPC_LANE_CONTROL,
+    EXECUTION_IPC_LANE_DATA,
     ExecutionIpcAck,
     ExecutionIpcControlSignal,
     ExecutionIpcEndpointRegistry,
@@ -22,6 +23,8 @@ from stream_kernel.execution.transport.ipc.ipc_transport import (
     ExecutionIpcMessage,
     ExecutionIpcPort,
     ExecutionIpcReceivePolicy,
+    compose_execution_ipc_worker_target_id,
+    decompose_execution_ipc_worker_target_id,
 )
 from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
 
@@ -38,7 +41,7 @@ class InMemoryExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
     def __init__(self, *, kv_store: KVStore | None = None) -> None:
         self._kv_store = kv_store if isinstance(kv_store, KVStore) else InMemoryKvStore()
         self._lock = Lock()
-        self._ack_handlers: dict[str, Callable[[int], None]] = {}
+        self._ack_handlers: dict[str, Callable[[object], None]] = {}
         self._ack_enabled = False
 
     def build_port(
@@ -92,12 +95,16 @@ class InMemoryExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
         buffer = self._ensure_receiver(target_id, ExecutionIpcReceivePolicy(buffer_enabled=True))
         return buffer.recv(timeout=timeout)
 
+    def recv_buffered(self, target_id: str, *, timeout: float | None = None) -> ExecutionIpcMessage | None:
+        # In-memory transport has no separate channel drain step; recv() is already buffered-only.
+        return self.recv(target_id, timeout=timeout)
+
     def metrics(self, target_id: str) -> dict[str, object]:
         # Simple queue depth/age diagnostics for observability.
         buffer = self._ensure_receiver(target_id, ExecutionIpcReceivePolicy(buffer_enabled=True))
         return buffer.metrics()
 
-    def register_ack_handler(self, target_id: str, handler: Callable[[int], None]) -> None:
+    def register_ack_handler(self, target_id: str, handler: Callable[[object], None]) -> None:
         if not callable(handler):
             raise ValueError("register_ack_handler requires a callable")
         self._ack_handlers[target_id] = handler
@@ -174,19 +181,15 @@ class PipeExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
         self._ctx = context or mp.get_context("spawn")
         self._endpoints: dict[str, _PipeEndpoint] = {}
         self._lock = Lock()
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._loop_thread: Thread | None = None
-        self._loop_ready = Event()
-        self._loop_started = Event()
+        self._loop: object | None = None
+        self._loop_thread: object | None = None
         self._reader_targets: set[str] = set()
-        self._reader_backend: dict[str, str] = {}
-        self._reader_fds: dict[str, int] = {}
         self._reader_last_read: dict[str, float] = {}
         self._poll_interval_seconds = max(0.001, float(poll_interval_seconds))
-        self._poll_mode = _coerce_poll_mode(poll_mode)
+        self._poll_mode = _normalize_poll_mode(poll_mode)
         self._close_join_timeout_seconds = 0.1
         self._stopping = Event()
-        self._ack_handlers: dict[str, Callable[[int], None]] = {}
+        self._ack_handlers: dict[str, Callable[[object], None]] = {}
         self._ack_enabled = False
         self._sender_buffers: dict[str, _PipeSendBuffer] = {}
         self._sender_threads: dict[str, Thread] = {}
@@ -253,34 +256,33 @@ class PipeExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
         return ExecutionIpcAck(status="accepted", enqueued=enqueued)
 
     def recv(self, target_id: str, *, timeout: float | None = None) -> ExecutionIpcMessage | None:
-        # Resolve endpoint and read a single payload.
-        # The pipe endpoint is drained by a background asyncio poller into a buffer.
-        # recv() consumes from that buffer with optional timeout.
+        # Single receive path: non-blocking pipe drain -> receive buffer -> consumer.
         endpoint = self._resolve_endpoint(target_id)
         buffer = self._ensure_receive_buffer(target_id, endpoint)
-        # Fast-path: try a non-blocking drain before waiting on the buffer.
-        _drain_pipe(
-            endpoint,
-            buffer,
-            on_read=lambda: self._touch_reader(target_id),
-            on_ack=lambda count: self._handle_ack(target_id, count),
-            ack_enabled=self._ack_enabled,
+        payload = self._recv_from_pipe_buffer(
+            target_id=target_id,
+            endpoint=endpoint,
+            buffer=buffer,
+            timeout=timeout,
         )
-        payload = buffer.recv(timeout=0.0)
-        if payload is None and timeout is not None and timeout > 0:
-            deadline = _deadline(timeout)
-            while payload is None:
-                remaining = _remaining(deadline)
-                if remaining <= 0:
-                    break
-                _drain_pipe(
-                    endpoint,
-                    buffer,
-                    on_read=lambda: self._touch_reader(target_id),
-                    on_ack=lambda count: self._handle_ack(target_id, count),
-                    ack_enabled=self._ack_enabled,
-                )
-                payload = buffer.recv(timeout=min(remaining, self._poll_interval_seconds))
+        if payload is None:
+            return None
+        return ExecutionIpcMessage(
+            target_id=target_id,
+            payload=payload,
+            ts_epoch_ms=int(time.time() * 1000),
+        )
+
+    def recv_buffered(self, target_id: str, *, timeout: float | None = None) -> ExecutionIpcMessage | None:
+        # Buffered receive uses the same single receive path as recv().
+        endpoint = self._resolve_endpoint(target_id)
+        buffer = self._ensure_receive_buffer(target_id, endpoint)
+        payload = self._recv_from_pipe_buffer(
+            target_id=target_id,
+            endpoint=endpoint,
+            buffer=buffer,
+            timeout=timeout,
+        )
         if payload is None:
             return None
         return ExecutionIpcMessage(
@@ -304,7 +306,7 @@ class PipeExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
         payload.update(outbound)
         return payload
 
-    def register_ack_handler(self, target_id: str, handler: Callable[[int], None]) -> None:
+    def register_ack_handler(self, target_id: str, handler: Callable[[object], None]) -> None:
         if not callable(handler):
             raise ValueError("register_ack_handler requires a callable")
         self._ack_handlers[target_id] = handler
@@ -402,75 +404,55 @@ class PipeExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
         return None
 
     def _ensure_receive_buffer(self, target_id: str, endpoint: "_PipeEndpoint") -> "_PipeReceiveBuffer":
-        # Each target_id gets a receive buffer and a registered reader on the asyncio loop.
-        # The loop schedules periodic non-blocking polls instead of per-target threads.
-        needs_register = False
+        # Each target_id gets a receive buffer.
+        # Pipe draining is performed explicitly from recv/recv_buffered.
+        _ = endpoint
         with self._lock:
             buffer = self._get_buffer(target_id)
             if buffer is None:
                 buffer = _PipeReceiveBuffer()
                 self._set_buffer(target_id, buffer)
-            if target_id not in self._reader_targets:
-                self._reader_targets.add(target_id)
-                needs_register = True
-        if needs_register:
-            self._register_reader(target_id, endpoint, buffer)
         return buffer
 
-    def _register_reader(
+    def _recv_from_pipe_buffer(
         self,
         target_id: str,
         endpoint: "_PipeEndpoint",
         buffer: "_PipeReceiveBuffer",
-    ) -> None:
-        loop = self._ensure_event_loop()
-        ack_handler = lambda count: self._handle_ack(target_id, count)
-
-        def _register() -> None:
-            if self._stopping.is_set():
-                return
-            _register_pipe_reader(
-                loop=loop,
-                endpoint=endpoint,
-                buffer=buffer,
-                poll_interval_seconds=self._poll_interval_seconds,
-                stopping=self._stopping,
-                poll_mode=self._poll_mode,
-                on_backend=lambda backend, fd: self._record_reader_backend(target_id, backend, fd),
-                on_read=lambda: self._touch_reader(target_id),
-                on_ack=ack_handler,
-                ack_enabled=self._ack_enabled,
-            )
-
-        loop.call_soon_threadsafe(_register)
-
-    def _ensure_event_loop(self) -> asyncio.AbstractEventLoop:
-        with self._lock:
-            loop = self._loop
-            thread = self._loop_thread
-            if loop is not None and thread is not None and thread.is_alive():
-                return loop
-            self._loop_ready.clear()
-            self._loop_started.clear()
-            self._stopping.clear()
-            thread = Thread(target=self._loop_main, daemon=True, name="ipc-pipe-loop")
-            self._loop_thread = thread
-            thread.start()
-        if not self._loop_ready.wait(timeout=1.0):
-            raise RuntimeError("PipeExecutionIpcTransportAdapter failed to start event loop")
-        if not self._loop_started.wait(timeout=1.0):
-            raise RuntimeError("PipeExecutionIpcTransportAdapter event loop failed to start")
-        if self._loop is None:
-            raise RuntimeError("PipeExecutionIpcTransportAdapter event loop unavailable")
-        return self._loop
-
-    def _loop_main(self) -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self._loop = loop
-        self._loop_ready.set()
-        loop.call_soon(self._loop_started.set)
-        loop.run_forever()
+        timeout: float | None,
+    ) -> object | None:
+        ack_handler = lambda signal: self._handle_ack(target_id, signal)
+        ack_enabled = self._ack_enabled and _target_uses_flow_control_ack(target_id)
+        send_ack = lambda count: self._send_ack_for_target(
+            target_id=target_id,
+            endpoint=endpoint,
+            count=count,
+        )
+        _drain_pipe(
+            endpoint,
+            buffer,
+            on_read=lambda: self._touch_reader(target_id),
+            on_ack=ack_handler,
+            send_ack=send_ack,
+            ack_enabled=ack_enabled,
+        )
+        payload = buffer.recv(timeout=0.0)
+        if payload is None and timeout is not None and timeout > 0:
+            deadline = _deadline(timeout)
+            while payload is None:
+                remaining = _remaining(deadline)
+                if remaining <= 0:
+                    break
+                _drain_pipe(
+                    endpoint,
+                    buffer,
+                    on_read=lambda: self._touch_reader(target_id),
+                    on_ack=ack_handler,
+                    send_ack=send_ack,
+                    ack_enabled=ack_enabled,
+                )
+                payload = buffer.recv(timeout=min(remaining, self._poll_interval_seconds))
+        return payload
 
     def _get_buffer(self, target_id: str) -> "_PipeReceiveBuffer" | None:
         key = f"{_BUFFER_PREFIX}{target_id}"
@@ -484,8 +466,7 @@ class PipeExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
         self._kv_store.set(key, buffer)
 
     def close(self) -> None:
-        # Graceful shutdown for the adapter-owned asyncio loop.
-        # Stops periodic polling and terminates the loop thread.
+        # Graceful shutdown for sender workers.
         with self._lock:
             sender_buffers = list(self._sender_buffers.values())
             sender_threads = list(self._sender_threads.values())
@@ -496,22 +477,7 @@ class PipeExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
         for sender in sender_threads:
             sender.join(timeout=max(0.01, float(self._close_join_timeout_seconds)))
         self._stopping.set()
-        loop = self._loop
-        thread = self._loop_thread
-        if loop is not None:
-            try:
-                for fd in list(self._reader_fds.values()):
-                    loop.call_soon_threadsafe(loop.remove_reader, fd)
-                loop.call_soon_threadsafe(loop.stop)
-            except RuntimeError:
-                pass
-        if thread is not None:
-            thread.join(timeout=max(0.01, float(self._close_join_timeout_seconds)))
         with self._lock:
-            self._loop = None
-            self._loop_thread = None
-            self._reader_fds.clear()
-            self._reader_backend.clear()
             self._reader_last_read.clear()
             self._sender_threads.clear()
             self._sender_buffers.clear()
@@ -523,20 +489,13 @@ class PipeExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
         poll_mode: str | None = None,
         poll_interval_ms: float | int | None = None,
     ) -> None:
-        # Runtime-level override for polling strategy.
-        # Must be called before endpoints are registered to take full effect.
+        # Runtime-level override for recv() drain cadence.
         with self._lock:
             if poll_mode is not None:
-                self._poll_mode = _coerce_poll_mode(poll_mode)
+                self._poll_mode = _normalize_poll_mode(poll_mode)
             if poll_interval_ms is not None:
                 if isinstance(poll_interval_ms, (int, float)) and poll_interval_ms > 0:
                     self._poll_interval_seconds = max(0.001, float(poll_interval_ms) / 1000.0)
-
-    def _record_reader_backend(self, target_id: str, backend: str, fd: int | None) -> None:
-        with self._lock:
-            self._reader_backend[target_id] = backend
-            if isinstance(fd, int):
-                self._reader_fds[target_id] = fd
 
     def _touch_reader(self, target_id: str) -> None:
         with self._lock:
@@ -546,11 +505,34 @@ class PipeExecutionIpcTransportAdapter(ExecutionIpcKvStreamPort):
         with self._lock:
             self._writer_last_send[target_id] = time.monotonic()
 
-    def _handle_ack(self, target_id: str, count: int) -> None:
+    def _handle_ack(self, target_id: str, signal: object) -> None:
         handler = self._ack_handlers.get(target_id)
         if handler is None:
             return
-        handler(count)
+        if isinstance(signal, ExecutionIpcControlSignal) and signal.target_id is None:
+            handler(int(signal.count))
+            return
+        handler(signal)
+
+    def _send_ack_for_target(
+        self,
+        *,
+        target_id: str,
+        endpoint: "_PipeEndpoint",
+        count: int,
+    ) -> None:
+        ack_target_id = _flow_control_ack_target_id(target_id)
+        ack_endpoint: _PipeEndpoint | None = None
+        try:
+            if ack_target_id == target_id:
+                ack_endpoint = endpoint
+            else:
+                ack_endpoint = self._resolve_endpoint(ack_target_id)
+        except Exception:
+            ack_endpoint = None
+        if ack_endpoint is None:
+            return
+        _send_ack(endpoint=ack_endpoint, count=count, source_target_id=target_id)
 
 
 @adapter(
@@ -869,31 +851,31 @@ def _is_pipe_connection(candidate: object) -> bool:
     return callable(getattr(candidate, "send", None)) or callable(getattr(candidate, "send_bytes", None))
 
 
-def _coerce_poll_mode(value: object) -> str:
+def _normalize_poll_mode(value: object) -> str:
     if not isinstance(value, str):
-        return "timer"
+        return "reader"
     mode = value.strip().lower()
-    if mode not in {"timer", "reader", "auto"}:
-        return "timer"
-    return mode
+    if mode in {"reader", "timer", "auto"}:
+        return mode
+    return "reader"
 
 
-def _endpoint_fileno(endpoint: "_PipeEndpoint") -> int | None:
-    fileno = getattr(endpoint.connection, "fileno", None)
-    if not callable(fileno):
-        return None
-    try:
-        fd = fileno()
-    except Exception:
-        return None
-    if not isinstance(fd, int):
-        try:
-            fd = int(fd)
-        except Exception:
-            return None
-    if fd < 0:
-        return None
-    return fd
+def _flow_control_ack_target_id(target_id: str) -> str:
+    resolved = decompose_execution_ipc_worker_target_id(target_id)
+    if resolved is None:
+        return target_id
+    worker_id, lane = resolved
+    if lane == "control":
+        return target_id
+    return compose_execution_ipc_worker_target_id(worker_id, lane="control")
+
+
+def _target_uses_flow_control_ack(target_id: str) -> bool:
+    resolved = decompose_execution_ipc_worker_target_id(target_id)
+    if resolved is None:
+        return True
+    _worker_id, lane = resolved
+    return lane in {EXECUTION_IPC_LANE_CONTROL, EXECUTION_IPC_LANE_DATA}
 
 
 def _drain_pipe(
@@ -901,7 +883,8 @@ def _drain_pipe(
     buffer: _PipeReceiveBuffer,
     *,
     on_read: Callable[[], None] | None = None,
-    on_ack: Callable[[int], None] | None = None,
+    on_ack: Callable[[ExecutionIpcControlSignal], None] | None = None,
+    send_ack: Callable[[int], None] | None = None,
     ack_enabled: bool = False,
 ) -> int:
     # Drain all available payloads for this endpoint into the buffer.
@@ -913,7 +896,7 @@ def _drain_pipe(
             break
         if isinstance(payload, ExecutionIpcControlSignal) and payload.kind == "ack":
             if on_ack is not None:
-                on_ack(int(payload.count))
+                on_ack(payload)
             if on_read is not None:
                 on_read()
             continue
@@ -921,129 +904,25 @@ def _drain_pipe(
         drained += 1
         if on_read is not None:
             on_read()
-    if drained > 0 and ack_enabled:
-        _send_ack(endpoint, drained)
+    if drained > 0 and ack_enabled and callable(send_ack):
+        send_ack(drained)
     return drained
 
 
-def _poll_pipe(
-    loop: asyncio.AbstractEventLoop,
+def _send_ack(
+    *,
     endpoint: "_PipeEndpoint",
-    buffer: _PipeReceiveBuffer,
-    interval_seconds: float,
-    stopping: Event,
-    on_read: Callable[[], None] | None = None,
-    on_ack: Callable[[int], None] | None = None,
-    ack_enabled: bool = False,
+    count: int,
+    source_target_id: str,
 ) -> None:
-    # Periodic polling scheduled on the adapter's asyncio loop.
-    if stopping.is_set():
-        return
     try:
-        _drain_pipe(endpoint, buffer, on_read=on_read, on_ack=on_ack, ack_enabled=ack_enabled)
-    except Exception:
-        # Reader loop must be failure-isolated; malformed frames or transient
-        # pipe errors should not crash scheduling callbacks.
-        pass
-    loop.call_later(
-        interval_seconds,
-        _poll_pipe,
-        loop,
-        endpoint,
-        buffer,
-        interval_seconds,
-        stopping,
-        on_read,
-        on_ack,
-        ack_enabled,
-    )
-
-
-def _send_ack(endpoint: "_PipeEndpoint", count: int) -> None:
-    try:
-        endpoint.send(ExecutionIpcControlSignal(kind="ack", count=int(count)))
+        endpoint.send(
+            ExecutionIpcControlSignal(
+                kind="ack",
+                count=int(count),
+                target_id=source_target_id,
+            )
+        )
     except Exception:
         # ACKs are best-effort; never block the pipe reader on failures.
         return
-
-
-def _register_pipe_reader(
-    *,
-    loop: asyncio.AbstractEventLoop,
-    endpoint: "_PipeEndpoint",
-    buffer: _PipeReceiveBuffer,
-    poll_interval_seconds: float,
-    stopping: Event,
-    poll_mode: str,
-    on_backend: Callable[[str, int | None], None],
-    on_read: Callable[[], None] | None = None,
-    on_ack: Callable[[int], None] | None = None,
-    ack_enabled: bool = False,
-) -> None:
-    mode = _coerce_poll_mode(poll_mode)
-    if mode == "timer":
-        _poll_pipe(
-            loop,
-            endpoint,
-            buffer,
-            poll_interval_seconds,
-            stopping,
-            on_read,
-            on_ack,
-            ack_enabled,
-        )
-        on_backend("timer", None)
-        return
-
-    fd = _endpoint_fileno(endpoint)
-    if fd is None:
-        _poll_pipe(
-            loop,
-            endpoint,
-            buffer,
-            poll_interval_seconds,
-            stopping,
-            on_read,
-            on_ack,
-            ack_enabled,
-        )
-        on_backend("timer", None)
-        return
-
-    def _on_readable() -> None:
-        if stopping.is_set():
-            return
-        try:
-            _drain_pipe(endpoint, buffer, on_read=on_read, on_ack=on_ack, ack_enabled=ack_enabled)
-        except Exception:
-            # Reader callback must remain alive across transient decode/read failures.
-            return
-
-    try:
-        loop.add_reader(fd, _on_readable)
-    except Exception:
-        _poll_pipe(
-            loop,
-            endpoint,
-            buffer,
-            poll_interval_seconds,
-            stopping,
-            on_read,
-            on_ack,
-            ack_enabled,
-        )
-        on_backend("timer", None)
-        return
-
-    on_backend("reader", fd)
-    if mode == "auto":
-        _poll_pipe(
-            loop,
-            endpoint,
-            buffer,
-            poll_interval_seconds,
-            stopping,
-            on_read,
-            on_ack,
-            ack_enabled,
-        )

@@ -76,13 +76,8 @@ from stream_kernel.execution.transport.handoff.runtime_wiring import (
     resolve_execution_ipc_adapter_from_adapters as resolve_execution_ipc_adapter_from_adapters_via_transport,
 )
 from stream_kernel.execution.transport.ipc.ipc_transport import (
-    ExecutionIpcEndpointRegistry,
     ExecutionIpcKvStreamPort,
     ExecutionIpcTransportService,
-)
-from stream_kernel.execution.transport.ipc.ipc_transport_service import (
-    ExecutionIpcTransportCoordinatorService,
-    InMemoryExecutionIpcTransportAdapter,
 )
 from stream_kernel.execution.transport.secure_tcp_transport import (
     SecureTcpConfig,
@@ -460,6 +455,7 @@ def build_runtime_artifacts(
     )
     ensure_runtime_ipc_handoff_bindings_via_transport(
         injection_registry=injection_registry,
+        runtime=runtime,
     )
     ensure_runtime_lifecycle_bindings(
         injection_registry=injection_registry,
@@ -1332,27 +1328,6 @@ def ensure_runtime_registry_bindings(
             )
         except InjectionRegistryError:
             pass
-    fallback_endpoint_registry = InMemoryKvStore()
-    fallback_ipc_transport = ExecutionIpcTransportCoordinatorService(
-        adapter=InMemoryExecutionIpcTransportAdapter(),
-        endpoint_registry=fallback_endpoint_registry,
-    )
-    try:
-        injection_registry.register_factory(
-            "kv",
-            ExecutionIpcEndpointRegistry,
-            lambda _store=fallback_endpoint_registry: _store,
-        )
-    except InjectionRegistryError:
-        pass
-    try:
-        injection_registry.register_factory(
-            "service",
-            ExecutionIpcTransportService,
-            lambda _service=fallback_ipc_transport: _service,
-        )
-    except InjectionRegistryError:
-        pass
     default_platform_discovery_adapter = platform_discovery_source_adapter({})
     default_project_discovery_adapter = project_discovery_source_adapter({"project_modules": []})
     try:
@@ -1677,8 +1652,8 @@ def _resolve_async_runner_queue_qualifier(artifacts: RuntimeBuildArtifacts) -> s
         bootstrap = platform.get("bootstrap", {})
         mode = bootstrap.get("mode") if isinstance(bootstrap, dict) else None
         if mode == "process_supervisor" and _contains_root_pulse_input(artifacts.inputs):
-            # Root control-plane runtime relies on platform scheduler ticker, which
-            # emits ticks into the default async queue.
+            # Root control-plane scheduler timer emits tick envelopes into
+            # the default async queue.
             return DEFAULT_ASYNC_QUEUE_QUALIFIER
     if not isinstance(platform, dict):
         return DEFAULT_ASYNC_QUEUE_QUALIFIER

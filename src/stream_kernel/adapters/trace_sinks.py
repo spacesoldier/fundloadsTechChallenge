@@ -401,13 +401,12 @@ class OTelOtlpTraceSink:
             self._dropped += 1
             self._span_buffer.append(span)
             return True
-        if self._queue_drop_policy == "block_forever":
+        if self._queue_drop_policy == "non_block":
             started_at = self._time_fn()
-            while len(self._span_buffer) >= self._queue_max_items:
+            if len(self._span_buffer) >= self._queue_max_items:
+                # Non-blocking/no-drop mode: try a single flush attempt, then
+                # allow in-memory buffer growth when exporter cannot keep up.
                 self._flush_batch()
-                if len(self._span_buffer) < self._queue_max_items:
-                    break
-                self._sleep_fn(0.001)
             waited_ms = max(0, int((self._time_fn() - started_at) * 1000))
             self._block_wait_ms_total += waited_ms
             self._span_buffer.append(span)
@@ -449,13 +448,12 @@ class OTelOtlpTraceSink:
             self._dropped += 1
             self._span_buffer.append(span)
             return True
-        if self._queue_drop_policy == "block_forever":
+        if self._queue_drop_policy == "non_block":
             started_at = self._time_fn()
-            while len(self._span_buffer) >= self._queue_max_items:
+            if len(self._span_buffer) >= self._queue_max_items:
+                # Non-blocking/no-drop mode: try a single flush attempt, then
+                # allow in-memory buffer growth when exporter cannot keep up.
                 await self._flush_batch_async()
-                if len(self._span_buffer) < self._queue_max_items:
-                    break
-                await asyncio.sleep(0.001)
             waited_ms = max(0, int((self._time_fn() - started_at) * 1000))
             self._block_wait_ms_total += waited_ms
             self._span_buffer.append(span)

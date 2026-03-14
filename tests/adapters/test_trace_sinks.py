@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace
 from datetime import UTC, date, datetime
@@ -1421,8 +1422,8 @@ def test_otel_otlp_trace_sink_obs_aio_02c_block_with_timeout_can_flush_and_admit
     assert diagnostics["block_wait_ms_total"] >= 1
 
 
-def test_otel_otlp_trace_sink_obs_aio_02d_block_forever_retries_without_drop() -> None:
-    # OBS-AIO-02D: block_forever should keep buffered spans on transient export failures.
+def test_otel_otlp_trace_sink_obs_aio_02d_non_block_retries_without_drop() -> None:
+    # OBS-AIO-02D: non_block should keep buffered spans on transient export failures.
     exported_payloads: list[list[str]] = []
     attempts = {"count": 0}
     clock = {"now": 0.0}
@@ -1438,7 +1439,7 @@ def test_otel_otlp_trace_sink_obs_aio_02d_block_forever_retries_without_drop() -
         backend="urllib",
         batch_max_items=10,
         queue_max_items=1,
-        queue_drop_policy="block_forever",
+        queue_drop_policy="non_block",
         time_fn=_time_fn,
         sleep_fn=_sleep_fn,
     )
@@ -1460,8 +1461,33 @@ def test_otel_otlp_trace_sink_obs_aio_02d_block_forever_retries_without_drop() -
     assert diagnostics["exported"] == 2
     assert diagnostics["submit_timeout_total"] == 0
     assert attempts["count"] >= 2
-    assert exported_payloads[0] == ["step-a"]
-    assert exported_payloads[1] == ["step-b"]
+    flattened = [name for batch in exported_payloads for name in batch]
+    assert flattened == ["step-a", "step-b"]
+
+
+def test_otel_otlp_trace_sink_obs_aio_02e_non_block_emit_async_is_non_blocking_when_queue_is_full() -> None:
+    # OBS-AIO-02E: non_block must not hang async runner when queue is full.
+    sink = OTelOtlpTraceSink(
+        endpoint="http://collector:4318/v1/traces",
+        backend="aiohttp",
+        batch_max_items=10,
+        queue_max_items=1,
+        queue_drop_policy="non_block",
+    )
+    sink.emit(_record("step-a", 0))
+
+    async def _no_flush_space() -> None:
+        return None
+
+    sink._flush_batch_async = _no_flush_space  # type: ignore[method-assign]
+
+    async def _run() -> None:
+        await asyncio.wait_for(sink.emit_async(_record("step-b", 1)), timeout=0.05)
+
+    trace_sinks._run_async_blocking(_run())
+    diagnostics = sink.diagnostics()
+    assert diagnostics["dropped"] == 0
+    assert diagnostics["buffered"] == 2
 
 
 def test_otel_otlp_trace_sink_obs_aio_03_flush_interval_sends_under_low_throughput(

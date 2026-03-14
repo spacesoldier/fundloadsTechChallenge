@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from threading import Event, Lock, Thread
 from typing import Protocol, runtime_checkable
 
 from stream_kernel.application_context.inject import inject
@@ -118,15 +117,6 @@ class PlatformSchedulerService(Protocol):
 
 
 @runtime_checkable
-class PlatformSchedulerTickerService(Protocol):
-    def ensure_started(self) -> None:
-        raise NotImplementedError
-
-    def stop(self) -> None:
-        raise NotImplementedError
-
-
-@runtime_checkable
 class PlatformSchedulerTimerService(Protocol):
     def apply_command(
         self,
@@ -145,6 +135,16 @@ class PlatformSchedulerTimerService(Protocol):
 @dataclass(slots=True)
 class InMemoryPlatformSchedulerService(PlatformSchedulerService):
     store: KVStore = inject.kv(PlatformSchedulerStore)
+    max_dispatch_per_tick: int = 256
+    lane_weights: dict[str, int] = field(
+        default_factory=lambda: {
+            "control": 4,
+            "data": 8,
+            "trace": 2,
+            "log": 1,
+            "metric": 1,
+        }
+    )
 
     def apply_command(
         self,
@@ -183,8 +183,13 @@ class InMemoryPlatformSchedulerService(PlatformSchedulerService):
         jobs = self._load_jobs()
         if not jobs:
             return []
-        due: list[PlatformSchedulerDispatch] = []
-        changed = False
+        due_by_lane: dict[str, list[tuple[str, str, object, float]]] = {
+            "control": [],
+            "data": [],
+            "trace": [],
+            "log": [],
+            "metric": [],
+        }
         for job_id in sorted(jobs):
             job = jobs.get(job_id)
             if not isinstance(job, dict):
@@ -197,6 +202,18 @@ class InMemoryPlatformSchedulerService(PlatformSchedulerService):
             if now < next_due:
                 continue
             payload = job.get("payload")
+            lane = _scheduler_lane_for_target(target)
+            if lane not in due_by_lane:
+                lane = "control"
+            due_by_lane[lane].append((job_id, target, payload, interval))
+        budget = _as_positive_int(self.max_dispatch_per_tick, default=256)
+        selected = _select_weighted_due(
+            due_by_lane=due_by_lane,
+            budget=budget,
+            lane_weights=self.lane_weights,
+        )
+        due: list[PlatformSchedulerDispatch] = []
+        for job_id, target, payload, interval in selected:
             due.append(
                 PlatformSchedulerDispatch(
                     job_id=job_id,
@@ -204,10 +221,12 @@ class InMemoryPlatformSchedulerService(PlatformSchedulerService):
                     payload=payload,
                 )
             )
+            job = jobs.get(job_id)
+            if not isinstance(job, dict):
+                continue
             job["last_dispatched_monotonic"] = now
             job["next_due_monotonic"] = now + interval
-            changed = True
-        if changed:
+        if due:
             self._save_jobs(jobs)
         return due
 
@@ -257,7 +276,8 @@ class AsyncioPlatformSchedulerTimerService(PlatformSchedulerTimerService):
     store: KVStore = inject.kv(PlatformSchedulerTimerStore)
     work_queue: object = inject.queue(Envelope, qualifier="execution.asyncio")
     tick_target: str = "system.scheduler.tick"
-    _tasks: dict[str, asyncio.Task[None]] = field(default_factory=dict, init=False, repr=False)
+    _task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
+    _wake_event: asyncio.Event | None = field(default=None, init=False, repr=False)
 
     def apply_command(
         self,
@@ -265,9 +285,10 @@ class AsyncioPlatformSchedulerTimerService(PlatformSchedulerTimerService):
     ) -> None:
         if isinstance(command, PlatformSchedulerUpsertCommand):
             self._upsert(command)
-            return
-        if isinstance(command, PlatformSchedulerCancelCommand):
+        elif isinstance(command, PlatformSchedulerCancelCommand):
             self._cancel(command.job_id)
+        self._ensure_task()
+        self._wake_loop()
 
     def snapshot(self) -> PlatformSchedulerTimerSnapshot:
         jobs = self._load_jobs()
@@ -296,69 +317,52 @@ class AsyncioPlatformSchedulerTimerService(PlatformSchedulerTimerService):
         return PlatformSchedulerTimerSnapshot(jobs=tuple(snapshots))
 
     def close(self) -> None:
-        for job_id in list(self._tasks.keys()):
-            self._cancel_task(job_id)
+        self._cancel_task()
 
     def _upsert(self, command: PlatformSchedulerUpsertCommand) -> None:
+        now_ms = int(time.time() * 1000)
         interval = max(0.001, float(command.interval_seconds))
+        interval_ms = max(1, int(interval * 1000))
         jobs = self._load_jobs()
+        previous = jobs.get(command.job_id) if isinstance(jobs.get(command.job_id), dict) else {}
+        next_tick_epoch_ms = now_ms if bool(command.run_immediately) else now_ms + interval_ms
         jobs[command.job_id] = {
             "job_id": command.job_id,
             "target": command.target,
             "interval_seconds": interval,
             "run_immediately": bool(command.run_immediately),
             "payload": command.payload,
-            "last_tick_epoch_ms": jobs.get(command.job_id, {}).get("last_tick_epoch_ms")
-            if isinstance(jobs.get(command.job_id), dict)
-            else None,
+            "last_tick_epoch_ms": previous.get("last_tick_epoch_ms"),
+            "next_tick_epoch_ms": next_tick_epoch_ms,
         }
         self._save_jobs(jobs)
-        self._arm_task(
-            job_id=command.job_id,
-            interval_seconds=interval,
-            run_immediately=bool(command.run_immediately),
-        )
 
     def _cancel(self, job_id: str) -> None:
         jobs = self._load_jobs()
         if job_id in jobs:
             del jobs[job_id]
             self._save_jobs(jobs)
-        self._cancel_task(job_id)
 
-    def _arm_task(
-        self,
-        *,
-        job_id: str,
-        interval_seconds: float,
-        run_immediately: bool,
-    ) -> None:
-        self._cancel_task(job_id)
-        loop = self._running_loop()
-        if loop is None:
-            return
-        task = loop.create_task(
-            self._timer_loop(
-                job_id=job_id,
-                interval_seconds=max(0.001, float(interval_seconds)),
-                run_immediately=bool(run_immediately),
-            ),
-            name=f"platform-scheduler-timer:{job_id}",
-        )
-        self._tasks[job_id] = task
-
-    async def _timer_loop(
-        self,
-        *,
-        job_id: str,
-        interval_seconds: float,
-        run_immediately: bool,
-    ) -> None:
-        delay = 0.0 if run_immediately else max(0.001, float(interval_seconds))
+    async def _timer_loop(self) -> None:
         try:
             while True:
-                if delay > 0:
-                    await asyncio.sleep(delay)
+                jobs = self._load_jobs()
+                if not jobs:
+                    await self._wait_for_wake(None)
+                    continue
+                now_ms = int(time.time() * 1000)
+                next_due_ms = self._next_due_epoch_ms(jobs=jobs, now_ms=now_ms)
+                delay_seconds = max(0.0, float(next_due_ms - now_ms) / 1000.0)
+                woke = await self._wait_for_wake(delay_seconds)
+                if woke:
+                    continue
+                jobs = self._load_jobs()
+                if not jobs:
+                    continue
+                now_ms = int(time.time() * 1000)
+                due_job_ids = self._due_job_ids(jobs=jobs, now_ms=now_ms)
+                if not due_job_ids:
+                    continue
                 queue = self._queue_port()
                 if queue is not None:
                     try:
@@ -370,33 +374,115 @@ class AsyncioPlatformSchedulerTimerService(PlatformSchedulerTimerService):
                         )
                     except Exception:
                         pass
-                self._mark_tick(job_id)
-                delay = max(0.001, float(interval_seconds))
+                self._mark_tick(jobs=jobs, due_job_ids=due_job_ids, now_ms=now_ms)
+                self._save_jobs(jobs)
         except asyncio.CancelledError:
             return
         finally:
-            current = self._tasks.get(job_id)
-            if current is not None and current.done():
-                self._tasks.pop(job_id, None)
+            self._task = None
 
-    def _mark_tick(self, job_id: str) -> None:
-        jobs = self._load_jobs()
-        job = jobs.get(job_id)
-        if not isinstance(job, dict):
-            return
-        job["last_tick_epoch_ms"] = int(time.time() * 1000)
-        self._save_jobs(jobs)
+    def _mark_tick(
+        self,
+        *,
+        jobs: dict[str, dict[str, object]],
+        due_job_ids: list[str],
+        now_ms: int,
+    ) -> None:
+        for job_id in due_job_ids:
+            job = jobs.get(job_id)
+            if not isinstance(job, dict):
+                continue
+            interval_seconds = _as_positive_float(job.get("interval_seconds"), default=0.001)
+            interval_ms = max(1, int(interval_seconds * 1000))
+            job["last_tick_epoch_ms"] = now_ms
+            job["next_tick_epoch_ms"] = now_ms + interval_ms
 
-    def _cancel_task(self, job_id: str) -> None:
-        task = self._tasks.pop(job_id, None)
+    def _cancel_task(self) -> None:
+        task = self._task
+        self._task = None
         if task is None:
             return
         if not task.done():
             task.cancel()
 
-    def _is_task_active(self, job_id: str) -> bool:
-        task = self._tasks.get(job_id)
+    def _is_task_active(self, _job_id: str) -> bool:
+        task = self._task
         return bool(task is not None and not task.done())
+
+    def _ensure_task(self) -> None:
+        task = self._task
+        if task is not None and not task.done():
+            return
+        loop = self._running_loop()
+        if loop is None:
+            return
+        if self._wake_event is None:
+            self._wake_event = asyncio.Event()
+        self._task = loop.create_task(
+            self._timer_loop(),
+            name="platform-scheduler-timer",
+        )
+
+    def _wake_loop(self) -> None:
+        event = self._wake_event
+        if event is None:
+            return
+        if not event.is_set():
+            event.set()
+
+    async def _wait_for_wake(self, delay_seconds: float | None) -> bool:
+        event = self._wake_event
+        if event is None:
+            if delay_seconds is None:
+                await asyncio.sleep(0.001)
+                return True
+            await asyncio.sleep(max(0.0, float(delay_seconds)))
+            return False
+        if event.is_set():
+            event.clear()
+            return True
+        if delay_seconds is None:
+            await event.wait()
+            event.clear()
+            return True
+        try:
+            await asyncio.wait_for(event.wait(), timeout=max(0.0, float(delay_seconds)))
+            event.clear()
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    @staticmethod
+    def _next_due_epoch_ms(*, jobs: dict[str, dict[str, object]], now_ms: int) -> int:
+        next_due: int | None = None
+        for job in jobs.values():
+            if not isinstance(job, dict):
+                continue
+            candidate = job.get("next_tick_epoch_ms")
+            if not isinstance(candidate, int):
+                interval_seconds = _as_positive_float(job.get("interval_seconds"), default=0.001)
+                candidate = now_ms + max(1, int(interval_seconds * 1000))
+            if next_due is None or candidate < next_due:
+                next_due = candidate
+        if next_due is None:
+            return now_ms
+        return int(next_due)
+
+    @staticmethod
+    def _due_job_ids(*, jobs: dict[str, dict[str, object]], now_ms: int) -> list[str]:
+        due: list[str] = []
+        for job_id in sorted(jobs):
+            job = jobs.get(job_id)
+            if not isinstance(job, dict):
+                continue
+            candidate = job.get("next_tick_epoch_ms")
+            if not isinstance(candidate, int):
+                interval_seconds = _as_positive_float(job.get("interval_seconds"), default=0.001)
+                candidate = now_ms + max(1, int(interval_seconds * 1000))
+                job["next_tick_epoch_ms"] = candidate
+            if now_ms >= candidate:
+                due.append(job_id)
+        return due
 
     def _running_loop(self) -> asyncio.AbstractEventLoop | None:
         try:
@@ -429,92 +515,6 @@ class AsyncioPlatformSchedulerTimerService(PlatformSchedulerTimerService):
         self.store.set(_TIMER_JOBS_KEY, {job_id: dict(value) for job_id, value in jobs.items()})
 
 
-@service(name="platform_scheduler_ticker_service")
-@dataclass(slots=True)
-class DefaultPlatformSchedulerTickerService(PlatformSchedulerTickerService):
-    scheduler: PlatformSchedulerService = inject.service(PlatformSchedulerService)
-    work_queue: object = inject.queue(Envelope, qualifier="execution.asyncio")
-    tick_target: str = "system.scheduler.tick"
-    tick_interval_seconds: float = 0.01
-    _thread: Thread | None = field(default=None, init=False, repr=False)
-    _stop_event: Event = field(default_factory=Event, init=False, repr=False)
-    _lock: Lock = field(default_factory=Lock, init=False, repr=False)
-
-    def ensure_started(self) -> None:
-        with self._lock:
-            if self._thread is not None and self._thread.is_alive():
-                return
-            self._stop_event.clear()
-            self._thread = Thread(
-                target=self._thread_main,
-                name="platform-scheduler-ticker",
-                daemon=True,
-            )
-            self._thread.start()
-
-    def stop(self) -> None:
-        with self._lock:
-            thread = self._thread
-            self._thread = None
-            self._stop_event.set()
-        if thread is not None:
-            thread.join(timeout=1.0)
-
-    def _thread_main(self) -> None:
-        interval = max(0.001, float(self.tick_interval_seconds))
-        loop = asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(self._ticker_loop(interval_seconds=interval))
-        finally:
-            try:
-                loop.close()
-            except Exception:
-                pass
-
-    async def _ticker_loop(self, *, interval_seconds: float) -> None:
-        while not self._stop_event.is_set():
-            queue = self._queue_port()
-            scheduler = self._scheduler()
-            if queue is not None and scheduler is not None and self._has_jobs(scheduler):
-                try:
-                    queue.push(
-                        Envelope(
-                            payload=PlatformSchedulerTickEvent(),
-                            target=self.tick_target,
-                        )
-                    )
-                except Exception:
-                    pass
-            await asyncio.sleep(max(0.001, float(interval_seconds)))
-
-    def _queue_port(self) -> QueuePort | None:
-        candidate = self.work_queue
-        if isinstance(candidate, QueuePort):
-            return candidate
-        if callable(getattr(candidate, "push", None)):
-            return candidate  # type: ignore[return-value]
-        return None
-
-    def _scheduler(self) -> PlatformSchedulerService | None:
-        candidate = self.scheduler
-        if isinstance(candidate, PlatformSchedulerService):
-            return candidate
-        if callable(getattr(candidate, "snapshot", None)):
-            return candidate  # type: ignore[return-value]
-        return None
-
-    @staticmethod
-    def _has_jobs(scheduler: PlatformSchedulerService) -> bool:
-        try:
-            snapshot = scheduler.snapshot()
-        except Exception:
-            return False
-        if not isinstance(snapshot, PlatformSchedulerSnapshot):
-            return False
-        return bool(snapshot.jobs)
-
-
 def _resolve_now_monotonic(now_monotonic: float | None) -> float:
     if isinstance(now_monotonic, (int, float)):
         return float(now_monotonic)
@@ -539,6 +539,77 @@ def _as_positive_float(value: object, *, default: float) -> float:
     return float(default)
 
 
+def _as_positive_int(value: object, *, default: int) -> int:
+    if isinstance(value, bool):
+        return int(default)
+    if isinstance(value, int) and value > 0:
+        return int(value)
+    if isinstance(value, float) and value > 0:
+        return int(value)
+    return int(default)
+
+
+def _scheduler_lane_for_target(target: str) -> str:
+    lowered = target.strip().lower()
+    for lane in ("control", "data", "trace", "log", "metric"):
+        if lowered.endswith(f":{lane}") or lowered.endswith(f"::{lane}"):
+            return lane
+    if lowered.startswith("system.obs.trace"):
+        return "trace"
+    if lowered.startswith("system.obs.log"):
+        return "log"
+    if lowered.startswith("system.obs.metric"):
+        return "metric"
+    return "control"
+
+
+def _select_weighted_due(
+    *,
+    due_by_lane: dict[str, list[tuple[str, str, object, float]]],
+    budget: int,
+    lane_weights: dict[str, int],
+) -> list[tuple[str, str, object, float]]:
+    # Smooth weighted round-robin across lane queues for deterministic, starvation-safe draining.
+    if budget <= 0:
+        return []
+    lanes = tuple(
+        lane
+        for lane in ("control", "data", "trace", "log", "metric")
+        if due_by_lane.get(lane)
+    )
+    if not lanes:
+        return []
+    weights: dict[str, int] = {
+        lane: _as_positive_int(lane_weights.get(lane), default=1)
+        for lane in lanes
+    }
+    total_weight = sum(weights.values())
+    if total_weight <= 0:
+        return []
+    current: dict[str, int] = {lane: 0 for lane in lanes}
+    selected: list[tuple[str, str, object, float]] = []
+    while len(selected) < budget:
+        active_lanes = [lane for lane in lanes if due_by_lane.get(lane)]
+        if not active_lanes:
+            break
+        best_lane: str | None = None
+        best_score: int | None = None
+        for lane in active_lanes:
+            score = current.get(lane, 0) + weights[lane]
+            current[lane] = score
+            if best_lane is None or best_score is None or score > best_score:
+                best_lane = lane
+                best_score = score
+        if best_lane is None:
+            break
+        current[best_lane] = current.get(best_lane, 0) - total_weight
+        lane_queue = due_by_lane.get(best_lane)
+        if not lane_queue:
+            continue
+        selected.append(lane_queue.pop(0))
+    return selected
+
+
 __all__ = [
     "PlatformSchedulerStore",
     "PlatformSchedulerTimerStore",
@@ -553,7 +624,5 @@ __all__ = [
     "PlatformSchedulerService",
     "PlatformSchedulerTimerService",
     "AsyncioPlatformSchedulerTimerService",
-    "PlatformSchedulerTickerService",
-    "DefaultPlatformSchedulerTickerService",
     "InMemoryPlatformSchedulerService",
 ]

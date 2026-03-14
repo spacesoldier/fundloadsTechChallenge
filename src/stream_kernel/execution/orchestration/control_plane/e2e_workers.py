@@ -18,7 +18,7 @@ from stream_kernel.execution.transport.ipc.ipc_transport_service import (
 from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafBoundaryExecuteCommand,
-    ControlPlaneLeafBoundaryResultEvent,
+    ControlPlaneLeafBoundaryOutputsEvent,
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafConfigCardEvent,
     ControlPlaneLeafHelloEvent,
@@ -104,11 +104,10 @@ def leaf_boundary_worker(stop_event: object | None, control_pipe: object | None)
             _send_worker_payload(
                 ipc=ipc,
                 worker_id=worker_id,
-                payload=ControlPlaneLeafBoundaryResultEvent(
+                payload=ControlPlaneLeafBoundaryOutputsEvent(
                     target_group=msg.target_group,
                     worker_id=msg.worker_id,
                     request_id=msg.request_id,
-                    status="completed",
                     outputs=({"count": len(payloads), "worker_id": msg.worker_id},),
                 ),
                 lane=EXECUTION_IPC_LANE_DATA,
@@ -252,11 +251,10 @@ def leaf_full_flow_worker(stop_event: object | None, control_pipe: object | None
             _send_worker_payload(
                 ipc=ipc,
                 worker_id=worker_id,
-                payload=ControlPlaneLeafBoundaryResultEvent(
+                payload=ControlPlaneLeafBoundaryOutputsEvent(
                     target_group=msg.target_group,
                     worker_id=msg.worker_id,
                     request_id=msg.request_id,
-                    status="completed",
                     outputs=({"ok": True, "worker_id": msg.worker_id, "count": len(msg.inputs)},),
                 ),
                 lane=EXECUTION_IPC_LANE_DATA,
@@ -372,11 +370,10 @@ def leaf_pipeline_stage_worker_for_target(
             _send_worker_payload(
                 ipc=ipc,
                 worker_id=worker_id,
-                payload=ControlPlaneLeafBoundaryResultEvent(
+                payload=ControlPlaneLeafBoundaryOutputsEvent(
                     target_group=target_group,
                     worker_id=worker_id,
                     request_id=message.request_id,
-                    status="completed",
                     outputs=tuple(outputs),
                 ),
                 lane=EXECUTION_IPC_LANE_DATA,
@@ -401,11 +398,10 @@ def leaf_pipeline_stage_worker_for_target(
             _send_worker_payload(
                 ipc=ipc,
                 worker_id=worker_id,
-                payload=ControlPlaneLeafBoundaryResultEvent(
+                payload=ControlPlaneLeafBoundaryOutputsEvent(
                     target_group=target_group,
                     worker_id=worker_id,
                     request_id=message.request_id,
-                    status="completed",
                     outputs=tuple(terminal),
                 ),
                 lane=EXECUTION_IPC_LANE_DATA,
@@ -434,11 +430,10 @@ def leaf_pipeline_stage_worker_for_target(
             _send_worker_payload(
                 ipc=ipc,
                 worker_id=worker_id,
-                payload=ControlPlaneLeafBoundaryResultEvent(
+                payload=ControlPlaneLeafBoundaryOutputsEvent(
                     target_group=msg.target_group,
                     worker_id=msg.worker_id,
                     request_id=msg.request_id,
-                    status="completed",
                     outputs=({"ok": True, "worker_id": msg.worker_id, "count": len(msg.inputs)},),
                 ),
                 lane=EXECUTION_IPC_LANE_DATA,
@@ -510,11 +505,10 @@ def leaf_boundary_echo_worker_for_target(
             _send_worker_payload(
                 ipc=ipc,
                 worker_id=worker_id,
-                payload=ControlPlaneLeafBoundaryResultEvent(
+                payload=ControlPlaneLeafBoundaryOutputsEvent(
                     target_group=target_group,
                     worker_id=worker_id,
                     request_id=message.request_id,
-                    status="completed",
                     outputs=tuple(outputs),
                 ),
                 lane=EXECUTION_IPC_LANE_DATA,
@@ -533,6 +527,219 @@ def leaf_boundary_echo_worker_for_target(
                 lane=EXECUTION_IPC_LANE_CONTROL,
             )
             return
+
+
+def leaf_linear_pipeline_worker_for_target(
+    stop_event: object | None,
+    control_pipe: object | None,
+    worker_id: str,
+    target_group: str,
+    stage_name: str,
+    next_target: str | None,
+    observability_target: str | None,
+    observability_multiplier: int,
+) -> None:
+    ipc = _open_worker_ipc(control_pipe=control_pipe, target_id=worker_id)
+    if ipc is None:
+        return
+    _send_worker_payload(
+        ipc=ipc,
+        worker_id=worker_id,
+        payload=ControlPlaneLeafHelloEvent(target_group=target_group, worker_id=worker_id),
+        lane=EXECUTION_IPC_LANE_CONTROL,
+    )
+    configured = False
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline:
+        if callable(getattr(stop_event, "is_set", None)) and bool(stop_event.is_set()):
+            return
+        message = _recv_worker_message(ipc=ipc, worker_id=worker_id, timeout=0.05)
+        if message is None:
+            continue
+        if isinstance(message, ControlPlaneLeafConfigCardEvent):
+            _send_worker_payload(
+                ipc=ipc,
+                worker_id=worker_id,
+                payload=ControlPlaneLeafConfigAckEvent(
+                    target_group=message.target_group,
+                    worker_id=message.worker_id,
+                    config_id=message.config_id,
+                    status="applied",
+                    resolved_nodes=tuple(message.nodes),
+                ),
+                lane=EXECUTION_IPC_LANE_CONTROL,
+            )
+            configured = True
+            continue
+        if isinstance(message, ControlPlaneLeafStopCommand):
+            _send_worker_payload(
+                ipc=ipc,
+                worker_id=worker_id,
+                payload=ControlPlaneLeafStopAckEvent(
+                    target_group=message.target_group,
+                    worker_id=message.worker_id,
+                    command_id=message.command_id,
+                    status="accepted",
+                ),
+                lane=EXECUTION_IPC_LANE_CONTROL,
+            )
+            return
+        if not configured or not isinstance(message, ControlPlaneLeafBoundaryExecuteCommand):
+            continue
+        for item in tuple(message.inputs):
+            payload, trace_id, tombstone = _extract_dispatch_input(item)
+            if not isinstance(payload, dict):
+                continue
+            record_id = payload.get("id")
+            if tombstone:
+                if isinstance(next_target, str) and next_target:
+                    _send_worker_payload(
+                        ipc=ipc,
+                        worker_id=worker_id,
+                        payload=Envelope(
+                            payload={"id": "tombstone"},
+                            target=next_target,
+                            trace_id=trace_id,
+                            tombstone=True,
+                        ),
+                        lane=EXECUTION_IPC_LANE_DATA,
+                    )
+                else:
+                    _send_worker_payload(
+                        ipc=ipc,
+                        worker_id=worker_id,
+                        payload=ControlPlaneLeafBoundaryOutputsEvent(
+                            target_group=target_group,
+                            worker_id=worker_id,
+                            request_id=f"egress:{stage_name}:tombstone",
+                            outputs=({"stage": stage_name, "kind": "tombstone"},),
+                            tombstone_output=True,
+                        ),
+                        lane=EXECUTION_IPC_LANE_DATA,
+                    )
+                continue
+            if stage_name == "egress":
+                if isinstance(record_id, int):
+                    _send_worker_payload(
+                        ipc=ipc,
+                        worker_id=worker_id,
+                        payload=ControlPlaneLeafBoundaryOutputsEvent(
+                            target_group=target_group,
+                            worker_id=worker_id,
+                            request_id=f"egress:{record_id}",
+                            outputs=({"stage": "egress", "kind": "data", "id": int(record_id)},),
+                        ),
+                        lane=EXECUTION_IPC_LANE_DATA,
+                    )
+            elif isinstance(next_target, str) and next_target and isinstance(record_id, int):
+                _send_worker_payload(
+                    ipc=ipc,
+                    worker_id=worker_id,
+                    payload=Envelope(
+                        payload={"id": int(record_id), "stage": stage_name},
+                        target=next_target,
+                        trace_id=trace_id,
+                    ),
+                    lane=EXECUTION_IPC_LANE_DATA,
+                )
+            if (
+                isinstance(observability_target, str)
+                and observability_target
+                and isinstance(record_id, int)
+            ):
+                for index in range(max(0, int(observability_multiplier))):
+                    _send_worker_payload(
+                        ipc=ipc,
+                        worker_id=worker_id,
+                        payload=Envelope(
+                            payload={
+                                "kind": "obs",
+                                "stage": stage_name,
+                                "id": int(record_id),
+                                "idx": index,
+                            },
+                            target=observability_target,
+                            trace_id=trace_id,
+                        ),
+                        lane=EXECUTION_IPC_LANE_DATA,
+                    )
+
+
+def observability_boundary_batch_sink_worker(
+    stop_event: object | None,
+    control_pipe: object | None,
+    worker_id: str,
+    target_group: str,
+) -> None:
+    ipc = _open_worker_ipc(control_pipe=control_pipe, target_id=worker_id)
+    if ipc is None:
+        return
+    _send_worker_payload(
+        ipc=ipc,
+        worker_id=worker_id,
+        payload=ControlPlaneLeafHelloEvent(target_group=target_group, worker_id=worker_id),
+        lane=EXECUTION_IPC_LANE_CONTROL,
+    )
+    configured = False
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline:
+        if callable(getattr(stop_event, "is_set", None)) and bool(stop_event.is_set()):
+            return
+        message = _recv_worker_message(ipc=ipc, worker_id=worker_id, timeout=0.05)
+        if message is None:
+            continue
+        if isinstance(message, ControlPlaneLeafConfigCardEvent):
+            _send_worker_payload(
+                ipc=ipc,
+                worker_id=worker_id,
+                payload=ControlPlaneLeafConfigAckEvent(
+                    target_group=message.target_group,
+                    worker_id=message.worker_id,
+                    config_id=message.config_id,
+                    status="applied",
+                    resolved_nodes=tuple(message.nodes),
+                ),
+                lane=EXECUTION_IPC_LANE_CONTROL,
+            )
+            configured = True
+            continue
+        if isinstance(message, ControlPlaneLeafStopCommand):
+            _send_worker_payload(
+                ipc=ipc,
+                worker_id=worker_id,
+                payload=ControlPlaneLeafStopAckEvent(
+                    target_group=message.target_group,
+                    worker_id=message.worker_id,
+                    command_id=message.command_id,
+                    status="accepted",
+                ),
+                lane=EXECUTION_IPC_LANE_CONTROL,
+            )
+            return
+        if not configured or not isinstance(message, ControlPlaneLeafBoundaryExecuteCommand):
+            continue
+        _send_worker_payload(
+            ipc=ipc,
+            worker_id=worker_id,
+            payload=ControlPlaneLeafBoundaryOutputsEvent(
+                target_group=target_group,
+                worker_id=worker_id,
+                request_id=f"obs:{int(time.time() * 1000)}",
+                outputs=({"kind": "obs_batch", "count": len(tuple(message.inputs))},),
+            ),
+            lane=EXECUTION_IPC_LANE_DATA,
+        )
+
+
+def _extract_dispatch_input(item: object) -> tuple[object, str | None, bool]:
+    payload = getattr(item, "payload", item)
+    trace_id = getattr(item, "trace_id", None)
+    tombstone = bool(getattr(item, "tombstone", False))
+    return (
+        payload,
+        trace_id if isinstance(trace_id, str) else None,
+        tombstone,
+    )
 
 
 def _open_worker_ipc(*, control_pipe: object | None, target_id: str) -> ExecutionIpcTransportService | None:
@@ -596,6 +803,8 @@ __all__ = [
     "leaf_full_flow_worker",
     "leaf_handshake_worker",
     "leaf_ignores_stop_command_worker",
+    "leaf_linear_pipeline_worker_for_target",
+    "observability_boundary_batch_sink_worker",
     "leaf_pipeline_stage_worker_for_target",
     "leaf_stop_worker",
 ]

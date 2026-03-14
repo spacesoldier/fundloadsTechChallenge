@@ -12,6 +12,10 @@ from stream_kernel.execution.orchestration.control_plane.root.runtime_bootstrap_
 )
 from stream_kernel.execution.transport.ipc.ipc_transport import (
     EXECUTION_IPC_LANE_CONTROL,
+    EXECUTION_IPC_LANE_DATA,
+    EXECUTION_IPC_LANE_LOG,
+    EXECUTION_IPC_LANE_METRIC,
+    EXECUTION_IPC_LANE_TRACE,
     ExecutionIpcKvStreamPort,
     compose_execution_ipc_worker_target_id,
 )
@@ -61,7 +65,6 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLaunchPlanEvent,
     ControlPlaneStartWorkEvent,
     ControlPlaneLeafBoundaryExecuteCommand,
-    ControlPlaneLeafBoundaryResultEvent,
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafConfigCardEvent,
     ControlPlaneLeafHelloEvent,
@@ -83,6 +86,9 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
 )
 from stream_kernel.platform.services.runtime.control_plane_shutdown_readiness import (
     ControlPlaneShutdownReadinessService,
+)
+from stream_kernel.platform.services.runtime.platform_scheduler import (
+    PlatformSchedulerCancelCommand,
 )
 from stream_kernel.platform.services.runtime.control_plane_state import (
     ControlPlaneStateService,
@@ -804,10 +810,10 @@ class ControlPlaneRootLeafConfigAssignNode:
             return []
         self.state.append_event(payload)
         events = self.state.events()
-        group = _find_group_spec_from_state(events, payload.target_group)
+        group = find_group_spec_from_state(events, payload.target_group)
         if group is None:
             return []
-        revision = _next_config_revision(events, payload.worker_id)
+        revision = next_config_revision(events, payload.worker_id)
         card = ControlPlaneLeafConfigCardEvent(
             target_group=group.group_name,
             worker_id=payload.worker_id,
@@ -817,7 +823,7 @@ class ControlPlaneRootLeafConfigAssignNode:
             group_name=group.group_name,
             nodes=tuple(group.nodes),
             runner_profile=payload.runner_profile,
-            worker_slot=_worker_slot_from_worker_id(payload.worker_id),
+            worker_slot=worker_slot_from_worker_id(payload.worker_id),
             config_revision=revision,
         )
         self.state.append_event(card)
@@ -905,17 +911,6 @@ class ControlPlaneRootLeafBoundaryDispatchNode:
 
 
 @dataclass
-class ControlPlaneRootLeafBoundaryResultNode:
-    state: ControlPlaneStateService = inject.service(ControlPlaneStateService)
-
-    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
-        payload = msg.payload if isinstance(msg, Envelope) else msg
-        if not isinstance(payload, ControlPlaneLeafBoundaryResultEvent):
-            return []
-        self.state.append_event(payload)
-        return []
-
-@dataclass
 class ControlPlaneRootLeafDrainReadyNode:
     state: ControlPlaneStateService = inject.service(ControlPlaneStateService)
     shutdown_readiness: ControlPlaneShutdownReadinessService = inject.service(
@@ -964,7 +959,7 @@ class ControlPlaneRootLeafDrainReadyNode:
 @node(
     name="system.cp.root_stop",
     consumes=[ControlPlaneShutdownReadyEvent],
-    emits=[ControlPlaneRootLeafStopRequestEvent],
+    emits=[ControlPlaneRootLeafStopRequestEvent, PlatformSchedulerCancelCommand],
 )
 @dataclass
 class ControlPlaneRootStopNode:
@@ -977,10 +972,11 @@ class ControlPlaneRootStopNode:
         payload = msg.payload if isinstance(msg, Envelope) else msg
         if not isinstance(payload, ControlPlaneShutdownReadyEvent):
             return []
+        events = self.state.events()
         requests: list[ControlPlaneRootLeafStopRequestEvent] = []
         seen: set[str] = set()
         for group_name, worker_id in _spawned_workers_for_shutdown(
-            events=self.state.events(),
+            events=events,
             expected_groups=payload.expected_groups,
         ):
             if worker_id in seen:
@@ -994,8 +990,39 @@ class ControlPlaneRootStopNode:
                     reason="control_plane.shutdown_ready",
                 )
             )
+        cancel_commands = _root_leaf_ingress_scheduler_cancel_commands(
+            expected_groups=payload.expected_groups,
+            events=events,
+        )
         self.runner_control.request_stop()
-        return requests
+        return [*requests, *cancel_commands]
+
+
+def _root_leaf_ingress_scheduler_cancel_commands(
+    *,
+    expected_groups: tuple[str, ...],
+    events: list[object],
+) -> list[PlatformSchedulerCancelCommand]:
+    lanes = (
+        EXECUTION_IPC_LANE_CONTROL,
+        EXECUTION_IPC_LANE_DATA,
+        EXECUTION_IPC_LANE_TRACE,
+        EXECUTION_IPC_LANE_LOG,
+        EXECUTION_IPC_LANE_METRIC,
+    )
+    commands: list[PlatformSchedulerCancelCommand] = []
+    for _group_name, worker_id in _spawned_workers_for_shutdown(
+        events=events,
+        expected_groups=expected_groups,
+    ):
+        for lane in lanes:
+            source_name = f"source:system.cp.root_leaf_ingress:{worker_id}:{lane}"
+            commands.append(
+                PlatformSchedulerCancelCommand(
+                    job_id=f"cp.root.leaf_ingress:{source_name}",
+                )
+            )
+    return commands
 
 
 def resolve_group_specs(
@@ -1149,13 +1176,6 @@ def worker_slot_from_worker_id(worker_id: str) -> int | None:
     if parsed <= 0:
         return None
     return parsed - 1
-
-
-# private aliases kept to minimize call-site churn in this module
-_find_group_spec_from_state = find_group_spec_from_state
-_next_config_revision = next_config_revision
-_worker_slot_from_worker_id = worker_slot_from_worker_id
-_resolve_group_specs = resolve_group_specs
 
 
 def _launch_plan_signature(plan: ControlPlaneLaunchPlan) -> tuple[tuple[str, int, tuple[str, ...]], ...]:
@@ -1445,7 +1465,6 @@ __all__ = [
     "ControlPlaneNodeConfigApplyNode",
     "ControlPlaneObservabilityConfigApplyNode",
     "ControlPlaneRootLeafBoundaryDispatchNode",
-    "ControlPlaneRootLeafBoundaryResultNode",
     "ControlPlaneRootConfigStreamNode",
     "ControlPlaneStartupBarrierNode",
     "ControlPlaneRootLeafConfigAckNode",

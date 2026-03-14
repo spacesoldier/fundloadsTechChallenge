@@ -57,14 +57,6 @@ class _RootBoundaryHandoff:
 
 
 @dataclass(slots=True)
-class _RootLeafCommands:
-    poll_calls: list[float] = field(default_factory=list)
-
-    def configure_poll_interval_seconds(self, value: float) -> None:
-        self.poll_calls.append(float(value))
-
-
-@dataclass(slots=True)
 class _RootLeafIngress:
     protocol_revision_calls: list[int] = field(default_factory=list)
 
@@ -248,13 +240,11 @@ def test_root_runtime_bootstrap_service_configures_boundary_handoff_and_control_
     lifecycle = _LifecycleService()
     router = _ProcessGroupRouter()
     handoff = _RootBoundaryHandoff()
-    commands = _RootLeafCommands()
     leaf_ingress = _RootLeafIngress()
     service = DefaultControlPlaneRootRuntimeBootstrapService(
         lifecycle=lifecycle,
         process_group_router=router,
         root_boundary_handoff=handoff,
-        root_leaf_commands=commands,
         root_leaf_ingress=leaf_ingress,
     )
     runtime = {
@@ -286,8 +276,6 @@ def test_root_runtime_bootstrap_service_configures_boundary_handoff_and_control_
             "inflight_idle_timeout_seconds": None,
         }
     ]
-    assert commands.poll_calls
-    assert abs(commands.poll_calls[-1] - 0.001) < 1e-9
     assert leaf_ingress.protocol_revision_calls == [2]
 
 

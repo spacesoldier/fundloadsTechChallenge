@@ -241,16 +241,16 @@ def trace_otel_otlp(settings: dict[str, object]) -> OTelOtlpTraceSink | NoOpTrac
     queue_max_items = queue.get("max_items", 10000)
     if not isinstance(queue_max_items, int) or queue_max_items <= 0:
         raise ValueError("trace_otel_otlp.settings.queue.max_items must be an integer > 0 when provided")
-    queue_drop_policy = queue.get("drop_policy", "block_with_timeout")
+    queue_drop_policy = queue.get("drop_policy", "non_block")
     if not isinstance(queue_drop_policy, str) or queue_drop_policy not in {
         "drop_newest",
         "drop_oldest",
         "block_with_timeout",
-        "block_forever",
+        "non_block",
     }:
         raise ValueError(
             "trace_otel_otlp.settings.queue.drop_policy must be one of: "
-            "['drop_newest', 'drop_oldest', 'block_with_timeout', 'block_forever']"
+            "['drop_newest', 'drop_oldest', 'block_with_timeout', 'non_block']"
         )
     queue_block_timeout_ms = queue.get("block_timeout_ms", 100)
     if queue_drop_policy == "block_with_timeout":

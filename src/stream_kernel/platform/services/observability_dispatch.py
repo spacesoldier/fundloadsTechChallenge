@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import time
 from dataclasses import dataclass, field
@@ -744,23 +745,33 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
 
     async def _emit_many_async(self, sinks: list[object], payload: object) -> list[tuple[str, Exception]]:
         errors: list[tuple[str, Exception]] = []
+        pending: list[tuple[str, object]] = []
         for sink in sinks:
+            sink_name = type(sink).__name__
             emit_async = getattr(sink, "emit_async", None)
             if callable(emit_async):
                 try:
                     result = emit_async(payload)
                     if inspect.isawaitable(result):
-                        await result
-                    continue
+                        pending.append((sink_name, result))
+                        continue
                 except Exception as exc:  # noqa: BLE001 - observability channel must not break business path.
-                    errors.append((type(sink).__name__, exc))
+                    errors.append((sink_name, exc))
                     continue
             emit = getattr(sink, "emit", None)
             if callable(emit):
                 try:
                     emit(payload)
                 except Exception as exc:  # noqa: BLE001 - observability channel must not break business path.
-                    errors.append((type(sink).__name__, exc))
+                    errors.append((sink_name, exc))
+        if pending:
+            results = await asyncio.gather(
+                *(awaitable for _name, awaitable in pending),
+                return_exceptions=True,
+            )
+            for (sink_name, _awaitable), result in zip(pending, results, strict=False):
+                if isinstance(result, Exception):
+                    errors.append((sink_name, result))
         return errors
 
     def _sink_error_events(

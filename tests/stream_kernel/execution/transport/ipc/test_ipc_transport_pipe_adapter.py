@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from threading import Event
 
 import pytest
@@ -8,6 +9,7 @@ from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.execution.transport.ipc.ipc_codec import ExecutionIpcCodecError
 from stream_kernel.execution.transport.ipc.ipc_transport import (
     EXECUTION_IPC_LANE_DATA,
+    EXECUTION_IPC_LANE_TRACE,
     ExecutionIpcControlSignal,
     ExecutionIpcEndpointRegistry,
     compose_execution_ipc_worker_target_id,
@@ -16,7 +18,10 @@ from stream_kernel.execution.transport.ipc.ipc_transport_service import (
     ExecutionIpcTransportCoordinatorService,
     PipeExecutionIpcTransportAdapter,
 )
-from stream_kernel.execution.transport.ipc.flow_control import NoopFlowControlPolicy
+from stream_kernel.execution.transport.ipc.flow_control import (
+    CreditWindowFlowControlPolicy,
+    NoopFlowControlPolicy,
+)
 
 
 class _EndpointRegistry(ExecutionIpcEndpointRegistry):
@@ -76,6 +81,21 @@ def test_pipe_ipc_service_no_reply_returns_none() -> None:
     message = child.recv("group:beta", timeout=0.1)
     assert message is not None
     assert message.payload == "ping"
+
+
+def test_pipe_ipc_service_buffered_recv_roundtrip_payload() -> None:
+    registry = _EndpointRegistry()
+    child = PipeExecutionIpcTransportAdapter(codec="pickle", endpoint_registry=registry)
+    parent = PipeExecutionIpcTransportAdapter(codec="pickle", endpoint_registry=registry)
+    _parent_endpoint, child_endpoint = parent.allocate_endpoints("group:buffered")
+    child.attach_endpoint(child_endpoint)
+    endpoint = child._resolve_endpoint("group:buffered")
+    buffer = child._ensure_receive_buffer("group:buffered", endpoint)
+    buffer.enqueue({"id": 7, "value": "buffered"})
+
+    message = child.recv_buffered("group:buffered", timeout=0.1)
+    assert message is not None
+    assert message.payload == {"id": 7, "value": "buffered"}
 
 
 def test_pipe_ipc_service_isolates_targets() -> None:
@@ -289,3 +309,157 @@ def test_ipc_transport_coordinator_does_not_collapse_non_control_lane_to_worker_
 
     # Ensure payload was not misrouted into the worker/control target.
     assert child.recv(worker_id, timeout=0.01) is None
+
+
+def test_ipc_transport_coordinator_send_is_non_blocking_when_credit_window_is_exhausted() -> None:
+    registry = _EndpointRegistry()
+    parent = PipeExecutionIpcTransportAdapter(codec="pickle", endpoint_registry=registry)
+    child = PipeExecutionIpcTransportAdapter(codec="pickle", endpoint_registry=registry)
+    service = ExecutionIpcTransportCoordinatorService(
+        adapter=parent,
+        endpoint_registry=registry,
+        flow_control=CreditWindowFlowControlPolicy(window_size=1),
+    )
+
+    worker_id = "execution.ingress#1"
+    data_target = compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_DATA)
+    control_target = worker_id
+    _parent_data, child_data = parent.allocate_endpoints(data_target)
+    _parent_control, child_control = parent.allocate_endpoints(control_target)
+    child.attach_endpoint(child_data)
+    child.attach_endpoint(child_control)
+    child.enable_ack(True)
+
+    first = service.send(data_target, {"id": 1})
+    assert first is not None
+    assert first.status == "accepted"
+
+    start = time.monotonic()
+    second = service.send(data_target, {"id": 2})
+    elapsed = time.monotonic() - start
+    assert second is not None
+    assert second.status == "buffered"
+    # Non-blocking contract: send path must not wait for downstream ack.
+    assert elapsed < 0.05
+
+    # Consume first data payload from child.
+    first_payload = child.recv(data_target, timeout=0.1)
+    assert first_payload is not None
+    assert first_payload.payload == {"id": 1}
+    # Pump control lane until ack is observed and pending payload is flushed.
+    second_payload = None
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and second_payload is None:
+        _ = parent.recv(control_target, timeout=0.01)
+        _ = service.flush_pending(data_target)
+        second_payload = child.recv(data_target, timeout=0.01)
+    assert second_payload is not None
+    assert second_payload.payload == {"id": 2}
+
+
+def test_pipe_ipc_adapter_does_not_emit_flow_control_ack_for_trace_lane() -> None:
+    registry = _EndpointRegistry()
+    parent = PipeExecutionIpcTransportAdapter(codec="pickle", endpoint_registry=registry)
+    child = PipeExecutionIpcTransportAdapter(codec="pickle", endpoint_registry=registry)
+
+    worker_id = "execution.ingress#1"
+    trace_target = compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_TRACE)
+    control_target = worker_id
+
+    _parent_trace, child_trace = parent.allocate_endpoints(trace_target)
+    _parent_control, child_control = parent.allocate_endpoints(control_target)
+    child.attach_endpoint(child_trace)
+    child.attach_endpoint(child_control)
+
+    parent.enable_ack(True)
+    child.enable_ack(True)
+
+    acked: list[int] = []
+
+    def _on_ack(payload: object) -> None:
+        if isinstance(payload, ExecutionIpcControlSignal):
+            acked.append(int(payload.count))
+            return
+        acked.append(int(payload))
+
+    child.register_ack_handler(control_target, _on_ack)
+
+    child.send(trace_target, {"id": 1})
+    received = parent.recv(trace_target, timeout=0.1)
+    assert received is not None
+    assert received.payload == {"id": 1}
+
+    # Drain control lane if any signal was generated.
+    _ = child.recv(control_target, timeout=0.05)
+    assert acked == []
+
+
+def test_ipc_transport_coordinator_trace_lane_bypasses_credit_window_and_stays_non_blocking() -> None:
+    registry = _EndpointRegistry()
+    parent = PipeExecutionIpcTransportAdapter(codec="pickle", endpoint_registry=registry)
+    child = PipeExecutionIpcTransportAdapter(codec="pickle", endpoint_registry=registry)
+    service = ExecutionIpcTransportCoordinatorService(
+        adapter=parent,
+        endpoint_registry=registry,
+        flow_control=CreditWindowFlowControlPolicy(window_size=1),
+    )
+
+    worker_id = "system.observability#1"
+    trace_target = compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_TRACE)
+    _parent_trace, child_trace = parent.allocate_endpoints(trace_target)
+    child.attach_endpoint(child_trace)
+
+    first = service.send(trace_target, {"id": 1})
+    assert first is not None
+    assert first.status == "accepted"
+
+    start = time.monotonic()
+    second = service.send(trace_target, {"id": 2})
+    elapsed = time.monotonic() - start
+    assert second is not None
+    assert second.status == "accepted"
+    assert elapsed < 0.05
+
+    first_payload = child.recv(trace_target, timeout=0.2)
+    second_payload = child.recv(trace_target, timeout=0.2)
+    assert first_payload is not None and first_payload.payload == {"id": 1}
+    assert second_payload is not None and second_payload.payload == {"id": 2}
+
+
+def test_ipc_transport_coordinator_recv_buffered_prefers_adapter_path() -> None:
+    class _Adapter:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def send(self, target_id: str, payload: object, *, no_reply: bool = False):
+            _ = (target_id, payload, no_reply)
+            return None
+
+        def recv(self, target_id: str, *, timeout: float | None = None):
+            _ = (target_id, timeout)
+            self.calls.append("recv")
+            return ExecutionIpcControlSignal(kind="unexpected")
+
+        def recv_buffered(self, target_id: str, *, timeout: float | None = None):
+            _ = (target_id, timeout)
+            self.calls.append("recv_buffered")
+            return "buffered"
+
+        def metrics(self, target_id: str) -> dict[str, object]:
+            _ = target_id
+            return {}
+
+        def build_port(self, *, target_id: str | None = None, receive_policy: object | None = None):
+            _ = (target_id, receive_policy)
+            return None
+
+    service = ExecutionIpcTransportCoordinatorService(
+        adapter=_Adapter(),  # type: ignore[arg-type]
+        endpoint_registry=_EndpointRegistry(),
+        flow_control=NoopFlowControlPolicy(),
+    )
+
+    payload = service.recv_buffered("group:buffered-path", timeout=0.01)
+
+    assert payload == "buffered"
+    assert service.adapter.calls == ["recv_buffered"]  # type: ignore[attr-defined]

@@ -83,3 +83,97 @@ def test_platform_scheduler_preserves_explicit_payload() -> None:
     assert len(due) == 1
     assert due[0].target == "system.scheduler.target"
     assert due[0].payload == payload
+
+
+def test_platform_scheduler_dispatch_due_respects_tick_budget() -> None:
+    service = InMemoryPlatformSchedulerService(
+        store=InMemoryKvStore(),
+        max_dispatch_per_tick=2,
+    )
+    commands = (
+        PlatformSchedulerUpsertCommand(
+            job_id="j.control",
+            target="source:system.cp.command_ingress:control",
+            interval_seconds=1.0,
+            run_immediately=True,
+        ),
+        PlatformSchedulerUpsertCommand(
+            job_id="j.data",
+            target="source:system.cp.command_ingress:data",
+            interval_seconds=1.0,
+            run_immediately=True,
+        ),
+        PlatformSchedulerUpsertCommand(
+            job_id="j.trace",
+            target="source:system.cp.command_ingress:trace",
+            interval_seconds=1.0,
+            run_immediately=True,
+        ),
+    )
+    for command in commands:
+        service.apply_command(command, now_monotonic=1.0)
+
+    first = service.dispatch_due(PlatformSchedulerTickEvent(), now_monotonic=1.0)
+    second = service.dispatch_due(PlatformSchedulerTickEvent(), now_monotonic=1.0)
+
+    assert len(first) == 2
+    assert len(second) == 1
+    assert {item.job_id for item in [*first, *second]} == {"j.control", "j.data", "j.trace"}
+
+
+def test_platform_scheduler_dispatch_due_uses_weighted_lane_fairness() -> None:
+    service = InMemoryPlatformSchedulerService(
+        store=InMemoryKvStore(),
+        max_dispatch_per_tick=6,
+    )
+    commands = (
+        PlatformSchedulerUpsertCommand(
+            job_id="data.1",
+            target="source:system.cp.root_leaf_ingress:worker#1:data",
+            interval_seconds=1.0,
+            run_immediately=True,
+        ),
+        PlatformSchedulerUpsertCommand(
+            job_id="data.2",
+            target="source:system.cp.root_leaf_ingress:worker#2:data",
+            interval_seconds=1.0,
+            run_immediately=True,
+        ),
+        PlatformSchedulerUpsertCommand(
+            job_id="data.3",
+            target="source:system.cp.root_leaf_ingress:worker#3:data",
+            interval_seconds=1.0,
+            run_immediately=True,
+        ),
+        PlatformSchedulerUpsertCommand(
+            job_id="control.1",
+            target="source:system.cp.root_leaf_ingress:worker#1:control",
+            interval_seconds=1.0,
+            run_immediately=True,
+        ),
+        PlatformSchedulerUpsertCommand(
+            job_id="control.2",
+            target="source:system.cp.root_leaf_ingress:worker#2:control",
+            interval_seconds=1.0,
+            run_immediately=True,
+        ),
+        PlatformSchedulerUpsertCommand(
+            job_id="trace.1",
+            target="source:system.cp.root_leaf_ingress:worker#1:trace",
+            interval_seconds=1.0,
+            run_immediately=True,
+        ),
+    )
+    for command in commands:
+        service.apply_command(command, now_monotonic=2.0)
+
+    due = service.dispatch_due(PlatformSchedulerTickEvent(), now_monotonic=2.0)
+
+    assert [item.job_id for item in due] == [
+        "data.1",
+        "control.1",
+        "data.2",
+        "trace.1",
+        "data.3",
+        "control.2",
+    ]

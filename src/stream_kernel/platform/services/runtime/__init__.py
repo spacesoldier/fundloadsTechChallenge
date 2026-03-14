@@ -94,10 +94,6 @@ from stream_kernel.platform.services.runtime.control_plane_config_apply import (
     InMemoryControlPlaneConfigApplyTrackerService,
     resolve_expected_config_apply_counts,
 )
-from stream_kernel.platform.services.runtime.control_plane_reply_waiter import (
-    ControlPlaneReplyWaiterService,
-    DefaultControlPlaneReplyWaiterService,
-)
 from stream_kernel.platform.services.runtime.control_plane_startup_barrier import (
     ControlPlaneStartupBarrierService,
     InMemoryControlPlaneStartupBarrierService,
@@ -142,8 +138,6 @@ from stream_kernel.platform.services.runtime.platform_scheduler import (
     PlatformSchedulerService,
     PlatformSchedulerTimerService,
     AsyncioPlatformSchedulerTimerService,
-    PlatformSchedulerTickerService,
-    DefaultPlatformSchedulerTickerService,
     InMemoryPlatformSchedulerService,
 )
 
@@ -217,8 +211,6 @@ __all__ = [
     "InMemoryControlPlaneAppliedConfigStore",
     "InMemoryControlPlaneConfigApplyTrackerService",
     "resolve_expected_config_apply_counts",
-    "ControlPlaneReplyWaiterService",
-    "DefaultControlPlaneReplyWaiterService",
     "ControlPlaneStartupBarrierService",
     "InMemoryControlPlaneStartupBarrierService",
     "ControlPlaneNodeInitializationStore",
@@ -249,7 +241,5 @@ __all__ = [
     "PlatformSchedulerTimerSnapshot",
     "PlatformSchedulerTimerService",
     "AsyncioPlatformSchedulerTimerService",
-    "PlatformSchedulerTickerService",
-    "DefaultPlatformSchedulerTickerService",
     "InMemoryPlatformSchedulerService",
 ]

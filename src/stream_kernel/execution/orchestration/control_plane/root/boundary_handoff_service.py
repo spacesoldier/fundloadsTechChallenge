@@ -14,9 +14,6 @@ from stream_kernel.execution.orchestration.lifecycle import BoundaryDispatchInpu
 from stream_kernel.execution.transport.handoff.ipc_route_table_service import (
     ExecutionIpcRouteTableService,
 )
-from stream_kernel.platform.services.runtime.control_plane_events import (
-    ControlPlaneLeafBoundaryResultEvent,
-)
 from stream_kernel.platform.services.runtime.control_plane_state import (
     ControlPlaneStateService,
 )
@@ -51,7 +48,6 @@ class ControlPlaneRootBoundaryHandoffService(Protocol):
 @service(name="control_plane_root_boundary_handoff_service")
 @dataclass(slots=True)
 class DefaultControlPlaneRootBoundaryHandoffService(ControlPlaneRootBoundaryHandoffService):
-    process_group_router: object | None = None
     root_boundary: ControlPlaneRootBoundaryExecutionService = inject.service(ControlPlaneRootBoundaryExecutionService)
     route_table: ExecutionIpcRouteTableService = inject.service(ExecutionIpcRouteTableService)
     leaf_ingress: object | None = None
@@ -65,6 +61,7 @@ class DefaultControlPlaneRootBoundaryHandoffService(ControlPlaneRootBoundaryHand
     _event_cursor: int = field(default=0, init=False, repr=False)
     _stream_request_seq: int = field(default=0, init=False, repr=False)
     _observability_request_seq: int = field(default=0, init=False, repr=False)
+    _streamed_requests: set[tuple[str, str]] = field(default_factory=set, init=False, repr=False)
     _pending_dispatch: deque[tuple[list[Envelope], str | None]] = field(
         default_factory=deque,
         init=False,
@@ -111,38 +108,17 @@ class DefaultControlPlaneRootBoundaryHandoffService(ControlPlaneRootBoundaryHand
         max_envelopes: int | None = None,
         pump_replies: bool = False,
     ) -> list[object]:
+        _ = pump_replies
         budget = (
             max(1, int(self.dispatch_max_envelopes_per_tick))
             if max_envelopes is None
             else max(1, int(max_envelopes))
         )
-        terminal_outputs: list[object] = []
-        # Cascade boundary outputs synchronously inside handoff so multi-hop
-        # chains can progress during a single root runner tick.
-        while True:
-            terminal_outputs.extend(
-                self._drain_pending_dispatch_queue(max_envelopes=budget)
-            )
-            completed = self.drain_completed_deliveries(
-                poll_timeout_seconds=0.0,
-                pump_replies=pump_replies,
-            )
-            if not completed:
-                break
-            chained_envelopes: list[Envelope] = []
-            for item in completed:
-                if (
-                    isinstance(item, Envelope)
-                    and isinstance(item.target, str)
-                    and item.target
-                ):
-                    chained_envelopes.append(item)
-                    continue
-                terminal_outputs.append(item)
-            if not chained_envelopes:
-                break
-            self._pending_dispatch.append((chained_envelopes, None))
-        return terminal_outputs
+        # Single graph-owned dispatch path:
+        # leaf boundary results are consumed by root sink nodes directly.
+        # Do not replay them from ControlPlaneStateService here, otherwise
+        # the same outputs are re-dispatched and duplicated.
+        return self._drain_pending_dispatch_queue(max_envelopes=budget)
 
     def _drain_pending_dispatch_queue(
         self,
@@ -229,7 +205,6 @@ class DefaultControlPlaneRootBoundaryHandoffService(ControlPlaneRootBoundaryHand
                 finalize=True,
                 wait_for_result=False,
             )
-            self._inflight[(worker_id, request_id)] = (time.monotonic(), False)
             terminal_outputs.extend(list(routing.terminal_outputs))
             pending_batch = []
             pending_batch_group = None
@@ -313,34 +288,13 @@ class DefaultControlPlaneRootBoundaryHandoffService(ControlPlaneRootBoundaryHand
         pump_replies: bool = False,
     ) -> list[object]:
         _ = (poll_timeout_seconds, pump_replies)
-        completed: list[object] = []
-        try:
-            events = self._state().events()
-        except Exception:
-            return completed
-        start = min(max(0, int(self._event_cursor)), len(events))
-        for event in events[start:]:
-            if not isinstance(event, ControlPlaneLeafBoundaryResultEvent):
-                continue
-            key = (event.worker_id, event.request_id)
-            if key not in self._inflight:
-                continue
-            completed.extend(list(event.outputs))
-            status = event.status.strip().lower()
-            if status in {"stream", "streaming", "partial"}:
-                continue
-            self._inflight.pop(key, None)
-        self._event_cursor = len(events)
-        self._expire_stale_inflight()
-        return completed
+        return []
 
     def has_inflight_deliveries(self) -> bool:
-        self._expire_stale_inflight()
-        return bool(self._inflight)
+        return False
 
     def has_replay_blocking_inflight_deliveries(self) -> bool:
-        self._expire_stale_inflight()
-        return any(not bool(is_background) for _started_at, is_background in self._inflight.values())
+        return False
 
     def _route_table(self) -> ExecutionIpcRouteTableService:
         candidate = self.route_table
@@ -414,6 +368,7 @@ class DefaultControlPlaneRootBoundaryHandoffService(ControlPlaneRootBoundaryHand
             return
         for key in expired:
             self._inflight.pop(key, None)
+            self._streamed_requests.discard(key)
         try:
             state = self._state()
         except Exception:
@@ -490,6 +445,19 @@ def _chunked(items: list[BoundaryDispatchInput], size: int) -> list[list[Boundar
         return []
     chunk_size = max(1, int(size))
     return [items[index:index + chunk_size] for index in range(0, len(items), chunk_size)]
+
+
+def _filter_completed_outputs_after_stream(outputs: list[object]) -> list[object]:
+    filtered: list[object] = []
+    for item in outputs:
+        if isinstance(item, Envelope):
+            # Non-tombstone envelopes were already streamed via partial events.
+            if item.tombstone:
+                filtered.append(item)
+            continue
+        # Keep non-envelope terminal outputs in completed event.
+        filtered.append(item)
+    return filtered
 
 
 def _is_observability_dispatch_target(target: str) -> bool:

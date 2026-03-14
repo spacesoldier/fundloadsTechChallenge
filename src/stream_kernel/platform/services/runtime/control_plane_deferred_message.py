@@ -9,6 +9,7 @@ from stream_kernel.integration.consumer_registry import ConsumerRegistry
 from stream_kernel.integration.kv_store import KVStore
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneDeferredMessageHoldEvent,
+    ControlPlaneLeafSinkDispatchAckEvent,
 )
 
 _PENDING_KEY = "control_plane.deferred_messages.pending"
@@ -38,6 +39,8 @@ class InMemoryControlPlaneDeferredMessageService(ControlPlaneDeferredMessageServ
 
     def hold(self, event: object) -> None:
         if not isinstance(event, ControlPlaneDeferredMessageHoldEvent):
+            return
+        if _is_transient_tail_payload(event.payload):
             return
         pending = self._load_pending()
         pending.append(event)
@@ -70,6 +73,12 @@ class InMemoryControlPlaneDeferredMessageService(ControlPlaneDeferredMessageServ
         if not isinstance(raw, list):
             return []
         return [event for event in raw if isinstance(event, ControlPlaneDeferredMessageHoldEvent)]
+
+
+def _is_transient_tail_payload(payload: object) -> bool:
+    if isinstance(payload, ControlPlaneLeafSinkDispatchAckEvent):
+        return True
+    return False
 
 
 __all__ = [

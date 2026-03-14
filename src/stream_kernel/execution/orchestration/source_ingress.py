@@ -28,6 +28,8 @@ _PUSH_INGRESS_POLL_METHODS = ("poll", "get_nowait", "recv_nowait")
 class BootstrapControl:
     # Framework control payload used to trigger source nodes on routing rails.
     target: str
+    # When True, source emits at most one payload and does not self-rearm.
+    single_shot: bool = False
 
 
 @dataclass(slots=True)
@@ -51,6 +53,7 @@ class PullIngressSourceNode:
     exhausted: bool = False
 
     def __call__(self, _msg: object, _ctx: object | None) -> list[Envelope]:
+        single_shot = isinstance(_msg, BootstrapControl) and bool(_msg.single_shot)
         if not self._primed:
             self._prime_next()
             self._primed = True
@@ -83,7 +86,7 @@ class PullIngressSourceNode:
                         span_id=span_id,
                     )
                 ]
-                if not self.exhausted:
+                if not self.exhausted and not single_shot:
                     outputs.append(
                         Envelope(
                             payload=BootstrapControl(target=self.node_name),
@@ -100,7 +103,7 @@ class PullIngressSourceNode:
                 tombstone=bool(self.exhausted and self.emit_tombstone),
             )
         ]
-        if not self.exhausted:
+        if not self.exhausted and not single_shot:
             # Re-schedule source polling on the same rails as regular node routing.
             outputs.append(
                 Envelope(

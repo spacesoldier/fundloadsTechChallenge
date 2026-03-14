@@ -12,14 +12,12 @@ runtime:
     service_worker:
       enabled: true
       queue_max_items: 131072
-      drop_policy: block_with_timeout
-      block_timeout_ms: 5000
+      drop_policy: non_block
       drain_timeout_seconds: 120
     tracing:
       dispatch_queue:
         max_items: 131072
-        drop_policy: block_with_timeout
-        block_timeout_ms: 5000
+        drop_policy: non_block
         forward_batch_max_items: 100
         forward_flush_interval_ms: 20
         drain_timeout_seconds: 120
@@ -43,8 +41,7 @@ runtime:
                 flush_interval_ms: 100
               queue:
                 max_items: 131072
-                drop_policy: block_with_timeout
-                block_timeout_ms: 5000
+                drop_policy: non_block
               httpx:
                 mode: async
             service:
@@ -73,8 +70,7 @@ runtime:
                 flush_interval_ms: 100
               queue:
                 max_items: 131072
-                drop_policy: block_with_timeout
-                block_timeout_ms: 5000
+                drop_policy: non_block
               httpx:
                 mode: async
             service:
@@ -108,10 +104,14 @@ runtime:
     lifecycle:
       graceful_timeout_seconds: 120
       drain_inflight: true
+      stop_command_timeout_seconds: 0.0
+      fallback_graceful_timeout_seconds: 0.0
     execution_ipc:
       transport: ipc_local
       flow_control:
-        mode: none
+        mode: credits
+        credits:
+          window_size: 4096
       auth:
         mode: hmac
         secret_mode: generated
@@ -124,9 +124,10 @@ runtime:
     boundary_dispatch:
       mode: stream
       control_poll_ms: 1.0
-      batch_max_items: 1000
-      stream_batch_max_items: 1000
+      batch_max_items: 1
+      stream_batch_max_items: 1
       timeout_seconds: 600.0
+      inflight_idle_timeout_seconds: 5.0
     process_groups:
       - name: execution.ingress
         workers: 1
@@ -155,6 +156,12 @@ runtime:
       enabled: true
       start_work_on_all_groups_ready: true
       readiness_timeout_seconds: 30
+      fail_on_timeout: true
+    runner_loop:
+      reply_drain_max_items: 256
+      post_start_settle_enabled: true
+      post_start_settle_max_wait_seconds: 0.0
+      post_start_settle_quiet_window_seconds: 1.0
 
 nodes:
   compute_time_keys:
@@ -192,6 +199,7 @@ nodes:
 
 adapters:
   source:
+    emit_tombstone: true
     settings:
       path: input.txt
       format: text/jsonl

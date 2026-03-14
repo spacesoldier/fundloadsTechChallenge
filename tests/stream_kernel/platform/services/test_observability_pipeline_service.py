@@ -371,6 +371,49 @@ def test_obs_k_f_02_fanout_publish_trace_async_awaits_async_observer_callback() 
     assert observer.calls == 1
 
 
+def test_obs_k_f_03_fanout_publish_trace_async_runs_observers_concurrently() -> None:
+    async def _run() -> None:
+        second_started = asyncio.Event()
+
+        @dataclass
+        class _WaitForSecondObserver:
+            async def on_trace_event_async(
+                self,
+                *,
+                event: object,
+                trace_id: str | None,
+                attributes: dict[str, object] | None,
+            ) -> None:
+                _ = (event, trace_id, attributes)
+                await second_started.wait()
+
+        @dataclass
+        class _TriggerObserver:
+            async def on_trace_event_async(
+                self,
+                *,
+                event: object,
+                trace_id: str | None,
+                attributes: dict[str, object] | None,
+            ) -> None:
+                _ = (event, trace_id, attributes)
+                second_started.set()
+
+        service = FanoutObservabilityService(
+            observers=[_WaitForSecondObserver(), _TriggerObserver()]
+        )
+        await asyncio.wait_for(
+            service.publish_trace_async(
+                event={"span": "n1"},
+                trace_id="t1",
+                attributes={"k": "v"},
+            ),
+            timeout=0.1,
+        )
+
+    asyncio.run(_run())
+
+
 def test_obs_k_c_03_reply_aware_forwards_pipeline_callbacks() -> None:
     @dataclass
     class _Inner(NoOpObservabilityService):

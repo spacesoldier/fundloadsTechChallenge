@@ -217,7 +217,7 @@ def _noop_shutdown_readiness_service() -> object:
 
 def _noop_leaf_shutdown_readiness_service() -> object:
     class _NoopLeafShutdownReadiness:
-        def observe_boundary_result(self, result: object) -> None:  # noqa: ARG002
+        def observe_boundary_outputs(self, event: object) -> None:  # noqa: ARG002
             return None
 
     return _NoopLeafShutdownReadiness()

@@ -35,7 +35,7 @@ _DEFAULT_TARGET_PREFIX_LANES: dict[str, str] = {
 
 _DEFAULT_PAYLOAD_LANES: dict[str, str] = {
     "stream_kernel.platform.services.runtime.control_plane_events.ControlPlaneLeafBoundaryExecuteCommand": EXECUTION_IPC_LANE_DATA,
-    "stream_kernel.platform.services.runtime.control_plane_events.ControlPlaneLeafBoundaryResultEvent": EXECUTION_IPC_LANE_DATA,
+    "stream_kernel.platform.services.runtime.control_plane_events.ControlPlaneLeafBoundaryOutputsEvent": EXECUTION_IPC_LANE_DATA,
     "stream_kernel.platform.services.runtime.control_plane_events.ControlPlaneLeafShutdownPrepareCommand": EXECUTION_IPC_LANE_CONTROL,
     "stream_kernel.platform.services.runtime.control_plane_events.ControlPlaneLeafDrainReadyEvent": EXECUTION_IPC_LANE_CONTROL,
     "stream_kernel.observability.events.TraceDispatchEvent": EXECUTION_IPC_LANE_TRACE,

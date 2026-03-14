@@ -1,32 +1,37 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from threading import RLock
 
+from stream_kernel.adapters.contracts import AdapterBatch
+from stream_kernel.application_context.inject import inject
+from stream_kernel.application_context.service import service
 from stream_kernel.execution.transport.carriers.ipc.ipc_adapters import (
     InMemoryExecutionIpcTransportAdapter,
     PipeExecutionIpcTransportAdapter,
 )
-from stream_kernel.application_context.inject import inject
-from stream_kernel.application_context.service import service
-from stream_kernel.integration.kv_store import KVStore
+from stream_kernel.execution.transport.ipc.flow_control import (
+    ExecutionIpcFlowControlPolicy,
+    NoopFlowControlPolicy,
+)
 from stream_kernel.execution.transport.ipc.ipc_transport import (
+    EXECUTION_IPC_LANE_CONTROL,
+    EXECUTION_IPC_LANE_DATA,
     ExecutionIpcAck,
+    ExecutionIpcControlSignal,
     ExecutionIpcEndpointRegistry,
     ExecutionIpcKvStreamPort,
     ExecutionIpcPort,
     ExecutionIpcReceivePolicy,
     ExecutionIpcTransportService,
+    compose_execution_ipc_worker_target_id,
     decompose_execution_ipc_worker_target_id,
 )
-from stream_kernel.execution.transport.ipc.flow_control import (
-    ExecutionIpcFlowControlPolicy,
-    CreditWindowFlowControlPolicy,
-    NoopFlowControlPolicy,
-)
-from stream_kernel.adapters.contracts import AdapterBatch
+from stream_kernel.integration.kv_store import KVStore
 from stream_kernel.platform.services.runtime.debug_buffer import (
+    RuntimeDebugBufferService,
     debug_instrument_service_methods,
+    publish_runtime_debug,
 )
 
 
@@ -36,10 +41,13 @@ from stream_kernel.platform.services.runtime.debug_buffer import (
 class ExecutionIpcTransportCoordinatorService(ExecutionIpcTransportService):
     adapter: ExecutionIpcKvStreamPort = inject.kv_stream(ExecutionIpcKvStreamPort)
     endpoint_registry: object = inject.kv(ExecutionIpcEndpointRegistry)
-    runtime_debug_buffer: object | None = None
+    runtime_debug_buffer: object | None = inject.service(RuntimeDebugBufferService)
     flow_control: ExecutionIpcFlowControlPolicy = field(
-        default_factory=lambda: CreditWindowFlowControlPolicy(window_size=16)
+        default_factory=NoopFlowControlPolicy
     )
+    _pending_lock: RLock = field(default_factory=RLock, init=False, repr=False)
+    _flow_control_lock: RLock = field(default_factory=RLock, init=False, repr=False)
+    _flow_control_registered_targets: set[str] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.flow_control.requires_ack:
@@ -59,7 +67,29 @@ class ExecutionIpcTransportCoordinatorService(ExecutionIpcTransportService):
         try:
             self._ensure_endpoint(resolved_target_id)
             self._flush_pending(resolved_target_id)
-            return self._send_now(resolved_target_id, payload, no_reply=no_reply)
+            sent, ack = self._try_send_now(resolved_target_id, payload, no_reply=no_reply)
+            if sent:
+                self._emit_ipc_debug(
+                    event="ipc.send",
+                    target_id=resolved_target_id,
+                    payload=payload,
+                    status="sent",
+                )
+                return ack
+            self._enqueue_pending(
+                target_id=resolved_target_id,
+                payload=payload,
+                no_reply=no_reply,
+            )
+            self._emit_ipc_debug(
+                event="ipc.send",
+                target_id=resolved_target_id,
+                payload=payload,
+                status="buffered",
+            )
+            if no_reply:
+                return None
+            return self._buffered_ack(payload)
         except Exception as exc:
             if self._should_buffer_until_endpoint_ready(target_id=resolved_target_id, error=exc):
                 self._enqueue_pending(target_id=resolved_target_id, payload=payload, no_reply=no_reply)
@@ -72,7 +102,35 @@ class ExecutionIpcTransportCoordinatorService(ExecutionIpcTransportService):
         resolved_target_id = self._resolve_transport_target_id(target_id)
         self._ensure_endpoint(resolved_target_id)
         self._flush_pending(resolved_target_id)
-        return self.adapter.recv(resolved_target_id, timeout=timeout)
+        message = self.adapter.recv(resolved_target_id, timeout=timeout)
+        if message is not None:
+            payload = getattr(message, "payload", None)
+            self._emit_ipc_debug(
+                event="ipc.recv",
+                target_id=resolved_target_id,
+                payload=payload,
+                status="received",
+            )
+        return message
+
+    def recv_buffered(self, target_id: str, *, timeout: float | None = None):
+        resolved_target_id = self._resolve_transport_target_id(target_id)
+        self._ensure_endpoint(resolved_target_id)
+        self._flush_pending(resolved_target_id)
+        recv_buffered = getattr(self.adapter, "recv_buffered", None)
+        if callable(recv_buffered):
+            message = recv_buffered(resolved_target_id, timeout=timeout)
+        else:
+            message = self.adapter.recv(resolved_target_id, timeout=timeout)
+        if message is not None:
+            payload = getattr(message, "payload", None)
+            self._emit_ipc_debug(
+                event="ipc.recv_buffered",
+                target_id=resolved_target_id,
+                payload=payload,
+                status="received",
+            )
+        return message
 
     def metrics(self, target_id: str) -> dict[str, object]:
         resolved_target_id = self._resolve_transport_target_id(target_id)
@@ -130,17 +188,22 @@ class ExecutionIpcTransportCoordinatorService(ExecutionIpcTransportService):
             registry.set(target_id, endpoint)
 
     def _ensure_flow_control(self, target_id: str) -> None:
-        if not self.flow_control.requires_ack:
+        if not self.flow_control.requires_ack or not _uses_credit_window(target_id):
             return
-        register = getattr(self.adapter, "register_ack_handler", None)
-        enable_ack = getattr(self.adapter, "enable_ack", None)
-        if callable(enable_ack):
-            enable_ack(True)
-        if callable(register):
-            register(
-                target_id,
-                lambda count, _target=target_id: self.flow_control.release(_target, count),
-            )
+        ack_target_id = _flow_control_ack_target_id(target_id)
+        with self._flow_control_lock:
+            if ack_target_id in self._flow_control_registered_targets:
+                return
+            register = getattr(self.adapter, "register_ack_handler", None)
+            enable_ack = getattr(self.adapter, "enable_ack", None)
+            if callable(enable_ack):
+                enable_ack(True)
+            if callable(register):
+                register(
+                    ack_target_id,
+                    lambda payload: self._on_flow_control_ack(ack_target_id, payload),
+                )
+            self._flow_control_registered_targets.add(ack_target_id)
 
     def _resolve_transport_target_id(self, target_id: str) -> str:
         if not isinstance(target_id, str) or not target_id:
@@ -185,41 +248,66 @@ class ExecutionIpcTransportCoordinatorService(ExecutionIpcTransportService):
         # This keeps transport state on platform rails without requiring an extra KV binding everywhere.
         return self._endpoint_store()
 
-    def _send_now(self, target_id: str, payload: object, *, no_reply: bool = False):
+    def _try_send_now(
+        self,
+        target_id: str,
+        payload: object,
+        *,
+        no_reply: bool = False,
+    ) -> tuple[bool, ExecutionIpcAck | None]:
+        if not _uses_credit_window(target_id):
+            return (True, self.adapter.send(target_id, payload, no_reply=no_reply))
         self._ensure_flow_control(target_id)
         count = _payload_count(payload)
-        self.flow_control.acquire(target_id, count)
+        if not self.flow_control.try_acquire(target_id, count):
+            return (False, None)
         try:
-            return self.adapter.send(target_id, payload, no_reply=no_reply)
+            return (True, self.adapter.send(target_id, payload, no_reply=no_reply))
         except Exception:
             self.flow_control.release(target_id, count)
             raise
 
     def _flush_pending(self, target_id: str) -> int:
-        entries = self._pending_entries(target_id)
-        if not entries:
-            return 0
-        # Keep insertion order and only clear storage after successful flush.
-        flushed = 0
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            payload = entry.get("payload")
-            no_reply = bool(entry.get("no_reply", False))
-            self._send_now(target_id, payload, no_reply=no_reply)
-            flushed += _payload_count(payload)
-        self._clear_pending(target_id)
-        return flushed
+        with self._pending_lock:
+            entries = self._pending_entries_unlocked(target_id)
+            if not entries:
+                return 0
+            flushed = 0
+            remaining: list[dict[str, object]] = []
+            for index, entry in enumerate(entries):
+                if not isinstance(entry, dict):
+                    continue
+                payload = entry.get("payload")
+                no_reply = bool(entry.get("no_reply", False))
+                sent, _ack = self._try_send_now(target_id, payload, no_reply=no_reply)
+                if sent:
+                    flushed += _payload_count(payload)
+                    continue
+                remaining.append({"payload": payload, "no_reply": no_reply})
+                for tail in entries[index + 1 :]:
+                    if isinstance(tail, dict):
+                        remaining.append(dict(tail))
+                break
+            if remaining:
+                self._set_pending_entries_unlocked(target_id, remaining)
+            else:
+                self._clear_pending_unlocked(target_id)
+            return flushed
 
     def _enqueue_pending(self, *, target_id: str, payload: object, no_reply: bool) -> None:
         store = self._pending_kv()
         if store is None:
             raise ConnectionError(f"ipc transport endpoint not registered for target '{target_id}'")
-        entries = self._pending_entries(target_id)
-        entries.append({"payload": payload, "no_reply": bool(no_reply)})
-        store.set(_pending_key(target_id), entries)
+        with self._pending_lock:
+            entries = self._pending_entries_unlocked(target_id)
+            entries.append({"payload": payload, "no_reply": bool(no_reply)})
+            self._set_pending_entries_unlocked(target_id, entries)
 
     def _pending_entries(self, target_id: str) -> list[dict[str, object]]:
+        with self._pending_lock:
+            return self._pending_entries_unlocked(target_id)
+
+    def _pending_entries_unlocked(self, target_id: str) -> list[dict[str, object]]:
         store = self._pending_kv()
         if store is None:
             return []
@@ -232,14 +320,43 @@ class ExecutionIpcTransportCoordinatorService(ExecutionIpcTransportService):
                 entries.append(dict(item))
         return entries
 
+    def _set_pending_entries_unlocked(self, target_id: str, entries: list[dict[str, object]]) -> None:
+        store = self._pending_kv()
+        if store is None:
+            return
+        store.set(_pending_key(target_id), list(entries))
+
     def _clear_pending(self, target_id: str) -> None:
+        with self._pending_lock:
+            self._clear_pending_unlocked(target_id)
+
+    def _clear_pending_unlocked(self, target_id: str) -> None:
         store = self._pending_kv()
         if store is None:
             return
         store.delete(_pending_key(target_id))
 
     def _pending_count(self, target_id: str) -> int:
-        return len(self._pending_entries(target_id))
+        with self._pending_lock:
+            return len(self._pending_entries_unlocked(target_id))
+
+    def _on_flow_control_ack(self, ack_target_id: str, payload: object) -> None:
+        count, source_target_id = _decode_ack_payload(payload=payload, ack_target_id=ack_target_id)
+        if count <= 0:
+            return
+        self.flow_control.release(source_target_id, count)
+        self._emit_ipc_debug(
+            event="ipc.flow_control.ack",
+            target_id=source_target_id,
+            payload=payload,
+            status="released",
+            count=count,
+        )
+        try:
+            self._flush_pending(source_target_id)
+        except Exception:
+            # Ack callback must stay failure-isolated.
+            return
 
     def _should_buffer_until_endpoint_ready(self, *, target_id: str, error: Exception) -> bool:
         if self._pending_kv() is None:
@@ -259,6 +376,34 @@ class ExecutionIpcTransportCoordinatorService(ExecutionIpcTransportService):
         count = _payload_count(payload)
         return ExecutionIpcAck(status="buffered", enqueued=max(0, int(count)))
 
+    def _emit_ipc_debug(
+        self,
+        *,
+        event: str,
+        target_id: str,
+        payload: object,
+        status: str,
+        count: int | None = None,
+    ) -> None:
+        if _is_runtime_debug_payload(payload):
+            return
+        fields: dict[str, object] = {
+            "target_id": target_id,
+            "lane": _lane_from_target_id(target_id),
+            "status": status,
+            "payload_type": _payload_type_name(payload),
+            "payload_count": _payload_count(payload),
+        }
+        if isinstance(count, int) and count > 0:
+            fields["count"] = count
+        publish_runtime_debug(
+            buffer=self.runtime_debug_buffer,
+            event=event,
+            source="stream_kernel.execution.transport.ipc",
+            fields=fields,
+            trace_id=None,
+        )
+
 
 def _payload_count(payload: object) -> int:
     if isinstance(payload, AdapterBatch):
@@ -266,8 +411,70 @@ def _payload_count(payload: object) -> int:
     return 1
 
 
+def _payload_type_name(payload: object) -> str:
+    token = payload if isinstance(payload, type) else payload.__class__
+    module = getattr(token, "__module__", None)
+    qualname = getattr(token, "__qualname__", None)
+    if isinstance(module, str) and module and isinstance(qualname, str) and qualname:
+        return f"{module}.{qualname}"
+    name = getattr(token, "__name__", None)
+    if isinstance(name, str) and name:
+        return name
+    return type(payload).__name__
+
+
+def _is_runtime_debug_payload(payload: object) -> bool:
+    name = _payload_type_name(payload)
+    return name.endswith("DebugMessage") or name.endswith("DebugDispatchEvent")
+
+
+def _lane_from_target_id(target_id: str) -> str:
+    resolved = decompose_execution_ipc_worker_target_id(target_id)
+    if resolved is None:
+        return "unknown"
+    _worker_id, lane = resolved
+    return lane
+
+
 def _pending_key(target_id: str) -> str:
     return f"execution_ipc.pending_outbound:{target_id}"
+
+
+def _uses_credit_window(target_id: str) -> bool:
+    lane = _lane_from_target_id(target_id)
+    if lane == "unknown":
+        return True
+    return lane in {EXECUTION_IPC_LANE_CONTROL, EXECUTION_IPC_LANE_DATA}
+
+
+def _flow_control_ack_target_id(target_id: str) -> str:
+    resolved = decompose_execution_ipc_worker_target_id(target_id)
+    if resolved is None:
+        return target_id
+    worker_id, lane = resolved
+    if lane == "control":
+        return target_id
+    return compose_execution_ipc_worker_target_id(worker_id, lane="control")
+
+
+def _decode_ack_payload(*, payload: object, ack_target_id: str) -> tuple[int, str]:
+    if isinstance(payload, ExecutionIpcControlSignal):
+        source_target_id = (
+            payload.target_id
+            if isinstance(payload.target_id, str) and payload.target_id
+            else ack_target_id
+        )
+        return (max(0, int(payload.count)), source_target_id)
+    if isinstance(payload, int):
+        return (max(0, int(payload)), ack_target_id)
+    count = getattr(payload, "count", None)
+    source_target_id = getattr(payload, "target_id", None)
+    if isinstance(count, int):
+        return (
+            max(0, int(count)),
+            source_target_id if isinstance(source_target_id, str) and source_target_id else ack_target_id,
+        )
+    return (0, ack_target_id)
 
 
 __all__ = [

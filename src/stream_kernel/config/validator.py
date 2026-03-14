@@ -32,7 +32,12 @@ _SUPPORTED_RUNNER_LOOP_KEYS = {
 }
 _SUPPORTED_PLATFORM_SOURCE_INGRESS_KEYS = {
     "emit_tombstone",
+    "pacing_mode",
+    "batch_size",
+    "advance_signal",
 }
+_SUPPORTED_PLATFORM_SOURCE_INGRESS_PACING_MODES = {"batch", "all"}
+_SUPPORTED_PLATFORM_SOURCE_INGRESS_ADVANCE_SIGNALS = {"sink_dispatch_ack"}
 _SUPPORTED_PLATFORM_DEBUG_KEYS = {
     "root_verbose_logging",
     "leaf_debug_enabled",
@@ -80,7 +85,13 @@ _SUPPORTED_OBSERVABILITY_PROMETHEUS_MODES = {"http_pull", "textfile"}
 _SUPPORTED_OBSERVABILITY_OTEL_BACKENDS = {"urllib", "requests", "httpx", "aiohttp", "urllib3", "grpcio", "otel_sdk"}
 _OBSERVABILITY_ASYNC_ONLY_BACKENDS = {"aiohttp"}
 _OBSERVABILITY_SYNC_ONLY_BACKENDS = {"urllib", "requests", "urllib3", "grpcio", "otel_sdk"}
-_SUPPORTED_OBSERVABILITY_QUEUE_DROP_POLICIES = {"drop_newest", "drop_oldest", "block_with_timeout", "block_forever"}
+_SUPPORTED_OBSERVABILITY_QUEUE_DROP_POLICIES = {"drop_newest", "drop_oldest", "block_with_timeout", "non_block"}
+_SUPPORTED_OBSERVABILITY_OTEL_QUEUE_DROP_POLICIES = {
+    "drop_newest",
+    "drop_oldest",
+    "block_with_timeout",
+    "non_block",
+}
 _SUPPORTED_OBSERVABILITY_PIPELINE_MODES = {"tracing_only", "full_multi_stream"}
 _SUPPORTED_OBSERVABILITY_PIPELINE_STREAMS = {"tracing", "logging", "telemetry", "monitoring"}
 _SUPPORTED_OBSERVABILITY_PIPELINE_SYSTEM_NODE_KINDS = {
@@ -616,6 +627,40 @@ def _normalize_runtime_platform(runtime: dict[str, object]) -> None:
                 "runtime.platform.source_ingress.emit_tombstone must be a boolean when provided"
             )
         source_ingress["emit_tombstone"] = emit_tombstone
+        pacing_mode = source_ingress.get("pacing_mode", "batch")
+        if not isinstance(pacing_mode, str):
+            raise ConfigError(
+                "runtime.platform.source_ingress.pacing_mode must be a string when provided"
+            )
+        pacing_mode = pacing_mode.strip().lower()
+        if pacing_mode not in _SUPPORTED_PLATFORM_SOURCE_INGRESS_PACING_MODES:
+            raise ConfigError(
+                "runtime.platform.source_ingress.pacing_mode must be one of: "
+                f"{sorted(_SUPPORTED_PLATFORM_SOURCE_INGRESS_PACING_MODES)}"
+            )
+        source_ingress["pacing_mode"] = pacing_mode
+        batch_size = source_ingress.get("batch_size", 1)
+        if not isinstance(batch_size, int):
+            raise ConfigError(
+                "runtime.platform.source_ingress.batch_size must be an integer when provided"
+            )
+        if batch_size <= 0:
+            raise ConfigError(
+                "runtime.platform.source_ingress.batch_size must be > 0 when provided"
+            )
+        source_ingress["batch_size"] = int(batch_size)
+        advance_signal = source_ingress.get("advance_signal", "sink_dispatch_ack")
+        if not isinstance(advance_signal, str):
+            raise ConfigError(
+                "runtime.platform.source_ingress.advance_signal must be a string when provided"
+            )
+        advance_signal = advance_signal.strip().lower()
+        if advance_signal not in _SUPPORTED_PLATFORM_SOURCE_INGRESS_ADVANCE_SIGNALS:
+            raise ConfigError(
+                "runtime.platform.source_ingress.advance_signal must be one of: "
+                f"{sorted(_SUPPORTED_PLATFORM_SOURCE_INGRESS_ADVANCE_SIGNALS)}"
+            )
+        source_ingress["advance_signal"] = advance_signal
 
     runner_loop = platform.get("runner_loop")
     if runner_loop is not None:
@@ -934,7 +979,11 @@ def _normalize_execution_ipc_mapping(mapping: dict[str, object], *, prefix: str)
     if flow_control is not None:
         if not isinstance(flow_control, dict):
             raise ConfigError(f"{prefix}.flow_control must be a mapping when provided")
-        _normalize_execution_ipc_flow_control_mapping(flow_control, prefix=f"{prefix}.flow_control")
+        _normalize_execution_ipc_flow_control_mapping(
+            flow_control,
+            prefix=f"{prefix}.flow_control",
+            allow_per_group=True,
+        )
         mapping["flow_control"] = flow_control
 
     poll_mode = mapping.get("poll_mode", "reader")
@@ -1008,6 +1057,7 @@ def _normalize_execution_ipc_flow_control_mapping(
     mapping: dict[str, object],
     *,
     prefix: str,
+    allow_per_group: bool,
 ) -> None:
     mode = mapping.get("mode", "credits")
     if not isinstance(mode, str) or not mode:
@@ -1050,6 +1100,31 @@ def _normalize_execution_ipc_flow_control_mapping(
         raise ConfigError(f"{prefix}.token_bucket.burst must be > 0")
     token_bucket["burst"] = burst
     mapping["token_bucket"] = token_bucket
+
+    if not allow_per_group:
+        if "per_group" in mapping:
+            raise ConfigError(f"{prefix}.per_group is not supported for nested overrides")
+        return
+
+    per_group = mapping.get("per_group", {})
+    if per_group is None:
+        per_group = {}
+    if not isinstance(per_group, dict):
+        raise ConfigError(f"{prefix}.per_group must be a mapping when provided")
+    normalized: dict[str, dict[str, object]] = {}
+    for group_name, override in per_group.items():
+        if not isinstance(group_name, str) or not group_name:
+            raise ConfigError(f"{prefix}.per_group keys must be non-empty strings")
+        if not isinstance(override, dict):
+            raise ConfigError(f"{prefix}.per_group.{group_name} must be a mapping")
+        override_copy = dict(override)
+        _normalize_execution_ipc_flow_control_mapping(
+            override_copy,
+            prefix=f"{prefix}.per_group.{group_name}",
+            allow_per_group=False,
+        )
+        normalized[group_name] = override_copy
+    mapping["per_group"] = normalized
 
 
 def _normalize_runtime_ordering(runtime: dict[str, object]) -> None:
@@ -1140,7 +1215,7 @@ def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
     if not isinstance(max_items, int) or max_items <= 0:
         raise ConfigError("runtime.observability.tracing.dispatch_queue.max_items must be an integer > 0")
     dispatch_queue["max_items"] = max_items
-    drop_policy = dispatch_queue.get("drop_policy", "drop_newest")
+    drop_policy = dispatch_queue.get("drop_policy", "non_block")
     if not isinstance(drop_policy, str) or not drop_policy:
         raise ConfigError("runtime.observability.tracing.dispatch_queue.drop_policy must be a non-empty string")
     if drop_policy not in _SUPPORTED_OBSERVABILITY_QUEUE_DROP_POLICIES:
@@ -1589,7 +1664,7 @@ def _normalize_runtime_observability(runtime: dict[str, object]) -> None:
         raise ConfigError("runtime.observability.service_worker.queue_max_items must be an integer > 0")
     service_worker["queue_max_items"] = queue_max_items
 
-    drop_policy = service_worker.get("drop_policy", "drop_newest")
+    drop_policy = service_worker.get("drop_policy", "non_block")
     if not isinstance(drop_policy, str) or not drop_policy:
         raise ConfigError("runtime.observability.service_worker.drop_policy must be a non-empty string")
     if drop_policy not in _SUPPORTED_OBSERVABILITY_QUEUE_DROP_POLICIES:
@@ -2073,12 +2148,12 @@ def _normalize_observability_otel_exporter_settings(
     if not isinstance(queue_max_items, int) or queue_max_items <= 0:
         raise ConfigError(f"{prefix}.queue.max_items must be an integer > 0 when provided")
     queue["max_items"] = queue_max_items
-    drop_policy = queue.get("drop_policy", "block_with_timeout")
+    drop_policy = queue.get("drop_policy", "non_block")
     if not isinstance(drop_policy, str) or not drop_policy:
         raise ConfigError(f"{prefix}.queue.drop_policy must be a non-empty string when provided")
-    if drop_policy not in _SUPPORTED_OBSERVABILITY_QUEUE_DROP_POLICIES:
+    if drop_policy not in _SUPPORTED_OBSERVABILITY_OTEL_QUEUE_DROP_POLICIES:
         raise ConfigError(
-            f"{prefix}.queue.drop_policy must be one of: {sorted(_SUPPORTED_OBSERVABILITY_QUEUE_DROP_POLICIES)}"
+            f"{prefix}.queue.drop_policy must be one of: {sorted(_SUPPORTED_OBSERVABILITY_OTEL_QUEUE_DROP_POLICIES)}"
         )
     queue["drop_policy"] = drop_policy
     block_timeout_ms = queue.get("block_timeout_ms", 100)

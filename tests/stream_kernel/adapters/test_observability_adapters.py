@@ -367,7 +367,7 @@ def test_trace_otel_otlp_applies_near_realtime_batch_defaults() -> None:
     assert isinstance(sink, OTelOtlpTraceSink)
     assert sink._batch_max_items == 64
     assert sink._batch_flush_interval_ms == 200
-    assert sink._queue_drop_policy == "block_with_timeout"
+    assert sink._queue_drop_policy == "non_block"
     assert sink._queue_block_timeout_ms == 100
 
 
@@ -384,14 +384,13 @@ def test_trace_otel_otlp_rejects_invalid_queue_block_timeout() -> None:
         )
 
 
-def test_trace_otel_otlp_accepts_block_forever_without_timeout() -> None:
-    sink = trace_otel_otlp(
-        {
-            "endpoint": "http://collector:4318/v1/traces",
-            "queue": {
-                "drop_policy": "block_forever",
-            },
-        }
-    )
-    assert isinstance(sink, OTelOtlpTraceSink)
-    assert sink._queue_drop_policy == "block_forever"
+def test_trace_otel_otlp_rejects_legacy_block_forever_policy() -> None:
+    with pytest.raises(ValueError, match="queue\\.drop_policy must be one of"):
+        trace_otel_otlp(
+            {
+                "endpoint": "http://collector:4318/v1/traces",
+                "queue": {
+                    "drop_policy": "block_forever",
+                },
+            }
+        )

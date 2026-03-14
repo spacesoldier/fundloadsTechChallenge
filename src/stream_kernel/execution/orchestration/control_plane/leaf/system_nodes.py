@@ -33,8 +33,6 @@ from stream_kernel.execution.transport.ipc.ipc_transport import (
     EXECUTION_IPC_LANE_LOG,
     EXECUTION_IPC_LANE_METRIC,
     EXECUTION_IPC_LANE_TRACE,
-    ExecutionIpcTransportService,
-    compose_execution_ipc_worker_target_id,
 )
 from stream_kernel.platform.services.runtime.control_plane_discovery_snapshot import (
     ControlPlaneLeafDiscoverySnapshotApplyService,
@@ -48,7 +46,8 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafDiscoveryRequestEvent,
     ControlPlaneLeafDiscoverySnapshotEvent,
     ControlPlaneLeafBoundaryExecuteCommand,
-    ControlPlaneLeafBoundaryResultEvent,
+    ControlPlaneLeafBoundaryOutputsEvent,
+    ControlPlaneLeafSinkDispatchAckEvent,
     ControlPlaneLeafDrainReadyEvent,
     ControlPlaneDiscoveryItemEvent,
     ControlPlaneLeafConfigAckEvent,
@@ -64,8 +63,7 @@ from stream_kernel.platform.services.runtime.control_plane_shutdown_readiness im
     ControlPlaneLeafShutdownReadinessService,
 )
 from stream_kernel.platform.services.runtime.platform_scheduler import (
-    PlatformSchedulerService,
-    PlatformSchedulerTimerService,
+    PlatformSchedulerCancelCommand,
     PlatformSchedulerUpsertCommand,
 )
 from stream_kernel.routing.envelope import Envelope
@@ -182,24 +180,23 @@ class ControlPlaneLeafBootstrapNode:
 class ControlPlaneLeafCommandIngressSourceNode:
     ingress: LeafCommandChannelIngressService = inject.service(LeafCommandChannelIngressService)
     runner_control: LeafRunnerControlService = inject.service(LeafRunnerControlService)
-    scheduler: PlatformSchedulerService = inject.service(PlatformSchedulerService)
-    timer: PlatformSchedulerTimerService | None = inject.service(PlatformSchedulerTimerService)
     debug_logging: object | None = inject.service(LeafLifecycleDebugLoggingService)
     lane: str = EXECUTION_IPC_LANE_CONTROL
     source_name: str = LEAF_COMMAND_INGRESS_SOURCE_NODE_NAME
     poll_interval_seconds: float = 0.01
     _scheduler_registered: bool = field(default=False, init=False, repr=False)
 
-    def initialize(self) -> None:
+    def initialize(self) -> list[object]:
         if self._scheduler_registered:
-            return
+            return []
         source_name = (
             self.source_name
             if isinstance(self.source_name, str) and self.source_name
             else LEAF_COMMAND_INGRESS_SOURCE_NODE_NAME
         )
         interval = max(0.001, float(self.poll_interval_seconds))
-        self.scheduler.apply_command(
+        self._scheduler_registered = True
+        return [
             PlatformSchedulerUpsertCommand(
                 job_id=f"cp.leaf.command_ingress:{source_name}",
                 target=source_name,
@@ -207,19 +204,7 @@ class ControlPlaneLeafCommandIngressSourceNode:
                 run_immediately=True,
                 payload=BootstrapControl(target=source_name),
             )
-        )
-        apply_timer_command = getattr(self.timer, "apply_command", None)
-        if callable(apply_timer_command):
-            apply_timer_command(
-                PlatformSchedulerUpsertCommand(
-                    job_id=f"cp.leaf.command_ingress:{source_name}",
-                    target=source_name,
-                    interval_seconds=interval,
-                    run_immediately=True,
-                    payload=BootstrapControl(target=source_name),
-                )
-            )
-        self._scheduler_registered = True
+        ]
 
     async def __call__(self, msg: object, _ctx: object | None) -> list[object]:
         payload = msg.payload if isinstance(msg, Envelope) else msg
@@ -271,11 +256,11 @@ class ControlPlaneLeafCommandIngressSourceNode:
         ControlPlaneLeafHelloEvent,
         ControlPlaneLeafDiscoveryAckEvent,
         ControlPlaneLeafConfigAckEvent,
-        ControlPlaneLeafBoundaryResultEvent,
+        ControlPlaneLeafBoundaryOutputsEvent,
         ControlPlaneLeafDrainReadyEvent,
         ControlPlaneLeafStopAckEvent,
     ],
-    emits=[],
+    emits=[ControlPlaneLeafSinkDispatchAckEvent],
 )
 @dataclass
 class ControlPlaneLeafReplyDispatchNode:
@@ -289,7 +274,7 @@ class ControlPlaneLeafReplyDispatchNode:
                 ControlPlaneLeafHelloEvent,
                 ControlPlaneLeafDiscoveryAckEvent,
                 ControlPlaneLeafConfigAckEvent,
-                ControlPlaneLeafBoundaryResultEvent,
+                ControlPlaneLeafBoundaryOutputsEvent,
                 ControlPlaneLeafDrainReadyEvent,
                 ControlPlaneLeafStopAckEvent,
             ),
@@ -298,8 +283,39 @@ class ControlPlaneLeafReplyDispatchNode:
         worker_id = payload.worker_id
         if not isinstance(worker_id, str) or not worker_id:
             worker_id = _leaf_worker_id_from_env()
-        self.reply_dispatch.dispatch_reply(worker_id=worker_id, payload=payload)
-        return []
+        if not isinstance(payload, ControlPlaneLeafBoundaryOutputsEvent):
+            accepted = self.reply_dispatch.dispatch_reply(worker_id=worker_id, payload=payload)
+            if not accepted:
+                return []
+            return []
+        produced: list[object] = []
+        all_dispatched = True
+        for output in payload.outputs:
+            accepted = self.reply_dispatch.dispatch_reply(worker_id=worker_id, payload=output)
+            if not accepted:
+                all_dispatched = False
+        if all_dispatched:
+            ack = _leaf_sink_dispatch_ack(payload)
+            if ack is not None:
+                produced.append(ack)
+        return produced
+
+
+@node(
+    name="system.cp.leaf_source_poll_from_sink_ack",
+    consumes=[ControlPlaneLeafSinkDispatchAckEvent],
+    emits=[ControlPlaneLeafBoundaryExecuteCommand],
+)
+@dataclass
+class ControlPlaneLeafSourcePollFromSinkAckNode:
+    def __call__(self, msg: object, ctx: object | None) -> list[object]:
+        payload = msg.payload if isinstance(msg, Envelope) else msg
+        if not isinstance(payload, ControlPlaneLeafSinkDispatchAckEvent):
+            return []
+        next_command = _leaf_next_source_poll_command(payload, ctx=ctx)
+        if next_command is None:
+            return []
+        return [next_command]
 
 
 @dataclass
@@ -606,32 +622,26 @@ class ControlPlaneLeafStartWorkNode:
                 targets=[],
             )
             return []
+        policy = _leaf_source_ingress_policy(ctx=ctx)
         session_group = getattr(session, "group_name", None)
         if not isinstance(session_group, str) or not session_group:
             session_group = os.environ.get("STREAM_KERNEL_PROCESS_GROUP") or "worker"
         session_worker_id = getattr(session, "worker_id", None)
         if not isinstance(session_worker_id, str) or not session_worker_id:
             session_worker_id = _leaf_worker_id_from_env()
-        produced = [
-            ControlPlaneLeafBoundaryExecuteCommand(
+        produced: list[ControlPlaneLeafBoundaryExecuteCommand] = []
+        for index, target in enumerate(unique_targets):
+            command = _leaf_make_source_poll_command(
                 target_group=session_group,
                 worker_id=session_worker_id,
-                request_id=f"start-work:{session_worker_id}:{time.time_ns()}:{index + 1}",
-                inputs=(
-                    {
-                        "dispatch_group": session_group,
-                        "target": target,
-                        "payload": BootstrapControl(target=target),
-                        "trace_id": None,
-                        "reply_to": None,
-                        "span_id": None,
-                        "tombstone": False,
-                    },
-                ),
-                finalize=True,
+                source_target=target,
+                single_shot=policy.single_shot,
+                batch_size=policy.batch_size,
+                request_id_prefix="start-work",
+                request_index=index + 1,
             )
-            for index, target in enumerate(unique_targets)
-        ]
+            if command is not None:
+                produced.append(command)
         _emit_leaf_debug(
             self.debug_logging,
             event="leaf.node.start_work.produced",
@@ -645,12 +655,11 @@ class ControlPlaneLeafStartWorkNode:
 @node(
     name="system.cp.leaf_boundary_execute",
     consumes=[ControlPlaneLeafBoundaryExecuteCommand],
-    emits=[ControlPlaneLeafBoundaryResultEvent],
+    emits=[ControlPlaneLeafBoundaryOutputsEvent],
 )
 @dataclass
 class ControlPlaneLeafBoundaryExecuteNode:
     boundary_execution: LeafBoundaryExecutionService = inject.service(LeafBoundaryExecutionService)
-    execution_ipc: ExecutionIpcTransportService = inject.service(ExecutionIpcTransportService)
     session_state: LeafRuntimeSessionStateService = inject.service(LeafRuntimeSessionStateService)
     debug_logging: object | None = inject.service(LeafLifecycleDebugLoggingService)
     # Stream leaf boundary outputs to root in small chunks instead of one giant batch.
@@ -670,41 +679,14 @@ class ControlPlaneLeafBoundaryExecuteNode:
         )
         session = _leaf_session_from_ctx(ctx, payload=payload, session_state=self.session_state)
         tombstone_input = any(_leaf_boundary_input_tombstone(item) for item in payload.inputs)
-        streamed_count = 0
-
-        def _stream_chunk(chunk: list[object]) -> bool:
-            nonlocal streamed_count
-            envelopes = [item for item in chunk if isinstance(item, Envelope)]
-            if not envelopes:
-                return True
-            event = ControlPlaneLeafBoundaryResultEvent(
-                target_group=payload.target_group,
-                worker_id=payload.worker_id,
-                request_id=payload.request_id,
-                status="partial",
-                outputs=tuple(envelopes),
-                tombstone_input=tombstone_input,
-                tombstone_output=any(item.tombstone for item in envelopes),
-            )
-            sent = self._send_boundary_result(session=session, event=event)
-            if sent:
-                streamed_count += len(envelopes)
-                _emit_leaf_debug(
-                    self.debug_logging,
-                    event="leaf.node.boundary_execute.chunk_sent",
-                    node_name="system.cp.leaf_boundary_execute",
-                    request_id=payload.request_id,
-                    chunk_size=len(envelopes),
-                    streamed_count=streamed_count,
-                )
-            return sent
+        source_target = _leaf_boundary_source_target(payload.inputs)
         try:
             outputs = tuple(
                 self._execute_boundary(
                     ctx=ctx,
                     session=session,
                     payload=payload,
-                    stream_callback=_stream_chunk if payload.finalize else None,
+                    stream_callback=None,
                 )
             )
             envelope_tombstone_output = any(
@@ -723,23 +705,22 @@ class ControlPlaneLeafBoundaryExecuteNode:
                     output_count=len(outputs),
                 )
                 return []
-            boundary_result = ControlPlaneLeafBoundaryResultEvent(
+            boundary_outputs = ControlPlaneLeafBoundaryOutputsEvent(
                 target_group=payload.target_group,
                 worker_id=payload.worker_id,
                 request_id=payload.request_id,
-                status="completed",
                 outputs=outputs,
+                source_target=source_target,
                 tombstone_input=tombstone_input,
                 tombstone_output=tombstone_output,
             )
-            produced: list[object] = [boundary_result]
+            produced: list[object] = [boundary_outputs]
             _emit_leaf_debug(
                 self.debug_logging,
                 event="leaf.node.boundary_execute.completed",
                 node_name="system.cp.leaf_boundary_execute",
                 request_id=payload.request_id,
                 output_count=len(outputs),
-                streamed_count=streamed_count,
                 tombstone_input=tombstone_input,
                 tombstone_output=tombstone_output,
                 sample_targets=[
@@ -768,16 +749,7 @@ class ControlPlaneLeafBoundaryExecuteNode:
                 request_id=payload.request_id,
                 error=exc.__class__.__name__,
             )
-            return [
-                ControlPlaneLeafBoundaryResultEvent(
-                    target_group=payload.target_group,
-                    worker_id=payload.worker_id,
-                    request_id=payload.request_id,
-                    status="failed",
-                    error=str(exc) or exc.__class__.__name__,
-                    tombstone_input=any(_leaf_boundary_input_tombstone(item) for item in payload.inputs),
-                )
-            ]
+            return []
 
     def _execute_boundary(
         self,
@@ -830,65 +802,10 @@ class ControlPlaneLeafBoundaryExecuteNode:
             return int(self.boundary_stream_batch_max_items)
         return 1
 
-    def _send_boundary_result(
-        self,
-        *,
-        session: object,
-        event: ControlPlaneLeafBoundaryResultEvent,
-    ) -> bool:
-        ipc = self._resolve_execution_ipc_service(session)
-        if ipc is None:
-            _emit_leaf_debug(
-                self.debug_logging,
-                event="leaf.node.boundary_execute.chunk_send_no_ipc",
-                node_name="system.cp.leaf_boundary_execute",
-                request_id=event.request_id,
-                output_count=len(event.outputs),
-            )
-            return False
-        try:
-            ipc.send(
-                compose_execution_ipc_worker_target_id(event.worker_id, lane=EXECUTION_IPC_LANE_DATA),
-                event,
-                no_reply=True,
-            )
-            return True
-        except Exception as exc:  # noqa: BLE001 - preserve chunk for final result fallback.
-            _emit_leaf_debug(
-                self.debug_logging,
-                event="leaf.node.boundary_execute.chunk_send_failed",
-                node_name="system.cp.leaf_boundary_execute",
-                request_id=event.request_id,
-                output_count=len(event.outputs),
-                error=exc.__class__.__name__,
-            )
-            return False
-
-    def _resolve_execution_ipc_service(self, session: object) -> ExecutionIpcTransportService | None:
-        candidate = self.execution_ipc
-        if isinstance(candidate, ExecutionIpcTransportService):
-            return candidate
-        if callable(getattr(candidate, "send", None)) and callable(getattr(candidate, "recv", None)):
-            return candidate  # type: ignore[return-value]
-        child = getattr(session, "child", None)
-        scope = getattr(child, "scenario_scope", None)
-        resolve = getattr(scope, "resolve", None)
-        if not callable(resolve):
-            return None
-        try:
-            service = resolve("service", ExecutionIpcTransportService)
-        except Exception:
-            return None
-        if isinstance(service, ExecutionIpcTransportService):
-            return service
-        if callable(getattr(service, "send", None)) and callable(getattr(service, "recv", None)):
-            return service  # type: ignore[return-value]
-        return None
-
 
 @node(
     name="system.cp.leaf_tombstone_finalize",
-    consumes=[ControlPlaneLeafBoundaryResultEvent],
+    consumes=[ControlPlaneLeafBoundaryOutputsEvent],
     emits=[ControlPlaneLeafDrainReadyEvent],
 )
 @dataclass
@@ -899,9 +816,9 @@ class ControlPlaneLeafTombstoneFinalizeNode:
 
     def __call__(self, msg: object, _ctx: object | None) -> list[object]:
         payload = msg.payload if isinstance(msg, Envelope) else msg
-        if not isinstance(payload, ControlPlaneLeafBoundaryResultEvent):
+        if not isinstance(payload, ControlPlaneLeafBoundaryOutputsEvent):
             return []
-        event = self.readiness.observe_boundary_result(payload)
+        event = self.readiness.observe_boundary_outputs(payload)
         if event is None:
             return []
         return [event]
@@ -910,7 +827,7 @@ class ControlPlaneLeafTombstoneFinalizeNode:
 @node(
     name="system.cp.leaf_stop",
     consumes=[ControlPlaneLeafStopCommand],
-    emits=[ControlPlaneLeafStopAckEvent],
+    emits=[ControlPlaneLeafStopAckEvent, PlatformSchedulerCancelCommand],
 )
 @dataclass
 class ControlPlaneLeafStopNode:
@@ -927,7 +844,7 @@ class ControlPlaneLeafStopNode:
             node_name="system.cp.leaf_stop",
             command_id=payload.command_id,
         )
-        produced = [
+        produced: list[object] = [
             ControlPlaneLeafStopAckEvent(
                 target_group=payload.target_group,
                 worker_id=payload.worker_id,
@@ -935,6 +852,7 @@ class ControlPlaneLeafStopNode:
                 status="accepted",
             )
         ]
+        produced.extend(_leaf_scheduler_cancel_commands())
         _emit_leaf_debug(
             self.debug_logging,
             event="leaf.node.stop.ack_produced",
@@ -975,6 +893,173 @@ def _leaf_worker_id_from_env() -> str:
     if isinstance(worker_id, str) and worker_id:
         return worker_id
     return "worker#1"
+
+
+def _leaf_scheduler_cancel_commands() -> list[PlatformSchedulerCancelCommand]:
+    lanes = (
+        EXECUTION_IPC_LANE_CONTROL,
+        EXECUTION_IPC_LANE_DATA,
+        EXECUTION_IPC_LANE_TRACE,
+        EXECUTION_IPC_LANE_LOG,
+        EXECUTION_IPC_LANE_METRIC,
+    )
+    commands: list[PlatformSchedulerCancelCommand] = []
+    for lane in lanes:
+        source_name = leaf_command_ingress_source_node_name(lane=lane)
+        commands.append(
+            PlatformSchedulerCancelCommand(
+                job_id=f"cp.leaf.command_ingress:{source_name}",
+            )
+        )
+    return commands
+
+
+def _leaf_boundary_source_target(inputs: tuple[object, ...]) -> str | None:
+    if not isinstance(inputs, tuple) or not inputs:
+        return None
+    resolved_target: str | None = None
+    for item in inputs:
+        if not isinstance(item, dict):
+            return None
+        target = item.get("target")
+        payload = item.get("payload")
+        if not (
+            isinstance(target, str)
+            and target.startswith("source:")
+            and isinstance(payload, BootstrapControl)
+            and payload.target == target
+        ):
+            return None
+        if resolved_target is None:
+            resolved_target = target
+            continue
+        if target != resolved_target:
+            return None
+    return resolved_target
+
+
+def _leaf_next_source_poll_command(
+    payload: ControlPlaneLeafSinkDispatchAckEvent,
+    *,
+    ctx: object | None,
+) -> ControlPlaneLeafBoundaryExecuteCommand | None:
+    if payload.tombstone_output:
+        return None
+    policy = _leaf_source_ingress_policy(ctx=ctx)
+    if policy.advance_signal != "sink_dispatch_ack":
+        return None
+    if not policy.single_shot:
+        # all-at-once mode drains source using source self-rearm; no ack-driven polls.
+        return None
+    source_target = payload.source_target
+    if not isinstance(source_target, str) or not source_target:
+        return None
+    return _leaf_make_source_poll_command(
+        target_group=payload.target_group,
+        worker_id=payload.worker_id,
+        source_target=source_target,
+        single_shot=policy.single_shot,
+        batch_size=policy.batch_size,
+        request_id_prefix="source-poll",
+        request_index=1,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _LeafSourceIngressPolicy:
+    single_shot: bool
+    batch_size: int
+    advance_signal: str
+
+
+def _leaf_source_ingress_policy(*, ctx: object | None) -> _LeafSourceIngressPolicy:
+    runtime = _leaf_runtime_from_ctx(ctx)
+    platform = runtime.get("platform") if isinstance(runtime, dict) else None
+    source_ingress = platform.get("source_ingress") if isinstance(platform, dict) else None
+    if not isinstance(source_ingress, dict):
+        return _LeafSourceIngressPolicy(single_shot=True, batch_size=1, advance_signal="sink_dispatch_ack")
+    pacing_mode = source_ingress.get("pacing_mode", "batch")
+    if isinstance(pacing_mode, str):
+        pacing_mode = pacing_mode.strip().lower()
+    else:
+        pacing_mode = "batch"
+    batch_size = source_ingress.get("batch_size", 1)
+    if not isinstance(batch_size, int) or batch_size <= 0:
+        batch_size = 1
+    advance_signal = source_ingress.get("advance_signal", "sink_dispatch_ack")
+    if isinstance(advance_signal, str):
+        advance_signal = advance_signal.strip().lower()
+    else:
+        advance_signal = "sink_dispatch_ack"
+    if pacing_mode == "all":
+        return _LeafSourceIngressPolicy(single_shot=False, batch_size=1, advance_signal=advance_signal)
+    return _LeafSourceIngressPolicy(
+        single_shot=True,
+        batch_size=max(1, int(batch_size)),
+        advance_signal=advance_signal,
+    )
+
+
+def _leaf_make_source_poll_command(
+    *,
+    target_group: str,
+    worker_id: str,
+    source_target: str,
+    single_shot: bool,
+    batch_size: int,
+    request_id_prefix: str,
+    request_index: int,
+) -> ControlPlaneLeafBoundaryExecuteCommand | None:
+    if not isinstance(source_target, str) or not source_target:
+        return None
+    count = 1 if not single_shot else max(1, int(batch_size))
+    inputs: list[dict[str, object]] = []
+    for _ in range(count):
+        inputs.append(
+            {
+                "dispatch_group": target_group,
+                "target": source_target,
+                "payload": BootstrapControl(target=source_target, single_shot=single_shot),
+                "trace_id": None,
+                "reply_to": None,
+                "span_id": None,
+                "tombstone": False,
+            }
+        )
+    request_id = f"{request_id_prefix}:{worker_id}:{source_target}:{time.time_ns()}:{max(1, int(request_index))}"
+    return ControlPlaneLeafBoundaryExecuteCommand(
+        target_group=target_group,
+        worker_id=worker_id,
+        request_id=request_id,
+        inputs=tuple(inputs),
+        finalize=True,
+    )
+
+
+def _leaf_sink_dispatch_ack(
+    payload: ControlPlaneLeafBoundaryOutputsEvent,
+) -> ControlPlaneLeafSinkDispatchAckEvent | None:
+    source_target = payload.source_target
+    if not isinstance(source_target, str) or not source_target:
+        return None
+    payload_class = _leaf_payload_class_name(payload.outputs)
+    return ControlPlaneLeafSinkDispatchAckEvent(
+        target_group=payload.target_group,
+        worker_id=payload.worker_id,
+        request_id=payload.request_id,
+        source_target=source_target,
+        payload_class=payload_class,
+        tombstone_output=payload.tombstone_output,
+    )
+
+
+def _leaf_payload_class_name(outputs: tuple[object, ...]) -> str:
+    if not isinstance(outputs, tuple) or not outputs:
+        return "empty"
+    first = outputs[0]
+    if isinstance(first, Envelope):
+        return type(first.payload).__name__
+    return type(first).__name__
 
 
 def _leaf_target_group(runtime: dict[str, object]) -> str:
@@ -1101,6 +1186,7 @@ __all__ = [
     "is_leaf_command_ingress_source_node_name",
     "ControlPlaneLeafCommandIngressSourceNode",
     "ControlPlaneLeafReplyDispatchNode",
+    "ControlPlaneLeafSourcePollFromSinkAckNode",
     "ControlPlaneLeafApplyConfigNode",
     "ControlPlaneLeafDiscoveryRequestNode",
     "ControlPlaneLeafSnapshotApplyNode",

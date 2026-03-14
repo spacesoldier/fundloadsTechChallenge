@@ -246,7 +246,6 @@ def leaf_worker_process_entry(
         leaf_debug_log(
             event="leaf.process.entry.orchestrator_missing",
             service=debug_logging,
-            ingress_fallback=False,
         )
         raise RuntimeError("LeafProcessEntryOrchestrationService binding is required")
     orchestrator.run(
@@ -409,10 +408,19 @@ def _build_leaf_runner(
     scenario_steps = getattr(child, "scenario_steps", None)
     if not isinstance(scenario_steps, dict):
         raise RuntimeError("leaf runtime requires scenario_steps mapping")
+    # Leaf control-plane runner must stay on control/system rails only.
+    # Business/source/sink graph execution is driven through leaf boundary execution,
+    # not via the always-on command loop runner.
     nodes = {
         name: step
         for name, step in scenario_steps.items()
-        if isinstance(name, str) and name and callable(step)
+        if isinstance(name, str)
+        and name
+        and callable(step)
+        and (
+            name.startswith("system.")
+            or is_leaf_command_ingress_source_node_name(name)
+        )
     }
     ingress_source_names = [
         name
@@ -496,24 +504,6 @@ def _enqueue_leaf_startup_init(
         scenario_id=scenario_id,
         index=0,
     )
-
-
-# Backward-compatibility helpers retained for legacy tests/tools that monkeypatch
-# these symbols directly. Runtime path is DI-only and does not call them.
-def _resolve_execution_ipc_service(
-    session: "LeafWorkerRuntimeSession",
-    *,
-    explicit: object | None = None,
-) -> ExecutionIpcTransportService | None:
-    _ = session
-    if isinstance(explicit, ExecutionIpcTransportService):
-        return explicit
-    return None
-
-
-def resolve_leaf_control_ingress_service(session: "LeafWorkerRuntimeSession") -> object | None:
-    _ = session
-    return None
 
 
 __all__ = [

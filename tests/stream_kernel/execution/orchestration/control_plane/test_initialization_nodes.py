@@ -16,6 +16,9 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneNodeInitializeCommand,
     ControlPlaneReadyForWorkEvent,
 )
+from stream_kernel.platform.services.runtime.platform_scheduler import (
+    PlatformSchedulerUpsertCommand,
+)
 from stream_kernel.platform.services.runtime.control_plane_node_initialization import (
     InMemoryControlPlaneNodeInitializationService,
 )
@@ -25,8 +28,16 @@ from stream_kernel.platform.services.runtime.control_plane_node_initialization i
 class _NodeWithInitialize:
     initialized: bool = False
 
-    def initialize(self) -> None:
+    def initialize(self) -> list[object]:
         self.initialized = True
+        return [
+            PlatformSchedulerUpsertCommand(
+                job_id="init:job",
+                target="source:test",
+                interval_seconds=0.01,
+                run_immediately=True,
+            )
+        ]
 
 
 def test_initialization_dispatch_node_emits_requested_event() -> None:
@@ -62,6 +73,7 @@ def test_initialization_plan_and_initialize_node_complete_phase() -> None:
         produced = asyncio.run(produced)  # type: ignore[assignment]
 
     assert lookup["source:a"].initialized is True
+    assert any(isinstance(item, PlatformSchedulerUpsertCommand) for item in produced)
     assert any(isinstance(item, ControlPlaneInitializationCompletedEvent) for item in produced)
 
 

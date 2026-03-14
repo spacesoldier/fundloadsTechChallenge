@@ -251,6 +251,7 @@ def _to_wire(payload: object) -> object:
             {
                 "kind": payload.kind,
                 "count": payload.count,
+                "target_id": payload.target_id,
             },
         )
     discovery_record_type = _discovery_entity_record_type()
@@ -583,11 +584,16 @@ def _decode_execution_ipc_control_signal(data: object) -> ExecutionIpcControlSig
         raise ExecutionIpcCodecError("ExecutionIpcControlSignal payload must be a mapping")
     kind = data.get("kind")
     count = data.get("count", 0)
+    target_id = data.get("target_id")
     if not isinstance(kind, str) or not kind:
         raise ExecutionIpcCodecError("ExecutionIpcControlSignal.kind must be a non-empty string")
     if not isinstance(count, int):
         raise ExecutionIpcCodecError("ExecutionIpcControlSignal.count must be an integer")
-    return ExecutionIpcControlSignal(kind=kind, count=count)
+    if target_id is not None and (not isinstance(target_id, str) or not target_id):
+        raise ExecutionIpcCodecError(
+            "ExecutionIpcControlSignal.target_id must be a non-empty string when provided"
+        )
+    return ExecutionIpcControlSignal(kind=kind, count=count, target_id=target_id)
 
 
 def _decode_discovery_entity_record(data: object) -> object:

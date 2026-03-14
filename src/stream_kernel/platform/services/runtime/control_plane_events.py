@@ -271,27 +271,48 @@ class ControlPlaneLeafBoundaryExecuteCommand:
 
 
 @dataclass(frozen=True, slots=True)
-class ControlPlaneLeafBoundaryResultEvent:
+class ControlPlaneLeafBoundaryOutputsEvent:
     target_group: str
     worker_id: str
     request_id: str
-    status: str
     outputs: tuple[object, ...] = field(default_factory=tuple)
-    error: str | None = None
+    source_target: str | None = None
     tombstone_input: bool = False
     tombstone_output: bool = False
 
     def __post_init__(self) -> None:
-        _require_non_empty_str(self.target_group, "ControlPlaneLeafBoundaryResultEvent.target_group")
-        _require_non_empty_str(self.worker_id, "ControlPlaneLeafBoundaryResultEvent.worker_id")
-        _require_non_empty_str(self.request_id, "ControlPlaneLeafBoundaryResultEvent.request_id")
-        _require_non_empty_str(self.status, "ControlPlaneLeafBoundaryResultEvent.status")
-        if self.error is not None and (not isinstance(self.error, str) or not self.error):
-            raise ValueError("ControlPlaneLeafBoundaryResultEvent.error must be a non-empty string when provided")
+        _require_non_empty_str(self.target_group, "ControlPlaneLeafBoundaryOutputsEvent.target_group")
+        _require_non_empty_str(self.worker_id, "ControlPlaneLeafBoundaryOutputsEvent.worker_id")
+        _require_non_empty_str(self.request_id, "ControlPlaneLeafBoundaryOutputsEvent.request_id")
+        if self.source_target is not None and (
+            not isinstance(self.source_target, str) or not self.source_target
+        ):
+            raise ValueError(
+                "ControlPlaneLeafBoundaryOutputsEvent.source_target must be a non-empty string when provided"
+            )
         if not isinstance(self.tombstone_input, bool):
-            raise ValueError("ControlPlaneLeafBoundaryResultEvent.tombstone_input must be a boolean")
+            raise ValueError("ControlPlaneLeafBoundaryOutputsEvent.tombstone_input must be a boolean")
         if not isinstance(self.tombstone_output, bool):
-            raise ValueError("ControlPlaneLeafBoundaryResultEvent.tombstone_output must be a boolean")
+            raise ValueError("ControlPlaneLeafBoundaryOutputsEvent.tombstone_output must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class ControlPlaneLeafSinkDispatchAckEvent:
+    target_group: str
+    worker_id: str
+    request_id: str
+    source_target: str
+    payload_class: str
+    tombstone_output: bool = False
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str(self.target_group, "ControlPlaneLeafSinkDispatchAckEvent.target_group")
+        _require_non_empty_str(self.worker_id, "ControlPlaneLeafSinkDispatchAckEvent.worker_id")
+        _require_non_empty_str(self.request_id, "ControlPlaneLeafSinkDispatchAckEvent.request_id")
+        _require_non_empty_str(self.source_target, "ControlPlaneLeafSinkDispatchAckEvent.source_target")
+        _require_non_empty_str(self.payload_class, "ControlPlaneLeafSinkDispatchAckEvent.payload_class")
+        if not isinstance(self.tombstone_output, bool):
+            raise ValueError("ControlPlaneLeafSinkDispatchAckEvent.tombstone_output must be a boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -892,7 +913,8 @@ __all__ = [
     "ControlPlaneLeafStopCommand",
     "ControlPlaneLeafStopAckEvent",
     "ControlPlaneLeafBoundaryExecuteCommand",
-    "ControlPlaneLeafBoundaryResultEvent",
+    "ControlPlaneLeafBoundaryOutputsEvent",
+    "ControlPlaneLeafSinkDispatchAckEvent",
     "ControlPlaneLeafShutdownPrepareCommand",
     "ControlPlaneLeafDrainReadyEvent",
     "ControlPlaneShutdownReadyEvent",

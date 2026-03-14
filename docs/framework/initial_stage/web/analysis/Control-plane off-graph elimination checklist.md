@@ -165,8 +165,8 @@ Status:
 ### Phase 7. Scheduler normalization
 
 - [x] Replace ticker thread loop with graph-owned scheduling tick source model.
-- [ ] Keep scheduler store/service, but tick production should be lifecycle-consistent and explicit.
-- [ ] Ensure no hidden background loops outside graph control contract.
+- [x] Keep scheduler store/service, but tick production should be lifecycle-consistent and explicit.
+- [x] Ensure no hidden background loops outside graph control contract.
 
 Done criteria:
 
@@ -183,18 +183,74 @@ Status:
   - Root/leaf control-plane source initialize path switched from `ticker.ensure_started()` to
     explicit timer service `apply_command(...)`.
   - Added timer coverage in scheduler node tests and kept control-plane e2e gate green.
+  - Removed legacy `platform_scheduler_ticker_service` thread-loop path from runtime services and exports.
+  - Root/leaf stop nodes now emit explicit `PlatformSchedulerCancelCommand` for scheduler jobs
+    (no hidden timer loops left running after stop request).
+  - Verification:
+    - `tests/stream_kernel/execution/orchestration/test_scheduler_system_nodes.py`
+    - `tests/stream_kernel/execution/orchestration/control_plane/root/test_control_plane_root_stop_node.py`
+    - `tests/stream_kernel/execution/orchestration/control_plane/leaf/test_control_plane_leaf_runtime_nodes.py`
+    - `tests/stream_kernel/platform/services/runtime/test_platform_scheduler_service.py`
 
 ### Phase 8. Final hardening and deletion pass
 
-- [ ] Delete dead compatibility helpers and legacy aliases.
-- [ ] Remove duplicate fallback branches once graph path is authoritative.
-- [ ] Update docs/protocol notes to reflect single-path control-plane.
+- [x] Delete dead compatibility helpers and legacy aliases.
+- [x] Remove duplicate fallback branches once graph path is authoritative.
+- [x] Update docs/protocol notes to reflect single-path control-plane.
 
 Done criteria:
 
 - No duplicate control paths (`off-graph` vs `on-graph`) for same responsibility.
 
-### Phase 9. Optional transport uplift (deferred)
+Status:
+
+- Completed on 2026-03-13.
+- Completed:
+  - Removed dead backward-compat helpers from leaf process-entry control-plane service.
+  - Removed root system-node private alias wrappers and switched call sites to canonical functions.
+  - Removed legacy observability handoff fallback branch that exposed old node-path behavior.
+  - Removed send-only IPC legacy lane-collapsing fallback in runtime wiring.
+  - Removed legacy constructor alias path in root runtime bootstrap service and simplified root leaf-ingress setup path.
+- Verification:
+  - root/leaf control-plane node tests
+  - handoff system/wiring tests
+  - control-plane e2e handshake/pipeline/startup scale tests
+
+### Phase 9. Leaf source pacing and start-work simplification
+
+- [x] Keep root start-work as one-shot command after readiness barrier (no per-item sync wait).
+- [x] Switch leaf pull-source progression to single-shot bootstrap + graph-driven next-read trigger.
+- [x] Trigger next source read only after successful outbound boundary dispatch; stop on tombstone.
+
+Done criteria:
+
+- Leaf does not drain full source in one boundary call due source self-rearm.
+- Source progression is explicit graph flow (`boundary_outputs -> reply_dispatch -> sink_dispatch_ack -> next boundary command`).
+
+Status:
+
+- In progress since 2026-03-13.
+- Completed in unit-scope:
+  - `BootstrapControl(single_shot=True)` introduced for pull-source no-self-rearm mode.
+  - Leaf start-work now emits single-shot source bootstrap commands.
+  - Source pacing policy moved under `runtime.platform.source_ingress`:
+    `pacing_mode=batch|all`, `batch_size`, `advance_signal=sink_dispatch_ack`.
+  - Leaf source poll node emits next read only for `advance_signal=sink_dispatch_ack` and only when
+    `tombstone_output=false`; `pacing_mode=all` disables ack-driven polling.
+  - `ControlPlaneLeafBoundaryResultEvent` removed from active root/leaf data path.
+  - Leaf boundary execution now emits `ControlPlaneLeafBoundaryOutputsEvent`.
+  - Root leaf ingress now forwards `ControlPlaneRootLeafIngressEnvelopeEvent` to boundary handoff sink.
+  - Leaf shutdown readiness now derives `ControlPlaneLeafDrainReadyEvent` from boundary outputs
+    (tombstone-only, deduped by `target_group + request_id`), while source pacing keeps
+    `sink_dispatch_ack` for next-read feedback.
+  - Verification:
+    - `tests/stream_kernel/execution/orchestration/control_plane/leaf/test_control_plane_leaf_runtime_nodes.py`
+    - `tests/stream_kernel/execution/orchestration/control_plane/root/test_control_plane_root_leaf_ingress_nodes.py`
+    - `tests/stream_kernel/execution/orchestration/control_plane/root/test_control_plane_root_leaf_ingress_service.py`
+    - `tests/stream_kernel/platform/services/runtime/test_control_plane_shutdown_readiness_service.py`
+    - `tests/stream_kernel/execution/orchestration/test_builder.py` (source ingress slice)
+
+### Phase 10. Optional transport uplift (deferred)
 
 - [ ] (Optional) Replace per-source sync IPC `recv` path with shared async-friendly multiplexer
   (`multiprocessing.connection.wait(...)` for all lane endpoints in process).

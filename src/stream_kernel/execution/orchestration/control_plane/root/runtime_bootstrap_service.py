@@ -21,9 +21,6 @@ from stream_kernel.execution.orchestration.lifecycle.root.startup.lifecycle_serv
 from stream_kernel.execution.orchestration.control_plane.root.boundary_handoff_service import (
     ControlPlaneRootBoundaryHandoffService,
 )
-from stream_kernel.execution.orchestration.control_plane.root.leaf_command_service import (
-    ControlPlaneRootLeafCommandService,
-)
 from stream_kernel.execution.orchestration.control_plane.root.leaf_ingress_service import (
     ControlPlaneRootLeafIngressService,
 )
@@ -44,10 +41,7 @@ class DefaultControlPlaneRootRuntimeBootstrapService(ControlPlaneRootRuntimeBoot
     )
     process_group_router: ProcessGroupRouterService = inject.service(ProcessGroupRouterService)
     root_boundary_handoff: object = inject.service(ControlPlaneRootBoundaryHandoffService)
-    root_leaf_commands: object = inject.service(ControlPlaneRootLeafCommandService)
     root_leaf_ingress: object = inject.service(ControlPlaneRootLeafIngressService)
-    # Backward-compatible alias for legacy constructor keyword.
-    root_leaf_ingress: object | None = None
     route_table: object | None = inject.service(ExecutionIpcRouteTableService)
 
     def prepare_root_runtime(
@@ -83,7 +77,6 @@ class DefaultControlPlaneRootRuntimeBootstrapService(ControlPlaneRootRuntimeBoot
         configured_groups = self._configure_process_group_router(runtime_map)
         self._preload_route_table_snapshot(configured_groups)
         self._configure_root_boundary_handoff(runtime_map)
-        self._configure_root_leaf_command_poll(runtime_map)
         self._configure_root_leaf_ingress(runtime_map)
 
     def _lifecycle(self) -> ControlPlaneLifecycleOrchestrationService:
@@ -157,24 +150,8 @@ class DefaultControlPlaneRootRuntimeBootstrapService(ControlPlaneRootRuntimeBoot
             ),
         )
 
-    def _configure_root_leaf_command_poll(self, runtime: dict[str, object]) -> None:
-        candidate = self.root_leaf_commands
-        configure = getattr(candidate, "configure_poll_interval_seconds", None)
-        if not callable(configure):
-            return
-        configure(_boundary_control_poll_seconds(runtime))
-
     def _configure_root_leaf_ingress(self, runtime: dict[str, object]) -> None:
         candidate = self.root_leaf_ingress
-        if not (
-            hasattr(candidate, "root_boundary_handoff")
-            or callable(getattr(candidate, "configure_startup_protocol_revision", None))
-            or callable(getattr(candidate, "configure_verbose_logging", None))
-        ):
-            if self.root_leaf_ingress is not None:
-                candidate = self.root_leaf_ingress
-        elif candidate is None and self.root_leaf_ingress is not None:
-            candidate = self.root_leaf_ingress
         if hasattr(candidate, "root_boundary_handoff"):
             try:
                 setattr(candidate, "root_boundary_handoff", self.root_boundary_handoff)

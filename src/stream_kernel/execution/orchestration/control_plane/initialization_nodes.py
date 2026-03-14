@@ -80,15 +80,18 @@ class ControlPlaneNodeInitializeNode:
         payload = msg.payload if isinstance(msg, Envelope) else msg
         if not isinstance(payload, ControlPlaneNodeInitializeCommand):
             return []
+        initialize_outputs: list[object] = []
         node = self.node_lookup.get(payload.node_name)
         if node is not None:
             initialize = getattr(node, "initialize", None)
             if callable(initialize):
                 result = initialize()
                 if hasattr(result, "__await__"):
-                    await result
+                    result = await result
+                initialize_outputs = _normalize_initialize_outputs(result)
         progress = self.initialization.mark_initialized(node_name=payload.node_name)
         produced: list[object] = [
+            *initialize_outputs,
             ControlPlaneNodeInitializedEvent(
                 node_name=payload.node_name,
                 initialized_count=len(progress.initialized_nodes),
@@ -104,6 +107,16 @@ class ControlPlaneNodeInitializeNode:
                 )
             )
         return produced
+
+
+def _normalize_initialize_outputs(result: object) -> list[object]:
+    if result is None:
+        return []
+    if isinstance(result, list):
+        return [item for item in result if item is not None]
+    if isinstance(result, tuple):
+        return [item for item in result if item is not None]
+    return [result]
 
 
 @node(

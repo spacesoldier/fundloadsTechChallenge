@@ -18,7 +18,6 @@ from stream_kernel.execution.transport.ipc.ipc_transport import (
     ExecutionIpcKvStreamPort,
     ExecutionIpcPort,
     ExecutionIpcReceivePolicy,
-    ExecutionIpcMessage,
     ExecutionIpcTransportService,
     resolve_execution_ipc_target_id,
 )
@@ -30,6 +29,11 @@ from stream_kernel.execution.transport.ipc.ipc_lane_routing_service import (
 from stream_kernel.execution.transport.ipc.ipc_transport_service import (
     ExecutionIpcTransportCoordinatorService,
     InMemoryExecutionIpcTransportAdapter,
+)
+from stream_kernel.observability.domain.debug import DebugMessage
+from stream_kernel.platform.services.runtime.debug_buffer import (
+    InMemoryRuntimeDebugBufferService,
+    RuntimeDebugBufferService,
 )
 from stream_kernel.platform.services.runtime.control_plane_state import (
     ControlPlaneEventStore,
@@ -76,6 +80,23 @@ def ensure_runtime_ipc_bindings(
     if not isinstance(endpoint_registry_store, KVStore):
         endpoint_registry_store = InMemoryKvStore()
     _apply_execution_ipc_polling_settings(runtime=runtime, adapter=service.adapter)
+    try:
+        injection_registry.register_factory(
+            "service",
+            RuntimeDebugBufferService,
+            lambda: InMemoryRuntimeDebugBufferService(),
+        )
+    except InjectionRegistryError:
+        pass
+    try:
+        injection_registry.register_factory(
+            "stream",
+            DebugMessage,
+            lambda: _NoOpDebugStreamSink(),
+            is_async=True,
+        )
+    except InjectionRegistryError:
+        pass
     try:
         injection_registry.register_factory(
             "kv",
@@ -182,8 +203,9 @@ def ensure_runtime_ipc_bindings(
 def ensure_runtime_ipc_handoff_bindings(
     *,
     injection_registry: InjectionRegistry,
+    runtime: dict[str, object] | None = None,
 ) -> None:
-    _ensure_execution_ipc_transport_service_binding(injection_registry=injection_registry)
+    _require_execution_ipc_transport_service_binding(injection_registry=injection_registry)
     _ensure_control_plane_state_service_binding(injection_registry=injection_registry)
 
     store = InMemoryKvStore()
@@ -197,6 +219,7 @@ def ensure_runtime_ipc_handoff_bindings(
         pass
 
     route_table = InMemoryExecutionIpcRouteTableService(store=store)
+    _preload_execution_ipc_route_table(route_table=route_table, runtime=runtime)
     for contract in {ExecutionIpcRouteTableService, InMemoryExecutionIpcRouteTableService}:
         try:
             injection_registry.register_factory(
@@ -245,110 +268,19 @@ def ensure_runtime_ipc_handoff_bindings(
         pass
 
 
-def _ensure_execution_ipc_transport_service_binding(
+def _require_execution_ipc_transport_service_binding(
     *,
     injection_registry: InjectionRegistry,
 ) -> None:
     bindings = getattr(injection_registry, "_bindings", None)
     if not isinstance(bindings, dict):
-        return
+        raise InjectionRegistryError("ipc transport bindings registry is unavailable")
     if ("service", ExecutionIpcTransportService, None) in bindings:
         return
-    kv_stream_binding = bindings.get(("kv_stream", ExecutionIpcKvStreamPort, None))
-    if kv_stream_binding is None:
-        return
-    adapter_factory = getattr(kv_stream_binding, "factory", None)
-    if not callable(adapter_factory):
-        return
-    try:
-        adapter = adapter_factory()
-    except Exception:
-        return
-    if isinstance(adapter, ExecutionIpcKvStreamPort):
-        endpoint_registry_store = InMemoryKvStore()
-        flow_control = resolve_execution_ipc_flow_control({})
-        try:
-            injection_registry.register_factory(
-                "kv",
-                ExecutionIpcEndpointRegistry,
-                lambda _store=endpoint_registry_store: _store,
-            )
-        except InjectionRegistryError:
-            pass
-        try:
-            injection_registry.register_factory(
-                "service",
-                ExecutionIpcTransportService,
-                lambda _adapter=adapter, _store=endpoint_registry_store, _flow=flow_control: ExecutionIpcTransportCoordinatorService(
-                    adapter=_adapter,
-                    endpoint_registry=_store,
-                    flow_control=_flow,
-                ),
-            )
-        except InjectionRegistryError:
-            return
-        return
-    if callable(getattr(adapter, "send", None)):
-        try:
-            injection_registry.register_factory(
-                "service",
-                ExecutionIpcTransportService,
-                lambda _adapter=adapter: _SendOnlyExecutionIpcTransportService(raw_adapter=_adapter),
-            )
-        except InjectionRegistryError:
-            return
-
-
-class _SendOnlyExecutionIpcTransportService(ExecutionIpcTransportService):
-    def __init__(self, *, raw_adapter: object) -> None:
-        self._raw_adapter = raw_adapter
-
-    def send(
-        self,
-        target_id: str,
-        payload: object,
-        *,
-        no_reply: bool = False,
-    ):
-        send = getattr(self._raw_adapter, "send", None)
-        if not callable(send):
-            raise ConnectionError("send-only ipc adapter is unavailable")
-        legacy_target = target_id
-        if isinstance(legacy_target, str) and "::" in legacy_target:
-            base, _sep, lane = legacy_target.partition("::")
-            if lane == EXECUTION_IPC_LANE_DATA and base:
-                legacy_target = base
-        return send(legacy_target, payload, no_reply=no_reply)
-
-    def recv(self, target_id: str, *, timeout: float | None = None) -> ExecutionIpcMessage | None:
-        _ = target_id
-        _ = timeout
-        return None
-
-    def metrics(self, target_id: str) -> dict[str, object]:
-        _ = target_id
-        return {}
-
-    def flush_pending(self, target_id: str) -> int:
-        _ = target_id
-        return 0
-
-    def build_port(
-        self,
-        *,
-        target_id: str | None = None,
-        receive_policy: ExecutionIpcReceivePolicy | None = None,
-    ) -> ExecutionIpcPort:
-        _ = receive_policy
-        return ExecutionIpcPort(service=self, target_id=target_id)
-
-    def allocate_local_endpoints(self, target_id: str) -> tuple[object, object]:
-        _ = target_id
-        raise ValueError("send-only ipc transport service does not allocate local endpoints")
-
-    def bind_local_endpoint(self, target_id: str, endpoint: object) -> None:
-        _ = target_id
-        _ = endpoint
+    raise InjectionRegistryError(
+        "ExecutionIpcTransportService binding is required before handoff bindings. "
+        "Call ensure_runtime_ipc_bindings(...) first."
+    )
 
 
 def _ensure_control_plane_state_service_binding(
@@ -512,6 +444,194 @@ def _resolve_execution_ipc_group_policy(
         buffer_enabled=enabled,
         batch_max_items=batch_max_items,
         flush_interval_ms=flush_interval_ms,
+    )
+
+
+class _NoOpDebugStreamSink:
+    def emit(self, _payload: object) -> None:
+        return
+
+    async def emit_async(self, _payload: object) -> None:
+        return
+
+
+def _preload_execution_ipc_route_table(
+    *,
+    route_table: InMemoryExecutionIpcRouteTableService,
+    runtime: dict[str, object] | None,
+) -> None:
+    if not isinstance(runtime, dict):
+        return
+    snapshot = _route_table_snapshot_from_runtime(runtime)
+    if not snapshot:
+        return
+    route_table.preload_snapshot(routes=snapshot)
+
+
+def _route_table_snapshot_from_runtime(runtime: dict[str, object]) -> dict[str, str]:
+    groups = _runtime_process_groups_with_observability(runtime)
+    snapshot: dict[str, str] = {}
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        group_name = group.get("name")
+        if not isinstance(group_name, str) or not group_name:
+            continue
+        workers = group.get("workers")
+        worker_count = int(workers) if isinstance(workers, int) and workers > 0 else 1
+        nodes = group.get("nodes")
+        if not isinstance(nodes, list):
+            continue
+        target_id = f"{group_name}#1" if worker_count >= 1 else None
+        if not isinstance(target_id, str):
+            continue
+        for node_name in nodes:
+            if not isinstance(node_name, str) or not node_name:
+                continue
+            snapshot.setdefault(node_name, target_id)
+    return snapshot
+
+
+def _runtime_process_groups_with_observability(runtime: dict[str, object]) -> list[dict[str, object]]:
+    platform = runtime.get("platform", {})
+    if not isinstance(platform, dict):
+        return []
+    raw_groups = platform.get("process_groups", [])
+    groups: list[dict[str, object]] = [
+        dict(item) for item in raw_groups if isinstance(item, dict)
+    ]
+    observability_group = _observability_service_group(runtime)
+    if observability_group is None:
+        return groups
+    group_name = observability_group.get("name")
+    if not isinstance(group_name, str) or not group_name:
+        return groups
+    for existing in groups:
+        if existing.get("name") != group_name:
+            continue
+        merged_nodes = _merge_unique_node_names(
+            existing=existing.get("nodes"),
+            extra=observability_group.get("nodes"),
+        )
+        existing["nodes"] = merged_nodes
+        if not isinstance(existing.get("workers"), int) or int(existing["workers"]) <= 0:
+            existing["workers"] = int(observability_group.get("workers", 1))
+        return groups
+    groups.append(observability_group)
+    return groups
+
+
+def _observability_service_group(runtime: dict[str, object]) -> dict[str, object] | None:
+    role = runtime.get("__process_role")
+    if isinstance(role, str) and role == "observability_worker":
+        return None
+    observability = runtime.get("observability", {})
+    if not isinstance(observability, dict):
+        return None
+    service_process = observability.get("service_process")
+    if not isinstance(service_process, dict):
+        service_process = observability.get("service_worker")
+    if not isinstance(service_process, dict):
+        return None
+    if service_process.get("enabled") is not True:
+        return None
+    group_name = service_process.get("group_name")
+    if not isinstance(group_name, str) or not group_name:
+        group_name = "system.observability"
+    workers = service_process.get("workers", 1)
+    if not isinstance(workers, int) or workers <= 0:
+        workers = 1
+    nodes = _observability_service_nodes(
+        service_process=service_process,
+        observability=observability,
+    )
+    if not nodes:
+        return None
+    return {
+        "name": group_name,
+        "workers": workers,
+        "nodes": nodes,
+    }
+
+
+def _observability_service_nodes(
+    *,
+    service_process: dict[str, object],
+    observability: dict[str, object],
+) -> list[str]:
+    configured = service_process.get("nodes")
+    if isinstance(configured, list):
+        explicit = [item for item in configured if isinstance(item, str) and item]
+        if explicit:
+            return explicit
+    nodes: list[str] = []
+    if _has_enabled_exporters(observability, "tracing"):
+        nodes.append("system.obs.trace_dispatch")
+    if _has_enabled_exporters(observability, "logging"):
+        nodes.append("system.obs.log_dispatch")
+    if _has_enabled_exporter_kind(observability, "logging", "redis_debug"):
+        nodes.append("system.obs.debug_dispatch")
+    if _has_enabled_exporters(observability, "telemetry"):
+        nodes.append("system.obs.metric_dispatch")
+    if _has_enabled_exporters(observability, "monitoring"):
+        nodes.extend(
+            [
+                "system.obs.monitor_dispatch",
+                "system.obs.monitoring_metrics_dispatch",
+            ]
+        )
+    worker_queue_telemetry = observability.get("worker_queue_telemetry", {})
+    if isinstance(worker_queue_telemetry, dict) and worker_queue_telemetry.get("enabled") is True:
+        nodes.append("system.obs.worker_queue_dispatch")
+    return _unique_non_empty_strings(nodes)
+
+
+def _merge_unique_node_names(*, existing: object, extra: object) -> list[str]:
+    base = existing if isinstance(existing, list) else []
+    tail = extra if isinstance(extra, list) else []
+    return _unique_non_empty_strings([*base, *tail])
+
+
+def _unique_non_empty_strings(values: list[object]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str) or not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _has_enabled_exporters(observability: dict[str, object], section: str) -> bool:
+    channel = observability.get(section)
+    if not isinstance(channel, dict):
+        return False
+    exporters = channel.get("exporters", [])
+    if not isinstance(exporters, list):
+        return False
+    return any(
+        isinstance(exporter, dict) and exporter.get("enabled", True) is not False
+        for exporter in exporters
+    )
+
+
+def _has_enabled_exporter_kind(
+    observability: dict[str, object],
+    section: str,
+    kind: str,
+) -> bool:
+    channel = observability.get(section)
+    if not isinstance(channel, dict):
+        return False
+    exporters = channel.get("exporters", [])
+    if not isinstance(exporters, list):
+        return False
+    return any(
+        isinstance(exporter, dict)
+        and exporter.get("enabled", True) is not False
+        and exporter.get("kind") == kind
+        for exporter in exporters
     )
 
 

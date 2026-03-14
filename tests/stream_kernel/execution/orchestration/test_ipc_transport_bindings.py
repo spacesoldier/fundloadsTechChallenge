@@ -9,6 +9,7 @@ from stream_kernel.execution.transport.ipc import (
     ExecutionIpcTransportService,
     ExecutionIpcTransportCoordinatorService,
     InMemoryExecutionIpcTransportAdapter,
+    NoopFlowControlPolicy,
     PipeExecutionIpcTransportAdapter,
 )
 
@@ -120,11 +121,33 @@ def test_runtime_ipc_service_resolves_from_adapter_bindings() -> None:
     assert resolved is adapter
 
 
-def test_runtime_ipc_bindings_apply_flow_control_defaults() -> None:
+def test_runtime_ipc_bindings_apply_flow_control_defaults_to_noop() -> None:
     runtime = {
         "platform": {
             "process_groups": [{"name": "alpha", "workers": 1}],
             "execution_ipc": {"transport": "tcp_local", "auth": {"mode": "hmac"}},
+        }
+    }
+    registry = InjectionRegistry()
+    execution_builder.ensure_runtime_ipc_bindings(injection_registry=registry, runtime=runtime)
+    scope = registry.instantiate_for_scenario("run")
+    service = scope.resolve("service", ExecutionIpcTransportService)
+    assert isinstance(service, ExecutionIpcTransportCoordinatorService)
+    assert isinstance(service.flow_control, NoopFlowControlPolicy)
+
+
+def test_runtime_ipc_bindings_apply_flow_control_credits_when_configured() -> None:
+    runtime = {
+        "platform": {
+            "process_groups": [{"name": "alpha", "workers": 1}],
+            "execution_ipc": {
+                "transport": "tcp_local",
+                "auth": {"mode": "hmac"},
+                "flow_control": {
+                    "mode": "credits",
+                    "credits": {"window_size": 32},
+                },
+            },
         }
     }
     registry = InjectionRegistry()

@@ -2,15 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-import pytest
-
 from stream_kernel.execution.transport.ipc.ipc_transport import (
     EXECUTION_IPC_LANE_DATA,
     compose_execution_ipc_worker_target_id,
-)
-from stream_kernel.platform.services.runtime.control_plane_events import (
-    ControlPlaneLeafBoundaryResultEvent,
-    ControlPlaneRootLeafBoundaryExecuteRequestEvent,
 )
 
 
@@ -19,34 +13,24 @@ class _IpcPort:
     sends: list[dict[str, object]] = field(default_factory=list)
 
     def send(self, target_id: str, payload: object, *, no_reply: bool = False):
-        self.sends.append(
-            {"target_id": target_id, "payload": payload, "no_reply": no_reply}
-        )
+        self.sends.append({"target_id": target_id, "payload": payload, "no_reply": no_reply})
         return None
 
 
 @dataclass(slots=True)
-class _RootLeafCommands:
-    requests: list[dict[str, object]] = field(default_factory=list)
-    waits: list[dict[str, object]] = field(default_factory=list)
-    result: object | None = None
+class _LaneRouting:
+    lane: str = "custom"
+    raises: bool = False
+    calls: list[dict[str, object]] = field(default_factory=list)
 
-    def make_boundary_execute_request(self, **kwargs: object) -> ControlPlaneRootLeafBoundaryExecuteRequestEvent:
-        self.requests.append(dict(kwargs))
-        return ControlPlaneRootLeafBoundaryExecuteRequestEvent(
-            target_group=str(kwargs["target_group"]),
-            worker_id=str(kwargs["worker_id"]),
-            request_id=str(kwargs["request_id"]),
-            inputs=tuple(kwargs["inputs"]),  # type: ignore[arg-type]
-            finalize=bool(kwargs.get("finalize", True)),
-        )
-
-    def wait_boundary_result(self, **kwargs: object):
-        self.waits.append(dict(kwargs))
-        return self.result
+    def resolve_lane(self, *, target: str, payload: object, default_lane: str) -> str:
+        self.calls.append({"target": target, "payload": payload, "default_lane": default_lane})
+        if self.raises:
+            raise RuntimeError("lane-failed")
+        return self.lane
 
 
-def test_root_boundary_execution_service_sends_typed_command_and_returns_routing_result() -> None:
+def test_root_boundary_execution_service_sends_typed_command_fire_and_forget() -> None:
     from stream_kernel.execution.orchestration.control_plane.root.boundary_execution_service import (
         DefaultControlPlaneRootBoundaryExecutionService,
     )
@@ -55,19 +39,7 @@ def test_root_boundary_execution_service_sends_typed_command_and_returns_routing
     )
 
     ipc = _IpcPort()
-    commands = _RootLeafCommands(
-        result=ControlPlaneLeafBoundaryResultEvent(
-            target_group="execution.alpha",
-            worker_id="execution.alpha#1",
-            request_id="req-1",
-            status="completed",
-            outputs=("out-1", "out-2"),
-        )
-    )
-    service = DefaultControlPlaneRootBoundaryExecutionService(
-        root_leaf_commands=commands,
-        execution_ipc=ipc,
-    )
+    service = DefaultControlPlaneRootBoundaryExecutionService(execution_ipc=ipc, lane_routing=None)
 
     result = service.execute_boundary_on_leaf(
         target_group="execution.alpha",
@@ -76,8 +48,12 @@ def test_root_boundary_execution_service_sends_typed_command_and_returns_routing
         inputs=({"payload": 1},),
         timeout_seconds=0.1,
         finalize=True,
+        wait_for_result=True,
     )
 
+    assert result.local_deliveries == []
+    assert result.boundary_deliveries == []
+    assert result.terminal_outputs == []
     assert len(ipc.sends) == 1
     sent = ipc.sends[0]
     assert sent["target_id"] == compose_execution_ipc_worker_target_id(
@@ -86,124 +62,54 @@ def test_root_boundary_execution_service_sends_typed_command_and_returns_routing
     )
     assert sent["no_reply"] is True
     assert isinstance(sent["payload"], ControlPlaneLeafBoundaryExecuteCommand)
-    assert result.local_deliveries == []
-    assert result.boundary_deliveries == []
-    assert result.terminal_outputs == ["out-1", "out-2"]
+    assert sent["payload"].request_id == "req-1"
+    assert sent["payload"].inputs == ({"payload": 1},)
 
 
-def test_root_boundary_execution_service_raises_on_timeout() -> None:
-    from stream_kernel.execution.orchestration.control_plane.root.boundary_execution_service import (
-        DefaultControlPlaneRootBoundaryExecutionService,
-        ControlPlaneRootBoundaryExecutionTimeoutError,
-    )
-
-    service = DefaultControlPlaneRootBoundaryExecutionService(
-        root_leaf_commands=_RootLeafCommands(result=None),
-        execution_ipc=_IpcPort(),
-    )
-
-    with pytest.raises(ControlPlaneRootBoundaryExecutionTimeoutError):
-        service.execute_boundary_on_leaf(
-            target_group="execution.alpha",
-            worker_id="execution.alpha#1",
-            request_id="req-timeout",
-            inputs=(),
-            timeout_seconds=0.01,
-        )
-
-
-def test_root_boundary_execution_service_does_not_wait_for_result_when_finalize_is_false() -> None:
-    from stream_kernel.execution.orchestration.control_plane.root.boundary_execution_service import (
-        DefaultControlPlaneRootBoundaryExecutionService,
-    )
-    from stream_kernel.platform.services.runtime.control_plane_events import (
-        ControlPlaneLeafBoundaryExecuteCommand,
-    )
-
-    ipc = _IpcPort()
-    commands = _RootLeafCommands()
-    service = DefaultControlPlaneRootBoundaryExecutionService(
-        root_leaf_commands=commands,
-        execution_ipc=ipc,
-    )
-
-    result = service.execute_boundary_on_leaf(
-        target_group="system.observability",
-        worker_id="system.observability#1",
-        request_id="req-obs-1",
-        inputs=({"trace": 1},),
-        timeout_seconds=0.25,
-        finalize=False,
-    )
-
-    assert len(ipc.sends) == 1
-    sent = ipc.sends[0]
-    assert sent["target_id"] == compose_execution_ipc_worker_target_id(
-        "system.observability#1",
-        lane=EXECUTION_IPC_LANE_DATA,
-    )
-    assert sent["no_reply"] is True
-    assert isinstance(sent["payload"], ControlPlaneLeafBoundaryExecuteCommand)
-    assert sent["payload"].finalize is False
-    assert commands.requests[0]["finalize"] is False
-    assert commands.waits == []
-    assert result.local_deliveries == []
-    assert result.boundary_deliveries == []
-    assert result.terminal_outputs == []
-
-
-def test_root_boundary_execution_service_does_not_wait_for_result_when_wait_for_result_is_false() -> None:
+def test_root_boundary_execution_service_uses_lane_routing_when_available() -> None:
     from stream_kernel.execution.orchestration.control_plane.root.boundary_execution_service import (
         DefaultControlPlaneRootBoundaryExecutionService,
     )
 
     ipc = _IpcPort()
-    commands = _RootLeafCommands()
-    service = DefaultControlPlaneRootBoundaryExecutionService(
-        root_leaf_commands=commands,
-        execution_ipc=ipc,
-    )
+    routing = _LaneRouting(lane="trace")
+    service = DefaultControlPlaneRootBoundaryExecutionService(execution_ipc=ipc, lane_routing=routing)
 
-    result = service.execute_boundary_on_leaf(
+    _ = service.execute_boundary_on_leaf(
         target_group="execution.alpha",
         worker_id="execution.alpha#1",
-        request_id="req-non-blocking-1",
-        inputs=({"payload": 1},),
-        timeout_seconds=0.25,
-        finalize=True,
-        wait_for_result=False,
+        request_id="req-2",
+        inputs=(),
+        timeout_seconds=0.1,
+    )
+
+    assert len(routing.calls) == 1
+    assert len(ipc.sends) == 1
+    assert ipc.sends[0]["target_id"] == compose_execution_ipc_worker_target_id(
+        "execution.alpha#1",
+        lane="trace",
+    )
+
+
+def test_root_boundary_execution_service_falls_back_to_data_lane_when_routing_fails() -> None:
+    from stream_kernel.execution.orchestration.control_plane.root.boundary_execution_service import (
+        DefaultControlPlaneRootBoundaryExecutionService,
+    )
+
+    ipc = _IpcPort()
+    routing = _LaneRouting(raises=True)
+    service = DefaultControlPlaneRootBoundaryExecutionService(execution_ipc=ipc, lane_routing=routing)
+
+    _ = service.execute_boundary_on_leaf(
+        target_group="execution.alpha",
+        worker_id="execution.alpha#1",
+        request_id="req-3",
+        inputs=(),
+        timeout_seconds=0.1,
     )
 
     assert len(ipc.sends) == 1
-    assert commands.requests[0]["finalize"] is True
-    assert commands.waits == []
-    assert result.terminal_outputs == []
-
-
-def test_root_boundary_execution_service_raises_on_failed_leaf_result() -> None:
-    from stream_kernel.execution.orchestration.control_plane.root.boundary_execution_service import (
-        DefaultControlPlaneRootBoundaryExecutionService,
-        ControlPlaneRootBoundaryExecutionFailedError,
+    assert ipc.sends[0]["target_id"] == compose_execution_ipc_worker_target_id(
+        "execution.alpha#1",
+        lane=EXECUTION_IPC_LANE_DATA,
     )
-
-    service = DefaultControlPlaneRootBoundaryExecutionService(
-        root_leaf_commands=_RootLeafCommands(
-            result=ControlPlaneLeafBoundaryResultEvent(
-                target_group="execution.alpha",
-                worker_id="execution.alpha#1",
-                request_id="req-fail",
-                status="failed",
-                error="boom",
-            )
-        ),
-        execution_ipc=_IpcPort(),
-    )
-
-    with pytest.raises(ControlPlaneRootBoundaryExecutionFailedError, match="boom"):
-        service.execute_boundary_on_leaf(
-            target_group="execution.alpha",
-            worker_id="execution.alpha#1",
-            request_id="req-fail",
-            inputs=(),
-            timeout_seconds=0.1,
-        )

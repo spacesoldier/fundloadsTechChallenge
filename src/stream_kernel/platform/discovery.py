@@ -19,7 +19,6 @@ def platform_discovery_modules() -> list[str]:
         "stream_kernel.execution.orchestration.lifecycle.root.startup.log_factory_service",
         "stream_kernel.execution.orchestration.lifecycle.root.startup.console_log_dispatch_service",
         "stream_kernel.execution.orchestration.lifecycle.root.runtime.lifecycle_manager",
-        "stream_kernel.execution.orchestration.control_plane.root.leaf_command_service",
         "stream_kernel.execution.orchestration.control_plane.root.leaf_ingress_service",
         "stream_kernel.execution.orchestration.control_plane.root.discovery_snapshot_service",
         "stream_kernel.execution.orchestration.control_plane.root.runtime_bootstrap_service",

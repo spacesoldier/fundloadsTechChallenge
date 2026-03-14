@@ -12,6 +12,8 @@ from stream_kernel.execution.orchestration.control_plane.leaf import (
     ControlPlaneLeafTombstoneFinalizeNode,
 )
 from stream_kernel.execution.orchestration.control_plane.leaf.system_nodes import (
+    ControlPlaneLeafReplyDispatchNode,
+    ControlPlaneLeafSourcePollFromSinkAckNode,
     leaf_command_ingress_source_lanes,
     leaf_command_ingress_source_node_name,
 )
@@ -21,7 +23,8 @@ from stream_kernel.execution.orchestration.lifecycle.leaf.runtime.worker_runtime
 )
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafBoundaryExecuteCommand,
-    ControlPlaneLeafBoundaryResultEvent,
+    ControlPlaneLeafBoundaryOutputsEvent,
+    ControlPlaneLeafSinkDispatchAckEvent,
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafConfigCardEvent,
     ControlPlaneLeafDrainReadyEvent,
@@ -30,6 +33,7 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafStopCommand,
 )
 from stream_kernel.platform.services.runtime.platform_scheduler import (
+    PlatformSchedulerCancelCommand,
     PlatformSchedulerUpsertCommand,
 )
 from stream_kernel.routing.envelope import Envelope
@@ -37,7 +41,6 @@ from stream_kernel.execution.transport.ipc.ipc_transport import (
     EXECUTION_IPC_LANE_CONTROL,
     EXECUTION_IPC_LANE_TRACE,
     EXECUTION_IPC_LANE_DATA,
-    compose_execution_ipc_worker_target_id,
 )
 
 
@@ -99,11 +102,11 @@ class _RunnerControl:
 
 @dataclass(slots=True)
 class _Readiness:
-    seen: list[ControlPlaneLeafBoundaryResultEvent] = field(default_factory=list)
+    seen: list[ControlPlaneLeafBoundaryOutputsEvent] = field(default_factory=list)
 
-    def observe_boundary_result(
+    def observe_boundary_outputs(
         self,
-        boundary_result: ControlPlaneLeafBoundaryResultEvent,
+        boundary_result: ControlPlaneLeafBoundaryOutputsEvent,
     ) -> ControlPlaneLeafDrainReadyEvent:
         self.seen.append(boundary_result)
         return ControlPlaneLeafDrainReadyEvent(
@@ -154,6 +157,16 @@ class _TimerStub:
         self.commands.append(command)
 
 
+@dataclass(slots=True)
+class _ReplyDispatch:
+    sent: list[tuple[str, object]] = field(default_factory=list)
+    accepted: bool = True
+
+    def dispatch_reply(self, *, worker_id: str, payload: object) -> bool:
+        self.sent.append((worker_id, payload))
+        return bool(self.accepted)
+
+
 def test_leaf_command_ingress_source_node_polls_single_lane_without_rearm() -> None:
     source_name = leaf_command_ingress_source_node_name(lane=EXECUTION_IPC_LANE_TRACE)
     event = ControlPlaneLeafStopCommand(
@@ -190,26 +203,18 @@ def test_leaf_command_ingress_source_lanes_include_control_and_data_only() -> No
 
 def test_leaf_command_ingress_source_initialize_registers_scheduler_job() -> None:
     source_name = leaf_command_ingress_source_node_name(lane=EXECUTION_IPC_LANE_TRACE)
-    scheduler = _SchedulerStub()
-    timer = _TimerStub()
     node = ControlPlaneLeafCommandIngressSourceNode(
         ingress=_LaneIngress(seen=[], payload=None),  # type: ignore[arg-type]
         runner_control=_RunnerControlStopFlag(),  # type: ignore[arg-type]
-        scheduler=scheduler,  # type: ignore[arg-type]
-        timer=timer,  # type: ignore[arg-type]
         lane=EXECUTION_IPC_LANE_TRACE,
         source_name=source_name,
     )
 
-    node.initialize()
-
-    assert len(scheduler.commands) == 1
-    command = scheduler.commands[0]
+    produced = node.initialize()
+    assert len(produced) == 1
+    command = produced[0]
     assert isinstance(command, PlatformSchedulerUpsertCommand)
     assert command.target == source_name
-    assert len(timer.commands) == 1
-    assert isinstance(timer.commands[0], PlatformSchedulerUpsertCommand)
-    assert timer.commands[0].target == source_name
 
 
 def test_leaf_config_apply_runtime_node_uses_activation_service() -> None:
@@ -254,13 +259,51 @@ def test_leaf_boundary_execute_node_emits_result_when_finalize_true() -> None:
     assert boundary.seen == [(session, [{"payload": 1}], True)]
     assert len(produced) == 1
     event = produced[0]
-    assert isinstance(event, ControlPlaneLeafBoundaryResultEvent)
+    assert isinstance(event, ControlPlaneLeafBoundaryOutputsEvent)
     assert event.request_id == "req-1"
-    assert event.status == "completed"
     assert event.outputs == ("ok",)
 
 
-def test_leaf_boundary_execute_node_streams_partial_outputs_to_root() -> None:
+def test_leaf_boundary_execute_node_detects_source_target_for_batched_source_inputs() -> None:
+    boundary = _BoundaryExecution()
+    node = ControlPlaneLeafBoundaryExecuteNode(boundary_execution=boundary)
+    session = _session()
+    command = ControlPlaneLeafBoundaryExecuteCommand(
+        target_group="execution.alpha",
+        worker_id="execution.alpha#1",
+        request_id="req-batch-source",
+        inputs=(
+            {
+                "dispatch_group": "execution.alpha",
+                "target": "source:source",
+                "payload": BootstrapControl(target="source:source", single_shot=True),
+                "trace_id": None,
+                "reply_to": None,
+                "span_id": None,
+                "tombstone": False,
+            },
+            {
+                "dispatch_group": "execution.alpha",
+                "target": "source:source",
+                "payload": BootstrapControl(target="source:source", single_shot=True),
+                "trace_id": None,
+                "reply_to": None,
+                "span_id": None,
+                "tombstone": False,
+            },
+        ),
+        finalize=True,
+    )
+
+    produced = node(command, {"__leaf_session": session})
+
+    assert len(produced) == 1
+    event = produced[0]
+    assert isinstance(event, ControlPlaneLeafBoundaryOutputsEvent)
+    assert event.source_target == "source:source"
+
+
+def test_leaf_boundary_execute_node_does_not_emit_partial_outputs_to_root() -> None:
     class _BoundaryWithStreaming:
         def execute(
             self,
@@ -275,27 +318,14 @@ def test_leaf_boundary_execute_node_streams_partial_outputs_to_root() -> None:
             _ = inputs
             _ = finalize_runtime
             _ = stream_batch_max_items
-            assert callable(stream_callback)
-            sent = stream_callback([Envelope(payload={"v": 1}, target="compute_time_keys")])  # type: ignore[misc]
-            assert sent is True
-            return [Envelope(payload={"v": 2}, target="compute_time_keys", tombstone=True)]
+            assert stream_callback is None
+            return [
+                Envelope(payload={"v": 1}, target="compute_time_keys"),
+                Envelope(payload={"v": 2}, target="compute_time_keys", tombstone=True),
+            ]
 
-    class _Ipc:
-        def __init__(self) -> None:
-            self.sent: list[tuple[str, object, bool]] = []
-
-        def send(self, target_id: str, payload: object, *, no_reply: bool = False) -> None:
-            self.sent.append((target_id, payload, no_reply))
-
-        def recv(self, target_id: str, *, timeout: float | None = None) -> object | None:
-            _ = target_id
-            _ = timeout
-            return None
-
-    ipc = _Ipc()
     node = ControlPlaneLeafBoundaryExecuteNode(
         boundary_execution=_BoundaryWithStreaming(),
-        execution_ipc=ipc,  # type: ignore[arg-type]
     )
     session = _session()
     command = ControlPlaneLeafBoundaryExecuteCommand(
@@ -308,23 +338,14 @@ def test_leaf_boundary_execute_node_streams_partial_outputs_to_root() -> None:
 
     produced = node(command, {"__leaf_session": session})
 
-    assert len(ipc.sent) == 1
-    target_id, payload, no_reply = ipc.sent[0]
-    assert target_id == compose_execution_ipc_worker_target_id("execution.alpha#1", lane=EXECUTION_IPC_LANE_DATA)
-    assert no_reply is True
-    assert isinstance(payload, ControlPlaneLeafBoundaryResultEvent)
-    assert payload.status == "partial"
-    assert len(payload.outputs) == 1
-    assert isinstance(payload.outputs[0], Envelope)
-    assert payload.outputs[0].tombstone is False
-
-    assert len(produced) >= 1
+    assert len(produced) == 1
     final_event = produced[0]
-    assert isinstance(final_event, ControlPlaneLeafBoundaryResultEvent)
-    assert final_event.status == "completed"
-    assert len(final_event.outputs) == 1
+    assert isinstance(final_event, ControlPlaneLeafBoundaryOutputsEvent)
+    assert len(final_event.outputs) == 2
     assert isinstance(final_event.outputs[0], Envelope)
-    assert final_event.outputs[0].tombstone is True
+    assert isinstance(final_event.outputs[1], Envelope)
+    assert final_event.outputs[0].tombstone is False
+    assert final_event.outputs[1].tombstone is True
 
 
 def test_leaf_boundary_execute_node_marks_tombstone_flags() -> None:
@@ -356,7 +377,7 @@ def test_leaf_boundary_execute_node_marks_tombstone_flags() -> None:
 
     assert len(produced) == 1
     event = produced[0]
-    assert isinstance(event, ControlPlaneLeafBoundaryResultEvent)
+    assert isinstance(event, ControlPlaneLeafBoundaryOutputsEvent)
     assert event.tombstone_input is True
     assert event.tombstone_output is True
     assert len(event.outputs) == 1
@@ -392,7 +413,7 @@ def test_leaf_boundary_execute_node_marks_tombstone_output_when_sink_consumes_te
 
     assert len(produced) == 1
     completed = produced[0]
-    assert isinstance(completed, ControlPlaneLeafBoundaryResultEvent)
+    assert isinstance(completed, ControlPlaneLeafBoundaryOutputsEvent)
     assert completed.tombstone_input is True
     assert completed.tombstone_output is True
     assert completed.outputs == ()
@@ -401,13 +422,11 @@ def test_leaf_boundary_execute_node_marks_tombstone_output_when_sink_consumes_te
 def test_leaf_tombstone_finalize_node_emits_drain_ready_event() -> None:
     readiness = _Readiness()
     node = ControlPlaneLeafTombstoneFinalizeNode(readiness=readiness)  # type: ignore[arg-type]
-    boundary_result = ControlPlaneLeafBoundaryResultEvent(
+    boundary_result = ControlPlaneLeafBoundaryOutputsEvent(
         target_group="execution.alpha",
         worker_id="execution.alpha#1",
         request_id="req-terminal-tombstone",
-        status="completed",
         outputs=(),
-        tombstone_input=True,
         tombstone_output=True,
     )
 
@@ -451,11 +470,18 @@ def test_leaf_stop_node_emits_ack() -> None:
 
     produced = node(command, {"__leaf_session": session})
 
-    assert len(produced) == 1
-    ack = produced[0]
+    acks = [item for item in produced if isinstance(item, ControlPlaneLeafStopAckEvent)]
+    cancel_commands = [item for item in produced if isinstance(item, PlatformSchedulerCancelCommand)]
+    assert len(acks) == 1
+    ack = acks[0]
     assert isinstance(ack, ControlPlaneLeafStopAckEvent)
     assert ack.command_id == "stop-1"
     assert ack.status == "accepted"
+    assert len(cancel_commands) == 5
+    assert all(
+        command.job_id.startswith("cp.leaf.command_ingress:source:system.cp.command_ingress:")
+        for command in cancel_commands
+    )
     assert runner_control.stop_calls == 1
 
 
@@ -486,7 +512,99 @@ def test_leaf_start_work_node_emits_bootstrap_controls_for_local_sources() -> No
     assert command.worker_id == "execution.ingress#1"
     assert len(command.inputs) == 1
     assert command.inputs[0]["target"] == "source:source"
-    assert command.inputs[0]["payload"] == BootstrapControl(target="source:source")
+    assert command.inputs[0]["payload"] == BootstrapControl(target="source:source", single_shot=True)
+
+
+def test_leaf_reply_dispatch_node_emits_sink_ack_after_successful_boundary_dispatch() -> None:
+    reply_dispatch = _ReplyDispatch(accepted=True)
+    node = ControlPlaneLeafReplyDispatchNode(
+        reply_dispatch=reply_dispatch,  # type: ignore[arg-type]
+    )
+    event = ControlPlaneLeafBoundaryOutputsEvent(
+        target_group="execution.ingress",
+        worker_id="execution.ingress#1",
+        request_id="req-1",
+        outputs=(Envelope(payload={"x": 1}, target="compute_features"),),
+        source_target="source:source",
+        tombstone_input=False,
+        tombstone_output=False,
+    )
+
+    produced = node(event, None)
+
+    assert len(reply_dispatch.sent) == 1
+    assert len(produced) == 1
+    ack = produced[0]
+    assert isinstance(ack, ControlPlaneLeafSinkDispatchAckEvent)
+    assert ack.target_group == "execution.ingress"
+    assert ack.worker_id == "execution.ingress#1"
+    assert ack.request_id == "req-1"
+    assert ack.source_target == "source:source"
+    assert ack.payload_class == "dict"
+    assert ack.tombstone_output is False
+
+
+def test_leaf_reply_dispatch_node_emits_sink_ack_for_tombstone_output() -> None:
+    reply_dispatch = _ReplyDispatch(accepted=True)
+    node = ControlPlaneLeafReplyDispatchNode(
+        reply_dispatch=reply_dispatch,  # type: ignore[arg-type]
+    )
+    event = ControlPlaneLeafBoundaryOutputsEvent(
+        target_group="execution.ingress",
+        worker_id="execution.ingress#1",
+        request_id="req-2",
+        outputs=(Envelope(payload={"x": 1}, target="compute_features", tombstone=True),),
+        source_target="source:source",
+        tombstone_input=True,
+        tombstone_output=True,
+    )
+
+    produced = node(event, None)
+
+    assert len(reply_dispatch.sent) == 1
+    assert len(produced) == 1
+    ack = produced[0]
+    assert isinstance(ack, ControlPlaneLeafSinkDispatchAckEvent)
+    assert ack.tombstone_output is True
+
+
+def test_leaf_source_poll_from_sink_ack_node_emits_next_source_poll_command_for_non_tombstone_ack() -> None:
+    node = ControlPlaneLeafSourcePollFromSinkAckNode()
+    ack = ControlPlaneLeafSinkDispatchAckEvent(
+        target_group="execution.ingress",
+        worker_id="execution.ingress#1",
+        request_id="req-1",
+        source_target="source:source",
+        payload_class="dict",
+        tombstone_output=False,
+    )
+
+    produced = node(ack, None)
+
+    assert len(produced) == 1
+    command = produced[0]
+    assert isinstance(command, ControlPlaneLeafBoundaryExecuteCommand)
+    assert command.target_group == "execution.ingress"
+    assert command.worker_id == "execution.ingress#1"
+    assert len(command.inputs) == 1
+    assert command.inputs[0]["target"] == "source:source"
+    assert command.inputs[0]["payload"] == BootstrapControl(target="source:source", single_shot=True)
+
+
+def test_leaf_source_poll_from_sink_ack_node_does_not_emit_poll_for_tombstone_ack() -> None:
+    node = ControlPlaneLeafSourcePollFromSinkAckNode()
+    ack = ControlPlaneLeafSinkDispatchAckEvent(
+        target_group="execution.ingress",
+        worker_id="execution.ingress#1",
+        request_id="req-2",
+        source_target="source:source",
+        payload_class="dict",
+        tombstone_output=True,
+    )
+
+    produced = node(ack, None)
+
+    assert produced == []
 
 
 def test_leaf_start_work_node_filters_non_local_sources() -> None:
@@ -531,5 +649,161 @@ def test_leaf_start_work_node_is_noop_when_group_has_no_local_sources() -> None:
         ControlPlaneLeafStartWorkEvent(source_targets=("source:source",)),
         {"__leaf_session": session},
     )
+
+    assert produced == []
+
+
+def test_leaf_start_work_node_honors_batch_pacing_policy() -> None:
+    node = ControlPlaneLeafStartWorkNode()
+    session = type(
+        "_Session",
+        (),
+        {
+            "group_name": "execution.ingress",
+            "worker_id": "execution.ingress#1",
+            "child": type(
+                "_Child",
+                (),
+                {
+                    "scenario_steps": {"source:source": object()},
+                    "runtime": {
+                        "platform": {
+                            "source_ingress": {
+                                "pacing_mode": "batch",
+                                "batch_size": 3,
+                            }
+                        }
+                    },
+                },
+            )(),
+        },
+    )()
+
+    produced = node(
+        ControlPlaneLeafStartWorkEvent(source_targets=("source:source",)),
+        {"__leaf_session": session},
+    )
+
+    assert len(produced) == 1
+    command = produced[0]
+    assert isinstance(command, ControlPlaneLeafBoundaryExecuteCommand)
+    assert len(command.inputs) == 3
+    assert all(item["target"] == "source:source" for item in command.inputs)
+    assert all(item["payload"] == BootstrapControl(target="source:source", single_shot=True) for item in command.inputs)
+
+
+def test_leaf_start_work_node_honors_all_pacing_policy() -> None:
+    node = ControlPlaneLeafStartWorkNode()
+    session = type(
+        "_Session",
+        (),
+        {
+            "group_name": "execution.ingress",
+            "worker_id": "execution.ingress#1",
+            "child": type(
+                "_Child",
+                (),
+                {
+                    "scenario_steps": {"source:source": object()},
+                    "runtime": {
+                        "platform": {
+                            "source_ingress": {
+                                "pacing_mode": "all",
+                            }
+                        }
+                    },
+                },
+            )(),
+        },
+    )()
+
+    produced = node(
+        ControlPlaneLeafStartWorkEvent(source_targets=("source:source",)),
+        {"__leaf_session": session},
+    )
+
+    assert len(produced) == 1
+    command = produced[0]
+    assert isinstance(command, ControlPlaneLeafBoundaryExecuteCommand)
+    assert len(command.inputs) == 1
+    assert command.inputs[0]["target"] == "source:source"
+    assert command.inputs[0]["payload"] == BootstrapControl(target="source:source", single_shot=False)
+
+
+def test_leaf_source_poll_from_sink_ack_node_honors_batch_size_policy() -> None:
+    node = ControlPlaneLeafSourcePollFromSinkAckNode()
+    ack = ControlPlaneLeafSinkDispatchAckEvent(
+        target_group="execution.ingress",
+        worker_id="execution.ingress#1",
+        request_id="req-batch",
+        source_target="source:source",
+        payload_class="dict",
+        tombstone_output=False,
+    )
+    ctx = {
+        "__leaf_session": type(
+            "_Session",
+            (),
+            {
+                "child": type(
+                    "_Child",
+                    (),
+                    {
+                        "runtime": {
+                            "platform": {
+                                "source_ingress": {
+                                    "pacing_mode": "batch",
+                                    "batch_size": 4,
+                                }
+                            }
+                        }
+                    },
+                )()
+            },
+        )()
+    }
+
+    produced = node(ack, ctx)
+
+    assert len(produced) == 1
+    command = produced[0]
+    assert isinstance(command, ControlPlaneLeafBoundaryExecuteCommand)
+    assert len(command.inputs) == 4
+    assert all(item["payload"] == BootstrapControl(target="source:source", single_shot=True) for item in command.inputs)
+
+
+def test_leaf_source_poll_from_sink_ack_node_is_noop_for_all_pacing_policy() -> None:
+    node = ControlPlaneLeafSourcePollFromSinkAckNode()
+    ack = ControlPlaneLeafSinkDispatchAckEvent(
+        target_group="execution.ingress",
+        worker_id="execution.ingress#1",
+        request_id="req-all",
+        source_target="source:source",
+        payload_class="dict",
+        tombstone_output=False,
+    )
+    ctx = {
+        "__leaf_session": type(
+            "_Session",
+            (),
+            {
+                "child": type(
+                    "_Child",
+                    (),
+                    {
+                        "runtime": {
+                            "platform": {
+                                "source_ingress": {
+                                    "pacing_mode": "all",
+                                }
+                            }
+                        }
+                    },
+                )()
+            },
+        )()
+    }
+
+    produced = node(ack, ctx)
 
     assert produced == []

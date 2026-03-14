@@ -88,6 +88,8 @@ Contract:
 - input trigger: control envelope (`BootstrapControl`) routed to `source:<adapter_role>`
 - action: read at most one item from adapter iterator and emit one business envelope
 - continuation: emit next `BootstrapControl` to self while source is not exhausted
+  (default mode); in `single_shot` mode source does not self-rearm and waits for
+  an explicit next trigger from control-plane graph.
 - completion: emit nothing once iterator is exhausted
 
 Notes:

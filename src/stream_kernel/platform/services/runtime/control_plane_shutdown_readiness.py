@@ -7,7 +7,7 @@ from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.service import service
 from stream_kernel.integration.kv_store import KVStore
 from stream_kernel.platform.services.runtime.control_plane_events import (
-    ControlPlaneLeafBoundaryResultEvent,
+    ControlPlaneLeafBoundaryOutputsEvent,
     ControlPlaneLeafDrainReadyEvent,
 )
 
@@ -62,7 +62,9 @@ class ControlPlaneShutdownReadinessService(Protocol):
 
 @runtime_checkable
 class ControlPlaneLeafShutdownReadinessService(Protocol):
-    def observe_boundary_result(self, result: ControlPlaneLeafBoundaryResultEvent) -> ControlPlaneLeafDrainReadyEvent | None:
+    def observe_boundary_outputs(
+        self, boundary: ControlPlaneLeafBoundaryOutputsEvent
+    ) -> ControlPlaneLeafDrainReadyEvent | None:
         raise NotImplementedError
 
 
@@ -127,19 +129,19 @@ class InMemoryControlPlaneShutdownReadinessService(ControlPlaneShutdownReadiness
 class InMemoryControlPlaneLeafShutdownReadinessService(ControlPlaneLeafShutdownReadinessService):
     store: KVStore = inject.kv(ControlPlaneLeafShutdownReadinessStore)
 
-    def observe_boundary_result(self, result: ControlPlaneLeafBoundaryResultEvent) -> ControlPlaneLeafDrainReadyEvent | None:
-        if result.status.strip().lower() != "completed":
-            return None
+    def observe_boundary_outputs(
+        self, boundary: ControlPlaneLeafBoundaryOutputsEvent
+    ) -> ControlPlaneLeafDrainReadyEvent | None:
         # Terminal-only semantics: leaf ready-to-drain can be emitted only for output tombstone.
-        if not result.tombstone_output:
+        if not boundary.tombstone_output:
             return None
-        if self._already_emitted(result.target_group, result.request_id):
+        if self._already_emitted(boundary.target_group, boundary.request_id):
             return None
         return self._emit_ready(
-            target_group=result.target_group,
-            worker_id=result.worker_id,
-            request_id=result.request_id,
-            tombstone_output=result.tombstone_output,
+            target_group=boundary.target_group,
+            worker_id=boundary.worker_id,
+            request_id=boundary.request_id,
+            tombstone_output=boundary.tombstone_output,
         )
 
     def _seen_request_ids(self) -> set[str]:

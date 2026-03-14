@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from dataclasses import dataclass
 from dataclasses import field
@@ -915,6 +916,7 @@ class FanoutObservabilityService(ObservabilityPipelineService):
         fallback_method_name: str | None = None,
         **kwargs: object,
     ) -> None:
+        pending: list[object] = []
         for observer in self.observers:
             callback = getattr(observer, method_name, None)
             if not callable(callback) and isinstance(fallback_method_name, str):
@@ -924,8 +926,14 @@ class FanoutObservabilityService(ObservabilityPipelineService):
             try:
                 result = callback(**kwargs)
                 if inspect.isawaitable(result):
-                    await result
+                    pending.append(result)
             except Exception:
+                continue
+        if not pending:
+            return
+        results = await asyncio.gather(*pending, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
                 continue
 
 

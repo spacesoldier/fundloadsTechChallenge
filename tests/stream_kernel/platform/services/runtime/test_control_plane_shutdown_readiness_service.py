@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.platform.services.runtime.control_plane_events import (
-    ControlPlaneLeafBoundaryResultEvent,
+    ControlPlaneLeafBoundaryOutputsEvent,
     ControlPlaneLeafDrainReadyEvent,
 )
 from stream_kernel.platform.services.runtime.control_plane_shutdown_readiness import (
@@ -99,13 +99,12 @@ def test_shutdown_readiness_requires_observability_group_when_in_expected_quorum
 def test_leaf_shutdown_readiness_emits_drain_ready_on_terminal_tombstone() -> None:
     service = InMemoryControlPlaneLeafShutdownReadinessService(store=InMemoryKvStore())
 
-    drain_ready = service.observe_boundary_result(
-        ControlPlaneLeafBoundaryResultEvent(
+    drain_ready = service.observe_boundary_outputs(
+        ControlPlaneLeafBoundaryOutputsEvent(
             target_group="execution.alpha",
             worker_id="execution.alpha#1",
             request_id="req-tomb-1",
-            status="completed",
-            tombstone_input=True,
+            outputs=(),
             tombstone_output=True,
         )
     )
@@ -118,21 +117,21 @@ def test_leaf_shutdown_readiness_emits_drain_ready_on_terminal_tombstone() -> No
 def test_leaf_shutdown_readiness_dedupes_terminal_tombstone_by_request_id() -> None:
     service = InMemoryControlPlaneLeafShutdownReadinessService(store=InMemoryKvStore())
 
-    first = service.observe_boundary_result(
-        ControlPlaneLeafBoundaryResultEvent(
+    first = service.observe_boundary_outputs(
+        ControlPlaneLeafBoundaryOutputsEvent(
             target_group="execution.alpha",
             worker_id="execution.alpha#1",
             request_id="req-tomb-2",
-            status="completed",
+            outputs=(),
             tombstone_output=True,
         )
     )
-    duplicate = service.observe_boundary_result(
-        ControlPlaneLeafBoundaryResultEvent(
+    duplicate = service.observe_boundary_outputs(
+        ControlPlaneLeafBoundaryOutputsEvent(
             target_group="execution.alpha",
             worker_id="execution.alpha#1",
             request_id="req-tomb-2",
-            status="completed",
+            outputs=(),
             tombstone_output=True,
         )
     )
@@ -143,13 +142,12 @@ def test_leaf_shutdown_readiness_dedupes_terminal_tombstone_by_request_id() -> N
 
 def test_leaf_shutdown_readiness_ignores_input_only_tombstone() -> None:
     service = InMemoryControlPlaneLeafShutdownReadinessService(store=InMemoryKvStore())
-    no_event = service.observe_boundary_result(
-        ControlPlaneLeafBoundaryResultEvent(
+    no_event = service.observe_boundary_outputs(
+        ControlPlaneLeafBoundaryOutputsEvent(
             target_group="execution.alpha",
             worker_id="execution.alpha#1",
             request_id="req-input-only",
-            status="completed",
-            tombstone_input=True,
+            outputs=(),
             tombstone_output=False,
         )
     )

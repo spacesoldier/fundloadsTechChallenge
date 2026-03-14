@@ -6,8 +6,6 @@ from typing import Any
 _EXPORTS = {
     'ControlPlaneRootRunnerControlService': 'channel_services',
     'DefaultControlPlaneRootRunnerControlService': 'channel_services',
-    'ControlPlaneRootLeafCommandService': 'leaf_command_service',
-    'DefaultControlPlaneRootLeafCommandService': 'leaf_command_service',
     'ControlPlaneRootLeafIngressService': 'leaf_ingress_service',
     'DefaultControlPlaneRootLeafIngressService': 'leaf_ingress_service',
     'ControlPlaneRootRuntimeBootstrapService': 'runtime_bootstrap_service',

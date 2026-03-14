@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from stream_kernel.application_context.injection_registry import InjectionRegistry
+import pytest
+
+from stream_kernel.application_context.injection_registry import (
+    InjectionRegistry,
+    InjectionRegistryError,
+)
 from stream_kernel.execution.transport.handoff.runtime_wiring import (
     ensure_runtime_ipc_handoff_bindings,
     ensure_runtime_ipc_bindings,
@@ -21,6 +26,7 @@ from stream_kernel.execution.transport.ipc.ipc_transport import ExecutionIpcKvSt
 from stream_kernel.execution.transport.ipc.ipc_transport_service import (
     ExecutionIpcTransportCoordinatorService,
 )
+from stream_kernel.execution.transport.ipc.ipc_transport import ExecutionIpcTransportService
 from stream_kernel.platform.services.runtime import ProcessGroupRouterService
 from stream_kernel.routing.envelope import Envelope
 
@@ -75,6 +81,7 @@ def test_runtime_wiring_handoff_bindings_register_dispatch_and_route_table_servi
     ipc = _IpcPort()
     router = _Router(groups={"remote.node": "execution.alpha"})
     registry.register_factory("kv_stream", ExecutionIpcKvStreamPort, lambda _ipc=ipc: _ipc)
+    registry.register_factory("service", ExecutionIpcTransportService, lambda _ipc=ipc: _ipc)
     registry.register_factory("service", ProcessGroupRouterService, lambda _router=router: _router)
 
     ensure_runtime_ipc_handoff_bindings(injection_registry=registry)
@@ -91,5 +98,52 @@ def test_runtime_wiring_handoff_bindings_register_dispatch_and_route_table_servi
     )
     assert dispatched is True
     assert ipc.sends == [
-        {"target_id": "execution.alpha#1", "payload": {"v": 1}, "no_reply": True}
+        {"target_id": "execution.alpha#1::data", "payload": {"v": 1}, "no_reply": True}
     ]
+
+
+def test_runtime_wiring_handoff_bindings_preload_observability_routes_from_runtime() -> None:
+    registry = InjectionRegistry()
+    ipc = _IpcPort()
+    router = _Router(groups={})
+    registry.register_factory("kv_stream", ExecutionIpcKvStreamPort, lambda _ipc=ipc: _ipc)
+    registry.register_factory("service", ExecutionIpcTransportService, lambda _ipc=ipc: _ipc)
+    registry.register_factory("service", ProcessGroupRouterService, lambda _router=router: _router)
+    runtime = {
+        "platform": {
+            "bootstrap": {"mode": "process_supervisor"},
+            "process_groups": [
+                {"name": "execution.ingress", "workers": 1, "nodes": ["source:source"]},
+            ],
+        },
+        "observability": {
+            "service_worker": {"enabled": True},
+            "tracing": {"exporters": [{"kind": "jsonl", "enabled": True}]},
+            "logging": {"exporters": [{"kind": "jsonl", "enabled": True}]},
+        },
+    }
+
+    ensure_runtime_ipc_handoff_bindings(injection_registry=registry, runtime=runtime)
+    scope = registry.instantiate_for_scenario("s1")
+    route_table = scope.resolve("service", ExecutionIpcRouteTableService)
+    dispatch = scope.resolve("service", ExecutionIpcHandoffDispatchService)
+
+    assert route_table.resolve_route(target="source:source") == "execution.ingress#1"
+    assert route_table.resolve_route(target="system.obs.trace_dispatch") == "system.observability#1"
+    assert route_table.resolve_route(target="system.obs.log_dispatch") == "system.observability#1"
+    dispatched = dispatch.dispatch_envelope(
+        Envelope(payload={"trace": 1}, target="system.obs.trace_dispatch"),
+        source_group="execution.ingress",
+    )
+    assert dispatched is True
+    assert ipc.sends[-1] == {
+        "target_id": "system.observability#1::trace",
+        "payload": {"trace": 1},
+        "no_reply": True,
+    }
+
+
+def test_runtime_wiring_handoff_bindings_require_transport_service_binding() -> None:
+    registry = InjectionRegistry()
+    with pytest.raises(InjectionRegistryError, match="ExecutionIpcTransportService binding is required"):
+        ensure_runtime_ipc_handoff_bindings(injection_registry=registry)

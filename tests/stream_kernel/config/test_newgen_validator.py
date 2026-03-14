@@ -746,6 +746,38 @@ def test_validate_newgen_config_accepts_execution_ipc_flow_control() -> None:
     assert flow_control["token_bucket"]["burst"] == 2000
 
 
+def test_validate_newgen_config_accepts_execution_ipc_flow_control_per_group() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "bind_host": "127.0.0.1",
+            "bind_port": 0,
+            "auth": {"mode": "hmac"},
+            "flow_control": {
+                "mode": "credits",
+                "credits": {"window_size": 64},
+                "per_group": {
+                    "execution.ingress": {
+                        "mode": "hybrid",
+                        "credits": {"window_size": 12},
+                        "token_bucket": {"rate_per_sec": 50, "burst": 100},
+                    }
+                },
+            },
+        }
+    }
+    validated = validate_newgen_config(raw)
+    flow_control = validated["runtime"]["platform"]["execution_ipc"]["flow_control"]
+    per_group = flow_control["per_group"]
+    assert per_group["execution.ingress"]["mode"] == "hybrid"
+    assert per_group["execution.ingress"]["credits"]["window_size"] == 12
+    assert per_group["execution.ingress"]["token_bucket"]["rate_per_sec"] == 50
+    assert per_group["execution.ingress"]["token_bucket"]["burst"] == 100
+
+
 def test_validate_newgen_config_rejects_invalid_execution_ipc_flow_control_mode() -> None:
     raw = _phase0_base_config()
     runtime = raw["runtime"]
@@ -785,6 +817,24 @@ def test_validate_newgen_config_rejects_invalid_execution_ipc_flow_control_bucke
             "transport": "tcp_local",
             "auth": {"mode": "hmac"},
             "flow_control": {"mode": "token_bucket", "token_bucket": {"rate_per_sec": 0}},
+        }
+    }
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_invalid_execution_ipc_flow_control_per_group() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "execution_ipc": {
+            "transport": "tcp_local",
+            "auth": {"mode": "hmac"},
+            "flow_control": {
+                "mode": "credits",
+                "per_group": ["execution.ingress"],
+            },
         }
     }
     with pytest.raises(ConfigError):
@@ -1437,8 +1487,8 @@ def test_validate_newgen_config_accepts_observability_service_worker_defaults() 
     assert isinstance(service_worker, dict)
     assert service_worker.get("enabled") is True
     assert service_worker.get("queue_max_items") == 131072
-    assert service_worker.get("drop_policy") == "drop_newest"
-    assert service_worker.get("block_timeout_ms") == 100
+    assert service_worker.get("drop_policy") == "non_block"
+    assert "block_timeout_ms" not in service_worker
     assert service_worker.get("drain_timeout_seconds") == 30.0
 
 
@@ -1513,7 +1563,7 @@ def test_validate_newgen_config_rejects_invalid_otel_exporter_queue_block_timeou
         validate_newgen_config(raw)
 
 
-def test_validate_newgen_config_accepts_otel_exporter_queue_block_forever_without_timeout() -> None:
+def test_validate_newgen_config_accepts_otel_exporter_queue_non_block_without_timeout() -> None:
     raw = _phase0_base_config()
     runtime = raw["runtime"]
     assert isinstance(runtime, dict)
@@ -1525,7 +1575,7 @@ def test_validate_newgen_config_accepts_otel_exporter_queue_block_forever_withou
                     "settings": {
                         "endpoint": "http://collector:4318/v1/traces",
                         "queue": {
-                            "drop_policy": "block_forever",
+                            "drop_policy": "non_block",
                         },
                     },
                 }
@@ -1545,7 +1595,69 @@ def test_validate_newgen_config_accepts_otel_exporter_queue_block_forever_withou
     assert isinstance(settings, dict)
     queue = settings.get("queue")
     assert isinstance(queue, dict)
-    assert queue.get("drop_policy") == "block_forever"
+    assert queue.get("drop_policy") == "non_block"
+
+
+def test_validate_newgen_config_rejects_otel_exporter_queue_block_forever_legacy_policy() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "exporters": [
+                {
+                    "kind": "otel_otlp",
+                    "settings": {
+                        "endpoint": "http://collector:4318/v1/traces",
+                        "queue": {
+                            "drop_policy": "block_forever",
+                        },
+                    },
+                }
+            ]
+        }
+    }
+    with pytest.raises(ConfigError, match="queue\\.drop_policy must be one of"):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_accepts_observability_tracing_dispatch_queue_non_block_without_timeout() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "dispatch_queue": {
+                "drop_policy": "non_block",
+            }
+        }
+    }
+    validated = validate_newgen_config(raw)
+    vruntime = validated.get("runtime")
+    assert isinstance(vruntime, dict)
+    observability = vruntime.get("observability")
+    assert isinstance(observability, dict)
+    tracing = observability.get("tracing")
+    assert isinstance(tracing, dict)
+    dispatch_queue = tracing.get("dispatch_queue")
+    assert isinstance(dispatch_queue, dict)
+    assert dispatch_queue.get("drop_policy") == "non_block"
+    assert "block_timeout_ms" not in dispatch_queue
+
+
+def test_validate_newgen_config_rejects_observability_tracing_dispatch_queue_block_forever_legacy_policy() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["observability"] = {
+        "tracing": {
+            "dispatch_queue": {
+                "drop_policy": "block_forever",
+            }
+        }
+    }
+    with pytest.raises(ConfigError, match="dispatch_queue\\.drop_policy must be one of"):
+        validate_newgen_config(raw)
 
 
 def test_validate_newgen_config_rejects_unknown_observability_logging_lifecycle_level() -> None:
@@ -2239,8 +2351,8 @@ def test_validate_newgen_config_obs_cfg_a_04d_applies_near_realtime_otlp_default
     queue = settings.get("queue")
     assert isinstance(queue, dict)
     assert queue.get("max_items") == 10000
-    assert queue.get("drop_policy") == "block_with_timeout"
-    assert queue.get("block_timeout_ms") == 100
+    assert queue.get("drop_policy") == "non_block"
+    assert "block_timeout_ms" not in queue
 
 
 def test_validate_newgen_config_obs_cfg_a_04c_accepts_transport_group_backend() -> None:
@@ -3205,6 +3317,9 @@ def test_validate_newgen_config_accepts_runtime_platform_source_ingress_contract
     source_ingress = platform.get("source_ingress")
     assert isinstance(source_ingress, dict)
     assert source_ingress.get("emit_tombstone") is True
+    assert source_ingress.get("pacing_mode") == "batch"
+    assert source_ingress.get("batch_size") == 1
+    assert source_ingress.get("advance_signal") == "sink_dispatch_ack"
 
 
 def test_validate_newgen_config_applies_runtime_platform_source_ingress_defaults() -> None:
@@ -3221,6 +3336,35 @@ def test_validate_newgen_config_applies_runtime_platform_source_ingress_defaults
     source_ingress = platform.get("source_ingress")
     assert isinstance(source_ingress, dict)
     assert source_ingress.get("emit_tombstone") is False
+    assert source_ingress.get("pacing_mode") == "batch"
+    assert source_ingress.get("batch_size") == 1
+    assert source_ingress.get("advance_signal") == "sink_dispatch_ack"
+
+
+def test_validate_newgen_config_accepts_runtime_platform_source_ingress_pacing_contract() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {
+        "source_ingress": {
+            "emit_tombstone": True,
+            "pacing_mode": "batch",
+            "batch_size": 16,
+            "advance_signal": "sink_dispatch_ack",
+        }
+    }
+
+    validated = validate_newgen_config(raw)
+    validated_runtime = validated["runtime"]
+    assert isinstance(validated_runtime, dict)
+    platform = validated_runtime.get("platform")
+    assert isinstance(platform, dict)
+    source_ingress = platform.get("source_ingress")
+    assert isinstance(source_ingress, dict)
+    assert source_ingress.get("emit_tombstone") is True
+    assert source_ingress.get("pacing_mode") == "batch"
+    assert source_ingress.get("batch_size") == 16
+    assert source_ingress.get("advance_signal") == "sink_dispatch_ack"
 
 
 def test_validate_newgen_config_rejects_runtime_platform_source_ingress_unknown_keys() -> None:
@@ -3238,6 +3382,36 @@ def test_validate_newgen_config_rejects_runtime_platform_source_ingress_bad_emit
     runtime = raw["runtime"]
     assert isinstance(runtime, dict)
     runtime["platform"] = {"source_ingress": {"emit_tombstone": "yes"}}
+
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_runtime_platform_source_ingress_bad_pacing_mode() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {"source_ingress": {"pacing_mode": "line"}}
+
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_runtime_platform_source_ingress_bad_batch_size() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {"source_ingress": {"batch_size": 0}}
+
+    with pytest.raises(ConfigError):
+        validate_newgen_config(raw)
+
+
+def test_validate_newgen_config_rejects_runtime_platform_source_ingress_bad_advance_signal() -> None:
+    raw = _phase0_base_config()
+    runtime = raw["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["platform"] = {"source_ingress": {"advance_signal": "custom_signal"}}
 
     with pytest.raises(ConfigError):
         validate_newgen_config(raw)

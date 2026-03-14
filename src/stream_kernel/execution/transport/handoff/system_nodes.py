@@ -167,19 +167,6 @@ def build_transport_observability_handoff_plan(
         steps.append(StepSpec(name=node_name, step=node))
         consumers[token] = [node_name]
         node_names.add(node_name)
-    # Backward compatibility: when no explicit token set was requested,
-    # keep legacy node name addressable by discovery.
-    if not steps and enabled_tokens is None:
-        legacy_node = IpcObservabilityHandoffDispatchNode()
-        if scenario_scope is not None:
-            apply_injection(legacy_node, scenario_scope, False)
-            if legacy_node.dispatch_service is None:
-                legacy_node.dispatch_service = inject.service(DefaultExecutionIpcHandoffDispatchService)
-        return (
-            [StepSpec(name=OBSERVABILITY_HANDOFF_NODE_NAME, step=legacy_node)],
-            {token: [OBSERVABILITY_HANDOFF_NODE_NAME] for token in _OBSERVABILITY_EVENT_TARGETS},
-            {OBSERVABILITY_HANDOFF_NODE_NAME},
-        )
     return (steps, consumers, node_names)
 
 

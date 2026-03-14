@@ -20,7 +20,6 @@ _ROOT_NODE_EXPORTS = {
     "ControlPlaneObservabilityConfigApplyNode",
     "ControlPlaneRootConfigStreamNode",
     "ControlPlaneRootLeafBoundaryDispatchNode",
-    "ControlPlaneRootLeafBoundaryResultNode",
     "ControlPlaneRootLeafStartWorkDispatchNode",
     "ControlPlaneRootLeafConfigAckNode",
     "ControlPlaneRootLeafConfigAssignNode",
@@ -49,10 +48,6 @@ _SHARED_INIT_NODE_EXPORTS = {
     "ControlPlaneReadyForWorkNode",
 }
 
-_ROOT_LEAF_COMMAND_EXPORTS = {
-    "ControlPlaneRootLeafCommandService",
-    "DefaultControlPlaneRootLeafCommandService",
-}
 _ROOT_LEAF_INGRESS_EXPORTS = {
     "ControlPlaneRootLeafIngressService",
     "DefaultControlPlaneRootLeafIngressService",
@@ -79,7 +74,6 @@ __all__ = sorted(
     | _ROOT_NODE_EXPORTS
     | _LEAF_NODE_EXPORTS
     | _SHARED_INIT_NODE_EXPORTS
-    | _ROOT_LEAF_COMMAND_EXPORTS
     | _ROOT_LEAF_INGRESS_EXPORTS
     | _ROOT_SNAPSHOT_EXPORTS
     | _ROOT_RUNTIME_BOOTSTRAP_EXPORTS
@@ -97,8 +91,6 @@ def __getattr__(name: str) -> object:
         mod = import_module("stream_kernel.execution.orchestration.control_plane.leaf.system_nodes")
     elif name in _SHARED_INIT_NODE_EXPORTS:
         mod = import_module("stream_kernel.execution.orchestration.control_plane.initialization_nodes")
-    elif name in _ROOT_LEAF_COMMAND_EXPORTS:
-        mod = import_module("stream_kernel.execution.orchestration.control_plane.root.leaf_command_service")
     elif name in _ROOT_LEAF_INGRESS_EXPORTS:
         mod = import_module("stream_kernel.execution.orchestration.control_plane.root.leaf_ingress_service")
     elif name in _ROOT_SNAPSHOT_EXPORTS:
