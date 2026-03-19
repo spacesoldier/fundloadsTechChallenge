@@ -236,7 +236,7 @@ def test_async_runner_routes_runtime_debug_messages_on_success_path(monkeypatch:
         and item.fields.get("source_node") == "worker"
     )
     assert runner_event.fields.get("payload_model") == "str"
-    assert runner_event.fields.get("payload") == "seed"
+    assert runner_event.fields.get("payload_preview") == "seed"
     assert runner_event.fields.get("stage") == "run_async.loop"
 
 

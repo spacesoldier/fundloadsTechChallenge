@@ -129,6 +129,39 @@ def test_pipe_ipc_service_bytes_codec_rejects_unknown_payload() -> None:
         parent.send("group:gamma", _Payload())
 
 
+def test_pipe_ipc_service_rejects_payload_larger_than_configured_limit() -> None:
+    registry = _EndpointRegistry()
+    parent = PipeExecutionIpcTransportAdapter(
+        codec="bytes",
+        endpoint_registry=registry,
+        max_payload_bytes=8,
+        respect_pipe_capacity=False,
+    )
+    child = PipeExecutionIpcTransportAdapter(codec="bytes", endpoint_registry=registry)
+    _parent_endpoint, child_endpoint = parent.allocate_endpoints("group:payload-limit")
+    child.attach_endpoint(child_endpoint)
+
+    with pytest.raises(ValueError, match="ipc payload exceeds configured/system pipe limit"):
+        parent.send("group:payload-limit", b"0123456789")
+
+
+def test_pipe_ipc_service_reports_payload_limit_metadata() -> None:
+    registry = _EndpointRegistry()
+    parent = PipeExecutionIpcTransportAdapter(
+        codec="bytes",
+        endpoint_registry=registry,
+        max_payload_bytes=4096,
+        respect_pipe_capacity=False,
+    )
+    _parent_endpoint, _child_endpoint = parent.allocate_endpoints("group:payload-limit-meta")
+
+    limits = parent.describe_payload_limit("group:payload-limit-meta")
+
+    assert limits["configured_max_payload_bytes"] == 4096
+    assert limits["effective_max_payload_bytes"] == 4096
+    assert limits["respect_pipe_capacity"] is False
+
+
 def test_pipe_ipc_service_resolves_endpoint_from_registry() -> None:
     registry = _EndpointRegistry()
     parent = PipeExecutionIpcTransportAdapter(codec="pickle", endpoint_registry=registry)
@@ -219,6 +252,44 @@ def test_pipe_ipc_adapter_ack_signal_is_consumed() -> None:
     assert acked == [3]
     # Ack should not surface as a user payload.
     assert parent.recv("group:ack", timeout=0.01) is None
+
+
+def test_pipe_ipc_adapter_send_ack_for_target_uses_async_sender_buffer() -> None:
+    registry = _EndpointRegistry()
+    adapter = PipeExecutionIpcTransportAdapter(codec="pickle", endpoint_registry=registry)
+    data_target = compose_execution_ipc_worker_target_id("execution.alpha#1", lane=EXECUTION_IPC_LANE_DATA)
+    control_target = compose_execution_ipc_worker_target_id("execution.alpha#1", lane="control")
+    _parent_data, _child_data = adapter.allocate_endpoints(data_target)
+    _parent_control, _child_control = adapter.allocate_endpoints(control_target)
+
+    enqueued: list[object] = []
+
+    class _DummySendBuffer:
+        def enqueue(self, payload: object) -> None:
+            enqueued.append(payload)
+
+    def _resolve_endpoint(_target_id: str):  # noqa: ANN001
+        # Endpoint availability is checked, but send() must not be called here.
+        return object()
+
+    def _ensure_send_buffer(_target_id: str):  # noqa: ANN001
+        return _DummySendBuffer()
+
+    adapter._resolve_endpoint = _resolve_endpoint  # type: ignore[method-assign]
+    adapter._ensure_send_buffer = _ensure_send_buffer  # type: ignore[method-assign]
+
+    adapter._send_ack_for_target(
+        target_id=data_target,
+        endpoint=object(),  # not used by async ACK path
+        count=5,
+    )
+
+    assert len(enqueued) == 1
+    ack = enqueued[0]
+    assert isinstance(ack, ExecutionIpcControlSignal)
+    assert ack.kind == "ack"
+    assert ack.count == 5
+    assert ack.target_id == data_target
 
 
 def test_ipc_transport_coordinator_buffers_until_endpoint_is_registered() -> None:

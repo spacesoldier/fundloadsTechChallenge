@@ -51,7 +51,6 @@ def test_root_stop_node_emits_leaf_stop_requests_and_requests_runner_stop() -> N
     payload = ControlPlaneShutdownReadyEvent(
         expected_groups=("execution.ingress",),
         ready_groups=("execution.ingress",),
-        tombstone_groups=(),
     )
 
     produced = node(Envelope(payload=payload, target="system.cp.root_stop"), None)
@@ -61,7 +60,7 @@ def test_root_stop_node_emits_leaf_stop_requests_and_requests_runner_stop() -> N
     assert len(stop_requests) == 1
     assert stop_requests[0].worker_id == "execution.ingress#1"
     assert stop_requests[0].command_id == "runtime-stop:execution.ingress#1"
-    assert len(cancel_commands) == 5
+    assert len(cancel_commands) == 2
     assert all(
         command.job_id.startswith("cp.root.leaf_ingress:source:system.cp.root_leaf_ingress:execution.ingress#1:")
         for command in cancel_commands

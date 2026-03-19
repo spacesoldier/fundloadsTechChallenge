@@ -348,7 +348,6 @@ class ControlPlaneLeafDrainReadyEvent:
 class ControlPlaneShutdownReadyEvent:
     expected_groups: tuple[str, ...] = field(default_factory=tuple)
     ready_groups: tuple[str, ...] = field(default_factory=tuple)
-    tombstone_groups: tuple[str, ...] = field(default_factory=tuple)
     emitted_at_epoch_ms: int = field(default_factory=lambda: int(time.time() * 1000))
 
     def __post_init__(self) -> None:
@@ -356,8 +355,6 @@ class ControlPlaneShutdownReadyEvent:
             raise ValueError("ControlPlaneShutdownReadyEvent.expected_groups must contain non-empty strings")
         if any(not isinstance(name, str) or not name for name in self.ready_groups):
             raise ValueError("ControlPlaneShutdownReadyEvent.ready_groups must contain non-empty strings")
-        if any(not isinstance(name, str) or not name for name in self.tombstone_groups):
-            raise ValueError("ControlPlaneShutdownReadyEvent.tombstone_groups must contain non-empty strings")
 
 
 @dataclass(frozen=True, slots=True)

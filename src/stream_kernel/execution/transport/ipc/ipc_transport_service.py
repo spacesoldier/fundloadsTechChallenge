@@ -48,6 +48,7 @@ class ExecutionIpcTransportCoordinatorService(ExecutionIpcTransportService):
     _pending_lock: RLock = field(default_factory=RLock, init=False, repr=False)
     _flow_control_lock: RLock = field(default_factory=RLock, init=False, repr=False)
     _flow_control_registered_targets: set[str] = field(default_factory=set, init=False, repr=False)
+    _payload_limit_logged_targets: set[str] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.flow_control.requires_ack:
@@ -159,7 +160,12 @@ class ExecutionIpcTransportCoordinatorService(ExecutionIpcTransportService):
             _ = self.adapter.build_port(target_id=target_id, receive_policy=receive_policy)
         return ExecutionIpcPort(service=self, target_id=target_id)
 
-    def allocate_local_endpoints(self, target_id: str) -> tuple[object, object]:
+    def allocate_local_endpoints(
+        self,
+        target_id: str,
+        *,
+        register_parent_endpoint: bool = True,
+    ) -> tuple[object, object]:
         if not isinstance(target_id, str) or not target_id:
             raise ValueError("ExecutionIpcTransportService.allocate_local_endpoints requires non-empty target_id")
         allocate = getattr(self.adapter, "allocate_endpoints", None)
@@ -169,7 +175,7 @@ class ExecutionIpcTransportCoordinatorService(ExecutionIpcTransportService):
         parent = getattr(parent_endpoint, "connection", parent_endpoint)
         child = getattr(child_endpoint, "connection", child_endpoint)
         registry = self._endpoint_store()
-        if registry is not None:
+        if register_parent_endpoint and registry is not None:
             registry.set(target_id, parent)
         return parent, child
 
@@ -186,6 +192,33 @@ class ExecutionIpcTransportCoordinatorService(ExecutionIpcTransportService):
         registry = self._endpoint_store()
         if registry is not None:
             registry.set(target_id, endpoint)
+
+    def register_data_available_callback(
+        self,
+        target_id: str,
+        callback: object,
+        *,
+        loop: object | None = None,
+    ) -> bool:
+        if not isinstance(target_id, str) or not target_id:
+            return False
+        if not callable(callback):
+            return False
+        resolved_target_id = self._resolve_transport_target_id(target_id)
+        try:
+            self._ensure_endpoint(resolved_target_id)
+        except Exception:
+            return False
+        register = getattr(self.adapter, "register_data_available_callback", None)
+        if not callable(register):
+            return False
+        try:
+            result = register(resolved_target_id, callback, loop=loop)
+            if isinstance(result, bool):
+                return result
+            return True
+        except Exception:
+            return False
 
     def _ensure_flow_control(self, target_id: str) -> None:
         if not self.flow_control.requires_ack or not _uses_credit_window(target_id):
@@ -237,6 +270,38 @@ class ExecutionIpcTransportCoordinatorService(ExecutionIpcTransportService):
                 attach(endpoint, target_id=target_id)
             except TypeError:
                 attach(endpoint)
+        self._emit_payload_limit_debug_once(target_id=target_id)
+
+    def _emit_payload_limit_debug_once(self, *, target_id: str) -> None:
+        with self._pending_lock:
+            if target_id in self._payload_limit_logged_targets:
+                return
+        describe_limits = getattr(self.adapter, "describe_payload_limit", None)
+        if not callable(describe_limits):
+            return
+        try:
+            payload = describe_limits(target_id)
+        except Exception:
+            return
+        if not isinstance(payload, dict):
+            return
+        fields = {
+            "target_id": target_id,
+            "lane": _lane_from_target_id(target_id),
+            "configured_max_payload_bytes": payload.get("configured_max_payload_bytes"),
+            "pipe_capacity_bytes": payload.get("pipe_capacity_bytes"),
+            "effective_max_payload_bytes": payload.get("effective_max_payload_bytes"),
+            "respect_pipe_capacity": payload.get("respect_pipe_capacity"),
+        }
+        publish_runtime_debug(
+            buffer=self.runtime_debug_buffer,
+            event="ipc.payload_limit.detected",
+            source="stream_kernel.execution.transport.ipc",
+            fields=fields,
+            trace_id=None,
+        )
+        with self._pending_lock:
+            self._payload_limit_logged_targets.add(target_id)
 
     def _endpoint_store(self) -> KVStore | None:
         if isinstance(self.endpoint_registry, KVStore):

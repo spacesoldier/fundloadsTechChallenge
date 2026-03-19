@@ -6,16 +6,15 @@ from dataclasses import dataclass
 
 from stream_kernel.execution.orchestration.control_plane.e2e_workers import (
     leaf_linear_pipeline_worker_for_target,
+    observability_ring_sink_worker_for_target,
     observability_boundary_batch_sink_worker,
-)
-from stream_kernel.execution.orchestration.control_plane.root.boundary_execution_service import (
-    DefaultControlPlaneRootBoundaryExecutionService,
-)
-from stream_kernel.execution.orchestration.control_plane.root.boundary_handoff_service import (
-    DefaultControlPlaneRootBoundaryHandoffService,
+    ring_pipeline_worker_for_target,
 )
 from stream_kernel.execution.orchestration.control_plane.root.leaf_ingress_service import (
     DefaultControlPlaneRootLeafIngressService,
+)
+from stream_kernel.execution.transport.handoff.ipc_handoff_dispatch_service import (
+    DefaultExecutionIpcHandoffDispatchService,
 )
 from stream_kernel.execution.transport.carriers.ipc.ipc_adapters import (
     PipeExecutionIpcTransportAdapter,
@@ -31,6 +30,7 @@ from stream_kernel.execution.transport.ipc.ipc_transport import (
     EXECUTION_IPC_LANE_TRACE,
     ExecutionIpcControlSignal,
     compose_execution_ipc_worker_target_id,
+    decompose_execution_ipc_worker_target_id,
 )
 from stream_kernel.execution.transport.ipc.ipc_transport_service import (
     ExecutionIpcTransportCoordinatorService,
@@ -45,6 +45,9 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafStopAckEvent,
     ControlPlaneLeafStopCommand,
+)
+from stream_kernel.platform.services.runtime.control_plane_ring_topology import (
+    DefaultControlPlaneRingTopologyService,
 )
 from stream_kernel.platform.services.runtime.control_plane_state import (
     InMemoryControlPlaneStateService,
@@ -258,21 +261,19 @@ def _cleanup_runtime(runtime: _Runtime, worker_ids: tuple[str, ...]) -> None:
     runtime.adapter.close()
 
 
-def _build_root_handoff(runtime: _Runtime) -> DefaultControlPlaneRootBoundaryHandoffService:
+def _build_root_handoff(runtime: _Runtime) -> DefaultExecutionIpcHandoffDispatchService:
     route_table = InMemoryExecutionIpcRouteTableService(store=InMemoryKvStore())
-    return DefaultControlPlaneRootBoundaryHandoffService(
-        root_boundary=DefaultControlPlaneRootBoundaryExecutionService(execution_ipc=runtime.ipc),
+    return DefaultExecutionIpcHandoffDispatchService(
+        execution_ipc=runtime.ipc,
         route_table=route_table,
-        timeout_seconds=2.0,
-        stream_batch_max_items=1,
-        observability_batch_max_items=64,
+        lane_routing=None,
     )
 
 
 def _pump_root_io(
     *,
     runtime: _Runtime,
-    handoff: DefaultControlPlaneRootBoundaryHandoffService,
+    handoff: DefaultExecutionIpcHandoffDispatchService,
     worker_ids: tuple[str, ...],
     max_cycles: int = 256,
 ) -> list[tuple[str, object]]:
@@ -298,14 +299,21 @@ def _pump_root_io(
                     continue
                 had_payload = True
                 if isinstance(payload, Envelope):
-                    handoff.drain_external_deliveries(
-                        envelopes=[payload],
-                        source_group=source_group,
-                    )
+                    if _is_worker_target_id(payload.target):
+                        runtime.ipc.send(payload.target, payload, no_reply=True)
+                    else:
+                        handoff.dispatch_envelope(payload, source_group=source_group)
                     continue
                 if isinstance(payload, ControlPlaneLeafBoundaryOutputsEvent):
                     for item in payload.outputs:
                         collected.append((worker_id, item))
+                    continue
+                if isinstance(payload, ControlPlaneLeafBoundaryExecuteCommand):
+                    runtime.ipc.send(
+                        compose_execution_ipc_worker_target_id(worker_id, lane=lane),
+                        payload,
+                        no_reply=True,
+                    )
                     continue
                 runtime.ingress.dispatch_polled_leaf_ingress(
                     worker_id=worker_id,
@@ -315,6 +323,24 @@ def _pump_root_io(
         if not had_payload:
             break
     return collected
+
+
+def _is_worker_target_id(target: object) -> bool:
+    if not isinstance(target, str) or not target:
+        return False
+    resolved = decompose_execution_ipc_worker_target_id(target)
+    if resolved is None:
+        return False
+    worker_id, _lane = resolved
+    if not isinstance(worker_id, str):
+        return False
+    # Worker target ids include "<group>#<slot>".
+    if "#" in worker_id:
+        return True
+    # Ring data-plane links are modeled as direct IPC targets.
+    if worker_id.startswith("ring:"):
+        return True
+    return False
 
 
 def test_real_spawn_ingress_stage_isolation_e2e() -> None:
@@ -606,16 +632,14 @@ def test_real_spawn_full_pipeline_ingress_transform_egress_e2e() -> None:
         for worker_id in worker_ids:
             _wait_config_applied(runtime=runtime, worker_id=worker_id)
         record_count = 150
-        handoff.drain_external_deliveries(
-            envelopes=[
-                *[
-                    Envelope(payload={"id": index}, target="ingress.node", trace_id=f"trace-{index}")
-                    for index in range(record_count)
-                ],
-                Envelope(payload={"id": "tombstone"}, target="ingress.node", trace_id="trace-t", tombstone=True),
+        for item in [
+            *[
+                Envelope(payload={"id": index}, target="ingress.node", trace_id=f"trace-{index}")
+                for index in range(record_count)
             ],
-            source_group="execution.root",
-        )
+            Envelope(payload={"id": "tombstone"}, target="ingress.node", trace_id="trace-t", tombstone=True),
+        ]:
+            handoff.dispatch_envelope(item, source_group="execution.root")
         processed_ids: list[int] = []
         tombstone_seen = False
         deadline = time.monotonic() + 8.0
@@ -717,16 +741,14 @@ def test_real_spawn_full_pipeline_with_observability_e2e() -> None:
         for worker_id in worker_ids:
             _wait_config_applied(runtime=runtime, worker_id=worker_id)
         record_count = 20
-        handoff.drain_external_deliveries(
-            envelopes=[
-                *[
-                    Envelope(payload={"id": index}, target="ingress.node", trace_id=f"trace-o-{index}")
-                    for index in range(record_count)
-                ],
-                Envelope(payload={"id": "tombstone"}, target="ingress.node", trace_id="trace-o-t", tombstone=True),
+        for item in [
+            *[
+                Envelope(payload={"id": index}, target="ingress.node", trace_id=f"trace-o-{index}")
+                for index in range(record_count)
             ],
-            source_group="execution.root",
-        )
+            Envelope(payload={"id": "tombstone"}, target="ingress.node", trace_id="trace-o-t", tombstone=True),
+        ]:
+            handoff.dispatch_envelope(item, source_group="execution.root")
         processed_ids: list[int] = []
         tombstone_seen = False
         obs_count_total = 0
@@ -813,3 +835,268 @@ def test_real_spawn_ack_signal_for_data_lane_arrives_via_control_lane() -> None:
     assert latest.kind == "ack"
     assert latest.target_id == data_target
     assert latest.count >= 1
+
+
+@dataclass(slots=True)
+class _RingPipelineProcessSpec:
+    worker_id: str
+    group_name: str
+    role: str
+    transform_steps: int
+    nodes: tuple[str, ...]
+
+
+def _build_ring_pipeline_specs(*, total_processes: int) -> tuple[_RingPipelineProcessSpec, ...]:
+    if total_processes < 5:
+        raise ValueError("total_processes must be >= 5 for ring pipeline e2e")
+    business_count = int(total_processes) - 1
+    ingress = _RingPipelineProcessSpec(
+        worker_id="execution.ingress#1",
+        group_name="execution.ingress",
+        role="ingress",
+        transform_steps=2,
+        nodes=("pipeline.ingress", "pipeline.ingress.t1", "pipeline.ingress.t2"),
+    )
+    middle_specs: list[_RingPipelineProcessSpec] = []
+    middle_count = max(0, business_count - 2)
+    for index in range(middle_count):
+        group_name = f"execution.stage{index + 1}"
+        middle_specs.append(
+            _RingPipelineProcessSpec(
+                worker_id=f"{group_name}#1",
+                group_name=group_name,
+                role="middle",
+                transform_steps=3,
+                nodes=(f"pipeline.{group_name}.t1", f"pipeline.{group_name}.t2", f"pipeline.{group_name}.t3"),
+            )
+        )
+    egress = _RingPipelineProcessSpec(
+        worker_id="execution.egress#1",
+        group_name="execution.egress",
+        role="egress",
+        transform_steps=3,
+        nodes=("pipeline.egress.t1", "pipeline.egress.t2", "pipeline.egress.sink"),
+    )
+    observability = _RingPipelineProcessSpec(
+        worker_id="system.observability#1",
+        group_name="system.observability",
+        role="observability",
+        transform_steps=0,
+        nodes=("system.obs.trace_dispatch",),
+    )
+    return (ingress, *tuple(middle_specs), egress, observability)
+
+
+def _build_groups_from_specs(
+    specs: tuple[_RingPipelineProcessSpec, ...],
+) -> tuple[ControlPlaneGroupSpec, ...]:
+    groups: list[ControlPlaneGroupSpec] = []
+    for spec in specs:
+        groups.append(
+            ControlPlaneGroupSpec(
+                group_name=spec.group_name,
+                workers=1,
+                nodes=tuple(spec.nodes),
+            )
+        )
+    return tuple(groups)
+
+
+def _spawn_ring_worker(
+    *,
+    runtime: _Runtime,
+    ring_topology: DefaultControlPlaneRingTopologyService,
+    spec: _RingPipelineProcessSpec,
+    inbound_target: str | None,
+    outbound_target: str | None,
+    observability_target: str,
+) -> None:
+    extra_endpoints = ring_topology.pop_child_endpoints(worker_id=spec.worker_id)
+    runtime.lifecycle.spawn_worker(
+        target_id=spec.worker_id,
+        target=ring_pipeline_worker_for_target,
+        args=(
+            spec.worker_id,
+            spec.group_name,
+            spec.role,
+            spec.transform_steps,
+            inbound_target,
+            outbound_target,
+            observability_target,
+        ),
+        name=f"sk:e2e:ring:{spec.worker_id}",
+        daemon=True,
+        start=True,
+        stop_event_position=0,
+        child_endpoint_position=1,
+        close_child_in_parent=True,
+        extra_child_endpoints=extra_endpoints if extra_endpoints else None,
+    )
+
+
+def _spawn_ring_observability_worker(*, runtime: _Runtime, spec: _RingPipelineProcessSpec) -> None:
+    runtime.lifecycle.spawn_worker(
+        target_id=spec.worker_id,
+        target=observability_ring_sink_worker_for_target,
+        args=(spec.worker_id, spec.group_name),
+        name=f"sk:e2e:ring:{spec.worker_id}",
+        daemon=True,
+        start=True,
+        stop_event_position=0,
+        child_endpoint_position=1,
+        close_child_in_parent=True,
+    )
+
+
+def _ring_inbound_outbound_maps(
+    *,
+    ring_topology: DefaultControlPlaneRingTopologyService,
+) -> tuple[dict[str, str], dict[str, str]]:
+    plan = ring_topology.plan()
+    if plan is None:
+        return {}, {}
+    inbound_by_worker: dict[str, str] = {}
+    outbound_by_worker: dict[str, str] = {}
+    for link in plan.links:
+        if link.lane != "data":
+            continue
+        outbound_by_worker[link.from_worker_id] = link.target_id
+        inbound_by_worker[link.to_worker_id] = link.target_id
+    return inbound_by_worker, outbound_by_worker
+
+
+def _run_ring_pipeline_e2e_case(*, total_processes: int, message_count: int) -> None:
+    specs = _build_ring_pipeline_specs(total_processes=total_processes)
+    groups = _build_groups_from_specs(specs)
+    runtime = _build_runtime(groups=groups)
+    ring_topology = DefaultControlPlaneRingTopologyService(
+        execution_ipc=runtime.ipc,
+        state=runtime.state,
+        store=InMemoryKvStore(),
+    )
+    runtime_config = {
+        "platform": {
+            "execution_ipc": {"data_plane_topology": "ring"},
+            "process_groups": [
+                {"name": spec.group_name, "workers": 1, "nodes": list(spec.nodes)}
+                for spec in specs
+            ],
+        }
+    }
+    ring_topology.configure(runtime=runtime_config, groups=runtime_config["platform"]["process_groups"])
+    plan = ring_topology.plan()
+    assert plan is not None
+
+    handoff = _build_root_handoff(runtime)
+    handoff.route_table.upsert_route(
+        target="system.obs.trace_dispatch",
+        target_id="system.observability#1",
+    )
+    for link in plan.links:
+        handoff.route_table.upsert_route(
+            target=link.target_id,
+            target_id=link.target_id,
+        )
+    inbound_by_worker, outbound_by_worker = _ring_inbound_outbound_maps(ring_topology=ring_topology)
+    worker_ids = tuple(spec.worker_id for spec in specs)
+    ingress_worker = next(spec for spec in specs if spec.role == "ingress")
+    egress_worker = next(spec for spec in specs if spec.role == "egress")
+    observability_worker = next(spec for spec in specs if spec.role == "observability")
+
+    for spec in specs:
+        if spec.role == "observability":
+            _spawn_ring_observability_worker(runtime=runtime, spec=spec)
+            continue
+        _spawn_ring_worker(
+            runtime=runtime,
+            ring_topology=ring_topology,
+            spec=spec,
+            inbound_target=inbound_by_worker.get(spec.worker_id),
+            outbound_target=outbound_by_worker.get(spec.worker_id),
+            observability_target="system.obs.trace_dispatch",
+        )
+
+    try:
+        for spec in specs:
+            _wait_config_applied(runtime=runtime, worker_id=spec.worker_id)
+
+        _send_execute_command(
+            runtime=runtime,
+            worker_id=ingress_worker.worker_id,
+            target_group=ingress_worker.group_name,
+            request_id=f"ring:{total_processes}:{message_count}",
+            inputs=tuple(
+                Envelope(
+                    payload={"id": index, "stage_sum": 0},
+                    target="pipeline.ingress",
+                    trace_id=f"ring-{total_processes}-{index}",
+                )
+                for index in range(int(message_count))
+            )
+            + (
+                Envelope(
+                    payload={"id": int(message_count), "stage_sum": 0},
+                    target="pipeline.ingress",
+                    trace_id=f"ring-{total_processes}-t",
+                    tombstone=True,
+                ),
+            ),
+        )
+
+        processed_ids: list[int] = []
+        expected_ids = set(range(int(message_count)))
+        tombstone_seen = False
+        observability_count = 0
+        expected_observability = int(message_count) * (int(total_processes) - 1)
+        timeout_seconds = 45.0 if int(message_count) <= 1_000 else 180.0
+        deadline = time.monotonic() + timeout_seconds
+        root_monitored_worker_ids = worker_ids
+        while time.monotonic() < deadline:
+            outputs = _pump_root_io(
+                runtime=runtime,
+                handoff=handoff,
+                worker_ids=root_monitored_worker_ids,
+                max_cycles=1024,
+            )
+            for origin_worker_id, item in outputs:
+                if not isinstance(item, dict):
+                    continue
+                if origin_worker_id == egress_worker.worker_id:
+                    if item.get("kind") == "data" and isinstance(item.get("id"), int):
+                        processed_ids.append(int(item["id"]))
+                    elif item.get("kind") == "tombstone":
+                        tombstone_seen = True
+                    continue
+                if origin_worker_id == observability_worker.worker_id:
+                    if item.get("kind") == "obs_batch" and isinstance(item.get("count"), int):
+                        observability_count += int(item["count"])
+            if (
+                tombstone_seen
+                and len(processed_ids) >= int(message_count)
+                and observability_count >= expected_observability
+            ):
+                break
+            time.sleep(0.001)
+
+        assert tombstone_seen is True
+        assert len(processed_ids) == int(message_count)
+        assert set(processed_ids) == expected_ids
+        assert observability_count == expected_observability
+
+        for spec in specs:
+            _stop_worker_and_wait_ack(
+                runtime=runtime,
+                worker_id=spec.worker_id,
+                target_group=spec.group_name,
+                timeout_seconds=5.0,
+            )
+    finally:
+        _cleanup_runtime(runtime, worker_ids)
+
+
+def test_real_spawn_ring_pipeline_5_processes_with_observability_1k_messages_e2e() -> None:
+    _run_ring_pipeline_e2e_case(total_processes=5, message_count=1_000)
+
+
+def test_real_spawn_ring_pipeline_10_processes_with_observability_10k_messages_e2e() -> None:
+    _run_ring_pipeline_e2e_case(total_processes=10, message_count=10_000)

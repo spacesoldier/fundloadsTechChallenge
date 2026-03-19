@@ -11,10 +11,6 @@ from datetime import UTC, datetime
 from threading import Lock
 from typing import Any, Protocol, runtime_checkable
 
-from stream_kernel.application_context.debug_payload import (
-    build_call_payload_fields,
-    build_result_payload_fields,
-)
 from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.service import service
 from stream_kernel.observability.domain.debug import DebugMessage
@@ -30,17 +26,29 @@ class RuntimeDebugBufferService(Protocol):
         raise NotImplementedError
 
 
+_DIRECT_BATCH_SIZE = 100
+
+
 @service(name="runtime_debug_buffer_service")
 @dataclass(slots=True)
 class InMemoryRuntimeDebugBufferService(RuntimeDebugBufferService):
     debug_stream: object | None = inject.stream(DebugMessage)
     _items: deque[DebugMessage] = field(default_factory=deque)
     _lock: Lock = field(default_factory=Lock)
+    _direct_batch: list[DebugMessage] = field(default_factory=list, init=False, repr=False)
 
     def publish(self, message: DebugMessage) -> None:
         if not isinstance(message, DebugMessage):
             return
-        if _runtime_debug_direct_dispatch_enabled() and self._emit_direct(message):
+        if _runtime_debug_direct_dispatch_enabled():
+            batch: list[DebugMessage] | None = None
+            with self._lock:
+                self._direct_batch.append(message)
+                if len(self._direct_batch) >= _DIRECT_BATCH_SIZE:
+                    batch = self._direct_batch[:]
+                    self._direct_batch.clear()
+            if batch is not None:
+                self._emit_direct_batch(batch)
             return
         with self._lock:
             self._items.append(message)
@@ -48,10 +56,49 @@ class InMemoryRuntimeDebugBufferService(RuntimeDebugBufferService):
     def drain(self, *, max_items: int = 256) -> list[DebugMessage]:
         limit = max(1, int(max_items))
         drained: list[DebugMessage] = []
+        pending_direct: list[DebugMessage] = []
         with self._lock:
+            if self._direct_batch:
+                pending_direct = self._direct_batch[:]
+                self._direct_batch.clear()
             while self._items and len(drained) < limit:
                 drained.append(self._items.popleft())
+        # Flush the pending direct batch; any messages that fail to emit are
+        # written back into _items by _emit_direct_batch.
+        if pending_direct:
+            self._emit_direct_batch(pending_direct)
+        # Second pass: pick up any fallback items written by _emit_direct_batch.
+        if len(drained) < limit:
+            with self._lock:
+                while self._items and len(drained) < limit:
+                    drained.append(self._items.popleft())
         return drained
+
+    def _emit_direct_batch(self, messages: list[DebugMessage]) -> None:
+        sink = self.debug_stream
+        emit_batch = getattr(sink, "emit_batch", None)
+        if callable(emit_batch):
+            try:
+                emit_batch(messages)
+                return
+            except Exception:
+                pass
+        # Fallback: individual emit. Messages that fail go back to _items so
+        # they are still retrievable via drain() (same contract as the old
+        # single-message _emit_direct fallback path).
+        emit = getattr(sink, "emit", None)
+        failed: list[DebugMessage] = []
+        if callable(emit):
+            for msg in messages:
+                try:
+                    emit(msg)
+                except Exception:
+                    failed.append(msg)
+        else:
+            failed = list(messages)
+        if failed:
+            with self._lock:
+                self._items.extend(failed)
 
     def _emit_direct(self, message: DebugMessage) -> bool:
         sink = self.debug_stream
@@ -106,6 +153,13 @@ def publish_runtime_debug(
 ) -> None:
     if not runtime_debug_enabled():
         return
+    normalized_fields = dict(fields or {})
+    if _is_runtime_debug_scheduler_noise(
+        event=event,
+        source=source,
+        fields=normalized_fields,
+    ):
+        return
     publish = getattr(buffer, "publish", None)
     if not callable(publish):
         return
@@ -115,7 +169,7 @@ def publish_runtime_debug(
                 timestamp=datetime.now(tz=UTC),
                 event=event,
                 source=source,
-                fields=dict(fields or {}),
+                fields=normalized_fields,
                 run_id=_env("STREAM_KERNEL_LOGICAL_RUN_ID"),
                 run_instance_id=_env("STREAM_KERNEL_RUN_INSTANCE_ID"),
                 process_group=_env("STREAM_KERNEL_PROCESS_GROUP"),
@@ -236,27 +290,19 @@ def _emit_service_call_debug(
     buffer = getattr(owner, "runtime_debug_buffer", None)
     if buffer is None:
         return
-    caller_module, caller_function = _resolve_caller()
+    # Intentionally omit recursive arg/result serialization and frame inspection
+    # here — those operations (build_call_payload_fields, _resolve_caller) are
+    # expensive on the hot asyncio event-loop path (frame walks + deep object
+    # traversal of binary IPC frames).  Basic timing/status fields are sufficient
+    # for runtime diagnostics; payload detail can be added per call-site if needed.
     fields: dict[str, object] = {
         "service_type": owner_cls.__name__,
         "service_module": owner_cls.__module__,
         "method": method_name,
         "duration_ms": round(max(0.0, float(duration_ms)), 3),
         "args_count": len(args),
-        "kwargs_keys": sorted(str(key) for key in kwargs.keys())[:12],
-        "caller_module": caller_module,
-        "caller_function": caller_function,
         "status": "error" if isinstance(error, Exception) else "ok",
     }
-    fields.update(
-        build_call_payload_fields(
-            method=method_name,
-            args=args,
-            kwargs=kwargs,
-        )
-    )
-    if not isinstance(error, Exception):
-        fields.update(build_result_payload_fields(result=result))
     if isinstance(error, Exception):
         fields["error_type"] = type(error).__name__
         fields["error_message"] = str(error)
@@ -269,22 +315,42 @@ def _emit_service_call_debug(
     )
 
 
-def _resolve_caller() -> tuple[str | None, str | None]:
-    frame = inspect.currentframe()
-    if frame is None:
-        return (None, None)
-    caller = frame.f_back
-    if caller is None:
-        return (None, None)
-    caller = caller.f_back
-    if caller is None:
-        return (None, None)
-    module = caller.f_globals.get("__name__")
-    function = caller.f_code.co_name
-    return (
-        module if isinstance(module, str) and module else None,
-        function if isinstance(function, str) and function else None,
-    )
+def _is_runtime_debug_scheduler_noise(
+    *,
+    event: str,
+    source: str,
+    fields: dict[str, object],
+) -> bool:
+    source_node = fields.get("source_node")
+    target = fields.get("target")
+    payload_model = fields.get("payload_model")
+    if event in {"runtime.runner.dequeued", "runtime.runner.enqueued"}:
+        if source_node == "system.scheduler.tick":
+            return True
+        if isinstance(target, str) and (
+            target == "system.scheduler.tick"
+            or target.startswith("source:system.cp.root_leaf_ingress:")
+            or target.startswith("source:system.cp.command_ingress:")
+            or target.startswith("source:system.ipc.ingress:")
+        ):
+            if payload_model in {"BootstrapControl", "PlatformSchedulerTickEvent"}:
+                return True
+    if event == "runtime.service.call":
+        service_module = fields.get("service_module")
+        method = fields.get("method")
+        if (
+            isinstance(service_module, str)
+            and service_module == "stream_kernel.platform.services.runtime.platform_scheduler"
+            and method in {"dispatch_due", "apply_command", "snapshot"}
+        ):
+            return True
+        if isinstance(source, str) and source.startswith(
+            "stream_kernel.platform.services.runtime.platform_scheduler."
+        ):
+            if method in {"dispatch_due", "apply_command", "snapshot"}:
+                return True
+    return False
+
 
 
 def _env(name: str) -> str | None:

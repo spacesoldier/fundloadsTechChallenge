@@ -17,6 +17,9 @@ from stream_kernel.execution.orchestration.scheduler_system_nodes import (
     SCHEDULER_TIMER_NODE_NAME,
     SCHEDULER_TICK_NODE_NAME,
 )
+from stream_kernel.execution.transport.handoff.ipc_handoff_dispatch_service import (
+    ExecutionIpcHandoffDispatchService,
+)
 from stream_kernel.execution.orchestration.source_ingress import BootstrapControl
 from stream_kernel.kernel.scenario import StepSpec
 from stream_kernel.integration.kv_store import InMemoryKvStore
@@ -107,11 +110,11 @@ from stream_kernel.platform.services.runtime.platform_scheduler import (
 from .leaf_ingress_nodes import (
     ROOT_BOUNDARY_HANDOFF_SINK_NODE_NAME,
     ROOT_LEAF_CONTROL_DISPATCH_SINK_NODE_NAME,
+    ROOT_LEAF_INGRESS_SOURCE_NODE_NAME,
     ControlPlaneRootLeafIngressEnvelopeEvent,
     ControlPlaneRootBoundaryHandoffSinkNode,
     ControlPlaneRootLeafControlDispatchSinkNode,
     ControlPlaneRootLeafIngressSourceNode,
-    root_leaf_ingress_source_node_name,
 )
 from .static_graph import (
     ROOT_STATIC_SYSTEM_NODE_NAMES,
@@ -156,7 +159,6 @@ def build_root_control_plane_system_plan(
     resolve_required_service: Callable[..., object],
     resolve_optional_service: Callable[..., object | None],
     inject_control_plane_steps: Callable[[list[StepSpec], ScenarioScope], None],
-    root_boundary_handoff_contract: Callable[[], type[object]],
     root_leaf_ingress_contract: Callable[[], type[object]],
     root_lifecycle_orchestration_contract: Callable[[], type[object]],
     root_lifecycle_log_factory_contract: Callable[[], type[object]],
@@ -301,8 +303,8 @@ def build_root_control_plane_system_plan(
     root_boundary_handoff_sink = ControlPlaneRootBoundaryHandoffSinkNode(
         handoff=resolve_required_service(
             scope=scenario_scope,
-            contract=root_boundary_handoff_contract(),
-            method_name="drain_external_deliveries",
+            contract=ExecutionIpcHandoffDispatchService,
+            method_name="dispatch_envelope",
         )
     )
     root_stop_ack_state = ControlPlaneRootLeafStopAckNode(
@@ -540,41 +542,99 @@ def _build_root_leaf_ingress_source_steps(
         contract=root_leaf_ingress_contract(),
         method_name="poll_next_leaf_ingress_for_worker_lane",
     )
-    steps: list[StepSpec] = []
-    lanes = _root_leaf_ingress_lanes()
+    ingress_specs = _root_leaf_ingress_specs(runtime)
+    if not ingress_specs:
+        return []
+    source_name = ROOT_LEAF_INGRESS_SOURCE_NODE_NAME
+    return [
+        StepSpec(
+            name=source_name,
+            step=ControlPlaneRootLeafIngressSourceNode(
+                ingress=ingress,
+                source_name=source_name,
+                ingress_specs=tuple(ingress_specs),
+            ),
+        )
+    ]
+
+
+def _root_leaf_ingress_specs(runtime: dict[str, object]) -> list[tuple[str, str]]:
+    specs: list[tuple[str, str]] = []
     for worker_id in _root_leaf_ingress_worker_ids(runtime):
+        lanes = _root_leaf_ingress_lanes_for_worker(runtime=runtime, worker_id=worker_id)
         for lane in lanes:
-            source_name = root_leaf_ingress_source_node_name(worker_id=worker_id, lane=lane)
-            steps.append(
-                StepSpec(
-                    name=source_name,
-                    step=ControlPlaneRootLeafIngressSourceNode(
-                        ingress=ingress,
-                        worker_id=worker_id,
-                        lane=lane,
-                        source_name=source_name,
-                    ),
-                )
-            )
-    return steps
+            if not isinstance(lane, str) or not lane:
+                continue
+            specs.append((worker_id, lane))
+    return specs
 
 
 def _root_leaf_ingress_lanes() -> tuple[str, ...]:
     from stream_kernel.execution.transport.ipc.ipc_transport import (
         EXECUTION_IPC_LANE_CONTROL,
         EXECUTION_IPC_LANE_DATA,
-        EXECUTION_IPC_LANE_LOG,
-        EXECUTION_IPC_LANE_METRIC,
-        EXECUTION_IPC_LANE_TRACE,
     )
 
     return (
         EXECUTION_IPC_LANE_CONTROL,
         EXECUTION_IPC_LANE_DATA,
-        EXECUTION_IPC_LANE_TRACE,
-        EXECUTION_IPC_LANE_LOG,
-        EXECUTION_IPC_LANE_METRIC,
     )
+
+
+def _root_leaf_ingress_lanes_for_worker(*, runtime: dict[str, object], worker_id: str) -> tuple[str, ...]:
+    lanes = _root_leaf_ingress_lanes()
+    if _resolve_data_plane_topology(runtime) != "ring":
+        return lanes
+    # Ring mode keeps root off the business data path for regular workers.
+    # Only observability worker keeps data lane ingress to relay selected logs
+    # back to root console path.
+    if _is_observability_worker_id(runtime=runtime, worker_id=worker_id):
+        return lanes
+    return (lanes[0],)
+
+
+def _resolve_data_plane_topology(runtime: dict[str, object]) -> str:
+    if not isinstance(runtime, dict):
+        return "star"
+    platform = runtime.get("platform")
+    if not isinstance(platform, dict):
+        return "star"
+    execution_ipc = platform.get("execution_ipc")
+    if not isinstance(execution_ipc, dict):
+        return "star"
+    raw = execution_ipc.get("data_plane_topology", "star")
+    if not isinstance(raw, str):
+        return "star"
+    normalized = raw.strip().lower()
+    if normalized not in {"star", "ring"}:
+        return "star"
+    return normalized
+
+
+def _is_observability_worker_id(*, runtime: dict[str, object], worker_id: str) -> bool:
+    if not isinstance(worker_id, str) or not worker_id:
+        return False
+    group_name = _resolve_observability_group_name(runtime)
+    if not isinstance(group_name, str) or not group_name:
+        return False
+    return worker_id.startswith(f"{group_name}#")
+
+
+def _resolve_observability_group_name(runtime: dict[str, object]) -> str:
+    if not isinstance(runtime, dict):
+        return "system.observability"
+    observability = runtime.get("observability")
+    if not isinstance(observability, dict):
+        return "system.observability"
+    service_cfg = observability.get("service_process")
+    if not isinstance(service_cfg, dict):
+        service_cfg = observability.get("service_worker")
+    if not isinstance(service_cfg, dict):
+        return "system.observability"
+    group_name = service_cfg.get("group_name")
+    if not isinstance(group_name, str) or not group_name:
+        return "system.observability"
+    return group_name
 
 
 def _root_leaf_ingress_worker_ids(runtime: dict[str, object]) -> tuple[str, ...]:

@@ -60,14 +60,6 @@ _ROOT_RUNTIME_BOOTSTRAP_EXPORTS = {
     "ControlPlaneRootRuntimeBootstrapService",
     "DefaultControlPlaneRootRuntimeBootstrapService",
 }
-_ROOT_BOUNDARY_EXEC_EXPORTS = {
-    "ControlPlaneRootBoundaryExecutionService",
-    "DefaultControlPlaneRootBoundaryExecutionService",
-}
-_ROOT_BOUNDARY_HANDOFF_EXPORTS = {
-    "ControlPlaneRootBoundaryHandoffService",
-    "DefaultControlPlaneRootBoundaryHandoffService",
-}
 
 __all__ = sorted(
     _PLANNING_EXPORTS
@@ -77,8 +69,6 @@ __all__ = sorted(
     | _ROOT_LEAF_INGRESS_EXPORTS
     | _ROOT_SNAPSHOT_EXPORTS
     | _ROOT_RUNTIME_BOOTSTRAP_EXPORTS
-    | _ROOT_BOUNDARY_EXEC_EXPORTS
-    | _ROOT_BOUNDARY_HANDOFF_EXPORTS
 )
 
 
@@ -97,10 +87,6 @@ def __getattr__(name: str) -> object:
         mod = import_module("stream_kernel.execution.orchestration.control_plane.root.discovery_snapshot_service")
     elif name in _ROOT_RUNTIME_BOOTSTRAP_EXPORTS:
         mod = import_module("stream_kernel.execution.orchestration.control_plane.root.runtime_bootstrap_service")
-    elif name in _ROOT_BOUNDARY_EXEC_EXPORTS:
-        mod = import_module("stream_kernel.execution.orchestration.control_plane.root.boundary_execution_service")
-    elif name in _ROOT_BOUNDARY_HANDOFF_EXPORTS:
-        mod = import_module("stream_kernel.execution.orchestration.control_plane.root.boundary_handoff_service")
     else:
         raise AttributeError(name)
     value = getattr(mod, name)

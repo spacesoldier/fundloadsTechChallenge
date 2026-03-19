@@ -66,6 +66,35 @@ class _FailingSendIpcPort(_IpcPort):
         return super().send(target_id, payload, no_reply=no_reply)
 
 
+@dataclass(slots=True)
+class _NoBufferedRecvIpcPort:
+    recv_calls: list[tuple[str, float | None]] = field(default_factory=list)
+
+    def recv(self, target_id: str, *, timeout: float | None = None):
+        self.recv_calls.append((target_id, timeout))
+        raise AssertionError("recv() fallback path must not be used")
+
+    def send(self, target_id: str, payload: object, *, no_reply: bool = False):
+        _ = (target_id, payload, no_reply)
+        return None
+
+
+@dataclass(slots=True)
+class _CallbackIpcPort:
+    callbacks: list[tuple[str, object]] = field(default_factory=list)
+
+    def register_data_available_callback(
+        self,
+        target_id: str,
+        callback: object,
+        *,
+        loop: object | None = None,
+    ) -> bool:
+        _ = loop
+        self.callbacks.append((target_id, callback))
+        return True
+
+
 def test_root_leaf_ingress_service_polls_envelope_payload() -> None:
     from stream_kernel.execution.orchestration.control_plane.root.leaf_ingress_service import (
         DefaultControlPlaneRootLeafIngressService,
@@ -145,6 +174,56 @@ def test_root_leaf_ingress_service_prefers_buffered_recv_when_available() -> Non
     assert isinstance(payload, Envelope)
     assert payload.target == "compute_time_keys"
     assert len(ipc.recv_buffered_calls) == 1
+
+
+def test_root_leaf_ingress_service_returns_none_when_buffered_recv_is_unavailable() -> None:
+    from stream_kernel.execution.orchestration.control_plane.root.leaf_ingress_service import (
+        DefaultControlPlaneRootLeafIngressService,
+    )
+
+    state = InMemoryControlPlaneStateService(store=InMemoryKvStore())
+    ipc = _NoBufferedRecvIpcPort()
+    service = DefaultControlPlaneRootLeafIngressService(state=state, execution_ipc=ipc)
+
+    payload = service.poll_next_leaf_ingress_for_worker_lane(
+        worker_id="execution.alpha#1",
+        lane="control",
+        timeout_seconds=0.0,
+    )
+
+    assert payload is None
+    assert ipc.recv_calls == []
+
+
+def test_root_leaf_ingress_service_registers_data_available_callback_for_lane_target() -> None:
+    from stream_kernel.execution.orchestration.control_plane.root.leaf_ingress_service import (
+        DefaultControlPlaneRootLeafIngressService,
+    )
+
+    state = InMemoryControlPlaneStateService(store=InMemoryKvStore())
+    control = _CallbackIpcPort()
+    data = _CallbackIpcPort()
+    trace = _CallbackIpcPort()
+    log = _CallbackIpcPort()
+    metric = _CallbackIpcPort()
+    service = DefaultControlPlaneRootLeafIngressService(
+        state=state,
+        control_lane_ipc=control,  # type: ignore[arg-type]
+        data_lane_ipc=data,  # type: ignore[arg-type]
+        trace_lane_ipc=trace,  # type: ignore[arg-type]
+        log_lane_ipc=log,  # type: ignore[arg-type]
+        metric_lane_ipc=metric,  # type: ignore[arg-type]
+    )
+    callback = lambda: None
+
+    accepted = service.register_data_available_callback(
+        worker_id="execution.alpha#1",
+        lane="data",
+        callback=callback,
+    )
+
+    assert accepted is True
+    assert data.callbacks == [("execution.alpha#1::data", callback)]
 
 
 def test_root_leaf_ingress_service_processes_leaf_hello_and_sends_config_card() -> None:

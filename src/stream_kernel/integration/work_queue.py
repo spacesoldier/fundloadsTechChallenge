@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from threading import Condition
 from time import monotonic
@@ -29,6 +30,21 @@ class QueuePort:
         _ = timeout_seconds
         return self.size() > 0
 
+    async def wait_for_item_async(self, timeout_seconds: float) -> bool:
+        timeout = max(0.0, float(timeout_seconds))
+        if self.size() > 0:
+            return True
+        if timeout == 0.0:
+            return False
+        deadline = monotonic() + timeout
+        while True:
+            if self.size() > 0:
+                return True
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(0.001, max(0.0, remaining)))
+
     def close(self) -> None:
         # Optional shutdown hook; default no-op for transports without close semantics.
         return None
@@ -56,6 +72,7 @@ class InMemoryQueue(QueuePort):
         self._queue: deque[object] = deque()
         self._cv = Condition()
         self._closed = False
+        self._async_waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Future[bool]]] = []
 
     def push(self, envelope: object) -> None:
         with self._cv:
@@ -63,6 +80,7 @@ class InMemoryQueue(QueuePort):
                 raise RuntimeError("InMemoryQueue is closed")
             self._queue.append(envelope)
             self._cv.notify()
+            self._notify_async_waiters_unlocked(ready=True)
 
     def pop(self) -> object | None:
         with self._cv:
@@ -94,14 +112,50 @@ class InMemoryQueue(QueuePort):
                 remaining = deadline - monotonic()
             return False
 
+    async def wait_for_item_async(self, timeout_seconds: float) -> bool:
+        timeout = max(0.0, float(timeout_seconds))
+        loop = asyncio.get_running_loop()
+        with self._cv:
+            if self._queue:
+                return True
+            if self._closed:
+                return False
+            if timeout == 0.0:
+                return False
+            waiter: asyncio.Future[bool] = loop.create_future()
+            self._async_waiters.append((loop, waiter))
+        try:
+            return bool(await asyncio.wait_for(waiter, timeout=timeout))
+        except asyncio.TimeoutError:
+            return self.size() > 0
+        finally:
+            with self._cv:
+                self._async_waiters = [
+                    (candidate_loop, candidate_waiter)
+                    for candidate_loop, candidate_waiter in self._async_waiters
+                    if candidate_waiter is not waiter
+                ]
+
     def close(self) -> None:
         with self._cv:
             self._closed = True
             self._cv.notify_all()
+            self._notify_async_waiters_unlocked(ready=False)
 
     def is_closed(self) -> bool:
         with self._cv:
             return self._closed
+
+    def _notify_async_waiters_unlocked(self, *, ready: bool) -> None:
+        if not self._async_waiters:
+            return
+        waiters = list(self._async_waiters)
+        self._async_waiters.clear()
+        for loop, waiter in waiters:
+            try:
+                loop.call_soon_threadsafe(_resolve_waiter_future, waiter, ready)
+            except Exception:
+                continue
 
 
 @service(name="execution_queue_tcp_local")
@@ -115,6 +169,7 @@ class TcpLocalQueue(QueuePort):
         self._transport_rejects = 0
         self._cv = Condition()
         self._closed = False
+        self._async_waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Future[bool]]] = []
 
     def push(self, envelope: object) -> None:
         with self._cv:
@@ -126,6 +181,7 @@ class TcpLocalQueue(QueuePort):
         with self._cv:
             self._queue.append(envelope)
             self._cv.notify()
+            self._notify_async_waiters_unlocked(ready=True)
 
     def pop(self) -> object | None:
         with self._cv:
@@ -157,10 +213,35 @@ class TcpLocalQueue(QueuePort):
                 remaining = deadline - monotonic()
             return False
 
+    async def wait_for_item_async(self, timeout_seconds: float) -> bool:
+        timeout = max(0.0, float(timeout_seconds))
+        loop = asyncio.get_running_loop()
+        with self._cv:
+            if self._queue:
+                return True
+            if self._closed:
+                return False
+            if timeout == 0.0:
+                return False
+            waiter: asyncio.Future[bool] = loop.create_future()
+            self._async_waiters.append((loop, waiter))
+        try:
+            return bool(await asyncio.wait_for(waiter, timeout=timeout))
+        except asyncio.TimeoutError:
+            return self.size() > 0
+        finally:
+            with self._cv:
+                self._async_waiters = [
+                    (candidate_loop, candidate_waiter)
+                    for candidate_loop, candidate_waiter in self._async_waiters
+                    if candidate_waiter is not waiter
+                ]
+
     def close(self) -> None:
         with self._cv:
             self._closed = True
             self._cv.notify_all()
+            self._notify_async_waiters_unlocked(ready=False)
 
     def is_closed(self) -> bool:
         with self._cv:
@@ -175,6 +256,7 @@ class TcpLocalQueue(QueuePort):
             with self._cv:
                 self._queue.append(framed)
                 self._cv.notify()
+                self._notify_async_waiters_unlocked(ready=True)
             return
         try:
             secure = self._transport.decode_framed_message(framed)
@@ -184,6 +266,18 @@ class TcpLocalQueue(QueuePort):
         with self._cv:
             self._queue.append(_secure_to_envelope(secure))
             self._cv.notify()
+            self._notify_async_waiters_unlocked(ready=True)
+
+    def _notify_async_waiters_unlocked(self, *, ready: bool) -> None:
+        if not self._async_waiters:
+            return
+        waiters = list(self._async_waiters)
+        self._async_waiters.clear()
+        for loop, waiter in waiters:
+            try:
+                loop.call_soon_threadsafe(_resolve_waiter_future, waiter, ready)
+            except Exception:
+                continue
 
 
 @service(name="execution_topic")
@@ -253,3 +347,9 @@ def _secure_to_envelope(secure: SecureEnvelope) -> Envelope:
         reply_to=secure.reply_to,
         span_id=secure.span_id,
     )
+
+
+def _resolve_waiter_future(waiter: asyncio.Future[bool], ready: bool) -> None:
+    if waiter.done():
+        return
+    waiter.set_result(bool(ready))

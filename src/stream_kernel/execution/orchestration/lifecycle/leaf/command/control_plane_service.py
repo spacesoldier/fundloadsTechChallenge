@@ -10,6 +10,7 @@ from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.service import service
 from stream_kernel.execution.orchestration.control_plane.leaf.system_nodes import (
     is_leaf_command_ingress_source_node_name,
+    is_leaf_runtime_ingress_source_node_name,
 )
 from stream_kernel.execution.orchestration.lifecycle.leaf.command.channel_services import (
     LeafCommandChannelIngressService,
@@ -284,10 +285,12 @@ def _bind_worker_control_endpoint(
         for lane_name, endpoint in control_pipe.items():
             if endpoint is None:
                 continue
-            lane_target = compose_execution_ipc_worker_target_id(
-                worker_id,
-                lane=str(lane_name),
+            lane_target = _resolve_child_endpoint_target_id(
+                worker_id=worker_id,
+                endpoint_key=str(lane_name),
             )
+            if not isinstance(lane_target, str) or not lane_target:
+                continue
             try:
                 binder(lane_target, endpoint)
                 bound_any = True
@@ -305,6 +308,17 @@ def _bind_worker_control_endpoint(
         )
     except Exception:
         return
+
+
+def _resolve_child_endpoint_target_id(*, worker_id: str, endpoint_key: str) -> str | None:
+    if not isinstance(endpoint_key, str) or not endpoint_key:
+        return None
+    if endpoint_key.startswith("target::"):
+        target_id = endpoint_key.removeprefix("target::")
+        if isinstance(target_id, str) and target_id:
+            return target_id
+        return None
+    return compose_execution_ipc_worker_target_id(worker_id, lane=endpoint_key)
 
 
 def build_leaf_startup_runtime(
@@ -408,28 +422,22 @@ def _build_leaf_runner(
     scenario_steps = getattr(child, "scenario_steps", None)
     if not isinstance(scenario_steps, dict):
         raise RuntimeError("leaf runtime requires scenario_steps mapping")
-    # Leaf control-plane runner must stay on control/system rails only.
-    # Business/source/sink graph execution is driven through leaf boundary execution,
-    # not via the always-on command loop runner.
     nodes = {
         name: step
         for name, step in scenario_steps.items()
         if isinstance(name, str)
         and name
         and callable(step)
-        and (
-            name.startswith("system.")
-            or is_leaf_command_ingress_source_node_name(name)
-        )
     }
     ingress_source_names = [
         name
         for name in nodes.keys()
         if is_leaf_command_ingress_source_node_name(name)
+        or is_leaf_runtime_ingress_source_node_name(name)
     ]
     if not ingress_source_names:
         raise RuntimeError(
-            "leaf runtime is missing command ingress source node"
+            "leaf runtime is missing IPC ingress source node"
         )
     scenario_id = getattr(child, "scenario_id", "scenario")
     if not isinstance(scenario_id, str) or not scenario_id:
@@ -447,6 +455,7 @@ def _build_leaf_runner(
         if isinstance(configured, str) and configured:
             sink_mode = configured
     profile = session.runner_profile_effective or session.runner_profile_requested
+    debug_buffer = resolve_leaf_runtime_debug_buffer(session)
     if profile == "sync":
         return SyncRunner(
             nodes=nodes,
@@ -454,6 +463,7 @@ def _build_leaf_runner(
             scenario_id=scenario_id,
             full_context_nodes=set(full_context_nodes),
             ordered_sink_mode=sink_mode,
+            runtime_debug_buffer=debug_buffer,
         )
     return AsyncRunner(
         nodes=nodes,
@@ -461,6 +471,7 @@ def _build_leaf_runner(
         scenario_id=scenario_id,
         full_context_nodes=set(full_context_nodes),
         ordered_sink_mode=sink_mode,
+        runtime_debug_buffer=debug_buffer,
     )
 
 

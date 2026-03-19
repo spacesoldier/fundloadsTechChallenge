@@ -6,6 +6,7 @@ from stream_kernel.observability.domain.debug import DebugMessage
 from stream_kernel.platform.services.runtime.debug_buffer import (
     InMemoryRuntimeDebugBufferService,
     debug_instrument_service_methods,
+    publish_runtime_debug,
 )
 
 
@@ -38,8 +39,10 @@ def test_runtime_debug_buffer_direct_dispatch_skips_buffer(monkeypatch) -> None:
 
     service.publish(_message())
 
+    # Messages are batched; drain() flushes the pending direct batch to sink.
+    drained = service.drain(max_items=16)
     assert len(sink.items) == 1
-    assert service.drain(max_items=16) == []
+    assert drained == []  # nothing went into the internal _items buffer
 
 
 def test_runtime_debug_buffer_direct_dispatch_falls_back_to_buffer_on_error(monkeypatch) -> None:
@@ -88,5 +91,82 @@ def test_debug_instrument_service_methods_emits_payload_fields(monkeypatch) -> N
     message = buffer.items[0]
     assert message.event == "runtime.service.call"
     assert message.fields.get("method") == "process"
-    assert message.fields.get("payload_model") == "dict"
-    assert message.fields.get("payload") == {"id": 42, "kind": "demo"}
+    assert message.fields.get("status") == "ok"
+    assert message.fields.get("args_count") == 1
+    # Payload serialization is intentionally omitted from the hot-path decorator
+    # to avoid blocking the event loop with recursive object traversal.
+
+
+def test_publish_runtime_debug_skips_scheduler_tick_noise(monkeypatch) -> None:
+    monkeypatch.setenv("STREAM_KERNEL_INJECT_PORT_DEBUG_ENABLED", "1")
+
+    class _Buffer:
+        def __init__(self) -> None:
+            self.items: list[DebugMessage] = []
+
+        def publish(self, message: DebugMessage) -> None:
+            self.items.append(message)
+
+    buffer = _Buffer()
+    publish_runtime_debug(
+        buffer=buffer,
+        event="runtime.runner.dequeued",
+        source="stream_kernel.execution.runtime.runner",
+        fields={
+            "source_node": "system.scheduler.tick",
+            "target": "source:system.cp.root_leaf_ingress:execution.ingress#1:control",
+            "payload_model": "PlatformSchedulerTickEvent",
+        },
+        trace_id="trace-x",
+    )
+    assert buffer.items == []
+
+
+def test_publish_runtime_debug_keeps_non_scheduler_runner_events(monkeypatch) -> None:
+    monkeypatch.setenv("STREAM_KERNEL_INJECT_PORT_DEBUG_ENABLED", "1")
+
+    class _Buffer:
+        def __init__(self) -> None:
+            self.items: list[DebugMessage] = []
+
+        def publish(self, message: DebugMessage) -> None:
+            self.items.append(message)
+
+    buffer = _Buffer()
+    publish_runtime_debug(
+        buffer=buffer,
+        event="runtime.runner.dequeued",
+        source="stream_kernel.execution.runtime.runner",
+        fields={
+            "source_node": "ingress.node",
+            "target": "transform.node",
+            "payload_model": "InputRecord",
+        },
+        trace_id="trace-y",
+    )
+    assert len(buffer.items) == 1
+
+
+def test_publish_runtime_debug_skips_scheduler_service_call_noise(monkeypatch) -> None:
+    monkeypatch.setenv("STREAM_KERNEL_INJECT_PORT_DEBUG_ENABLED", "1")
+
+    class _Buffer:
+        def __init__(self) -> None:
+            self.items: list[DebugMessage] = []
+
+        def publish(self, message: DebugMessage) -> None:
+            self.items.append(message)
+
+    buffer = _Buffer()
+    publish_runtime_debug(
+        buffer=buffer,
+        event="runtime.service.call",
+        source="stream_kernel.platform.services.runtime.platform_scheduler.InMemoryPlatformSchedulerService",
+        fields={
+            "service_module": "stream_kernel.platform.services.runtime.platform_scheduler",
+            "method": "dispatch_due",
+            "status": "ok",
+        },
+        trace_id=None,
+    )
+    assert buffer.items == []

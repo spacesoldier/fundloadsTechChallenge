@@ -35,28 +35,6 @@ class _ProcessGroupRouter:
 
 
 @dataclass(slots=True)
-class _RootBoundaryHandoff:
-    configure_calls: list[dict[str, object]] = field(default_factory=list)
-
-    def configure_dispatch(
-        self,
-        *,
-        timeout_seconds: float | None = None,
-        stream_batch_max_items: int | None = None,
-        observability_batch_max_items: int | None = None,
-        inflight_idle_timeout_seconds: float | None = None,
-    ) -> None:
-        self.configure_calls.append(
-            {
-                "timeout_seconds": timeout_seconds,
-                "stream_batch_max_items": stream_batch_max_items,
-                "observability_batch_max_items": observability_batch_max_items,
-                "inflight_idle_timeout_seconds": inflight_idle_timeout_seconds,
-            }
-        )
-
-
-@dataclass(slots=True)
 class _RootLeafIngress:
     protocol_revision_calls: list[int] = field(default_factory=list)
 
@@ -232,19 +210,17 @@ def test_root_runtime_bootstrap_service_adds_missing_observability_group_for_rou
     assert "system.obs.monitor_dispatch" in upserted_targets
 
 
-def test_root_runtime_bootstrap_service_configures_boundary_handoff_and_control_poll_from_runtime() -> None:
+def test_root_runtime_bootstrap_service_configures_control_poll_and_protocol_from_runtime() -> None:
     from stream_kernel.execution.orchestration.control_plane.root.runtime_bootstrap_service import (
         DefaultControlPlaneRootRuntimeBootstrapService,
     )
 
     lifecycle = _LifecycleService()
     router = _ProcessGroupRouter()
-    handoff = _RootBoundaryHandoff()
     leaf_ingress = _RootLeafIngress()
     service = DefaultControlPlaneRootRuntimeBootstrapService(
         lifecycle=lifecycle,
         process_group_router=router,
-        root_boundary_handoff=handoff,
         root_leaf_ingress=leaf_ingress,
     )
     runtime = {
@@ -268,14 +244,9 @@ def test_root_runtime_bootstrap_service_configures_boundary_handoff_and_control_
         discovery_modules=["fund_load"],
     )
 
-    assert handoff.configure_calls == [
-        {
-            "timeout_seconds": 2.5,
-            "stream_batch_max_items": 10,
-            "observability_batch_max_items": None,
-            "inflight_idle_timeout_seconds": None,
-        }
-    ]
+    assert lifecycle.spawn_context_calls
+    call = lifecycle.spawn_context_calls[-1]
+    assert float(call["boundary_control_poll_seconds"]) == 0.001
     assert leaf_ingress.protocol_revision_calls == [2]
 
 

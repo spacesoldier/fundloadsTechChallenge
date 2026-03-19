@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import pytest
 
@@ -65,6 +66,23 @@ class _LeafWorkerControlPlaneService:
 
     def worker_target(self):
         return self.target
+
+
+@dataclass(slots=True)
+class _RingTopology:
+    endpoints_by_worker: dict[str, dict[str, object]]
+    calls: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def pop_child_endpoints(self, *, worker_id: str) -> dict[str, object]:
+        self.calls.append(worker_id)
+        payload = self.endpoints_by_worker.get(worker_id)
+        if not isinstance(payload, dict):
+            return {}
+        return dict(payload)
+
+    def plan(self) -> object:
+        return SimpleNamespace(enabled=self.enabled)
 
 
 def test_default_lifecycle_orchestration_service_records_spawn_request_in_state() -> None:
@@ -263,3 +281,86 @@ def test_lifecycle_orchestration_service_uses_lifecycle_bundle_projection_helper
 
     assert len(lifecycle.spawn_calls) == 1
     assert seen == [({"bundle": "raw"}, "execution.alpha", "async")]
+
+
+def test_lifecycle_orchestration_service_passes_ring_extra_child_endpoints_to_spawn() -> None:
+    state = InMemoryControlPlaneStateService(store=InMemoryKvStore())
+    endpoint_store = InMemoryKvStore()
+    lifecycle = _WorkerLifecycle()
+    ring = _RingTopology(
+        endpoints_by_worker={
+            "execution.alpha#1": {
+                "target::ring:execution.alpha#1->execution.beta#1:data": object(),
+            }
+        }
+    )
+    service = DefaultControlPlaneLifecycleOrchestrationService(
+        worker_lifecycle=lifecycle,
+        endpoint_registry=endpoint_store,
+        state=state,
+        ring_topology=ring,
+    )
+    service.configure_spawn_context(
+        child_bundle={"bundle": "raw"},
+        boundary_control_poll_seconds=0.125,
+        pipe_codec_mode="pickle",
+        worker_target=lambda *_args, **_kwargs: None,
+    )
+    service.on_spawn_requested(
+        ControlPlaneSpawnRequestedEvent(
+            group_name="execution.alpha",
+            workers=1,
+            nodes=("node.a",),
+        )
+    )
+
+    assert ring.calls == ["execution.alpha#1"]
+    assert len(lifecycle.spawn_calls) == 1
+    spawn_call = lifecycle.spawn_calls[0]
+    assert isinstance(spawn_call.get("extra_child_endpoints"), dict)
+    assert "target::ring:execution.alpha#1->execution.beta#1:data" in spawn_call["extra_child_endpoints"]
+    assert spawn_call.get("lane_names") == ("control",)
+    spawned_event = next(
+        item
+        for item in state.events()
+        if isinstance(item, dict) and item.get("kind") == "control_plane.lifecycle.worker_spawned"
+    )
+    assert spawned_event.get("extra_endpoint_count") == 1
+
+
+def test_lifecycle_orchestration_service_uses_control_and_data_lanes_for_observability_group_in_ring() -> None:
+    state = InMemoryControlPlaneStateService(store=InMemoryKvStore())
+    endpoint_store = InMemoryKvStore()
+    lifecycle = _WorkerLifecycle()
+    ring = _RingTopology(endpoints_by_worker={})
+    service = DefaultControlPlaneLifecycleOrchestrationService(
+        worker_lifecycle=lifecycle,
+        endpoint_registry=endpoint_store,
+        state=state,
+        ring_topology=ring,
+    )
+    service.configure_spawn_context(
+        child_bundle={
+            "runtime": {
+                "observability": {
+                    "service_process": {
+                        "enabled": True,
+                        "group_name": "system.observability",
+                    }
+                }
+            }
+        },
+        boundary_control_poll_seconds=0.125,
+        pipe_codec_mode="pickle",
+        worker_target=lambda *_args, **_kwargs: None,
+    )
+    service.on_spawn_requested(
+        ControlPlaneSpawnRequestedEvent(
+            group_name="system.observability",
+            workers=1,
+            nodes=("system.obs.log_dispatch",),
+        )
+    )
+
+    assert len(lifecycle.spawn_calls) == 1
+    assert lifecycle.spawn_calls[0].get("lane_names") == ("control", "data")

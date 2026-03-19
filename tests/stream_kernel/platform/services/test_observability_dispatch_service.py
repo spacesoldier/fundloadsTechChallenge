@@ -55,6 +55,18 @@ class _ReplyCoordinator:
         self.completed.append((trace_id, terminal_event))
 
 
+class _SlowSink:
+    def __init__(self, *, sleep_seconds: float = 0.02) -> None:
+        self.sleep_seconds = sleep_seconds
+        self.payloads: list[object] = []
+
+    def emit(self, payload: object) -> None:
+        import time
+
+        time.sleep(self.sleep_seconds)
+        self.payloads.append(payload)
+
+
 def test_dispatching_observability_service_emits_dispatch_events_in_supervisor_mode() -> None:
     service = DispatchingObservabilityService(
         runtime={
@@ -364,3 +376,40 @@ def test_dispatching_observability_service_emit_trace_event_async_runs_sinks_con
         assert produced == []
 
     asyncio.run(_run())
+
+
+def test_dispatching_observability_service_submit_trace_event_uses_background_dispatch_queue() -> None:
+    import time
+
+    sink = _SlowSink(sleep_seconds=0.03)
+    service = DispatchingObservabilityService(
+        runtime={
+            "__process_role": "observability_worker",
+            "platform": {"bootstrap": {"mode": "process_supervisor"}},
+            "observability": {
+                "service_worker": {"enabled": True},
+                "tracing": {
+                    "exporters": [{"kind": "jsonl", "enabled": True}],
+                    "dispatch_queue": {
+                        "max_items": 1024,
+                        "drop_policy": "non_block",
+                        "forward_batch_max_items": 64,
+                        "forward_flush_interval_ms": 10,
+                        "drain_timeout_seconds": 3.0,
+                    },
+                },
+            },
+        },
+        trace_sinks=[sink],
+    )
+
+    started = time.monotonic()
+    for index in range(4):
+        produced = service.submit_trace_event(event={"span": index}, trace_id=f"t-{index}")
+        assert produced == []
+    enqueue_elapsed = time.monotonic() - started
+    # submit_* path must not wait for slow sink emit().
+    assert enqueue_elapsed < 0.03
+
+    service.on_run_end()
+    assert len(sink.payloads) == 4

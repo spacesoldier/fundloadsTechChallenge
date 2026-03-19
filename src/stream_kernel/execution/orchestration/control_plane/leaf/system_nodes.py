@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import os
 import time
 from dataclasses import dataclass, field
+from threading import Lock
 from types import SimpleNamespace
 
 from stream_kernel.application_context.inject import inject
@@ -34,6 +36,10 @@ from stream_kernel.execution.transport.ipc.ipc_transport import (
     EXECUTION_IPC_LANE_METRIC,
     EXECUTION_IPC_LANE_TRACE,
 )
+from stream_kernel.execution.transport.handoff.ipc_handoff_dispatch_service import (
+    ExecutionIpcHandoffDispatchService,
+)
+from stream_kernel.integration.work_queue import QueuePort
 from stream_kernel.platform.services.runtime.control_plane_discovery_snapshot import (
     ControlPlaneLeafDiscoverySnapshotApplyService,
 )
@@ -62,14 +68,12 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
 from stream_kernel.platform.services.runtime.control_plane_shutdown_readiness import (
     ControlPlaneLeafShutdownReadinessService,
 )
-from stream_kernel.platform.services.runtime.platform_scheduler import (
-    PlatformSchedulerCancelCommand,
-    PlatformSchedulerUpsertCommand,
-)
 from stream_kernel.routing.envelope import Envelope
 
 LEAF_COMMAND_INGRESS_SOURCE_NODE_NAME = "source:system.cp.command_ingress"
 LEAF_COMMAND_INGRESS_SOURCE_NODE_PREFIX = f"{LEAF_COMMAND_INGRESS_SOURCE_NODE_NAME}:"
+LEAF_RUNTIME_INGRESS_SOURCE_NODE_NAME = "source:system.ipc.ingress"
+LEAF_RUNTIME_INGRESS_SOURCE_NODE_PREFIX = f"{LEAF_RUNTIME_INGRESS_SOURCE_NODE_NAME}:"
 
 
 def _emit_leaf_debug(
@@ -96,10 +100,33 @@ def is_leaf_command_ingress_source_node_name(node_name: object) -> bool:
 
 
 def leaf_command_ingress_source_lanes() -> tuple[str, ...]:
-    return (
-        EXECUTION_IPC_LANE_CONTROL,
-        EXECUTION_IPC_LANE_DATA,
+    return (EXECUTION_IPC_LANE_CONTROL,)
+
+
+def leaf_runtime_ingress_source_node_name(*, lane: str) -> str:
+    lane_name = lane if isinstance(lane, str) and lane else EXECUTION_IPC_LANE_DATA
+    return f"{LEAF_RUNTIME_INGRESS_SOURCE_NODE_PREFIX}{lane_name}"
+
+
+def is_leaf_runtime_ingress_source_node_name(node_name: object) -> bool:
+    if not isinstance(node_name, str) or not node_name:
+        return False
+    return node_name == LEAF_RUNTIME_INGRESS_SOURCE_NODE_NAME or node_name.startswith(
+        LEAF_RUNTIME_INGRESS_SOURCE_NODE_PREFIX
     )
+
+
+def leaf_runtime_ingress_source_lanes() -> tuple[str, ...]:
+    return (
+        EXECUTION_IPC_LANE_DATA,
+        EXECUTION_IPC_LANE_TRACE,
+        EXECUTION_IPC_LANE_LOG,
+        EXECUTION_IPC_LANE_METRIC,
+    )
+
+
+def leaf_runtime_ingress_drain_source_node_name() -> str:
+    return leaf_runtime_ingress_source_node_name(lane="drain")
 
 
 @node(
@@ -168,6 +195,7 @@ class ControlPlaneLeafBootstrapNode:
     name=LEAF_COMMAND_INGRESS_SOURCE_NODE_NAME,
     consumes=[BootstrapControl],
     emits=[
+        BootstrapControl,
         ControlPlaneLeafDiscoveryRequestEvent,
         ControlPlaneLeafDiscoverySnapshotEvent,
         ControlPlaneLeafConfigCardEvent,
@@ -182,11 +210,22 @@ class ControlPlaneLeafCommandIngressSourceNode:
     runner_control: LeafRunnerControlService = inject.service(LeafRunnerControlService)
     debug_logging: object | None = inject.service(LeafLifecycleDebugLoggingService)
     lane: str = EXECUTION_IPC_LANE_CONTROL
+    poll_lanes: tuple[str, ...] = ()
+    poll_worker_ids: tuple[str, ...] = ()
+    poll_worker_ids_by_lane: dict[str, tuple[str, ...]] = field(default_factory=dict)
     source_name: str = LEAF_COMMAND_INGRESS_SOURCE_NODE_NAME
     poll_interval_seconds: float = 0.01
+    max_messages_per_poll: int = 64
+    work_queue: object = inject.queue(Envelope, qualifier="execution.asyncio")
     _scheduler_registered: bool = field(default=False, init=False, repr=False)
+    _wakeup_registered: bool = field(default=False, init=False, repr=False)
+    _wakeup_pending: bool = field(default=False, init=False, repr=False)
+    _wakeup_lock: Lock = field(default_factory=Lock, init=False, repr=False)
+    _poll_lane_index: int = field(default=0, init=False, repr=False)
+    _poll_worker_index_by_lane: dict[str, int] = field(default_factory=dict, init=False, repr=False)
 
     def initialize(self) -> list[object]:
+        self._register_data_wakeup()
         if self._scheduler_registered:
             return []
         source_name = (
@@ -194,24 +233,19 @@ class ControlPlaneLeafCommandIngressSourceNode:
             if isinstance(self.source_name, str) and self.source_name
             else LEAF_COMMAND_INGRESS_SOURCE_NODE_NAME
         )
-        interval = max(0.001, float(self.poll_interval_seconds))
         self._scheduler_registered = True
-        return [
-            PlatformSchedulerUpsertCommand(
-                job_id=f"cp.leaf.command_ingress:{source_name}",
-                target=source_name,
-                interval_seconds=interval,
-                run_immediately=True,
-                payload=BootstrapControl(target=source_name),
-            )
-        ]
+        # Push-model bootstrap: one initial pulse is enough, next pulses are produced
+        # by transport data-available callbacks (and explicit self-rearm when drained
+        # exactly to budget boundary).
+        return [BootstrapControl(target=source_name)]
 
-    async def __call__(self, msg: object, _ctx: object | None) -> list[object]:
+    async def __call__(self, msg: object, ctx: object | None) -> list[object]:
         payload = msg.payload if isinstance(msg, Envelope) else msg
         if not isinstance(payload, BootstrapControl):
             return []
         if payload.target != self.source_name:
             return []
+        self._clear_wakeup_pending()
         if self.runner_control.stop_requested():
             _emit_leaf_debug(
                 self.debug_logging,
@@ -220,34 +254,212 @@ class ControlPlaneLeafCommandIngressSourceNode:
                 lane=self.lane,
             )
             return []
-        worker_id = _leaf_worker_id_from_env()
         poll_timeout_seconds = 0.0
         poll_for_lane_async = getattr(self.ingress, "poll_next_message_for_lane_async", None)
         poll_for_lane = getattr(self.ingress, "poll_next_message_for_lane", None)
-        if callable(poll_for_lane_async):
-            next_message = await poll_for_lane_async(
-                worker_id=worker_id,
-                lane=self.lane,
-                timeout_seconds=poll_timeout_seconds,
-            )
-        elif callable(poll_for_lane):
-            next_message = poll_for_lane(
-                worker_id=worker_id,
-                lane=self.lane,
-                timeout_seconds=poll_timeout_seconds,
-            )
-        else:
-            next_message = self.ingress.poll_next_message(worker_id=worker_id)
-        if next_message is None:
+        lane_specs = self._poll_lane_specs()
+        if not lane_specs:
             return []
-        _emit_leaf_debug(
-            self.debug_logging,
-            event="leaf.node.command_source.message_polled",
-            node_name=self.source_name,
-            lane=self.lane,
-            payload_type=type(next_message).__name__,
+        budget = max(1, int(self.max_messages_per_poll))
+        produced: list[object] = []
+        for _ in range(budget):
+            polled = await self._poll_one_message(
+                lane_specs=lane_specs,
+                poll_for_lane_async=poll_for_lane_async,
+                poll_for_lane=poll_for_lane,
+                poll_timeout_seconds=poll_timeout_seconds,
+            )
+            if polled is None:
+                break
+            lane_name, chosen_worker_id, next_message = polled
+            _emit_leaf_debug(
+                self.debug_logging,
+                event="leaf.node.command_source.message_polled",
+                node_name=self.source_name,
+                lane=lane_name,
+                polled_worker_id=chosen_worker_id,
+                payload_type=type(next_message).__name__,
+            )
+            normalized = self._normalize_polled_message(
+                message=next_message,
+                lane=lane_name,
+                polled_worker_id=chosen_worker_id,
+                ctx=ctx,
+            )
+            if normalized is None:
+                continue
+            produced.append(normalized)
+        if len(produced) >= budget:
+            produced.append(BootstrapControl(target=self.source_name))
+        return produced
+
+    def _normalize_polled_message(
+        self,
+        *,
+        message: object,
+        lane: str,
+        polled_worker_id: str,
+        ctx: object | None,
+    ) -> object | None:
+        if is_leaf_runtime_ingress_source_node_name(self.source_name):
+            wrapped = _leaf_runtime_ingress_boundary_command(
+                message=message,
+                lane=lane,
+                polled_worker_id=polled_worker_id,
+                ctx=ctx,
+            )
+            if wrapped is not None:
+                return wrapped
+        return message
+
+    def _poll_lane_specs(self) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        lanes = tuple(
+            lane.strip().lower()
+            for lane in self.poll_lanes
+            if isinstance(lane, str) and lane.strip()
         )
-        return [next_message]
+        if not lanes:
+            lanes = (self.lane if isinstance(self.lane, str) and self.lane else EXECUTION_IPC_LANE_CONTROL,)
+        resolved: list[tuple[str, tuple[str, ...]]] = []
+        for lane in lanes:
+            worker_ids = self._poll_worker_ids_for_lane(lane)
+            if not worker_ids:
+                continue
+            resolved.append((lane, worker_ids))
+        return tuple(resolved)
+
+    def _poll_worker_ids_for_lane(self, lane: str) -> tuple[str, ...]:
+        mapped = self.poll_worker_ids_by_lane.get(lane)
+        if isinstance(mapped, tuple):
+            configured = tuple(
+                worker_id
+                for worker_id in mapped
+                if isinstance(worker_id, str) and worker_id
+            )
+            if configured:
+                return configured
+        return self._poll_worker_ids()
+
+    def _poll_worker_ids(self) -> tuple[str, ...]:
+        configured = tuple(
+            worker_id
+            for worker_id in self.poll_worker_ids
+            if isinstance(worker_id, str) and worker_id
+        )
+        if configured:
+            return configured
+        return (_leaf_worker_id_from_env(),)
+
+    def _round_robin_worker_ids(self, lane: str, worker_ids: tuple[str, ...]) -> tuple[str, ...]:
+        if not worker_ids:
+            return ()
+        size = len(worker_ids)
+        start = self._poll_worker_index_by_lane.get(lane, 0) % size
+        ordered = tuple(worker_ids[(start + offset) % size] for offset in range(size))
+        self._poll_worker_index_by_lane[lane] = (start + 1) % size
+        return ordered
+
+    async def _poll_one_message(
+        self,
+        *,
+        lane_specs: tuple[tuple[str, tuple[str, ...]], ...],
+        poll_for_lane_async: object,
+        poll_for_lane: object,
+        poll_timeout_seconds: float,
+    ) -> tuple[str, str, object] | None:
+        if not lane_specs:
+            return None
+        size = len(lane_specs)
+        start_lane = self._poll_lane_index % size
+        for lane_offset in range(size):
+            index = (start_lane + lane_offset) % size
+            lane_name, worker_ids = lane_specs[index]
+            for worker_id in self._round_robin_worker_ids(lane_name, worker_ids):
+                if callable(poll_for_lane_async):
+                    next_message = await poll_for_lane_async(
+                        worker_id=worker_id,
+                        lane=lane_name,
+                        timeout_seconds=poll_timeout_seconds,
+                    )
+                elif callable(poll_for_lane):
+                    next_message = poll_for_lane(
+                        worker_id=worker_id,
+                        lane=lane_name,
+                        timeout_seconds=poll_timeout_seconds,
+                    )
+                else:
+                    next_message = self.ingress.poll_next_message(worker_id=worker_id)
+                if next_message is None:
+                    continue
+                self._poll_lane_index = (index + 1) % size
+                return (lane_name, worker_id, next_message)
+        self._poll_lane_index = (start_lane + 1) % size
+        return None
+
+    def _register_data_wakeup(self) -> None:
+        if self._wakeup_registered:
+            return
+        loop: object | None = None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        register = getattr(self.ingress, "register_data_available_callback", None)
+        if not callable(register):
+            return
+        lane_specs = self._poll_lane_specs()
+        if not lane_specs:
+            return
+        registered_any = False
+        for lane_name, worker_ids in lane_specs:
+            for worker_id in worker_ids:
+                try:
+                    result = register(
+                        worker_id=worker_id,
+                        lane=lane_name,
+                        callback=self._on_data_available,
+                        loop=loop,
+                    )
+                    if result is False:
+                        continue
+                    registered_any = True
+                except Exception:
+                    continue
+        self._wakeup_registered = registered_any
+
+    def _on_data_available(self) -> None:
+        queue = self._queue_port()
+        if queue is None:
+            return
+        source_name = (
+            self.source_name
+            if isinstance(self.source_name, str) and self.source_name
+            else LEAF_COMMAND_INGRESS_SOURCE_NODE_NAME
+        )
+        with self._wakeup_lock:
+            if self._wakeup_pending:
+                return
+            self._wakeup_pending = True
+        envelope = Envelope(
+            payload=BootstrapControl(target=source_name),
+            target=source_name,
+        )
+        try:
+            queue.push(envelope)
+        except Exception:
+            self._clear_wakeup_pending()
+
+    def _clear_wakeup_pending(self) -> None:
+        with self._wakeup_lock:
+            self._wakeup_pending = False
+
+    def _queue_port(self) -> QueuePort | None:
+        candidate = self.work_queue
+        if isinstance(candidate, QueuePort):
+            return candidate
+        if callable(getattr(candidate, "push", None)):
+            return candidate  # type: ignore[return-value]
+        return None
 
 
 @node(
@@ -265,6 +477,9 @@ class ControlPlaneLeafCommandIngressSourceNode:
 @dataclass
 class ControlPlaneLeafReplyDispatchNode:
     reply_dispatch: LeafControlReplyDispatchService = inject.service(LeafControlReplyDispatchService)
+    handoff_dispatch: ExecutionIpcHandoffDispatchService = inject.service(
+        ExecutionIpcHandoffDispatchService
+    )
 
     def __call__(self, msg: object, _ctx: object | None) -> list[object]:
         payload = msg.payload if isinstance(msg, Envelope) else msg
@@ -290,8 +505,15 @@ class ControlPlaneLeafReplyDispatchNode:
             return []
         produced: list[object] = []
         all_dispatched = True
+        source_group = worker_id.rsplit("#", 1)[0] if "#" in worker_id else None
         for output in payload.outputs:
-            accepted = self.reply_dispatch.dispatch_reply(worker_id=worker_id, payload=output)
+            if isinstance(output, Envelope):
+                accepted = self._dispatch_boundary_envelope(
+                    envelope=output,
+                    source_group=source_group,
+                )
+            else:
+                accepted = self.reply_dispatch.dispatch_reply(worker_id=worker_id, payload=output)
             if not accepted:
                 all_dispatched = False
         if all_dispatched:
@@ -299,6 +521,24 @@ class ControlPlaneLeafReplyDispatchNode:
             if ack is not None:
                 produced.append(ack)
         return produced
+
+    def _dispatch_boundary_envelope(
+        self,
+        *,
+        envelope: Envelope,
+        source_group: str | None,
+    ) -> bool:
+        if not isinstance(envelope.target, str) or not envelope.target:
+            return False
+        dispatch = getattr(self.handoff_dispatch, "dispatch_envelope", None)
+        if not callable(dispatch):
+            return False
+        try:
+            return bool(dispatch(envelope, source_group=source_group))
+        except TypeError:
+            return bool(dispatch(envelope))
+        except Exception:
+            return False
 
 
 @node(
@@ -827,7 +1067,7 @@ class ControlPlaneLeafTombstoneFinalizeNode:
 @node(
     name="system.cp.leaf_stop",
     consumes=[ControlPlaneLeafStopCommand],
-    emits=[ControlPlaneLeafStopAckEvent, PlatformSchedulerCancelCommand],
+    emits=[ControlPlaneLeafStopAckEvent],
 )
 @dataclass
 class ControlPlaneLeafStopNode:
@@ -852,7 +1092,6 @@ class ControlPlaneLeafStopNode:
                 status="accepted",
             )
         ]
-        produced.extend(_leaf_scheduler_cancel_commands())
         _emit_leaf_debug(
             self.debug_logging,
             event="leaf.node.stop.ack_produced",
@@ -888,30 +1127,49 @@ def _leaf_session_from_ctx(
     )
 
 
+def _leaf_runtime_ingress_boundary_command(
+    *,
+    message: object,
+    lane: str,
+    polled_worker_id: str,
+    ctx: object | None,
+) -> ControlPlaneLeafBoundaryExecuteCommand | None:
+    if not isinstance(message, Envelope):
+        return None
+    target = message.target
+    if not isinstance(target, str) or not target:
+        return None
+    runtime = _leaf_runtime_from_ctx(ctx)
+    target_group = _leaf_target_group(runtime)
+    runtime_worker_id = _leaf_worker_id(runtime=runtime, target_group=target_group)
+    worker_id = runtime_worker_id
+    if not isinstance(worker_id, str) or not worker_id:
+        worker_id = polled_worker_id if isinstance(polled_worker_id, str) and polled_worker_id else _leaf_worker_id_from_env()
+    request_id = f"runtime-ingress:{worker_id}:{lane}:{time.time_ns()}"
+    return ControlPlaneLeafBoundaryExecuteCommand(
+        target_group=target_group,
+        worker_id=worker_id,
+        request_id=request_id,
+        inputs=(
+            {
+                "dispatch_group": target_group,
+                "target": target,
+                "payload": message.payload,
+                "trace_id": message.trace_id,
+                "reply_to": message.reply_to,
+                "span_id": message.span_id,
+                "tombstone": bool(message.tombstone),
+            },
+        ),
+        finalize=True,
+    )
+
+
 def _leaf_worker_id_from_env() -> str:
     worker_id = os.environ.get("STREAM_KERNEL_WORKER_ID")
     if isinstance(worker_id, str) and worker_id:
         return worker_id
     return "worker#1"
-
-
-def _leaf_scheduler_cancel_commands() -> list[PlatformSchedulerCancelCommand]:
-    lanes = (
-        EXECUTION_IPC_LANE_CONTROL,
-        EXECUTION_IPC_LANE_DATA,
-        EXECUTION_IPC_LANE_TRACE,
-        EXECUTION_IPC_LANE_LOG,
-        EXECUTION_IPC_LANE_METRIC,
-    )
-    commands: list[PlatformSchedulerCancelCommand] = []
-    for lane in lanes:
-        source_name = leaf_command_ingress_source_node_name(lane=lane)
-        commands.append(
-            PlatformSchedulerCancelCommand(
-                job_id=f"cp.leaf.command_ingress:{source_name}",
-            )
-        )
-    return commands
 
 
 def _leaf_boundary_source_target(inputs: tuple[object, ...]) -> str | None:
@@ -1032,6 +1290,8 @@ def _leaf_make_source_poll_command(
         worker_id=worker_id,
         request_id=request_id,
         inputs=tuple(inputs),
+        # Source-ingress pacing depends on boundary outputs for sink ACK feedback.
+        # Keep finalization enabled so each poll cycle emits boundary outputs event.
         finalize=True,
     )
 
@@ -1184,6 +1444,10 @@ __all__ = [
     "leaf_command_ingress_source_node_name",
     "leaf_command_ingress_source_lanes",
     "is_leaf_command_ingress_source_node_name",
+    "leaf_runtime_ingress_source_node_name",
+    "leaf_runtime_ingress_source_lanes",
+    "leaf_runtime_ingress_drain_source_node_name",
+    "is_leaf_runtime_ingress_source_node_name",
     "ControlPlaneLeafCommandIngressSourceNode",
     "ControlPlaneLeafReplyDispatchNode",
     "ControlPlaneLeafSourcePollFromSinkAckNode",

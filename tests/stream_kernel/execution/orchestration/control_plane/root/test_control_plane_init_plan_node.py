@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 from stream_kernel.execution.orchestration.control_plane import ControlPlaneInitPlanNode
 from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.platform.services.runtime.control_plane_events import (
@@ -16,9 +18,18 @@ from stream_kernel.platform.services.runtime.control_plane_state import (
 )
 
 
+@dataclass(slots=True)
+class _RingTopology:
+    configure_calls: list[dict[str, object]] = field(default_factory=list)
+
+    def configure(self, *, runtime: dict[str, object], groups: list[dict[str, object]]) -> None:
+        self.configure_calls.append({"runtime": dict(runtime), "groups": list(groups)})
+
+
 def test_control_plane_init_plan_emits_init_launch_and_spawn_from_dag_assembled() -> None:
     state = InMemoryControlPlaneStateService(store=InMemoryKvStore())
-    node = ControlPlaneInitPlanNode(state=state)
+    ring = _RingTopology()
+    node = ControlPlaneInitPlanNode(state=state, ring_topology=ring)
     runtime = {"platform": {"process_groups": []}}
     assembled = ControlPlaneDagAssembledEvent(
         runtime=runtime,
@@ -42,6 +53,15 @@ def test_control_plane_init_plan_emits_init_launch_and_spawn_from_dag_assembled(
     stored = state.events()
     assert stored
     assert isinstance(stored[0], ControlPlaneLaunchPlanEvent)
+    assert ring.configure_calls == [
+        {
+            "runtime": runtime,
+            "groups": [
+                {"name": "execution.alpha", "workers": 2, "nodes": ["node.a", "node.b"]},
+                {"name": "execution.beta", "workers": 1, "nodes": ["node.c"]},
+            ],
+        }
+    ]
 
 
 def test_control_plane_init_plan_ignores_non_assembled_event() -> None:

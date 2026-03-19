@@ -29,6 +29,11 @@ def test_shutdown_expected_groups_node_configures_expected_groups_from_launch_pl
                 groups=(
                     ControlPlaneGroupSpec(group_name="execution.ingress", workers=1, nodes=("n1",)),
                     ControlPlaneGroupSpec(group_name="execution.features", workers=2, nodes=("n2",)),
+                    ControlPlaneGroupSpec(
+                        group_name="system.observability",
+                        workers=1,
+                        nodes=("system.obs.trace_dispatch",),
+                    ),
                     ControlPlaneGroupSpec(group_name="execution.ingress", workers=1, nodes=("n3",)),
                 )
             )

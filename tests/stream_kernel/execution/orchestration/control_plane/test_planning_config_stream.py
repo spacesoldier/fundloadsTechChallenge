@@ -8,13 +8,17 @@ from stream_kernel.execution.orchestration.control_plane.planning import (
     build_control_plane_system_plan,
 )
 from stream_kernel.execution.orchestration.control_plane.leaf.system_nodes import (
-    leaf_command_ingress_source_node_name,
+    leaf_runtime_ingress_drain_source_node_name,
+)
+from stream_kernel.execution.orchestration.control_plane.root.leaf_ingress_nodes import (
+    ROOT_LEAF_INGRESS_SOURCE_NODE_NAME,
+    ControlPlaneRootLeafIngressSourceNode,
 )
 from stream_kernel.execution.orchestration.control_plane.root.leaf_ingress_service import (
     ControlPlaneRootLeafIngressService,
 )
-from stream_kernel.execution.orchestration.control_plane.root.boundary_handoff_service import (
-    ControlPlaneRootBoundaryHandoffService,
+from stream_kernel.execution.transport.handoff.ipc_handoff_dispatch_service import (
+    ExecutionIpcHandoffDispatchService,
 )
 from stream_kernel.execution.orchestration.lifecycle.leaf.runtime.boundary_execution_service import (
     LeafBoundaryExecutionService,
@@ -181,20 +185,10 @@ class _DynamicConsumerRouting:
         _ = node_names
 
 
-class _RootBoundaryHandoff(ControlPlaneRootBoundaryHandoffService):
-    def drain_external_deliveries(self, *, envelopes, source_group=None, pump_replies=True):
-        _ = (envelopes, source_group, pump_replies)
-        return []
-
-    def drain_completed_deliveries(self, *, poll_timeout_seconds=0.0):
-        _ = poll_timeout_seconds
-        return []
-
-    def has_inflight_deliveries(self) -> bool:
-        return False
-
-    def has_replay_blocking_inflight_deliveries(self) -> bool:
-        return False
+class _HandoffDispatch:
+    def dispatch_envelope(self, envelope, *, source_group=None):
+        _ = (envelope, source_group)
+        return True
 
 
 def test_control_plane_system_plan_includes_root_config_stream_node() -> None:
@@ -216,7 +210,7 @@ def test_control_plane_system_plan_includes_root_config_stream_node() -> None:
         lambda: _DynamicConsumerRouting(),
     )
     registry.register_factory("service", ControlPlaneRootLeafIngressService, lambda: _LeafIngress())
-    registry.register_factory("service", ControlPlaneRootBoundaryHandoffService, lambda: _RootBoundaryHandoff())
+    registry.register_factory("service", ExecutionIpcHandoffDispatchService, lambda: _HandoffDispatch())
     scope = registry.instantiate_for_scenario("s1")
     runtime = {
         "platform": {
@@ -306,10 +300,10 @@ def test_control_plane_system_plan_includes_root_config_stream_node() -> None:
     assert "system.cp.dag_assembly" in plan.system_consumers.get(
         ControlPlaneDagAssemblyRequestedEvent, []
     )
-    assert "source:system.cp.root_leaf_ingress:execution.alpha#1:control" in step_names
+    assert ROOT_LEAF_INGRESS_SOURCE_NODE_NAME in step_names
 
 
-def test_control_plane_system_plan_root_builds_reply_sources_per_worker_lane() -> None:
+def test_control_plane_system_plan_root_builds_single_reply_drain_source_with_specs() -> None:
     registry = InjectionRegistry()
     registry.register_factory("service", ControlPlaneConfigStreamService, lambda: _ConfigStream())
     registry.register_factory("service", ControlPlaneDiscoveryStreamService, lambda: _DiscoveryStream())
@@ -328,7 +322,7 @@ def test_control_plane_system_plan_root_builds_reply_sources_per_worker_lane() -
         lambda: _DynamicConsumerRouting(),
     )
     registry.register_factory("service", ControlPlaneRootLeafIngressService, lambda: _LeafIngress())
-    registry.register_factory("service", ControlPlaneRootBoundaryHandoffService, lambda: _RootBoundaryHandoff())
+    registry.register_factory("service", ExecutionIpcHandoffDispatchService, lambda: _HandoffDispatch())
     scope = registry.instantiate_for_scenario("s-root-workers")
     runtime = {
         "platform": {
@@ -340,10 +334,19 @@ def test_control_plane_system_plan_root_builds_reply_sources_per_worker_lane() -
     plan = build_control_plane_system_plan(runtime=runtime, scenario_scope=scope)
     step_names = {step.name for step in plan.system_steps}
 
-    assert "source:system.cp.root_leaf_ingress:execution.alpha#1:control" in step_names
-    assert "source:system.cp.root_leaf_ingress:execution.alpha#1:data" in step_names
-    assert "source:system.cp.root_leaf_ingress:execution.alpha#2:control" in step_names
-    assert "source:system.cp.root_leaf_ingress:execution.alpha#2:data" in step_names
+    assert ROOT_LEAF_INGRESS_SOURCE_NODE_NAME in step_names
+    source_steps = [
+        step
+        for step in plan.system_steps
+        if step.name == ROOT_LEAF_INGRESS_SOURCE_NODE_NAME
+    ]
+    assert len(source_steps) == 1
+    source_node = source_steps[0].step
+    assert isinstance(source_node, ControlPlaneRootLeafIngressSourceNode)
+    assert ("execution.alpha#1", EXECUTION_IPC_LANE_CONTROL) in source_node.ingress_specs
+    assert ("execution.alpha#1", EXECUTION_IPC_LANE_DATA) in source_node.ingress_specs
+    assert ("execution.alpha#2", EXECUTION_IPC_LANE_CONTROL) in source_node.ingress_specs
+    assert ("execution.alpha#2", EXECUTION_IPC_LANE_DATA) in source_node.ingress_specs
 
 
 def test_control_plane_system_plan_leaf_mode_includes_discovery_stage() -> None:
@@ -422,10 +425,7 @@ def test_control_plane_system_plan_leaf_mode_includes_discovery_stage() -> None:
     )
     assert "system.scheduler.command" in plan.system_consumers.get(PlatformSchedulerUpsertCommand, [])
     assert "system.scheduler.tick" in plan.system_consumers.get(PlatformSchedulerTickEvent, [])
-    ingress_sources = {
-        leaf_command_ingress_source_node_name(lane=EXECUTION_IPC_LANE_CONTROL),
-        leaf_command_ingress_source_node_name(lane=EXECUTION_IPC_LANE_DATA),
-    }
+    ingress_sources = {leaf_runtime_ingress_drain_source_node_name()}
     assert ingress_sources.issubset(step_names)
     assert ingress_sources.issubset(set(plan.system_consumers.get(BootstrapControl, [])))
 
@@ -469,12 +469,6 @@ def test_control_plane_system_plan_observability_leaf_includes_observability_lan
     step_names = {step.name for step in plan.system_steps}
     assert "system.scheduler.command" in step_names
     assert "system.scheduler.tick" in step_names
-    ingress_sources = {
-        leaf_command_ingress_source_node_name(lane=EXECUTION_IPC_LANE_CONTROL),
-        leaf_command_ingress_source_node_name(lane=EXECUTION_IPC_LANE_DATA),
-        leaf_command_ingress_source_node_name(lane=EXECUTION_IPC_LANE_TRACE),
-        leaf_command_ingress_source_node_name(lane=EXECUTION_IPC_LANE_LOG),
-        leaf_command_ingress_source_node_name(lane=EXECUTION_IPC_LANE_METRIC),
-    }
+    ingress_sources = {leaf_runtime_ingress_drain_source_node_name()}
     assert ingress_sources.issubset(step_names)
     assert ingress_sources.issubset(set(plan.system_consumers.get(BootstrapControl, [])))

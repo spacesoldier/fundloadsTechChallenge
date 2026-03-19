@@ -80,6 +80,7 @@ def ensure_runtime_ipc_bindings(
     if not isinstance(endpoint_registry_store, KVStore):
         endpoint_registry_store = InMemoryKvStore()
     _apply_execution_ipc_polling_settings(runtime=runtime, adapter=service.adapter)
+    _apply_execution_ipc_payload_settings(runtime=runtime, adapter=service.adapter)
     try:
         injection_registry.register_factory(
             "service",
@@ -423,6 +424,29 @@ def _apply_execution_ipc_polling_settings(
     configure(poll_mode=poll_mode, poll_interval_ms=poll_interval_ms)
 
 
+def _apply_execution_ipc_payload_settings(
+    *,
+    runtime: dict[str, object],
+    adapter: ExecutionIpcKvStreamPort,
+) -> None:
+    configure = getattr(adapter, "configure_payload_limits", None)
+    if not callable(configure):
+        return
+    platform = runtime.get("platform", {})
+    if not isinstance(platform, dict):
+        return
+    execution_ipc = platform.get("execution_ipc", {})
+    if not isinstance(execution_ipc, dict):
+        return
+    max_payload_bytes = execution_ipc.get("max_payload_bytes")
+    raw_respect = execution_ipc.get("respect_pipe_capacity", True)
+    respect_pipe_capacity = raw_respect if isinstance(raw_respect, bool) else None
+    configure(
+        max_payload_bytes=max_payload_bytes,
+        respect_pipe_capacity=respect_pipe_capacity,
+    )
+
+
 def _resolve_execution_ipc_group_policy(
     *,
     group_name: str,
@@ -470,6 +494,8 @@ def _preload_execution_ipc_route_table(
 
 def _route_table_snapshot_from_runtime(runtime: dict[str, object]) -> dict[str, str]:
     groups = _runtime_process_groups_with_observability(runtime)
+    if _resolve_data_plane_topology(runtime) == "ring":
+        return _route_table_snapshot_for_ring_runtime(runtime=runtime, groups=groups)
     snapshot: dict[str, str] = {}
     for group in groups:
         if not isinstance(group, dict):
@@ -487,6 +513,55 @@ def _route_table_snapshot_from_runtime(runtime: dict[str, object]) -> dict[str, 
             continue
         for node_name in nodes:
             if not isinstance(node_name, str) or not node_name:
+                continue
+            snapshot.setdefault(node_name, target_id)
+    return snapshot
+
+
+def _route_table_snapshot_for_ring_runtime(
+    *,
+    runtime: dict[str, object],
+    groups: list[dict[str, object]],
+) -> dict[str, str]:
+    snapshot: dict[str, str] = {}
+    current_worker_id = runtime.get("__worker_id")
+    current_worker = current_worker_id if isinstance(current_worker_id, str) and current_worker_id else None
+    current_group = _group_name_from_worker_id(current_worker)
+    ring_workers = _ring_data_worker_ids(groups)
+    outbound_data_target = _ring_outbound_data_target(
+        current_worker=current_worker,
+        ring_workers=ring_workers,
+    )
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        group_name = group.get("name")
+        if not isinstance(group_name, str) or not group_name:
+            continue
+        nodes = group.get("nodes")
+        if not isinstance(nodes, list):
+            continue
+        if _is_observability_group(group):
+            target_id = _ring_observability_target_id(
+                current_worker=current_worker,
+                ring_workers=ring_workers,
+                group_name=group_name,
+            )
+        else:
+            target_id = f"{group_name}#1"
+            if (
+                isinstance(current_worker, str)
+                and current_worker in ring_workers
+                and group_name != current_group
+                and isinstance(outbound_data_target, str)
+                and outbound_data_target
+            ):
+                target_id = outbound_data_target
+        for node_name in nodes:
+            if not isinstance(node_name, str) or not node_name:
+                continue
+            if node_name.startswith("system.cp."):
+                snapshot.setdefault(node_name, f"{group_name}#1")
                 continue
             snapshot.setdefault(node_name, target_id)
     return snapshot
@@ -519,6 +594,86 @@ def _runtime_process_groups_with_observability(runtime: dict[str, object]) -> li
         return groups
     groups.append(observability_group)
     return groups
+
+
+def _resolve_data_plane_topology(runtime: dict[str, object]) -> str:
+    platform = runtime.get("platform", {})
+    if not isinstance(platform, dict):
+        return "star"
+    execution_ipc = platform.get("execution_ipc", {})
+    if not isinstance(execution_ipc, dict):
+        return "star"
+    raw = execution_ipc.get("data_plane_topology", "star")
+    if not isinstance(raw, str) or not raw:
+        return "star"
+    normalized = raw.strip().lower()
+    if normalized not in {"star", "ring"}:
+        return "star"
+    return normalized
+
+
+def _is_observability_group(group: dict[str, object]) -> bool:
+    group_name = group.get("name")
+    if isinstance(group_name, str) and group_name == "system.observability":
+        return True
+    nodes = group.get("nodes")
+    if not isinstance(nodes, list):
+        return False
+    return any(
+        isinstance(node_name, str) and node_name.startswith("system.obs.")
+        for node_name in nodes
+    )
+
+
+def _ring_data_worker_ids(groups: list[dict[str, object]]) -> tuple[str, ...]:
+    worker_ids: list[str] = []
+    for group in groups:
+        if not isinstance(group, dict) or _is_observability_group(group):
+            continue
+        group_name = group.get("name")
+        if not isinstance(group_name, str) or not group_name:
+            continue
+        workers = group.get("workers")
+        worker_count = int(workers) if isinstance(workers, int) and workers > 0 else 1
+        for index in range(worker_count):
+            worker_ids.append(f"{group_name}#{index + 1}")
+    return tuple(worker_ids)
+
+
+def _group_name_from_worker_id(worker_id: str | None) -> str | None:
+    if not isinstance(worker_id, str) or "#" not in worker_id:
+        return None
+    group_name, _sep, _slot = worker_id.partition("#")
+    if not group_name:
+        return None
+    return group_name
+
+
+def _ring_outbound_data_target(
+    *,
+    current_worker: str | None,
+    ring_workers: tuple[str, ...],
+) -> str | None:
+    if not isinstance(current_worker, str) or not current_worker:
+        return None
+    if current_worker not in ring_workers:
+        return None
+    if len(ring_workers) < 2:
+        return None
+    index = ring_workers.index(current_worker)
+    next_worker = ring_workers[(index + 1) % len(ring_workers)]
+    return f"ring:{current_worker}->{next_worker}:data"
+
+
+def _ring_observability_target_id(
+    *,
+    current_worker: str | None,
+    ring_workers: tuple[str, ...],
+    group_name: str,
+) -> str:
+    if isinstance(current_worker, str) and current_worker in ring_workers:
+        return current_worker
+    return f"{group_name}#1"
 
 
 def _observability_service_group(runtime: dict[str, object]) -> dict[str, object] | None:

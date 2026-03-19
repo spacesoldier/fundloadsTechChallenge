@@ -52,7 +52,6 @@ def build_control_plane_system_plan(
         resolve_required_service=_resolve_required_service,
         resolve_optional_service=_resolve_optional_service,
         inject_control_plane_steps=_inject_control_plane_steps,
-        root_boundary_handoff_contract=_root_boundary_handoff_contract,
         root_leaf_ingress_contract=_root_leaf_ingress_contract,
         root_lifecycle_orchestration_contract=_root_lifecycle_orchestration_contract,
         root_lifecycle_log_factory_contract=_root_lifecycle_log_factory_contract,
@@ -136,14 +135,6 @@ def _leaf_snapshot_apply_contract() -> type[object]:
     )
 
     return ControlPlaneLeafDiscoverySnapshotApplyService
-
-
-def _root_boundary_handoff_contract() -> type[object]:
-    from stream_kernel.execution.orchestration.control_plane.root.boundary_handoff_service import (
-        ControlPlaneRootBoundaryHandoffService,
-    )
-
-    return ControlPlaneRootBoundaryHandoffService
 
 
 def _root_leaf_ingress_contract() -> type[object]:

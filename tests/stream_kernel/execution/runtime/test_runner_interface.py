@@ -241,6 +241,80 @@ def test_runner_ingress_keeps_source_bootstrap_trace_empty_and_runner_generates_
     assert ("sink", "run:events:1") in obs.before
 
 
+def test_sync_runner_source_bootstrap_trace_does_not_collapse_generated_business_outputs() -> None:
+    class _Obs(NoOpObservabilityService):
+        def __init__(self) -> None:
+            self.sink_trace_ids: list[str] = []
+
+        def before_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+        ) -> None:
+            _ = (payload, ctx)
+            if node_name == "sink" and isinstance(trace_id, str) and trace_id:
+                self.sink_trace_ids.append(trace_id)
+
+        def after_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            outputs: list[object],
+            state: object | None,
+        ) -> None:
+            _ = (node_name, payload, ctx, trace_id, outputs, state)
+
+        def on_node_error(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            error: Exception,
+            state: object | None,
+        ) -> None:
+            _ = (node_name, payload, ctx, trace_id, error, state)
+
+        def on_run_end(self) -> None:
+            return None
+
+    queue = InMemoryQueue()
+    routing = RoutingService(registry=InMemoryConsumerRegistry({int: ["sink"]}), strict=True)
+    obs = _Obs()
+    runner = SyncRunner(
+        nodes={
+            "source:events": (lambda _payload, _ctx: [1, 2]),
+            "sink": (lambda _payload, _ctx: []),
+        },
+        run_id="run",
+        scenario_id="scenario",
+        work_queue=queue,
+        context_service=InMemoryKvContextService(InMemoryKvStore()),
+        router=routing,
+        observability=obs,
+    )
+    queue.push(
+        Envelope(
+            payload=BootstrapControl(target="source:events"),
+            target="source:events",
+            trace_id="bootstrap-trace",
+        )
+    )
+
+    runner.run()
+
+    assert len(obs.sink_trace_ids) == 2
+    assert len(set(obs.sink_trace_ids)) == 2
+    assert all(trace_id != "bootstrap-trace" for trace_id in obs.sink_trace_ids)
+
+
 def test_inmemory_kv_context_service_implements_context_service_contract() -> None:
     # SyncRunner depends on service contract, not storage adapter lifecycle.
     assert isinstance(InMemoryKvContextService(InMemoryKvStore()), ContextService)

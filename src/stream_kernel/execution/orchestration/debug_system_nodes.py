@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -24,11 +25,18 @@ class RuntimeDebugMessageDispatchNode:
     def __post_init__(self) -> None:
         self._marker = inject.service(RuntimeDebugMessageDispatchService, qualifier=self.qualifier)
 
-    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
+    async def __call__(self, msg: object, _ctx: object | None) -> list[object]:
         payload = msg.payload if isinstance(msg, Envelope) else msg
         if not isinstance(payload, DebugMessage):
             return []
-        return _coerce_outputs(self.service.dispatch(message=payload))
+        results = self.service.dispatch(message=payload)
+        for item in results:
+            if inspect.isawaitable(item):
+                try:
+                    await item
+                except Exception:
+                    pass
+        return []
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 # QueuePort behavior is specified in docs/framework/initial_stage/Execution runtime and routing integration.md.
+import asyncio
 import threading
 import time
 
-from stream_kernel.integration.work_queue import InMemoryQueue
+from stream_kernel.integration.work_queue import InMemoryQueue, TcpLocalQueue
 
 
 def test_work_queue_fifo_order() -> None:
@@ -95,3 +96,30 @@ def test_work_queue_close_wakes_waiters_and_reports_closed() -> None:
 
     assert queue.is_closed() is True
     assert result == [False]
+
+
+def test_work_queue_wait_for_item_async_unblocks_on_push() -> None:
+    queue = InMemoryQueue()
+
+    async def _scenario() -> bool:
+        waiter = asyncio.create_task(queue.wait_for_item_async(0.5))
+        await asyncio.sleep(0.02)
+        queue.push("A")
+        return await waiter
+
+    ready = asyncio.run(_scenario())
+    assert ready is True
+    assert queue.pop() == "A"
+
+
+def test_work_queue_wait_for_item_async_unblocks_on_close() -> None:
+    queue = TcpLocalQueue()
+
+    async def _scenario() -> bool:
+        waiter = asyncio.create_task(queue.wait_for_item_async(0.5))
+        await asyncio.sleep(0.02)
+        queue.close()
+        return await waiter
+
+    ready = asyncio.run(_scenario())
+    assert ready is False

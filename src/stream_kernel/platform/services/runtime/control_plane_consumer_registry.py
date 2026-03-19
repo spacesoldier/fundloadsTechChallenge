@@ -85,7 +85,10 @@ class InMemoryControlPlaneDynamicConsumerRoutingService(ControlPlaneDynamicConsu
                 continue
             consumes = _resolve_node_consumes(record)
             if not consumes:
-                self.remove_node_bindings((node_name,))
+                # Discovery metadata may be partial during startup (for example,
+                # when symbol resolution is unavailable for some system nodes).
+                # Do not drop already-registered bindings on empty consumes.
+                # Keep current routing until an explicit remove event is emitted.
                 continue
             new_token_keys = {_token_key(token) for token in consumes}
             previous = set(by_node.get(node_name, []))

@@ -194,13 +194,29 @@ class ExecutionIpcTransportService:
     ) -> ExecutionIpcPort:
         raise NotImplementedError("ExecutionIpcTransportService.build_port must be implemented")
 
-    def allocate_local_endpoints(self, target_id: str) -> tuple[object, object]:
+    def allocate_local_endpoints(
+        self,
+        target_id: str,
+        *,
+        register_parent_endpoint: bool = True,
+    ) -> tuple[object, object]:
         # Allocate parent/child local endpoints for target_id.
         raise NotImplementedError("ExecutionIpcTransportService.allocate_local_endpoints must be implemented")
 
     def bind_local_endpoint(self, target_id: str, endpoint: object) -> None:
         # Attach a process-local endpoint (for example, child-side pipe endpoint) to target_id.
         raise NotImplementedError("ExecutionIpcTransportService.bind_local_endpoint must be implemented")
+
+    def register_data_available_callback(
+        self,
+        target_id: str,
+        callback: object,
+        *,
+        loop: object | None = None,
+    ) -> bool:
+        # Optional hook: register callback invoked when receive-side data was drained for target_id.
+        _ = loop
+        return False
 
 
 class ExecutionIpcEndpointRegistry(KVStore):
@@ -239,3 +255,11 @@ class ExecutionIpcKvStreamPort(Protocol):
         target_id: str | None = None,
         receive_policy: ExecutionIpcReceivePolicy | None = None,
     ) -> ExecutionIpcPort: ...
+
+    def register_data_available_callback(
+        self,
+        target_id: str,
+        callback: object,
+        *,
+        loop: object | None = None,
+    ) -> bool: ...

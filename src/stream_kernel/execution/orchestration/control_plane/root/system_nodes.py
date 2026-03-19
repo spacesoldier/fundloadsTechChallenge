@@ -13,9 +13,6 @@ from stream_kernel.execution.orchestration.control_plane.root.runtime_bootstrap_
 from stream_kernel.execution.transport.ipc.ipc_transport import (
     EXECUTION_IPC_LANE_CONTROL,
     EXECUTION_IPC_LANE_DATA,
-    EXECUTION_IPC_LANE_LOG,
-    EXECUTION_IPC_LANE_METRIC,
-    EXECUTION_IPC_LANE_TRACE,
     ExecutionIpcKvStreamPort,
     compose_execution_ipc_worker_target_id,
 )
@@ -87,6 +84,9 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
 from stream_kernel.platform.services.runtime.control_plane_shutdown_readiness import (
     ControlPlaneShutdownReadinessService,
 )
+from stream_kernel.platform.services.runtime.control_plane_ring_topology import (
+    ControlPlaneRingTopologyService,
+)
 from stream_kernel.platform.services.runtime.platform_scheduler import (
     PlatformSchedulerCancelCommand,
 )
@@ -133,6 +133,7 @@ class ControlPlaneDagAssemblyNode:
 @dataclass
 class ControlPlaneInitPlanNode:
     state: ControlPlaneStateService = inject.service(ControlPlaneStateService)
+    ring_topology: object | None = inject.service(ControlPlaneRingTopologyService)
 
     def __call__(self, msg: object, _ctx: object | None) -> list[object]:
         payload = msg.payload if isinstance(msg, Envelope) else msg
@@ -145,6 +146,7 @@ class ControlPlaneInitPlanNode:
             if _launch_plan_signature(event.plan) == plan_signature:
                 # Idempotency guard: repeated startup pulses must not re-emit spawn requests.
                 return []
+        self._configure_ring_topology(payload)
         plan_event = ControlPlaneLaunchPlanEvent(plan=payload.plan)
         self.state.append_event(plan_event)
         spawn_events = [
@@ -160,6 +162,24 @@ class ControlPlaneInitPlanNode:
             ControlPlaneInitializationRequestedEvent(runtime=payload.runtime),
             *spawn_events,
         ]
+
+    def _configure_ring_topology(self, payload: ControlPlaneDagAssembledEvent) -> None:
+        candidate = self.ring_topology
+        configure = getattr(candidate, "configure", None)
+        if not callable(configure):
+            return
+        groups = [
+            {
+                "name": group.group_name,
+                "workers": int(group.workers),
+                "nodes": list(group.nodes),
+            }
+            for group in payload.plan.groups
+        ]
+        try:
+            configure(runtime=dict(payload.runtime), groups=groups)
+        except Exception:
+            return
 
 
 @node(
@@ -425,6 +445,12 @@ class ControlPlaneLogDispatchNode:
         payload = msg.payload if isinstance(msg, Envelope) else msg
         if not isinstance(payload, LogMessage):
             return []
+        publish = getattr(self.console_dispatch, "publish", None)
+        if callable(publish):
+            try:
+                publish(payload)
+            except Exception:
+                pass
         return [
             LogDispatchEvent(
                 payload=payload,
@@ -479,6 +505,7 @@ class ControlPlaneShutdownExpectedGroupsNode:
                     for group in payload.plan.groups
                     if isinstance(group.group_name, str)
                     and group.group_name
+                    and not _is_readiness_exempt_group_name(group.group_name)
                     and isinstance(group.workers, int)
                     and group.workers > 0
                 }
@@ -942,7 +969,6 @@ class ControlPlaneRootLeafDrainReadyNode:
         event = ControlPlaneShutdownReadyEvent(
             expected_groups=snapshot.expected_groups,
             ready_groups=snapshot.ready_groups,
-            tombstone_groups=(),
         )
         self.state.append_event(event)
         self.state.append_event(
@@ -950,7 +976,6 @@ class ControlPlaneRootLeafDrainReadyNode:
                 "kind": "control_plane.shutdown.all_ready",
                 "expected_groups": list(snapshot.expected_groups),
                 "ready_groups": list(snapshot.ready_groups),
-                "tombstone_groups": [],
             }
         )
         return [event]
@@ -1006,9 +1031,6 @@ def _root_leaf_ingress_scheduler_cancel_commands(
     lanes = (
         EXECUTION_IPC_LANE_CONTROL,
         EXECUTION_IPC_LANE_DATA,
-        EXECUTION_IPC_LANE_TRACE,
-        EXECUTION_IPC_LANE_LOG,
-        EXECUTION_IPC_LANE_METRIC,
     )
     commands: list[PlatformSchedulerCancelCommand] = []
     for _group_name, worker_id in _spawned_workers_for_shutdown(
@@ -1216,6 +1238,22 @@ def _latest_launch_plan_from_state(events: list[object]) -> ControlPlaneLaunchPl
 
 
 def _expected_worker_ids_for_start_work(events: list[object]) -> list[str]:
+    plan = _latest_launch_plan_from_state(events)
+    if isinstance(plan, ControlPlaneLaunchPlan):
+        worker_ids: list[str] = []
+        seen: set[str] = set()
+        for group in plan.groups:
+            if _is_readiness_exempt_group_name(group.group_name):
+                continue
+            for index in range(max(1, int(group.workers))):
+                worker_id = f"{group.group_name}#{index + 1}"
+                if worker_id in seen:
+                    continue
+                seen.add(worker_id)
+                worker_ids.append(worker_id)
+        return worker_ids
+
+    # Fallback path when launch plan is unavailable in state.
     worker_ids: list[str] = []
     seen: set[str] = set()
     for event in events:
@@ -1226,20 +1264,6 @@ def _expected_worker_ids_for_start_work(events: list[object]) -> list[str]:
             and not _is_readiness_exempt_worker_id(worker_id)
             and worker_id not in seen
         ):
-            seen.add(worker_id)
-            worker_ids.append(worker_id)
-    if worker_ids:
-        return worker_ids
-    plan = _latest_launch_plan_from_state(events)
-    if not isinstance(plan, ControlPlaneLaunchPlan):
-        return worker_ids
-    for group in plan.groups:
-        if _is_readiness_exempt_group_name(group.group_name):
-            continue
-        for index in range(max(1, int(group.workers))):
-            worker_id = f"{group.group_name}#{index + 1}"
-            if worker_id in seen:
-                continue
             seen.add(worker_id)
             worker_ids.append(worker_id)
     return worker_ids

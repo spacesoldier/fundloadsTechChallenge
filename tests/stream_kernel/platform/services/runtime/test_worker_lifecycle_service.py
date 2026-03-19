@@ -4,7 +4,11 @@ import multiprocessing as mp
 from threading import Event
 
 from stream_kernel.integration.kv_store import InMemoryKvStore
-from stream_kernel.execution.transport.ipc.ipc_transport import EXECUTION_IPC_LANE_CONTROL
+from stream_kernel.execution.transport.ipc.ipc_transport import (
+    EXECUTION_IPC_LANE_CONTROL,
+    EXECUTION_IPC_LANE_DATA,
+    compose_execution_ipc_worker_target_id,
+)
 from stream_kernel.platform.services.runtime.lifecycle import (
     ExecutionWorkerHandle,
     LocalExecutionWorkerLifecycleService,
@@ -20,7 +24,13 @@ class _IpcTransport:
         self._context = context
         self._endpoint_registry = endpoint_registry
 
-    def allocate_local_endpoints(self, target_id: str) -> tuple[object, object]:
+    def allocate_local_endpoints(
+        self,
+        target_id: str,
+        *,
+        register_parent_endpoint: bool = True,
+    ) -> tuple[object, object]:
+        _ = register_parent_endpoint
         parent, child = self._context.Pipe(duplex=True)
         self._endpoint_registry.set(target_id, parent)
         return parent, child
@@ -200,3 +210,55 @@ def test_worker_lifecycle_insert_arg_preserves_position_for_none_placeholder() -
 
     assert shifted[0] is None
     assert shifted[1:] == ["bundle", "worker_id"]
+
+
+def test_worker_lifecycle_spawn_merges_extra_child_endpoints() -> None:
+    endpoint_registry = InMemoryKvStore()
+    worker_registry = InMemoryKvStore()
+    context = mp.get_context("spawn")
+    service = LocalExecutionWorkerLifecycleService(
+        worker_registry=worker_registry,
+        execution_ipc=_IpcTransport(context=context, endpoint_registry=endpoint_registry),
+        context=context,
+    )
+    custom_endpoint = object()
+
+    handle = service.spawn_worker(
+        target_id="group:ring",
+        target=_noop_worker,
+        start=False,
+        extra_child_endpoints={"target::ring:group:ring->group:beta:data": custom_endpoint},
+    )
+
+    assert isinstance(handle.process._args, tuple)
+    child_endpoint = handle.process._args[-1]
+    assert isinstance(child_endpoint, dict)
+    assert child_endpoint["target::ring:group:ring->group:beta:data"] is custom_endpoint
+
+
+def test_worker_lifecycle_spawn_allows_lane_subset_for_endpoint_allocation() -> None:
+    endpoint_registry = InMemoryKvStore()
+    worker_registry = InMemoryKvStore()
+    context = mp.get_context("spawn")
+    service = LocalExecutionWorkerLifecycleService(
+        worker_registry=worker_registry,
+        execution_ipc=_IpcTransport(context=context, endpoint_registry=endpoint_registry),
+        context=context,
+    )
+
+    handle = service.spawn_worker(
+        target_id="group:subset",
+        target=_noop_worker,
+        start=False,
+        lane_names=(EXECUTION_IPC_LANE_CONTROL, EXECUTION_IPC_LANE_DATA),
+    )
+
+    assert isinstance(handle.process._args, tuple)
+    child_endpoint = handle.process._args[-1]
+    assert isinstance(child_endpoint, dict)
+    assert set(child_endpoint.keys()) == {EXECUTION_IPC_LANE_CONTROL, EXECUTION_IPC_LANE_DATA}
+    assert endpoint_registry.get("group:subset") is not None
+    assert endpoint_registry.get(compose_execution_ipc_worker_target_id("group:subset", lane=EXECUTION_IPC_LANE_DATA)) is not None
+    assert endpoint_registry.get(compose_execution_ipc_worker_target_id("group:subset", lane="trace")) is None
+    assert endpoint_registry.get(compose_execution_ipc_worker_target_id("group:subset", lane="log")) is None
+    assert endpoint_registry.get(compose_execution_ipc_worker_target_id("group:subset", lane="metric")) is None

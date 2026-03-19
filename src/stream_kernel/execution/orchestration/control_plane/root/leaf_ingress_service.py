@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import time
 from typing import Protocol, runtime_checkable
@@ -65,6 +66,16 @@ class ControlPlaneRootLeafIngressService(Protocol):
         lane: str,
         timeout_seconds: float = 0.0,
     ) -> object | None:
+        raise NotImplementedError
+
+    def register_data_available_callback(
+        self,
+        *,
+        worker_id: str,
+        lane: str,
+        callback: object,
+        loop: object | None = None,
+    ) -> bool:
         raise NotImplementedError
 
     def dispatch_polled_leaf_ingress(
@@ -165,11 +176,46 @@ class DefaultControlPlaneRootLeafIngressService(ControlPlaneRootLeafIngressServi
         lane: str,
         timeout_seconds: float = 0.0,
     ) -> object | None:
+        # Cooperative yield keeps ingress drain budget from monopolizing event loop.
+        await asyncio.sleep(0)
         return self.poll_next_leaf_ingress_for_worker_lane(
             worker_id=worker_id,
             lane=lane,
             timeout_seconds=timeout_seconds,
         )
+
+    def register_data_available_callback(
+        self,
+        *,
+        worker_id: str,
+        lane: str,
+        callback: object,
+        loop: object | None = None,
+    ) -> bool:
+        if not isinstance(worker_id, str) or not worker_id:
+            return False
+        if not callable(callback):
+            return False
+        lane_name = lane.strip().lower() if isinstance(lane, str) and lane else EXECUTION_IPC_LANE_CONTROL
+        target_id = compose_execution_ipc_worker_target_id(worker_id, lane=lane_name)
+        adapter = _lane_adapter_ingress(
+            control_lane_ipc=self.control_lane_ipc,
+            data_lane_ipc=self.data_lane_ipc,
+            trace_lane_ipc=self.trace_lane_ipc,
+            log_lane_ipc=self.log_lane_ipc,
+            metric_lane_ipc=self.metric_lane_ipc,
+            lane=lane_name,
+        )
+        register = getattr(adapter, "register_data_available_callback", None)
+        if not callable(register):
+            return False
+        try:
+            result = register(target_id, callback, loop=loop)
+            if isinstance(result, bool):
+                return result
+            return True
+        except Exception:
+            return False
 
     def dispatch_polled_leaf_ingress(
         self,
@@ -549,26 +595,44 @@ def _recv_from_worker_lane(
     timeout_seconds: float,
 ) -> object | None:
     normalized_lane = lane.strip().lower() if isinstance(lane, str) and lane else EXECUTION_IPC_LANE_CONTROL
-    if normalized_lane == EXECUTION_IPC_LANE_DATA:
-        lane_ipc = data_lane_ipc
-    elif normalized_lane == EXECUTION_IPC_LANE_TRACE:
-        lane_ipc = trace_lane_ipc
-    elif normalized_lane == EXECUTION_IPC_LANE_LOG:
-        lane_ipc = log_lane_ipc
-    elif normalized_lane == EXECUTION_IPC_LANE_METRIC:
-        lane_ipc = metric_lane_ipc
-    else:
-        lane_ipc = control_lane_ipc
-        normalized_lane = EXECUTION_IPC_LANE_CONTROL
+    lane_ipc = _lane_adapter_ingress(
+        control_lane_ipc=control_lane_ipc,
+        data_lane_ipc=data_lane_ipc,
+        trace_lane_ipc=trace_lane_ipc,
+        log_lane_ipc=log_lane_ipc,
+        metric_lane_ipc=metric_lane_ipc,
+        lane=normalized_lane,
+    )
     lane_target = compose_execution_ipc_worker_target_id(worker_id, lane=normalized_lane)
     try:
         recv_buffered = getattr(lane_ipc, "recv_buffered", None)
         timeout = max(0.0, float(timeout_seconds))
-        if callable(recv_buffered):
-            return recv_buffered(lane_target, timeout=timeout)
-        return lane_ipc.recv(lane_target, timeout=timeout)
+        if not callable(recv_buffered):
+            return None
+        return recv_buffered(lane_target, timeout=timeout)
     except Exception:
         return None
+
+
+def _lane_adapter_ingress(
+    *,
+    control_lane_ipc: ExecutionIpcKvStreamPort,
+    data_lane_ipc: ExecutionIpcKvStreamPort,
+    trace_lane_ipc: ExecutionIpcKvStreamPort,
+    log_lane_ipc: ExecutionIpcKvStreamPort,
+    metric_lane_ipc: ExecutionIpcKvStreamPort,
+    lane: str,
+) -> ExecutionIpcKvStreamPort:
+    normalized_lane = lane.strip().lower() if isinstance(lane, str) and lane else EXECUTION_IPC_LANE_CONTROL
+    if normalized_lane == EXECUTION_IPC_LANE_DATA:
+        return data_lane_ipc
+    if normalized_lane == EXECUTION_IPC_LANE_TRACE:
+        return trace_lane_ipc
+    if normalized_lane == EXECUTION_IPC_LANE_LOG:
+        return log_lane_ipc
+    if normalized_lane == EXECUTION_IPC_LANE_METRIC:
+        return metric_lane_ipc
+    return control_lane_ipc
 
 
 def _coerce_leaf_ingress_payload(message: object) -> object | None:

@@ -8,6 +8,9 @@ from stream_kernel.execution.transport.carriers.ipc.ipc_adapters import (
 from stream_kernel.execution.transport.ipc.ipc_transport import (
     EXECUTION_IPC_LANE_CONTROL,
     EXECUTION_IPC_LANE_DATA,
+    EXECUTION_IPC_LANE_LOG,
+    EXECUTION_IPC_LANE_METRIC,
+    EXECUTION_IPC_LANE_TRACE,
     ExecutionIpcMessage,
     ExecutionIpcTransportService,
     compose_execution_ipc_worker_target_id,
@@ -584,9 +587,16 @@ def leaf_linear_pipeline_worker_for_target(
                 lane=EXECUTION_IPC_LANE_CONTROL,
             )
             return
-        if not configured or not isinstance(message, ControlPlaneLeafBoundaryExecuteCommand):
+        if not configured:
             continue
-        for item in tuple(message.inputs):
+        inputs: tuple[object, ...]
+        if isinstance(message, ControlPlaneLeafBoundaryExecuteCommand):
+            inputs = tuple(message.inputs)
+        elif isinstance(message, Envelope):
+            inputs = (message,)
+        else:
+            continue
+        for item in inputs:
             payload, trace_id, tombstone = _extract_dispatch_input(item)
             if not isinstance(payload, dict):
                 continue
@@ -716,7 +726,13 @@ def observability_boundary_batch_sink_worker(
                 lane=EXECUTION_IPC_LANE_CONTROL,
             )
             return
-        if not configured or not isinstance(message, ControlPlaneLeafBoundaryExecuteCommand):
+        if not configured:
+            continue
+        if isinstance(message, ControlPlaneLeafBoundaryExecuteCommand):
+            count = len(tuple(message.inputs))
+        elif isinstance(message, Envelope):
+            count = 1
+        else:
             continue
         _send_worker_payload(
             ipc=ipc,
@@ -725,10 +741,359 @@ def observability_boundary_batch_sink_worker(
                 target_group=target_group,
                 worker_id=worker_id,
                 request_id=f"obs:{int(time.time() * 1000)}",
-                outputs=({"kind": "obs_batch", "count": len(tuple(message.inputs))},),
+                outputs=({"kind": "obs_batch", "count": count},),
             ),
             lane=EXECUTION_IPC_LANE_DATA,
         )
+
+
+def ring_pipeline_worker_for_target(
+    stop_event: object | None,
+    control_pipe: object | None,
+    worker_id: str,
+    target_group: str,
+    role: str,
+    local_transform_steps: int,
+    inbound_target: str | None,
+    outbound_target: str | None,
+    observability_target: str | None,
+) -> None:
+    ipc = _open_worker_ipc(control_pipe=control_pipe, target_id=worker_id)
+    if ipc is None:
+        return
+    _send_worker_payload(
+        ipc=ipc,
+        worker_id=worker_id,
+        payload=ControlPlaneLeafHelloEvent(target_group=target_group, worker_id=worker_id),
+        lane=EXECUTION_IPC_LANE_CONTROL,
+    )
+    configured = False
+    deadline = time.monotonic() + 120.0
+    role_name = role if isinstance(role, str) else "middle"
+    step_count = max(0, int(local_transform_steps))
+
+    while time.monotonic() < deadline:
+        if callable(getattr(stop_event, "is_set", None)) and bool(stop_event.is_set()):
+            return
+
+        control_message = ipc.recv(
+            compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_CONTROL),
+            timeout=0.0,
+        )
+        decoded_control = _unwrap_ipc_payload(control_message)
+        if isinstance(decoded_control, ControlPlaneLeafConfigCardEvent):
+            _send_worker_payload(
+                ipc=ipc,
+                worker_id=worker_id,
+                payload=ControlPlaneLeafConfigAckEvent(
+                    target_group=decoded_control.target_group,
+                    worker_id=decoded_control.worker_id,
+                    config_id=decoded_control.config_id,
+                    status="applied",
+                    resolved_nodes=tuple(decoded_control.nodes),
+                ),
+                lane=EXECUTION_IPC_LANE_CONTROL,
+            )
+            configured = True
+            continue
+        if isinstance(decoded_control, ControlPlaneLeafStopCommand):
+            _send_worker_payload(
+                ipc=ipc,
+                worker_id=worker_id,
+                payload=ControlPlaneLeafStopAckEvent(
+                    target_group=decoded_control.target_group,
+                    worker_id=decoded_control.worker_id,
+                    command_id=decoded_control.command_id,
+                    status="accepted",
+                ),
+                lane=EXECUTION_IPC_LANE_CONTROL,
+            )
+            return
+
+        if not configured:
+            time.sleep(0.001)
+            continue
+
+        if role_name == "ingress":
+            ingress_message = ipc.recv(
+                compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_DATA),
+                timeout=0.0,
+            )
+            decoded_ingress = _unwrap_ipc_payload(ingress_message)
+            if isinstance(decoded_ingress, ControlPlaneLeafBoundaryExecuteCommand):
+                for item in tuple(decoded_ingress.inputs):
+                    _process_ring_item(
+                        ipc=ipc,
+                        worker_id=worker_id,
+                        target_group=target_group,
+                        role_name=role_name,
+                        step_count=step_count,
+                        item=item,
+                        outbound_target=outbound_target,
+                        observability_target=observability_target,
+                    )
+            else:
+                time.sleep(0.0005)
+            continue
+
+        ring_target = inbound_target if isinstance(inbound_target, str) and inbound_target else ""
+        if not ring_target:
+            time.sleep(0.001)
+            continue
+        ring_message = ipc.recv(ring_target, timeout=0.0)
+        decoded_ring = _unwrap_ipc_payload(ring_message)
+        if decoded_ring is None:
+            time.sleep(0.0005)
+            continue
+        _process_ring_item(
+            ipc=ipc,
+            worker_id=worker_id,
+            target_group=target_group,
+            role_name=role_name,
+            step_count=step_count,
+            item=decoded_ring,
+            outbound_target=outbound_target,
+            observability_target=observability_target,
+        )
+
+
+def observability_ring_sink_worker_for_target(
+    stop_event: object | None,
+    control_pipe: object | None,
+    worker_id: str,
+    target_group: str,
+) -> None:
+    ipc = _open_worker_ipc(control_pipe=control_pipe, target_id=worker_id)
+    if ipc is None:
+        return
+    _send_worker_payload(
+        ipc=ipc,
+        worker_id=worker_id,
+        payload=ControlPlaneLeafHelloEvent(target_group=target_group, worker_id=worker_id),
+        lane=EXECUTION_IPC_LANE_CONTROL,
+    )
+    configured = False
+    deadline = time.monotonic() + 120.0
+    buffered = 0
+
+    while time.monotonic() < deadline:
+        if callable(getattr(stop_event, "is_set", None)) and bool(stop_event.is_set()):
+            return
+
+        control_message = ipc.recv(
+            compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_CONTROL),
+            timeout=0.0,
+        )
+        decoded_control = _unwrap_ipc_payload(control_message)
+        if isinstance(decoded_control, ControlPlaneLeafConfigCardEvent):
+            _send_worker_payload(
+                ipc=ipc,
+                worker_id=worker_id,
+                payload=ControlPlaneLeafConfigAckEvent(
+                    target_group=decoded_control.target_group,
+                    worker_id=decoded_control.worker_id,
+                    config_id=decoded_control.config_id,
+                    status="applied",
+                    resolved_nodes=tuple(decoded_control.nodes),
+                ),
+                lane=EXECUTION_IPC_LANE_CONTROL,
+            )
+            configured = True
+            continue
+        if isinstance(decoded_control, ControlPlaneLeafStopCommand):
+            _send_worker_payload(
+                ipc=ipc,
+                worker_id=worker_id,
+                payload=ControlPlaneLeafStopAckEvent(
+                    target_group=decoded_control.target_group,
+                    worker_id=decoded_control.worker_id,
+                    command_id=decoded_control.command_id,
+                    status="accepted",
+                ),
+                lane=EXECUTION_IPC_LANE_CONTROL,
+            )
+            return
+        if not configured:
+            time.sleep(0.001)
+            continue
+
+        decoded_data: object | None = None
+        for lane in (
+            EXECUTION_IPC_LANE_DATA,
+            EXECUTION_IPC_LANE_TRACE,
+            EXECUTION_IPC_LANE_LOG,
+            EXECUTION_IPC_LANE_METRIC,
+        ):
+            lane_message = ipc.recv(
+                compose_execution_ipc_worker_target_id(worker_id, lane=lane),
+                timeout=0.0,
+            )
+            decoded_data = _unwrap_ipc_payload(lane_message)
+            if decoded_data is not None:
+                break
+        if decoded_data is None:
+            time.sleep(0.0005)
+            continue
+        items: tuple[object, ...]
+        if isinstance(decoded_data, ControlPlaneLeafBoundaryExecuteCommand):
+            items = tuple(decoded_data.inputs)
+        else:
+            items = (decoded_data,)
+        flush = False
+        for item in items:
+            payload, _trace_id, tombstone = _extract_dispatch_input(item)
+            if tombstone:
+                flush = True
+                continue
+            if isinstance(payload, dict) and payload.get("kind") == "obs":
+                buffered += 1
+        if flush:
+            _send_worker_payload(
+                ipc=ipc,
+                worker_id=worker_id,
+                payload=ControlPlaneLeafBoundaryOutputsEvent(
+                    target_group=target_group,
+                    worker_id=worker_id,
+                    request_id=f"obs:ring:{int(time.time() * 1000)}",
+                    outputs=({"kind": "obs_batch", "count": int(buffered)},),
+                    tombstone_output=True,
+                ),
+                lane=EXECUTION_IPC_LANE_DATA,
+            )
+            buffered = 0
+
+
+def _process_ring_item(
+    *,
+    ipc: ExecutionIpcTransportService,
+    worker_id: str,
+    target_group: str,
+    role_name: str,
+    step_count: int,
+    item: object,
+    outbound_target: str | None,
+    observability_target: str | None,
+) -> None:
+    payload, trace_id, tombstone = _extract_dispatch_input(item)
+    if not isinstance(payload, dict):
+        return
+    raw_id = payload.get("id")
+    if isinstance(raw_id, bool) or not isinstance(raw_id, int):
+        return
+    record_id = int(raw_id)
+    stage_sum = int(payload.get("stage_sum")) if isinstance(payload.get("stage_sum"), int) else 0
+
+    if tombstone:
+        if role_name == "egress":
+            _send_worker_payload(
+                ipc=ipc,
+                worker_id=worker_id,
+                payload=ControlPlaneLeafBoundaryOutputsEvent(
+                    target_group=target_group,
+                    worker_id=worker_id,
+                    request_id=f"egress:ring:tombstone:{record_id}",
+                    outputs=({"kind": "tombstone", "id": record_id},),
+                    tombstone_output=True,
+                ),
+                lane=EXECUTION_IPC_LANE_DATA,
+            )
+            _emit_observability(
+                ipc=ipc,
+                worker_id=worker_id,
+                observability_target=observability_target,
+                payload={"kind": "obs_tombstone", "id": record_id},
+                trace_id=trace_id,
+                tombstone=True,
+            )
+            return
+        if isinstance(outbound_target, str) and outbound_target:
+            ipc.send(
+                outbound_target,
+                Envelope(
+                    payload={"id": record_id, "stage_sum": stage_sum},
+                    target=outbound_target,
+                    trace_id=trace_id,
+                    tombstone=True,
+                ),
+                no_reply=True,
+            )
+        return
+
+    next_sum = stage_sum + max(0, step_count)
+    if role_name == "egress":
+        _send_worker_payload(
+            ipc=ipc,
+            worker_id=worker_id,
+            payload=ControlPlaneLeafBoundaryOutputsEvent(
+                target_group=target_group,
+                worker_id=worker_id,
+                request_id=f"egress:ring:data:{record_id}",
+                outputs=(
+                    {
+                        "kind": "data",
+                        "id": record_id,
+                        "stage_sum": next_sum,
+                    },
+                ),
+            ),
+            lane=EXECUTION_IPC_LANE_DATA,
+        )
+    elif isinstance(outbound_target, str) and outbound_target:
+        ipc.send(
+            outbound_target,
+            Envelope(
+                payload={"id": record_id, "stage_sum": next_sum},
+                target=outbound_target,
+                trace_id=trace_id,
+            ),
+            no_reply=True,
+        )
+
+    _emit_observability(
+        ipc=ipc,
+        worker_id=worker_id,
+        observability_target=observability_target,
+        payload={
+            "kind": "obs",
+            "id": record_id,
+            "worker_id": worker_id,
+            "stage_sum": next_sum,
+        },
+        trace_id=trace_id,
+        tombstone=False,
+    )
+
+
+def _emit_observability(
+    *,
+    ipc: ExecutionIpcTransportService,
+    worker_id: str,
+    observability_target: str | None,
+    payload: dict[str, object],
+    trace_id: str | None,
+    tombstone: bool,
+) -> None:
+    if not (isinstance(observability_target, str) and observability_target):
+        return
+    _send_worker_payload(
+        ipc=ipc,
+        worker_id=worker_id,
+        payload=Envelope(
+            payload=payload,
+            target=observability_target,
+            trace_id=trace_id,
+            tombstone=bool(tombstone),
+        ),
+        lane=EXECUTION_IPC_LANE_DATA,
+    )
+
+
+def _unwrap_ipc_payload(message: object | None) -> object | None:
+    if message is None:
+        return None
+    if isinstance(message, ExecutionIpcMessage):
+        return message.payload
+    return message
 
 
 def _extract_dispatch_input(item: object) -> tuple[object, str | None, bool]:
@@ -752,10 +1117,11 @@ def _open_worker_ipc(*, control_pipe: object | None, target_id: str) -> Executio
         for lane_name, endpoint in control_pipe.items():
             if endpoint is None:
                 continue
-            ipc.bind_local_endpoint(
-                compose_execution_ipc_worker_target_id(target_id, lane=str(lane_name)),
-                endpoint,
-            )
+            lane_key = str(lane_name)
+            if lane_key.startswith("target::"):
+                ipc.bind_local_endpoint(lane_key.removeprefix("target::"), endpoint)
+                continue
+            ipc.bind_local_endpoint(compose_execution_ipc_worker_target_id(target_id, lane=lane_key), endpoint)
         return ipc
     ipc.bind_local_endpoint(target_id, control_pipe)
     return ipc
@@ -784,10 +1150,26 @@ def _recv_worker_message(
     lane_targets = (
         compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_CONTROL),
         compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_DATA),
+        compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_TRACE),
+        compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_LOG),
+        compose_execution_ipc_worker_target_id(worker_id, lane=EXECUTION_IPC_LANE_METRIC),
     )
-    for index, target_id in enumerate(lane_targets):
-        lane_timeout = max(0.0, float(timeout)) if index == 0 else 0.0
-        message = ipc.recv(target_id, timeout=lane_timeout)
+    # Fast-path: probe all lanes without blocking so data/observability traffic
+    # is not delayed behind an idle control lane wait.
+    for target_id in lane_targets:
+        message = ipc.recv(target_id, timeout=0.0)
+        if message is None:
+            continue
+        if isinstance(message, ExecutionIpcMessage):
+            return message.payload
+        return message
+
+    # Backoff path: if no payload is ready, wait once on control lane.
+    control_timeout = max(0.0, float(timeout))
+    if control_timeout <= 0.0:
+        return None
+    for target_id in (lane_targets[0],):
+        message = ipc.recv(target_id, timeout=control_timeout)
         if message is None:
             continue
         if isinstance(message, ExecutionIpcMessage):
@@ -804,6 +1186,8 @@ __all__ = [
     "leaf_handshake_worker",
     "leaf_ignores_stop_command_worker",
     "leaf_linear_pipeline_worker_for_target",
+    "ring_pipeline_worker_for_target",
+    "observability_ring_sink_worker_for_target",
     "observability_boundary_batch_sink_worker",
     "leaf_pipeline_stage_worker_for_target",
     "leaf_stop_worker",

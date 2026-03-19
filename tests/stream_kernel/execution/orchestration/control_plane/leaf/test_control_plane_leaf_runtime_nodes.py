@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 from stream_kernel.execution.orchestration.control_plane.leaf import (
     ControlPlaneLeafBoundaryExecuteNode,
@@ -16,6 +17,8 @@ from stream_kernel.execution.orchestration.control_plane.leaf.system_nodes impor
     ControlPlaneLeafSourcePollFromSinkAckNode,
     leaf_command_ingress_source_lanes,
     leaf_command_ingress_source_node_name,
+    leaf_runtime_ingress_drain_source_node_name,
+    leaf_runtime_ingress_source_lanes,
 )
 from stream_kernel.execution.orchestration.source_ingress import BootstrapControl
 from stream_kernel.execution.orchestration.lifecycle.leaf.runtime.worker_runtime import (
@@ -32,15 +35,13 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafStopAckEvent,
     ControlPlaneLeafStopCommand,
 )
-from stream_kernel.platform.services.runtime.platform_scheduler import (
-    PlatformSchedulerCancelCommand,
-    PlatformSchedulerUpsertCommand,
-)
 from stream_kernel.routing.envelope import Envelope
 from stream_kernel.execution.transport.ipc.ipc_transport import (
     EXECUTION_IPC_LANE_CONTROL,
     EXECUTION_IPC_LANE_TRACE,
     EXECUTION_IPC_LANE_DATA,
+    EXECUTION_IPC_LANE_LOG,
+    EXECUTION_IPC_LANE_METRIC,
 )
 
 
@@ -167,7 +168,54 @@ class _ReplyDispatch:
         return bool(self.accepted)
 
 
-def test_leaf_command_ingress_source_node_polls_single_lane_without_rearm() -> None:
+@dataclass(slots=True)
+class _HandoffDispatch:
+    sent: list[tuple[Envelope, str | None]] = field(default_factory=list)
+    accepted: bool = True
+
+    def dispatch_envelope(self, envelope: Envelope, *, source_group: str | None = None) -> bool:
+        self.sent.append((envelope, source_group))
+        return bool(self.accepted)
+
+
+@dataclass(slots=True)
+class _WakeQueue:
+    items: list[Envelope] = field(default_factory=list)
+
+    def push(self, envelope: Envelope) -> None:
+        self.items.append(envelope)
+
+
+@dataclass(slots=True)
+class _WakeIngress:
+    seen: list[tuple[str, str, float]] = field(default_factory=list)
+    callbacks: list[tuple[str, str, object]] = field(default_factory=list)
+    payload: object | None = None
+
+    def register_data_available_callback(
+        self,
+        *,
+        worker_id: str,
+        lane: str,
+        callback: object,
+        loop: object | None = None,
+    ) -> bool:
+        _ = loop
+        self.callbacks.append((worker_id, lane, callback))
+        return True
+
+    def poll_next_message_for_lane(
+        self,
+        *,
+        worker_id: str,
+        lane: str,
+        timeout_seconds: float = 0.0,
+    ) -> object | None:
+        self.seen.append((worker_id, lane, timeout_seconds))
+        return self.payload
+
+
+def test_leaf_command_ingress_source_node_polls_single_lane_and_self_rearms_on_budget() -> None:
     source_name = leaf_command_ingress_source_node_name(lane=EXECUTION_IPC_LANE_TRACE)
     event = ControlPlaneLeafStopCommand(
         target_group="execution.alpha",
@@ -180,12 +228,15 @@ def test_leaf_command_ingress_source_node_polls_single_lane_without_rearm() -> N
         runner_control=_RunnerControlStopFlag(),  # type: ignore[arg-type]
         lane=EXECUTION_IPC_LANE_TRACE,
         source_name=source_name,
+        max_messages_per_poll=1,
     )
 
     produced = asyncio.run(node(BootstrapControl(target=source_name), None))
 
-    assert len(produced) == 1
+    assert len(produced) == 2
     assert isinstance(produced[0], ControlPlaneLeafStopCommand)
+    assert isinstance(produced[1], BootstrapControl)
+    assert produced[1].target == source_name
     assert len(ingress.seen) == 1
     worker_id, lane, timeout = ingress.seen[0]
     assert isinstance(worker_id, str) and worker_id
@@ -194,14 +245,70 @@ def test_leaf_command_ingress_source_node_polls_single_lane_without_rearm() -> N
 
 
 
-def test_leaf_command_ingress_source_lanes_include_control_and_data_only() -> None:
-    assert leaf_command_ingress_source_lanes() == (
-        EXECUTION_IPC_LANE_CONTROL,
+def test_leaf_runtime_ingress_source_wraps_envelope_into_boundary_command() -> None:
+    source_name = leaf_runtime_ingress_drain_source_node_name()
+    ingress_payload = Envelope(
+        payload={"id": 42},
+        target="compute_features",
+        trace_id="trace-42",
+        reply_to="reply-42",
+        span_id="span-42",
+        tombstone=True,
+    )
+    ingress = _LaneIngress(seen=[], payload=ingress_payload)
+    node = ControlPlaneLeafCommandIngressSourceNode(
+        ingress=ingress,  # type: ignore[arg-type]
+        runner_control=_RunnerControlStopFlag(),  # type: ignore[arg-type]
+        lane=EXECUTION_IPC_LANE_DATA,
+        source_name=source_name,
+        max_messages_per_poll=1,
+    )
+    ctx = {
+        "__leaf_session": SimpleNamespace(
+            child=SimpleNamespace(
+                runtime={
+                    "__process_group": "execution.features",
+                    "__worker_id": "execution.features#1",
+                }
+            )
+        )
+    }
+
+    produced = asyncio.run(node(BootstrapControl(target=source_name), ctx))
+
+    assert len(produced) == 2
+    command = produced[0]
+    assert isinstance(command, ControlPlaneLeafBoundaryExecuteCommand)
+    assert command.target_group == "execution.features"
+    assert command.worker_id == "execution.features#1"
+    assert command.finalize is True
+    assert len(command.inputs) == 1
+    item = command.inputs[0]
+    assert isinstance(item, dict)
+    assert item["target"] == "compute_features"
+    assert item["payload"] == {"id": 42}
+    assert item["trace_id"] == "trace-42"
+    assert item["reply_to"] == "reply-42"
+    assert item["span_id"] == "span-42"
+    assert item["tombstone"] is True
+    assert isinstance(produced[1], BootstrapControl)
+    assert produced[1].target == source_name
+
+
+def test_leaf_command_ingress_source_lanes_include_control_only() -> None:
+    assert leaf_command_ingress_source_lanes() == (EXECUTION_IPC_LANE_CONTROL,)
+
+
+def test_leaf_runtime_ingress_source_lanes_include_non_control_lanes() -> None:
+    assert leaf_runtime_ingress_source_lanes() == (
         EXECUTION_IPC_LANE_DATA,
+        EXECUTION_IPC_LANE_TRACE,
+        EXECUTION_IPC_LANE_LOG,
+        EXECUTION_IPC_LANE_METRIC,
     )
 
 
-def test_leaf_command_ingress_source_initialize_registers_scheduler_job() -> None:
+def test_leaf_command_ingress_source_initialize_emits_bootstrap_pulse() -> None:
     source_name = leaf_command_ingress_source_node_name(lane=EXECUTION_IPC_LANE_TRACE)
     node = ControlPlaneLeafCommandIngressSourceNode(
         ingress=_LaneIngress(seen=[], payload=None),  # type: ignore[arg-type]
@@ -213,8 +320,85 @@ def test_leaf_command_ingress_source_initialize_registers_scheduler_job() -> Non
     produced = node.initialize()
     assert len(produced) == 1
     command = produced[0]
-    assert isinstance(command, PlatformSchedulerUpsertCommand)
+    assert isinstance(command, BootstrapControl)
     assert command.target == source_name
+
+
+def test_leaf_command_ingress_source_initialize_registers_wakeup_callback_and_coalesces() -> None:
+    source_name = leaf_command_ingress_source_node_name(lane=EXECUTION_IPC_LANE_TRACE)
+    ingress = _WakeIngress()
+    queue = _WakeQueue()
+    node = ControlPlaneLeafCommandIngressSourceNode(
+        ingress=ingress,  # type: ignore[arg-type]
+        runner_control=_RunnerControlStopFlag(),  # type: ignore[arg-type]
+        lane=EXECUTION_IPC_LANE_TRACE,
+        poll_worker_ids=("execution.alpha#1",),
+        source_name=source_name,
+        work_queue=queue,  # type: ignore[arg-type]
+    )
+
+    _ = node.initialize()
+    assert len(ingress.callbacks) == 1
+    _worker_id, _lane, callback = ingress.callbacks[0]
+    assert _worker_id == "execution.alpha#1"
+    assert _lane == EXECUTION_IPC_LANE_TRACE
+    assert callable(callback)
+
+    callback()
+    callback()
+    assert len(queue.items) == 1
+    assert isinstance(queue.items[0].payload, BootstrapControl)
+    assert queue.items[0].target == source_name
+
+    asyncio.run(node(queue.items[0], None))
+    callback()
+    assert len(queue.items) == 2
+
+
+def test_leaf_command_ingress_source_node_polls_configured_worker_ids_round_robin() -> None:
+    source_name = leaf_command_ingress_source_node_name(lane=EXECUTION_IPC_LANE_TRACE)
+    event = ControlPlaneLeafStopCommand(
+        target_group="system.observability",
+        worker_id="execution.features#1",
+        command_id="stop-obs",
+    )
+
+    @dataclass(slots=True)
+    class _MultiWorkerIngress:
+        calls: list[tuple[str, str, float]] = field(default_factory=list)
+
+        def poll_next_message_for_lane(
+            self,
+            *,
+            worker_id: str,
+            lane: str,
+            timeout_seconds: float = 0.0,
+        ) -> object | None:
+            self.calls.append((worker_id, lane, timeout_seconds))
+            if worker_id == "execution.features#1":
+                return event
+            return None
+
+    ingress = _MultiWorkerIngress()
+    node = ControlPlaneLeafCommandIngressSourceNode(
+        ingress=ingress,  # type: ignore[arg-type]
+        runner_control=_RunnerControlStopFlag(),  # type: ignore[arg-type]
+        lane=EXECUTION_IPC_LANE_TRACE,
+        poll_worker_ids=("execution.ingress#1", "execution.features#1"),
+        source_name=source_name,
+        max_messages_per_poll=1,
+    )
+
+    produced = asyncio.run(node(BootstrapControl(target=source_name), None))
+
+    assert len(produced) == 2
+    assert produced[0] == event
+    assert isinstance(produced[1], BootstrapControl)
+    assert produced[1].target == source_name
+    assert ingress.calls == [
+        ("execution.ingress#1", EXECUTION_IPC_LANE_TRACE, 0.0),
+        ("execution.features#1", EXECUTION_IPC_LANE_TRACE, 0.0),
+    ]
 
 
 def test_leaf_config_apply_runtime_node_uses_activation_service() -> None:
@@ -471,17 +655,11 @@ def test_leaf_stop_node_emits_ack() -> None:
     produced = node(command, {"__leaf_session": session})
 
     acks = [item for item in produced if isinstance(item, ControlPlaneLeafStopAckEvent)]
-    cancel_commands = [item for item in produced if isinstance(item, PlatformSchedulerCancelCommand)]
     assert len(acks) == 1
     ack = acks[0]
     assert isinstance(ack, ControlPlaneLeafStopAckEvent)
     assert ack.command_id == "stop-1"
     assert ack.status == "accepted"
-    assert len(cancel_commands) == 5
-    assert all(
-        command.job_id.startswith("cp.leaf.command_ingress:source:system.cp.command_ingress:")
-        for command in cancel_commands
-    )
     assert runner_control.stop_calls == 1
 
 
@@ -517,8 +695,10 @@ def test_leaf_start_work_node_emits_bootstrap_controls_for_local_sources() -> No
 
 def test_leaf_reply_dispatch_node_emits_sink_ack_after_successful_boundary_dispatch() -> None:
     reply_dispatch = _ReplyDispatch(accepted=True)
+    handoff_dispatch = _HandoffDispatch(accepted=True)
     node = ControlPlaneLeafReplyDispatchNode(
         reply_dispatch=reply_dispatch,  # type: ignore[arg-type]
+        handoff_dispatch=handoff_dispatch,  # type: ignore[arg-type]
     )
     event = ControlPlaneLeafBoundaryOutputsEvent(
         target_group="execution.ingress",
@@ -532,7 +712,10 @@ def test_leaf_reply_dispatch_node_emits_sink_ack_after_successful_boundary_dispa
 
     produced = node(event, None)
 
-    assert len(reply_dispatch.sent) == 1
+    assert len(reply_dispatch.sent) == 0
+    assert len(handoff_dispatch.sent) == 1
+    assert handoff_dispatch.sent[0][0] == event.outputs[0]
+    assert handoff_dispatch.sent[0][1] == "execution.ingress"
     assert len(produced) == 1
     ack = produced[0]
     assert isinstance(ack, ControlPlaneLeafSinkDispatchAckEvent)
@@ -546,8 +729,10 @@ def test_leaf_reply_dispatch_node_emits_sink_ack_after_successful_boundary_dispa
 
 def test_leaf_reply_dispatch_node_emits_sink_ack_for_tombstone_output() -> None:
     reply_dispatch = _ReplyDispatch(accepted=True)
+    handoff_dispatch = _HandoffDispatch(accepted=True)
     node = ControlPlaneLeafReplyDispatchNode(
         reply_dispatch=reply_dispatch,  # type: ignore[arg-type]
+        handoff_dispatch=handoff_dispatch,  # type: ignore[arg-type]
     )
     event = ControlPlaneLeafBoundaryOutputsEvent(
         target_group="execution.ingress",
@@ -561,11 +746,35 @@ def test_leaf_reply_dispatch_node_emits_sink_ack_for_tombstone_output() -> None:
 
     produced = node(event, None)
 
-    assert len(reply_dispatch.sent) == 1
+    assert len(reply_dispatch.sent) == 0
+    assert len(handoff_dispatch.sent) == 1
     assert len(produced) == 1
     ack = produced[0]
     assert isinstance(ack, ControlPlaneLeafSinkDispatchAckEvent)
     assert ack.tombstone_output is True
+
+
+def test_leaf_reply_dispatch_node_routes_control_events_via_reply_channel() -> None:
+    reply_dispatch = _ReplyDispatch(accepted=True)
+    handoff_dispatch = _HandoffDispatch(accepted=True)
+    node = ControlPlaneLeafReplyDispatchNode(
+        reply_dispatch=reply_dispatch,  # type: ignore[arg-type]
+        handoff_dispatch=handoff_dispatch,  # type: ignore[arg-type]
+    )
+    event = ControlPlaneLeafConfigAckEvent(
+        target_group="execution.ingress",
+        worker_id="execution.ingress#1",
+        config_id="cfg-1",
+        status="applied",
+    )
+
+    produced = node(event, None)
+
+    assert produced == []
+    assert len(reply_dispatch.sent) == 1
+    assert reply_dispatch.sent[0][0] == "execution.ingress#1"
+    assert reply_dispatch.sent[0][1] == event
+    assert handoff_dispatch.sent == []
 
 
 def test_leaf_source_poll_from_sink_ack_node_emits_next_source_poll_command_for_non_tombstone_ack() -> None:

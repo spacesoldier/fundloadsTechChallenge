@@ -57,10 +57,15 @@ class DefaultExecutionIpcHandoffDispatchService(ExecutionIpcHandoffDispatchServi
         target_id = self._route_table().resolve_route(target=target)
         if not isinstance(target_id, str) or not target_id:
             return False
-        lane = self._resolve_lane(target=target, payload=envelope.payload)
-        resolved_target_id = _lane_target_id(target_id=target_id, lane=lane)
-        self._ipc().send(resolved_target_id, envelope.payload, no_reply=True)
-        return True
+        try:
+            lane = self._resolve_lane(target=target, payload=envelope.payload)
+            resolved_target_id = _lane_target_id(target_id=target_id, lane=lane)
+            # Keep transport payload as Envelope so cross-process hops preserve
+            # trace/span/reply/tombstone context on data/observability lanes.
+            self._ipc().send(resolved_target_id, envelope, no_reply=True)
+            return True
+        except Exception:
+            return False
 
     def _ipc(self) -> ExecutionIpcTransportService:
         candidate = self.execution_ipc
@@ -85,14 +90,11 @@ class DefaultExecutionIpcHandoffDispatchService(ExecutionIpcHandoffDispatchServi
         routing = self._lane_routing_optional()
         if routing is None:
             return fallback
-        try:
-            return routing.resolve_lane(
-                target=target,
-                payload=payload,
-                default_lane=fallback,
-            )
-        except Exception:
-            return fallback
+        return routing.resolve_lane(
+            target=target,
+            payload=payload,
+            default_lane=fallback,
+        )
 
     def _lane_routing_optional(self) -> ExecutionIpcLaneRoutingService | None:
         candidate = self.lane_routing

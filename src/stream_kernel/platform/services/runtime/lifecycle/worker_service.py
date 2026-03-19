@@ -12,6 +12,7 @@ from stream_kernel.execution.transport.ipc.ipc_transport import (
     ExecutionIpcTransportService,
     compose_execution_ipc_worker_target_id,
     execution_ipc_worker_lane_targets,
+    normalize_execution_ipc_lane,
 )
 from stream_kernel.integration.kv_store import InMemoryKvStore, KVStore
 
@@ -35,6 +36,8 @@ class ExecutionWorkerLifecycleService(Protocol):
         stop_event_position: int | None = None,
         child_endpoint_position: int | None = None,
         close_child_in_parent: bool = True,
+        extra_child_endpoints: dict[str, object] | None = None,
+        lane_names: tuple[str, ...] | None = None,
     ) -> ExecutionWorkerHandle:
         raise NotImplementedError("ExecutionWorkerLifecycleService.spawn_worker must be implemented")
 
@@ -78,12 +81,14 @@ class LocalExecutionWorkerLifecycleService(ExecutionWorkerLifecycleService):
         stop_event_position: int | None = None,
         child_endpoint_position: int | None = None,
         close_child_in_parent: bool = True,
+        extra_child_endpoints: dict[str, object] | None = None,
+        lane_names: tuple[str, ...] | None = None,
     ) -> ExecutionWorkerHandle:
         if not isinstance(target_id, str) or not target_id:
             raise ValueError("ExecutionWorkerLifecycleService.spawn_worker requires non-empty target_id")
         if not callable(target):
             raise ValueError("ExecutionWorkerLifecycleService.spawn_worker requires callable target")
-        lane_targets = execution_ipc_worker_lane_targets(target_id)
+        lane_targets = _lane_targets_for_spawn(target_id=target_id, lane_names=lane_names)
         parent_conn = None
         child_lane_endpoints: dict[str, object] = {}
         for lane_name, lane_target_id in lane_targets.items():
@@ -91,6 +96,13 @@ class LocalExecutionWorkerLifecycleService(ExecutionWorkerLifecycleService):
             child_lane_endpoints[lane_name] = lane_child_conn
             if lane_name == EXECUTION_IPC_LANE_CONTROL:
                 parent_conn = lane_parent_conn
+        if isinstance(extra_child_endpoints, dict):
+            for endpoint_key, endpoint in extra_child_endpoints.items():
+                if not isinstance(endpoint_key, str) or not endpoint_key:
+                    continue
+                if endpoint is None:
+                    continue
+                child_lane_endpoints[endpoint_key] = endpoint
         if parent_conn is None:
             parent_conn = self._ipc().allocate_local_endpoints(
                 compose_execution_ipc_worker_target_id(target_id, lane=EXECUTION_IPC_LANE_CONTROL)
@@ -230,6 +242,27 @@ def _close_optional(resource: object | None) -> None:
     close = getattr(resource, "close", None)
     if callable(close):
         close()
+
+
+def _lane_targets_for_spawn(
+    *,
+    target_id: str,
+    lane_names: tuple[str, ...] | None,
+) -> dict[str, str]:
+    lane_targets = execution_ipc_worker_lane_targets(target_id)
+    if not isinstance(lane_names, tuple) or not lane_names:
+        return lane_targets
+    normalized: list[str] = [EXECUTION_IPC_LANE_CONTROL]
+    seen: set[str] = {EXECUTION_IPC_LANE_CONTROL}
+    for lane in lane_names:
+        if not isinstance(lane, str) or not lane:
+            continue
+        normalized_lane = normalize_execution_ipc_lane(lane)
+        if normalized_lane in seen:
+            continue
+        seen.add(normalized_lane)
+        normalized.append(normalized_lane)
+    return {lane: lane_targets[lane] for lane in normalized if lane in lane_targets}
 
 
 __all__ = [

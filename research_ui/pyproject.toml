@@ -16,6 +16,8 @@ psycopg = { version = "^3.3.3", extras = ["binary"] }
 pymongo = "^4.16.0"
 motor = "^3.7.1"
 mcp = "^1.26.0"
+simpy = "^4.1.1"
+numpy = "^2.4.3"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.1"

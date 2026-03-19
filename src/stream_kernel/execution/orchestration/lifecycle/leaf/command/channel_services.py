@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -20,8 +21,13 @@ from stream_kernel.execution.transport.ipc.ipc_transport import (
     compose_execution_ipc_worker_target_id,
 )
 from stream_kernel.platform.services.runtime.control_plane_events import (
+    ControlPlaneLeafConfigAckEvent,
+    ControlPlaneLeafDiscoveryAckEvent,
     ControlPlaneLeafDrainReadyEvent,
+    ControlPlaneLeafHelloEvent,
+    ControlPlaneLeafStopAckEvent,
 )
+from stream_kernel.observability.domain.logging import LogMessage
 from stream_kernel.routing.envelope import Envelope
 
 
@@ -49,6 +55,16 @@ class LeafCommandChannelIngressService(Protocol):
         lane: str,
         timeout_seconds: float = 0.0,
     ) -> object | None:
+        raise NotImplementedError
+
+    def register_data_available_callback(
+        self,
+        *,
+        worker_id: str,
+        lane: str,
+        callback: object,
+        loop: object | None = None,
+    ) -> bool:
         raise NotImplementedError
 
 
@@ -164,11 +180,38 @@ class DefaultLeafCommandChannelIngressService(LeafCommandChannelIngressService):
         lane: str,
         timeout_seconds: float = 0.0,
     ) -> object | None:
+        # Cooperative yield keeps ingress drain budget from monopolizing event loop.
+        await asyncio.sleep(0)
         return self.poll_next_message_for_lane(
             worker_id=worker_id,
             lane=lane,
             timeout_seconds=timeout_seconds,
         )
+
+    def register_data_available_callback(
+        self,
+        *,
+        worker_id: str,
+        lane: str,
+        callback: object,
+        loop: object | None = None,
+    ) -> bool:
+        if not isinstance(worker_id, str) or not worker_id:
+            return False
+        if not callable(callback):
+            return False
+        target_id = compose_execution_ipc_worker_target_id(worker_id, lane=lane)
+        adapter = _lane_adapter_ingress(self, lane)
+        register = getattr(adapter, "register_data_available_callback", None)
+        if not callable(register):
+            return False
+        try:
+            result = register(target_id, callback, loop=loop)
+            if isinstance(result, bool):
+                return result
+            return True
+        except Exception:
+            return False
 
 
 @service(name="leaf_control_reply_dispatch_service")
@@ -197,9 +240,9 @@ class DefaultLeafControlReplyDispatchService(LeafControlReplyDispatchService):
     lane_routing_service: ExecutionIpcLaneRoutingService = inject.service(ExecutionIpcLaneRoutingService)
 
     def dispatch_reply(self, *, worker_id: str, payload: object) -> bool:
-        lane = _resolve_reply_lane(payload=payload, lane_routing=self.lane_routing_service)
-        target_id = compose_execution_ipc_worker_target_id(worker_id, lane=lane)
         try:
+            lane = _resolve_reply_lane(payload=payload, lane_routing=self.lane_routing_service)
+            target_id = compose_execution_ipc_worker_target_id(worker_id, lane=lane)
             _lane_adapter(self, lane).send(target_id, payload, no_reply=True)
             return True
         except Exception:
@@ -244,19 +287,20 @@ def _recv_from_lane(
     try:
         recv_buffered = getattr(ipc, "recv_buffered", None)
         timeout = max(0.0, float(timeout_seconds))
-        if callable(recv_buffered):
-            return recv_buffered(lane_target, timeout=timeout)
-        return ipc.recv(lane_target, timeout=timeout)
+        if not callable(recv_buffered):
+            return None
+        return recv_buffered(lane_target, timeout=timeout)
     except Exception:
         return None
 
 
 def _resolve_reply_lane(*, payload: object, lane_routing: ExecutionIpcLaneRoutingService) -> str:
-    fallback = _fallback_reply_lane(payload=payload)
-    try:
-        return lane_routing.resolve_lane(payload=payload, default_lane=fallback)
-    except Exception:
-        return fallback
+    default_lane = _default_reply_lane(payload=payload)
+    return lane_routing.resolve_lane(
+        target=_reply_target(payload),
+        payload=payload,
+        default_lane=default_lane,
+    )
 
 
 def _lane_adapter(
@@ -289,12 +333,34 @@ def _lane_adapter_ingress(
     return service.control_lane_ipc
 
 
-def _fallback_reply_lane(*, payload: object) -> str:
+def _default_reply_lane(*, payload: object) -> str:
+    if isinstance(
+        payload,
+        (
+            ControlPlaneLeafHelloEvent,
+            ControlPlaneLeafDiscoveryAckEvent,
+            ControlPlaneLeafConfigAckEvent,
+            ControlPlaneLeafStopAckEvent,
+            ControlPlaneLeafDrainReadyEvent,
+        ),
+    ):
+        return EXECUTION_IPC_LANE_CONTROL
     if isinstance(payload, Envelope):
         return EXECUTION_IPC_LANE_DATA
-    if isinstance(payload, ControlPlaneLeafDrainReadyEvent):
-        return EXECUTION_IPC_LANE_CONTROL
-    return EXECUTION_IPC_LANE_CONTROL
+    if isinstance(payload, LogMessage):
+        return EXECUTION_IPC_LANE_DATA
+    # Unknown payloads are treated as data-plane to avoid silently collapsing
+    # business traffic into control lane.
+    return EXECUTION_IPC_LANE_DATA
+
+
+def _reply_target(payload: object) -> str | None:
+    if not isinstance(payload, Envelope):
+        return None
+    target = payload.target
+    if isinstance(target, str) and target:
+        return target
+    return None
 
 
 __all__ = [

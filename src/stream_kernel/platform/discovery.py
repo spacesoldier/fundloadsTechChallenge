@@ -22,8 +22,6 @@ def platform_discovery_modules() -> list[str]:
         "stream_kernel.execution.orchestration.control_plane.root.leaf_ingress_service",
         "stream_kernel.execution.orchestration.control_plane.root.discovery_snapshot_service",
         "stream_kernel.execution.orchestration.control_plane.root.runtime_bootstrap_service",
-        "stream_kernel.execution.orchestration.control_plane.root.boundary_execution_service",
-        "stream_kernel.execution.orchestration.control_plane.root.boundary_handoff_service",
         "stream_kernel.integration.work_queue",
         "stream_kernel.routing.routing_service",
         "stream_kernel.observability.adapters",

@@ -8,7 +8,7 @@ from threading import Event
 from typing import Callable
 
 from stream_kernel.application_context.inject import inject
-from stream_kernel.application_context.debug_payload import payload_model_name, serialize_debug_value
+from stream_kernel.application_context.debug_payload import payload_model_name
 from stream_kernel.integration.work_queue import QueuePort
 from stream_kernel.execution.runtime.trace_scope import scoped_trace_id_for_index
 from stream_kernel.execution.runtime.trace_scope import scoped_trace_id_for_source
@@ -28,6 +28,8 @@ from stream_kernel.observability.events import (
 from stream_kernel.observability.domain.debug import DebugMessage
 from stream_kernel.platform.services.runtime.debug_buffer import RuntimeDebugBufferService
 from stream_kernel.platform.services.runtime.debug_buffer import publish_runtime_debug
+from stream_kernel.platform.services.runtime.debug_buffer import runtime_debug_enabled
+from stream_kernel.execution.orchestration.source_ingress import BootstrapControl
 from stream_kernel.platform.services.state.context import ContextService
 from stream_kernel.routing.envelope import Envelope
 from stream_kernel.routing.errors import RoutingError, RoutingErrorCode
@@ -43,6 +45,8 @@ _ROOT_LEAF_INGRESS_SOURCE_NODE_NAME = "source:system.cp.root_leaf_ingress"
 _ROOT_LEAF_INGRESS_SOURCE_PREFIX = "source:system.cp.root_leaf_ingress:"
 _LEAF_COMMAND_INGRESS_SOURCE_NODE_NAME = "source:system.cp.command_ingress"
 _LEAF_COMMAND_INGRESS_SOURCE_PREFIX = "source:system.cp.command_ingress:"
+_LEAF_RUNTIME_INGRESS_SOURCE_NODE_NAME = "source:system.ipc.ingress"
+_LEAF_RUNTIME_INGRESS_SOURCE_PREFIX = "source:system.ipc.ingress:"
 
 
 @dataclass(slots=True)
@@ -411,6 +415,11 @@ class SyncRunner:
     ) -> None:
         if not self._should_emit_runner_debug_envelope(envelope=envelope, source_node=source_node):
             return
+        if not runtime_debug_enabled():
+            return
+        buffer = self._runtime_debug_buffer()
+        if buffer is None:
+            return
         target = envelope.target
         target_label = ",".join(target) if isinstance(target, tuple) else target
         fields: dict[str, object] = {
@@ -421,7 +430,7 @@ class SyncRunner:
             "span_id": envelope.span_id,
             "tombstone": bool(envelope.tombstone),
             "payload_model": payload_model_name(envelope.payload),
-            "payload": serialize_debug_value(envelope.payload),
+            "payload_preview": SyncRunner._payload_preview(envelope.payload),
         }
         if isinstance(source_node, str) and source_node:
             fields["source_node"] = source_node
@@ -439,9 +448,6 @@ class SyncRunner:
         queue_depth = self._queue_depth_safe()
         if queue_depth is not None:
             fields["queue_depth"] = queue_depth
-        buffer = self._runtime_debug_buffer()
-        if buffer is None:
-            return
         publish_runtime_debug(
             buffer=buffer,
             event=event,
@@ -449,6 +455,21 @@ class SyncRunner:
             fields=fields,
             trace_id=envelope.trace_id,
         )
+
+    @staticmethod
+    def _payload_preview(payload: object) -> object:
+        if payload is None or isinstance(payload, (bool, int, float)):
+            return payload
+        if isinstance(payload, str):
+            return payload if len(payload) <= 256 else f"{payload[:253]}..."
+        if isinstance(payload, (bytes, bytearray, memoryview)):
+            return {"kind": type(payload).__name__, "size": len(payload)}
+        if isinstance(payload, dict):
+            keys = [str(key) for key in list(payload.keys())[:8]]
+            return {"kind": "dict", "size": len(payload), "keys": keys}
+        if isinstance(payload, (list, tuple, set)):
+            return {"kind": type(payload).__name__, "size": len(payload)}
+        return {"kind": type(payload).__name__}
 
     def _should_emit_runner_debug_envelope(
         self,
@@ -519,6 +540,11 @@ class SyncRunner:
             return (worker, lane_value)
         if source_node.startswith(_LEAF_COMMAND_INGRESS_SOURCE_PREFIX):
             lane = source_node[len(_LEAF_COMMAND_INGRESS_SOURCE_PREFIX) :].strip().lower()
+            if not lane:
+                return (None, None)
+            return (None, lane)
+        if source_node.startswith(_LEAF_RUNTIME_INGRESS_SOURCE_PREFIX):
+            lane = source_node[len(_LEAF_RUNTIME_INGRESS_SOURCE_PREFIX) :].strip().lower()
             if not lane:
                 return (None, None)
             return (None, lane)
@@ -605,8 +631,12 @@ class SyncRunner:
         explicit = output.trace_id if isinstance(output, Envelope) else None
         if isinstance(explicit, str) and explicit:
             return explicit
+        source_bootstrap = SyncRunner._is_source_bootstrap_envelope(
+            node_name=node_name,
+            upstream=upstream,
+        )
         inherited = upstream.trace_id if isinstance(upstream.trace_id, str) and upstream.trace_id else None
-        if inherited is not None:
+        if inherited is not None and not source_bootstrap:
             return inherited
         if not node_name.startswith("source:"):
             return None
@@ -640,7 +670,14 @@ class SyncRunner:
             return
         if not isinstance(trace_id, str) or not trace_id:
             return
-        if isinstance(upstream.trace_id, str) and upstream.trace_id:
+        if (
+            isinstance(upstream.trace_id, str)
+            and upstream.trace_id
+            and not SyncRunner._is_source_bootstrap_envelope(
+                node_name=node_name,
+                upstream=upstream,
+            )
+        ):
             return
         if SyncRunner._terminal_event_from_output(output) is not None:
             return
@@ -674,6 +711,18 @@ class SyncRunner:
             work_queue=work_queue,
             router=router,
         )
+
+    @staticmethod
+    def _is_source_bootstrap_envelope(*, node_name: str, upstream: Envelope) -> bool:
+        if not isinstance(node_name, str) or not node_name.startswith("source:"):
+            return False
+        payload = upstream.payload
+        if not isinstance(payload, BootstrapControl):
+            return False
+        target = payload.target
+        if not isinstance(target, str) or not target:
+            return False
+        return target == node_name
 
     def _emit_ingress(
         self,
@@ -803,7 +852,10 @@ class SyncRunner:
                     router=router,
                 ):
                     continue
-                if exc.code == RoutingErrorCode.NO_CONSUMERS:
+                if exc.code in (
+                    RoutingErrorCode.NO_CONSUMERS,
+                    RoutingErrorCode.SELF_LOOP_REQUIRES_EXPLICIT_TARGET,
+                ):
                     self._collect_terminal_output(
                         Envelope(
                             payload=output.payload if isinstance(output, Envelope) else output,
@@ -1301,6 +1353,7 @@ class AsyncRunner:
     ) -> None:
         work_queue = self._work_queue()
         poll_timeout = max(0.0, float(poll_timeout_seconds))
+        wait_for_item_async = getattr(work_queue, "wait_for_item_async", None)
         idle_deadline = (
             time.monotonic() + float(idle_timeout_seconds)
             if isinstance(idle_timeout_seconds, (int, float)) and float(idle_timeout_seconds) > 0
@@ -1319,7 +1372,9 @@ class AsyncRunner:
             now = time.monotonic()
             if idle_deadline is not None and now >= idle_deadline and work_queue.size() == 0:
                 return
-            if poll_timeout > 0:
+            if callable(wait_for_item_async):
+                await wait_for_item_async(poll_timeout)
+            elif poll_timeout > 0:
                 await asyncio.sleep(poll_timeout)
             else:
                 await asyncio.sleep(0)

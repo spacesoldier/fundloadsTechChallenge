@@ -406,6 +406,23 @@ def test_build_leaf_startup_init_input_targets_consumer_bindings_bootstrap() -> 
     assert isinstance(payload.payload, ControlPlaneInitEvent)
 
 
+def test_bind_worker_control_endpoint_supports_direct_target_endpoints() -> None:
+    import stream_kernel.execution.orchestration.lifecycle.leaf.command.control_plane_service as mod
+
+    ipc = _ExecutionIpc(binds=[])
+    endpoint = object()
+
+    mod._bind_worker_control_endpoint(  # noqa: SLF001 - internal contract test
+        ipc=ipc,
+        worker_id="execution.alpha#1",
+        control_pipe={
+            "target::ring:execution.alpha#1->execution.beta#1:data": endpoint,
+        },
+    )
+
+    assert ipc.binds == [("ring:execution.alpha#1->execution.beta#1:data", endpoint)]
+
+
 def test_leaf_worker_process_entry_binds_debug_runtime_sink(monkeypatch) -> None:
     import stream_kernel.execution.orchestration.lifecycle.leaf.command.control_plane_service as mod
 

@@ -18,9 +18,6 @@ from stream_kernel.execution.orchestration.observability_system_nodes import (
 from stream_kernel.execution.orchestration.lifecycle.root.startup.lifecycle_service import (
     ControlPlaneLifecycleOrchestrationService,
 )
-from stream_kernel.execution.orchestration.control_plane.root.boundary_handoff_service import (
-    ControlPlaneRootBoundaryHandoffService,
-)
 from stream_kernel.execution.orchestration.control_plane.root.leaf_ingress_service import (
     ControlPlaneRootLeafIngressService,
 )
@@ -30,7 +27,9 @@ from stream_kernel.execution.orchestration.control_plane.root.runtime_bootstrap_
 from stream_kernel.execution.transport.handoff.ipc_route_table_service import (
     ExecutionIpcRouteTableService,
 )
-from stream_kernel.platform.services.runtime import ProcessGroupRouterService
+from stream_kernel.platform.services.runtime import (
+    ProcessGroupRouterService,
+)
 
 
 @service(name="control_plane_root_runtime_bootstrap_service")
@@ -40,7 +39,6 @@ class DefaultControlPlaneRootRuntimeBootstrapService(ControlPlaneRootRuntimeBoot
         ControlPlaneLifecycleOrchestrationService
     )
     process_group_router: ProcessGroupRouterService = inject.service(ProcessGroupRouterService)
-    root_boundary_handoff: object = inject.service(ControlPlaneRootBoundaryHandoffService)
     root_leaf_ingress: object = inject.service(ControlPlaneRootLeafIngressService)
     route_table: object | None = inject.service(ExecutionIpcRouteTableService)
 
@@ -76,7 +74,6 @@ class DefaultControlPlaneRootRuntimeBootstrapService(ControlPlaneRootRuntimeBoot
         self._lifecycle().configure_group_runner_profiles(_group_runner_profiles(runtime_map))
         configured_groups = self._configure_process_group_router(runtime_map)
         self._preload_route_table_snapshot(configured_groups)
-        self._configure_root_boundary_handoff(runtime_map)
         self._configure_root_leaf_ingress(runtime_map)
 
     def _lifecycle(self) -> ControlPlaneLifecycleOrchestrationService:
@@ -120,43 +117,8 @@ class DefaultControlPlaneRootRuntimeBootstrapService(ControlPlaneRootRuntimeBoot
             return candidate  # type: ignore[return-value]
         return None
 
-    def _configure_root_boundary_handoff(self, runtime: dict[str, object]) -> None:
-        candidate = self.root_boundary_handoff
-        configure = getattr(candidate, "configure_dispatch", None)
-        if not callable(configure):
-            return
-        boundary_dispatch = _boundary_dispatch_settings(runtime)
-        timeout_seconds = boundary_dispatch.get("timeout_seconds")
-        stream_batch_max_items = boundary_dispatch.get("stream_batch_max_items")
-        observability_batch_max_items = boundary_dispatch.get("batch_max_items")
-        inflight_idle_timeout_seconds = boundary_dispatch.get("inflight_idle_timeout_seconds")
-        configure(
-            timeout_seconds=timeout_seconds if isinstance(timeout_seconds, (int, float)) else None,
-            stream_batch_max_items=(
-                int(stream_batch_max_items)
-                if isinstance(stream_batch_max_items, int) and stream_batch_max_items > 0
-                else None
-            ),
-            observability_batch_max_items=(
-                int(observability_batch_max_items)
-                if isinstance(observability_batch_max_items, int) and observability_batch_max_items > 0
-                else None
-            ),
-            inflight_idle_timeout_seconds=(
-                float(inflight_idle_timeout_seconds)
-                if isinstance(inflight_idle_timeout_seconds, (int, float))
-                and float(inflight_idle_timeout_seconds) > 0
-                else None
-            ),
-        )
-
     def _configure_root_leaf_ingress(self, runtime: dict[str, object]) -> None:
         candidate = self.root_leaf_ingress
-        if hasattr(candidate, "root_boundary_handoff"):
-            try:
-                setattr(candidate, "root_boundary_handoff", self.root_boundary_handoff)
-            except Exception:
-                pass
         configure = getattr(candidate, "configure_startup_protocol_revision", None)
         if callable(configure):
             configure(_startup_protocol_revision(runtime))
@@ -205,7 +167,6 @@ class DefaultControlPlaneRootRuntimeBootstrapService(ControlPlaneRootRuntimeBoot
         if callable(getattr(candidate, "upsert_route", None)):
             return candidate  # type: ignore[return-value]
         return None
-
 
 def _group_runner_profiles(runtime: dict[str, object]) -> dict[str, str]:
     platform = runtime.get("platform", {})

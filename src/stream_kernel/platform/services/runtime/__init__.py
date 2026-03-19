@@ -112,6 +112,13 @@ from stream_kernel.platform.services.runtime.control_plane_dag_assembly import (
     ControlPlaneDagAssemblyService,
     DefaultControlPlaneDagAssemblyService,
 )
+from stream_kernel.platform.services.runtime.control_plane_ring_topology import (
+    ControlPlaneRingLinkSpec,
+    ControlPlaneRingTopologyPlan,
+    ControlPlaneRingTopologyService,
+    ControlPlaneRingTopologyStore,
+    DefaultControlPlaneRingTopologyService,
+)
 from stream_kernel.platform.services.runtime.control_plane_shutdown_readiness import (
     ControlPlaneShutdownReadinessStore,
     ControlPlaneLeafShutdownReadinessStore,
@@ -221,6 +228,11 @@ __all__ = [
     "DefaultControlPlaneLaunchPlanService",
     "ControlPlaneDagAssemblyService",
     "DefaultControlPlaneDagAssemblyService",
+    "ControlPlaneRingLinkSpec",
+    "ControlPlaneRingTopologyPlan",
+    "ControlPlaneRingTopologyService",
+    "ControlPlaneRingTopologyStore",
+    "DefaultControlPlaneRingTopologyService",
     "ControlPlaneShutdownReadinessStore",
     "ControlPlaneLeafShutdownReadinessStore",
     "ControlPlaneShutdownReadinessSnapshot",

@@ -71,6 +71,18 @@ class TraceDispatchNode:
         payload = msg.payload if isinstance(msg, Envelope) else msg
         if not isinstance(payload, TraceDispatchEvent):
             return []
+        submit_event = getattr(self.pipeline, "submit_trace_event", None)
+        if callable(submit_event):
+            try:
+                return _coerce_outputs(
+                    submit_event(
+                        event=payload.payload,
+                        trace_id=payload.trace_id,
+                        attributes=dict(payload.attributes),
+                    )
+                )
+            except Exception:
+                return []
         emit_event_async = getattr(self.pipeline, "emit_trace_event_async", None)
         if callable(emit_event_async):
             try:
@@ -134,6 +146,18 @@ class LogDispatchNode:
         payload = msg.payload if isinstance(msg, Envelope) else msg
         if not isinstance(payload, LogDispatchEvent):
             return []
+        submit_event = getattr(self.pipeline, "submit_log_event", None)
+        if callable(submit_event):
+            try:
+                return _coerce_outputs(
+                    submit_event(
+                        event=payload.payload,
+                        trace_id=payload.trace_id,
+                        attributes=dict(payload.attributes),
+                    )
+                )
+            except Exception:
+                return []
         emit_event_async = getattr(self.pipeline, "emit_log_event_async", None)
         if callable(emit_event_async):
             try:
@@ -214,6 +238,18 @@ class MetricDispatchNode:
         payload = msg.payload if isinstance(msg, Envelope) else msg
         if not isinstance(payload, MetricDispatchEvent):
             return []
+        submit_event = getattr(self.pipeline, "submit_metric_event", None)
+        if callable(submit_event):
+            try:
+                return _coerce_outputs(
+                    submit_event(
+                        event=payload.payload,
+                        trace_id=payload.trace_id,
+                        attributes=dict(payload.attributes),
+                    )
+                )
+            except Exception:
+                return []
         emit_event_async = getattr(self.pipeline, "emit_metric_event_async", None)
         if callable(emit_event_async):
             try:
@@ -277,6 +313,18 @@ class MonitorDispatchNode:
         payload = msg.payload if isinstance(msg, Envelope) else msg
         if not isinstance(payload, MonitorDispatchEvent):
             return []
+        submit_event = getattr(self.pipeline, "submit_monitoring_event", None)
+        if callable(submit_event):
+            try:
+                return _coerce_outputs(
+                    submit_event(
+                        event=payload.payload,
+                        trace_id=payload.trace_id,
+                        attributes=dict(payload.attributes),
+                    )
+                )
+            except Exception:
+                return []
         emit_event_async = getattr(self.pipeline, "emit_monitoring_event_async", None)
         if callable(emit_event_async):
             try:

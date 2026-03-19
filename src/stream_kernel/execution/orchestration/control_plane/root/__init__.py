@@ -10,12 +10,6 @@ _EXPORTS = {
     'DefaultControlPlaneRootLeafIngressService': 'leaf_ingress_service',
     'ControlPlaneRootRuntimeBootstrapService': 'runtime_bootstrap_service',
     'DefaultControlPlaneRootRuntimeBootstrapService': 'runtime_bootstrap_service',
-    'ControlPlaneRootBoundaryExecutionService': 'boundary_execution_service',
-    'DefaultControlPlaneRootBoundaryExecutionService': 'boundary_execution_service',
-    'ControlPlaneRootBoundaryExecutionTimeoutError': 'boundary_execution_service',
-    'ControlPlaneRootBoundaryExecutionFailedError': 'boundary_execution_service',
-    'ControlPlaneRootBoundaryHandoffService': 'boundary_handoff_service',
-    'DefaultControlPlaneRootBoundaryHandoffService': 'boundary_handoff_service',
     'ControlPlaneRootDiscoverySnapshotService': 'discovery_snapshot_service',
     'DefaultControlPlaneRootDiscoverySnapshotService': 'discovery_snapshot_service',
 }

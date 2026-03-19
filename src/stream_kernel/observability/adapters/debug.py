@@ -50,7 +50,7 @@ class RedisDebugSink:
         self._queue_max_items = max(1, int(queue_max_items))
         self._batch_max_items = max(1, int(batch_max_items))
         self._batch_flush_interval_ms = max(1, int(batch_flush_interval_ms))
-        self._bg_queue: SimpleQueue[list[list[object]]] = SimpleQueue()
+        self._bg_queue: SimpleQueue[DebugMessage] = SimpleQueue()
         self._bg_wake = Event()
         self._bg_closed = Event()
         self._bg_thread: Thread | None = None
@@ -66,6 +66,12 @@ class RedisDebugSink:
     def emit(self, message: DebugMessage) -> None:
         if not isinstance(message, DebugMessage):
             return
+        if self._write_mode == "background":
+            self._enqueue_background(message)
+            return
+        self._execute(self._build_commands(message))
+
+    def _build_commands(self, message: DebugMessage) -> list[list[object]]:
         fields = message.fields if isinstance(message.fields, dict) else {}
         run_id, logical_run_id = _resolve_run_identity(
             fields={
@@ -140,10 +146,33 @@ class RedisDebugSink:
                 commands.append(["HSET", run_meta_key, f"summary:{key}", _to_redis_string(value)])
             if self._ttl_seconds > 0:
                 commands.append(["EXPIRE", run_meta_key, self._ttl_seconds])
-        if self._write_mode == "background":
-            self._enqueue_background(commands)
+        return commands
+
+    def emit_batch(self, messages: list[DebugMessage]) -> None:
+        # Emit multiple messages, firing the background wake event only once.
+        if not messages:
             return
-        self._execute(commands)
+        if self._write_mode == "background":
+            for msg in messages:
+                if isinstance(msg, DebugMessage):
+                    if not self._bg_closed.is_set():
+                        self._bg_queue.put(msg)
+            self._bg_wake.set()
+            return
+        # inline: build all commands in one batch then execute together
+        batch: list[list[object]] = []
+        for msg in messages:
+            if not isinstance(msg, DebugMessage):
+                continue
+            try:
+                batch.extend(self._build_commands(msg))
+            except Exception:
+                continue
+        if batch:
+            try:
+                self._execute(batch)
+            except Exception:
+                pass
 
     async def emit_async(self, message: DebugMessage) -> None:
         self.emit(message)
@@ -176,12 +205,10 @@ class RedisDebugSink:
                 if not _read_redis_reply(conn):
                     raise RuntimeError("redis reply indicates failure")
 
-    def _enqueue_background(self, commands: list[list[object]]) -> None:
-        if not commands:
-            return
+    def _enqueue_background(self, message: DebugMessage) -> None:
         if self._bg_closed.is_set():
             return
-        self._bg_queue.put(commands)
+        self._bg_queue.put(message)
         self._bg_wake.set()
 
     def _run_background_writer(self) -> None:
@@ -189,18 +216,25 @@ class RedisDebugSink:
         while True:
             self._bg_wake.wait(wait_seconds)
             self._bg_wake.clear()
-            batch: list[list[object]] = []
-            while len(batch) < self._batch_max_items:
+            messages: list[DebugMessage] = []
+            while len(messages) < self._batch_max_items:
                 try:
-                    batch.extend(self._bg_queue.get_nowait())
+                    messages.append(self._bg_queue.get_nowait())
                 except Empty:
                     break
-            if batch:
-                try:
-                    self._execute(batch)
-                except Exception:
-                    # Debug sink must be best-effort and never break runtime loop.
-                    pass
+            if messages:
+                batch: list[list[object]] = []
+                for msg in messages:
+                    try:
+                        batch.extend(self._build_commands(msg))
+                    except Exception:
+                        continue
+                if batch:
+                    try:
+                        self._execute(batch)
+                    except Exception:
+                        # Debug sink must be best-effort and never break runtime loop.
+                        pass
             if self._bg_closed.is_set() and self._bg_queue.empty():
                 break
 

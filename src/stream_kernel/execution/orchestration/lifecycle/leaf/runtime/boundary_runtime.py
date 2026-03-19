@@ -13,6 +13,7 @@ from stream_kernel.platform.services.observability import (
     NoOpObservabilityService,
     ObservabilityService,
 )
+from stream_kernel.platform.services.runtime.debug_buffer import RuntimeDebugBufferService
 from stream_kernel.platform.services.state.context import ContextService
 from stream_kernel.routing.envelope import Envelope
 from stream_kernel.routing.routing_service import RoutingService
@@ -241,6 +242,7 @@ def execute_child_boundary_loop(
             "allow_external_deliveries": True,
             "boundary_outputs": emitted,
             "observability_context_enricher": _enrich_observability_ctx,
+            "runtime_debug_buffer": _resolve_runtime_debug_buffer(child.scenario_scope),
         }
         use_async_runner = (
             child.runner_profile_effective == "async"
@@ -433,6 +435,18 @@ def _resolve_leaf_debug_logging_service(
         return None
     if isinstance(service, LeafLifecycleDebugLoggingService):
         return service
+    return None
+
+
+def _resolve_runtime_debug_buffer(
+    scope: ScenarioScope,
+) -> RuntimeDebugBufferService | None:
+    try:
+        buf = scope.resolve("service", RuntimeDebugBufferService)
+    except InjectionRegistryError:
+        return None
+    if isinstance(buf, RuntimeDebugBufferService):
+        return buf
     return None
 
 

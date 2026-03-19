@@ -234,3 +234,44 @@ def test_trace_dispatch_node_uses_emit_trace_event_when_available() -> None:
     assert isinstance(produced, list)
     assert len(produced) == 1
     assert isinstance(produced[0], LogDispatchEvent)
+
+
+def test_trace_dispatch_node_prefers_submit_trace_event_when_available() -> None:
+    from stream_kernel.execution.orchestration.observability_system_nodes import (
+        TraceDispatchNode,
+    )
+    from stream_kernel.observability.events import TraceDispatchEvent
+
+    class _Pipeline:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def submit_trace_event(
+            self,
+            *,
+            event: object,
+            trace_id: str | None = None,
+            attributes: dict[str, object] | None = None,
+        ) -> list[object]:
+            _ = (event, trace_id, attributes)
+            self.calls.append("submit")
+            return []
+
+        async def emit_trace_event_async(
+            self,
+            *,
+            event: object,
+            trace_id: str | None = None,
+            attributes: dict[str, object] | None = None,
+        ) -> list[object]:
+            _ = (event, trace_id, attributes)
+            self.calls.append("async")
+            return []
+
+    pipeline = _Pipeline()
+    node = TraceDispatchNode(pipeline=pipeline)
+
+    produced = node(TraceDispatchEvent(payload={"span": "n1"}, trace_id="t1"), None)
+    assert isinstance(produced, list)
+    assert produced == []
+    assert pipeline.calls == ["submit"]

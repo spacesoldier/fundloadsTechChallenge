@@ -83,8 +83,10 @@ from .system_nodes import (
     ControlPlaneLeafStartWorkNode,
     ControlPlaneLeafStopNode,
     ControlPlaneLeafTombstoneFinalizeNode,
-    leaf_command_ingress_source_lanes,
     leaf_command_ingress_source_node_name,
+    leaf_command_ingress_source_lanes,
+    leaf_runtime_ingress_drain_source_node_name,
+    leaf_runtime_ingress_source_lanes,
 )
 
 
@@ -117,19 +119,49 @@ def build_leaf_control_plane_system_plan(
     )
     ready_for_work = ControlPlaneReadyForWorkNode()
     consumer_registry_bindings_bootstrap = ControlPlaneConsumerRegistryBindingsBootstrapNode()
-    leaf_command_lanes = _leaf_command_source_lanes_for_runtime(runtime)
-    leaf_command_source_steps = [
+    observability_source_workers = _leaf_observability_source_worker_ids(runtime)
+    command_ingress_lanes = leaf_command_ingress_source_lanes()
+    runtime_ingress_lanes = _leaf_runtime_ingress_lanes_for_runtime(runtime)
+    command_ingress_source_name = leaf_command_ingress_source_node_name(
+        lane=command_ingress_lanes[0]
+    )
+    command_poll_worker_ids_by_lane = _leaf_poll_worker_ids_by_lane(
+        lanes=command_ingress_lanes,
+        observability_source_workers=(),
+    )
+    leaf_ingress_source_steps = [
         StepSpec(
-            name=source_name,
+            name=command_ingress_source_name,
             step=ControlPlaneLeafCommandIngressSourceNode(
-                lane=lane,
-                source_name=source_name,
+                lane=command_ingress_lanes[0],
+                poll_lanes=tuple(command_ingress_lanes),
+                poll_worker_ids=(),
+                poll_worker_ids_by_lane=command_poll_worker_ids_by_lane,
+                source_name=command_ingress_source_name,
+                max_messages_per_poll=64,
             ),
         )
-        for lane in leaf_command_lanes
-        for source_name in [leaf_command_ingress_source_node_name(lane=lane)]
     ]
-    leaf_command_source_names = [spec.name for spec in leaf_command_source_steps]
+    if runtime_ingress_lanes:
+        runtime_ingress_source_name = leaf_runtime_ingress_drain_source_node_name()
+        runtime_poll_worker_ids_by_lane = _leaf_poll_worker_ids_by_lane(
+            lanes=runtime_ingress_lanes,
+            observability_source_workers=observability_source_workers,
+        )
+        leaf_ingress_source_steps.append(
+            StepSpec(
+                name=runtime_ingress_source_name,
+                step=ControlPlaneLeafCommandIngressSourceNode(
+                    lane=runtime_ingress_lanes[0],
+                    poll_lanes=tuple(runtime_ingress_lanes),
+                    poll_worker_ids=(),
+                    poll_worker_ids_by_lane=runtime_poll_worker_ids_by_lane,
+                    source_name=runtime_ingress_source_name,
+                    max_messages_per_poll=64,
+                ),
+            )
+        )
+    leaf_ingress_source_names = [spec.name for spec in leaf_ingress_source_steps]
     leaf_reply_dispatch = ControlPlaneLeafReplyDispatchNode()
     leaf_source_poll_from_sink_ack = ControlPlaneLeafSourcePollFromSinkAckNode()
     leaf_apply = ControlPlaneLeafConfigApplyRuntimeNode(
@@ -199,7 +231,7 @@ def build_leaf_control_plane_system_plan(
             leaf_tombstone_finalize=leaf_tombstone_finalize,
             leaf_stop=leaf_stop,
         ),
-        *leaf_command_source_steps,
+        *leaf_ingress_source_steps,
     ]
     initialization_plan.candidate_node_names = tuple(
         spec.name
@@ -228,7 +260,9 @@ def build_leaf_control_plane_system_plan(
             ],
             ControlPlaneDeferredMessageHoldEvent: ["system.cp.deferred_message_hold"],
             ControlPlaneDeferredMessageReplayRequestEvent: ["system.cp.deferred_message_replay"],
-            BootstrapControl: list(leaf_command_source_names),
+            BootstrapControl: [
+                *list(leaf_ingress_source_names),
+            ],
             ControlPlaneLeafDiscoveryRequestEvent: [
                 "system.cp.leaf_discovery",
             ],
@@ -264,16 +298,19 @@ def build_leaf_control_plane_system_plan(
         },
         system_node_names={
             *LEAF_STATIC_SYSTEM_NODE_NAMES,
-            *leaf_command_source_names,
+            *leaf_ingress_source_names,
         },
     )
 
 
-def _leaf_command_source_lanes_for_runtime(runtime: dict[str, object]) -> tuple[str, ...]:
-    base = tuple(leaf_command_ingress_source_lanes())
+def _leaf_runtime_ingress_lanes_for_runtime(runtime: dict[str, object]) -> tuple[str, ...]:
     role = runtime.get("__process_role")
-    if role != "observability_worker":
-        return base
+    if role == "observability_worker":
+        return _leaf_observability_ingress_lanes()
+    return (leaf_runtime_ingress_source_lanes()[0],)
+
+
+def _leaf_observability_ingress_lanes() -> tuple[str, ...]:
     from stream_kernel.execution.transport.ipc.ipc_transport import (
         EXECUTION_IPC_LANE_LOG,
         EXECUTION_IPC_LANE_METRIC,
@@ -281,11 +318,72 @@ def _leaf_command_source_lanes_for_runtime(runtime: dict[str, object]) -> tuple[
     )
 
     return (
-        *base,
         EXECUTION_IPC_LANE_TRACE,
         EXECUTION_IPC_LANE_LOG,
         EXECUTION_IPC_LANE_METRIC,
     )
+
+
+def _leaf_observability_source_worker_ids(runtime: dict[str, object]) -> tuple[str, ...]:
+    if not isinstance(runtime, dict):
+        return ()
+    if runtime.get("__process_role") != "observability_worker":
+        return ()
+    platform = runtime.get("platform")
+    if not isinstance(platform, dict):
+        return ()
+    raw_groups = platform.get("process_groups")
+    if not isinstance(raw_groups, list):
+        return ()
+    observability_group = _leaf_observability_group_name(runtime)
+    source_worker_ids: list[str] = []
+    seen: set[str] = set()
+    for group in raw_groups:
+        if not isinstance(group, dict):
+            continue
+        group_name = group.get("name")
+        if not isinstance(group_name, str) or not group_name:
+            continue
+        if group_name == observability_group:
+            continue
+        workers = group.get("workers", 1)
+        worker_count = int(workers) if isinstance(workers, int) and workers > 0 else 1
+        for index in range(worker_count):
+            worker_id = f"{group_name}#{index + 1}"
+            if worker_id in seen:
+                continue
+            seen.add(worker_id)
+            source_worker_ids.append(worker_id)
+    return tuple(source_worker_ids)
+
+
+def _leaf_poll_worker_ids_by_lane(
+    *,
+    lanes: tuple[str, ...],
+    observability_source_workers: tuple[str, ...],
+) -> dict[str, tuple[str, ...]]:
+    mapping: dict[str, tuple[str, ...]] = {}
+    if not observability_source_workers:
+        return mapping
+    for lane in lanes:
+        if lane in _leaf_observability_ingress_lanes():
+            mapping[lane] = observability_source_workers
+    return mapping
+
+
+def _leaf_observability_group_name(runtime: dict[str, object]) -> str:
+    observability = runtime.get("observability")
+    if not isinstance(observability, dict):
+        return "system.observability"
+    service_cfg = observability.get("service_process")
+    if not isinstance(service_cfg, dict):
+        service_cfg = observability.get("service_worker")
+    if not isinstance(service_cfg, dict):
+        return "system.observability"
+    group_name = service_cfg.get("group_name")
+    if not isinstance(group_name, str) or not group_name:
+        return "system.observability"
+    return group_name
 
 
 __all__ = ["build_leaf_control_plane_system_plan"]

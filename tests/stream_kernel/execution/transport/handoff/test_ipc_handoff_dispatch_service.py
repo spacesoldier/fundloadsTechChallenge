@@ -52,7 +52,7 @@ def test_ipc_handoff_dispatch_service_uses_route_table_and_default_lane() -> Non
     service = DefaultExecutionIpcHandoffDispatchService(
         execution_ipc=ipc,
         route_table=route_table,
-        lane_routing=None,
+        lane_routing=_LaneRouting(lane=EXECUTION_IPC_LANE_DATA),
     )
 
     dispatched = service.dispatch_envelope(
@@ -60,6 +60,7 @@ def test_ipc_handoff_dispatch_service_uses_route_table_and_default_lane() -> Non
         source_group="execution.root",
     )
 
+    expected_envelope = Envelope(payload={"v": 1}, target="remote.node")
     assert dispatched is True
     assert ipc.sends == [
         {
@@ -67,7 +68,7 @@ def test_ipc_handoff_dispatch_service_uses_route_table_and_default_lane() -> Non
                 "execution.alpha#1",
                 lane=EXECUTION_IPC_LANE_DATA,
             ),
-            "payload": {"v": 1},
+            "payload": expected_envelope,
             "no_reply": True,
         }
     ]
@@ -79,7 +80,7 @@ def test_ipc_handoff_dispatch_service_rejects_envelope_when_target_or_route_miss
     service = DefaultExecutionIpcHandoffDispatchService(
         execution_ipc=ipc,
         route_table=route_table,
-        lane_routing=None,
+        lane_routing=_LaneRouting(lane=EXECUTION_IPC_LANE_DATA),
     )
 
     missing_target = service.dispatch_envelope(Envelope(payload={"v": 1}, target=None))
@@ -88,6 +89,28 @@ def test_ipc_handoff_dispatch_service_rejects_envelope_when_target_or_route_miss
     assert missing_target is False
     assert missing_route is False
     assert ipc.sends == []
+
+
+def test_ipc_handoff_dispatch_service_falls_back_to_target_lane_when_lane_routing_binding_is_missing() -> None:
+    route_table = InMemoryExecutionIpcRouteTableService(store=InMemoryKvStore())
+    route_table.upsert_route(target="remote.node", target_id="execution.alpha#1")
+    ipc = _IpcPort()
+    service = DefaultExecutionIpcHandoffDispatchService(
+        execution_ipc=ipc,
+        route_table=route_table,
+        lane_routing=None,
+    )
+
+    dispatched = service.dispatch_envelope(
+        Envelope(payload={"v": 1}, target="remote.node"),
+        source_group="execution.root",
+    )
+
+    assert dispatched is True
+    assert ipc.sends[0]["target_id"] == compose_execution_ipc_worker_target_id(
+        "execution.alpha#1",
+        lane=EXECUTION_IPC_LANE_DATA,
+    )
 
 
 def test_ipc_handoff_dispatch_service_applies_lane_routing_override() -> None:
@@ -112,7 +135,7 @@ def test_ipc_handoff_dispatch_service_applies_lane_routing_override() -> None:
     )
 
 
-def test_ipc_handoff_dispatch_service_falls_back_to_target_lane_on_routing_error() -> None:
+def test_ipc_handoff_dispatch_service_returns_false_on_routing_error() -> None:
     route_table = InMemoryExecutionIpcRouteTableService(store=InMemoryKvStore())
     route_table.upsert_route(target="system.cp.leaf_stop", target_id="execution.alpha#1")
     ipc = _IpcPort()
@@ -127,8 +150,5 @@ def test_ipc_handoff_dispatch_service_falls_back_to_target_lane_on_routing_error
         source_group="execution.root",
     )
 
-    assert dispatched is True
-    assert ipc.sends[0]["target_id"] == compose_execution_ipc_worker_target_id(
-        "execution.alpha#1",
-        lane=EXECUTION_IPC_LANE_CONTROL,
-    )
+    assert dispatched is False
+    assert ipc.sends == []

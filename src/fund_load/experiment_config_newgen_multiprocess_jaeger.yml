@@ -119,6 +119,7 @@ runtime:
           settings:
             path: logs/runtime_all_experiment_multiprocess_jaeger.jsonl
         - kind: redis_debug
+          enabled: false
           mode: all
           settings:
             host: 127.0.0.1
@@ -169,7 +170,7 @@ runtime:
     - fund_load
   platform:
     debug:
-      root_verbose_logging: true
+      root_verbose_logging: false
       leaf_debug_enabled: false
       leaf_verbose_logging: false
       leaf_debug_write_to_file: false

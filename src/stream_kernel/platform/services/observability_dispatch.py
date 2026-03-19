@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from threading import Condition, Thread
 
 from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.service import service
@@ -34,6 +36,14 @@ class _NodeObservationState:
     previous_trace_exit: datetime | None = None
 
 
+@dataclass(slots=True, frozen=True)
+class _QueuedDispatch:
+    channel: str
+    event: object
+    trace_id: str | None
+    attributes: dict[str, object] | None
+
+
 @service(name="dispatching_observability_service")
 @dataclass(slots=True)
 class DispatchingObservabilityService(ObservabilityPipelineService):
@@ -55,6 +65,17 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
         )
     )
     _trace_contexts: dict[str, Context] = field(default_factory=dict)
+    _dispatch_queue_enabled: bool = field(default=False, init=False, repr=False)
+    _dispatch_queue_max_items: int = field(default=131072, init=False, repr=False)
+    _dispatch_queue_drop_policy: str = field(default="non_block", init=False, repr=False)
+    _dispatch_queue_block_timeout_ms: int = field(default=100, init=False, repr=False)
+    _dispatch_queue_batch_max_items: int = field(default=100, init=False, repr=False)
+    _dispatch_queue_flush_interval_seconds: float = field(default=0.02, init=False, repr=False)
+    _dispatch_queue_drain_timeout_seconds: float = field(default=30.0, init=False, repr=False)
+    _dispatch_queue: deque[_QueuedDispatch] = field(default_factory=deque, init=False, repr=False)
+    _dispatch_condition: Condition = field(default_factory=Condition, init=False, repr=False)
+    _dispatch_thread: Thread | None = field(default=None, init=False, repr=False)
+    _dispatch_stopping: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.runtime = dict(self.runtime)
@@ -63,6 +84,9 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
         self.telemetry_sinks = list(self.telemetry_sinks)
         self.monitoring_sinks = list(self.monitoring_sinks)
         self.debug_sinks = list(self.debug_sinks)
+        self._configure_dispatch_queue()
+        if self._dispatch_queue_enabled:
+            self._start_dispatch_worker()
 
     def before_node(
         self,
@@ -260,6 +284,7 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
         return events or None
 
     def on_run_end(self) -> None:
+        self._stop_dispatch_worker()
         for sink in [
             *self.trace_sinks,
             *self.log_sinks,
@@ -472,6 +497,82 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
             sink_errors=sink_errors,
         )
 
+    def submit_trace_event(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> list[object]:
+        if not self._dispatch_queue_enabled:
+            return self.emit_trace_event(event=event, trace_id=trace_id, attributes=attributes)
+        self._enqueue_dispatch(
+            _QueuedDispatch(
+                channel="trace",
+                event=event,
+                trace_id=trace_id,
+                attributes=dict(attributes) if isinstance(attributes, dict) else None,
+            )
+        )
+        return []
+
+    def submit_log_event(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> list[object]:
+        if not self._dispatch_queue_enabled:
+            return self.emit_log_event(event=event, trace_id=trace_id, attributes=attributes)
+        self._enqueue_dispatch(
+            _QueuedDispatch(
+                channel="log",
+                event=event,
+                trace_id=trace_id,
+                attributes=dict(attributes) if isinstance(attributes, dict) else None,
+            )
+        )
+        return []
+
+    def submit_metric_event(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> list[object]:
+        if not self._dispatch_queue_enabled:
+            return self.emit_metric_event(event=event, trace_id=trace_id, attributes=attributes)
+        self._enqueue_dispatch(
+            _QueuedDispatch(
+                channel="metric",
+                event=event,
+                trace_id=trace_id,
+                attributes=dict(attributes) if isinstance(attributes, dict) else None,
+            )
+        )
+        return []
+
+    def submit_monitoring_event(
+        self,
+        *,
+        event: object,
+        trace_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> list[object]:
+        if not self._dispatch_queue_enabled:
+            return self.emit_monitoring_event(event=event, trace_id=trace_id, attributes=attributes)
+        self._enqueue_dispatch(
+            _QueuedDispatch(
+                channel="monitor",
+                event=event,
+                trace_id=trace_id,
+                attributes=dict(attributes) if isinstance(attributes, dict) else None,
+            )
+        )
+        return []
+
     def on_ingress(
         self,
         *,
@@ -681,7 +782,7 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
     ) -> list[object]:
         if not self._channel_enabled("debug"):
             return []
-        if self._should_emit_dispatch_events():
+        if self._should_emit_dispatch_events() and not self.debug_sinks:
             return [
                 DebugDispatchEvent(
                     payload=self._coerce_debug_message(event),
@@ -773,6 +874,147 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
                 if isinstance(result, Exception):
                     errors.append((sink_name, result))
         return errors
+
+    def _configure_dispatch_queue(self) -> None:
+        observability = self.runtime.get("observability", {})
+        if not isinstance(observability, dict):
+            self._dispatch_queue_enabled = False
+            return
+        tracing = observability.get("tracing", {})
+        if not isinstance(tracing, dict):
+            self._dispatch_queue_enabled = False
+            return
+        queue_cfg = tracing.get("dispatch_queue", {})
+        if not isinstance(queue_cfg, dict):
+            self._dispatch_queue_enabled = False
+            return
+        max_items = queue_cfg.get("max_items", 131072)
+        if isinstance(max_items, int) and max_items > 0:
+            self._dispatch_queue_max_items = int(max_items)
+        drop_policy = queue_cfg.get("drop_policy", "non_block")
+        if isinstance(drop_policy, str) and drop_policy:
+            self._dispatch_queue_drop_policy = drop_policy
+        block_timeout_ms = queue_cfg.get("block_timeout_ms", 100)
+        if isinstance(block_timeout_ms, int) and block_timeout_ms > 0:
+            self._dispatch_queue_block_timeout_ms = int(block_timeout_ms)
+        forward_batch_max_items = queue_cfg.get("forward_batch_max_items", 100)
+        if isinstance(forward_batch_max_items, int) and forward_batch_max_items > 0:
+            self._dispatch_queue_batch_max_items = int(forward_batch_max_items)
+        forward_flush_interval_ms = queue_cfg.get("forward_flush_interval_ms", 20)
+        if isinstance(forward_flush_interval_ms, int) and forward_flush_interval_ms > 0:
+            self._dispatch_queue_flush_interval_seconds = float(forward_flush_interval_ms) / 1000.0
+        drain_timeout_seconds = queue_cfg.get("drain_timeout_seconds", 30.0)
+        if isinstance(drain_timeout_seconds, (int, float)) and float(drain_timeout_seconds) > 0:
+            self._dispatch_queue_drain_timeout_seconds = float(drain_timeout_seconds)
+        # Queue is always enabled for configured dispatch_queue: this keeps
+        # observability nodes non-blocking and shifts exporter latency off loop.
+        self._dispatch_queue_enabled = True
+
+    def _start_dispatch_worker(self) -> None:
+        with self._dispatch_condition:
+            if isinstance(self._dispatch_thread, Thread) and self._dispatch_thread.is_alive():
+                return
+            self._dispatch_stopping = False
+            self._dispatch_thread = Thread(
+                name="sk-observability-dispatch",
+                target=self._dispatch_loop,
+                daemon=True,
+            )
+            self._dispatch_thread.start()
+
+    def _stop_dispatch_worker(self) -> None:
+        thread: Thread | None = None
+        with self._dispatch_condition:
+            if not isinstance(self._dispatch_thread, Thread):
+                return
+            self._dispatch_stopping = True
+            self._dispatch_condition.notify_all()
+            thread = self._dispatch_thread
+        if isinstance(thread, Thread) and thread.is_alive():
+            thread.join(timeout=max(0.1, float(self._dispatch_queue_drain_timeout_seconds)))
+        with self._dispatch_condition:
+            self._dispatch_thread = None
+
+    def _enqueue_dispatch(self, item: _QueuedDispatch) -> None:
+        with self._dispatch_condition:
+            if self._dispatch_stopping:
+                return
+            queue_max = max(1, int(self._dispatch_queue_max_items))
+            if self._dispatch_queue_drop_policy == "drop_newest":
+                if len(self._dispatch_queue) >= queue_max:
+                    return
+            elif self._dispatch_queue_drop_policy == "drop_oldest":
+                if len(self._dispatch_queue) >= queue_max:
+                    self._dispatch_queue.popleft()
+            elif self._dispatch_queue_drop_policy == "block_with_timeout":
+                deadline = time.monotonic() + (float(self._dispatch_queue_block_timeout_ms) / 1000.0)
+                while len(self._dispatch_queue) >= queue_max and not self._dispatch_stopping:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    self._dispatch_condition.wait(timeout=min(remaining, 0.01))
+            # non_block/no-drop mode: do not reject items, allow in-memory growth.
+            self._dispatch_queue.append(item)
+            self._dispatch_condition.notify_all()
+
+    def _dispatch_loop(self) -> None:
+        flush_interval = max(0.001, float(self._dispatch_queue_flush_interval_seconds))
+        while True:
+            batch = self._dequeue_dispatch_batch(
+                max_items=max(1, int(self._dispatch_queue_batch_max_items)),
+                timeout_seconds=flush_interval,
+            )
+            if batch:
+                self._dispatch_batch(batch)
+                continue
+            with self._dispatch_condition:
+                if self._dispatch_stopping and not self._dispatch_queue:
+                    return
+
+    def _dequeue_dispatch_batch(self, *, max_items: int, timeout_seconds: float) -> list[_QueuedDispatch]:
+        with self._dispatch_condition:
+            if not self._dispatch_queue and not self._dispatch_stopping:
+                self._dispatch_condition.wait(timeout=timeout_seconds)
+            if not self._dispatch_queue:
+                return []
+            take = min(max_items, len(self._dispatch_queue))
+            batch: list[_QueuedDispatch] = []
+            for _ in range(take):
+                batch.append(self._dispatch_queue.popleft())
+            self._dispatch_condition.notify_all()
+            return batch
+
+    def _dispatch_batch(self, batch: list[_QueuedDispatch]) -> None:
+        for item in batch:
+            channel = item.channel
+            if channel == "trace":
+                _ = self.emit_trace_event(
+                    event=item.event,
+                    trace_id=item.trace_id,
+                    attributes=item.attributes,
+                )
+                continue
+            if channel == "log":
+                _ = self.emit_log_event(
+                    event=item.event,
+                    trace_id=item.trace_id,
+                    attributes=item.attributes,
+                )
+                continue
+            if channel == "metric":
+                _ = self.emit_metric_event(
+                    event=item.event,
+                    trace_id=item.trace_id,
+                    attributes=item.attributes,
+                )
+                continue
+            if channel == "monitor":
+                _ = self.emit_monitoring_event(
+                    event=item.event,
+                    trace_id=item.trace_id,
+                    attributes=item.attributes,
+                )
+                continue
 
     def _sink_error_events(
         self,
