@@ -71,6 +71,7 @@ class SyncRunner:
     runtime_debug_buffer: object | None = None
     run_id: str = "run"
     scenario_id: str = "scenario"
+    process_group: str | None = None
     # Service/system nodes can request full metadata, regular nodes receive filtered view.
     full_context_nodes: set[str] = field(default_factory=set)
     # Sink delivery ordering mode: `completion` (default) or `source_seq`.
@@ -144,9 +145,11 @@ class SyncRunner:
             raw_ctx = full_ctx if (node_name in self.full_context_nodes) else {
                 key: value for key, value in full_ctx.items() if not key.startswith("__")
             }
-            observability_ctx = dict(raw_ctx)
-            if isinstance(envelope.span_id, str) and envelope.span_id:
-                observability_ctx["__parent_span_id"] = envelope.span_id
+            observability_ctx = self._build_observability_ctx(
+                raw_ctx=raw_ctx,
+                full_ctx=full_ctx,
+                envelope=envelope,
+            )
             self._stamp_runner_gap(
                 envelope=envelope,
                 observability_ctx=observability_ctx,
@@ -744,10 +747,11 @@ class SyncRunner:
     def _span_id_from_observer_state(state: object) -> str | None:
         states = state if isinstance(state, list) else [state]
         for item in states:
-            span = getattr(item, "span", None)
-            span_id = getattr(span, "span_id", None)
-            if isinstance(span_id, str) and span_id:
-                return span_id
+            for span_attr in ("trace_span", "span"):
+                span = getattr(item, span_attr, None)
+                span_id = getattr(span, "span_id", None)
+                if isinstance(span_id, str) and span_id:
+                    return span_id
             candidate = getattr(item, "span_id", None)
             if isinstance(candidate, str) and candidate:
                 return candidate
@@ -1017,6 +1021,38 @@ class SyncRunner:
             return
         observability_ctx["__runner_gap_ms"] = (now - prev) * 1000.0
 
+    def _build_observability_ctx(
+        self,
+        *,
+        raw_ctx: dict[str, object],
+        full_ctx: dict[str, object],
+        envelope: Envelope,
+    ) -> dict[str, object]:
+        observability_ctx = dict(raw_ctx)
+        for key in (
+            "__run_id",
+            "__scenario_id",
+            "__step_index",
+            "__process_group",
+            "__handoff_from",
+            "__route_hop",
+            "__parent_span_id",
+        ):
+            if key in observability_ctx:
+                continue
+            value = full_ctx.get(key)
+            if value is not None:
+                observability_ctx[key] = value
+        if (
+            "__process_group" not in observability_ctx
+            and isinstance(self.process_group, str)
+            and self.process_group
+        ):
+            observability_ctx["__process_group"] = self.process_group
+        if isinstance(envelope.span_id, str) and envelope.span_id:
+            observability_ctx["__parent_span_id"] = envelope.span_id
+        return observability_ctx
+
     def run_until_stopped(
         self,
         *,
@@ -1065,6 +1101,7 @@ class AsyncRunner:
     runtime_debug_buffer: object | None = None
     run_id: str = "run"
     scenario_id: str = "scenario"
+    process_group: str | None = None
     full_context_nodes: set[str] = field(default_factory=set)
     ordered_sink_mode: str = "completion"
     allow_external_deliveries: bool = False
@@ -1135,9 +1172,11 @@ class AsyncRunner:
             raw_ctx = full_ctx if (node_name in self.full_context_nodes) else {
                 key: value for key, value in full_ctx.items() if not key.startswith("__")
             }
-            observability_ctx = dict(raw_ctx)
-            if isinstance(envelope.span_id, str) and envelope.span_id:
-                observability_ctx["__parent_span_id"] = envelope.span_id
+            observability_ctx = self._build_observability_ctx(
+                raw_ctx=raw_ctx,
+                full_ctx=full_ctx,
+                envelope=envelope,
+            )
             self._stamp_runner_gap(
                 envelope=envelope,
                 observability_ctx=observability_ctx,
@@ -1644,6 +1683,20 @@ class AsyncRunner:
         if prev is None:
             return
         observability_ctx["__runner_gap_ms"] = (now - prev) * 1000.0
+
+    def _build_observability_ctx(
+        self,
+        *,
+        raw_ctx: dict[str, object],
+        full_ctx: dict[str, object],
+        envelope: Envelope,
+    ) -> dict[str, object]:
+        return SyncRunner._build_observability_ctx(
+            self,  # type: ignore[arg-type]
+            raw_ctx=raw_ctx,
+            full_ctx=full_ctx,
+            envelope=envelope,
+        )
 
 async def _coerce_node_outputs(raw: object) -> list[object]:
     resolved = await _maybe_await(raw)

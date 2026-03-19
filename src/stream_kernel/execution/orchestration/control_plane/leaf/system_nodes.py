@@ -1045,7 +1045,7 @@ class ControlPlaneLeafBoundaryExecuteNode:
 
 @node(
     name="system.cp.leaf_tombstone_finalize",
-    consumes=[ControlPlaneLeafBoundaryOutputsEvent],
+    consumes=[ControlPlaneLeafBoundaryOutputsEvent, ControlPlaneLeafSinkDispatchAckEvent],
     emits=[ControlPlaneLeafDrainReadyEvent],
 )
 @dataclass
@@ -1056,9 +1056,17 @@ class ControlPlaneLeafTombstoneFinalizeNode:
 
     def __call__(self, msg: object, _ctx: object | None) -> list[object]:
         payload = msg.payload if isinstance(msg, Envelope) else msg
-        if not isinstance(payload, ControlPlaneLeafBoundaryOutputsEvent):
+        event: ControlPlaneLeafDrainReadyEvent | None = None
+        if isinstance(payload, ControlPlaneLeafSinkDispatchAckEvent):
+            event = self.readiness.observe_sink_dispatch_ack(payload)
+        elif isinstance(payload, ControlPlaneLeafBoundaryOutputsEvent):
+            # For source-driven commands we wait for sink-dispatch ACK before
+            # declaring drain-ready. Keep boundary path only as a fallback.
+            if isinstance(payload.source_target, str) and payload.source_target:
+                return []
+            event = self.readiness.observe_boundary_outputs(payload)
+        else:
             return []
-        event = self.readiness.observe_boundary_outputs(payload)
         if event is None:
             return []
         return [event]

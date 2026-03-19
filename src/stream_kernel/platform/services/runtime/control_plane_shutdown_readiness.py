@@ -9,6 +9,7 @@ from stream_kernel.integration.kv_store import KVStore
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafBoundaryOutputsEvent,
     ControlPlaneLeafDrainReadyEvent,
+    ControlPlaneLeafSinkDispatchAckEvent,
 )
 
 _EXPECTED_GROUPS_KEY = "control_plane.shutdown.expected_groups"
@@ -64,6 +65,11 @@ class ControlPlaneShutdownReadinessService(Protocol):
 class ControlPlaneLeafShutdownReadinessService(Protocol):
     def observe_boundary_outputs(
         self, boundary: ControlPlaneLeafBoundaryOutputsEvent
+    ) -> ControlPlaneLeafDrainReadyEvent | None:
+        raise NotImplementedError
+
+    def observe_sink_dispatch_ack(
+        self, ack: ControlPlaneLeafSinkDispatchAckEvent
     ) -> ControlPlaneLeafDrainReadyEvent | None:
         raise NotImplementedError
 
@@ -132,16 +138,41 @@ class InMemoryControlPlaneLeafShutdownReadinessService(ControlPlaneLeafShutdownR
     def observe_boundary_outputs(
         self, boundary: ControlPlaneLeafBoundaryOutputsEvent
     ) -> ControlPlaneLeafDrainReadyEvent | None:
-        # Terminal-only semantics: leaf ready-to-drain can be emitted only for output tombstone.
-        if not boundary.tombstone_output:
-            return None
-        if self._already_emitted(boundary.target_group, boundary.request_id):
-            return None
-        return self._emit_ready(
+        return self._observe_tombstone(
             target_group=boundary.target_group,
             worker_id=boundary.worker_id,
             request_id=boundary.request_id,
             tombstone_output=boundary.tombstone_output,
+        )
+
+    def observe_sink_dispatch_ack(
+        self, ack: ControlPlaneLeafSinkDispatchAckEvent
+    ) -> ControlPlaneLeafDrainReadyEvent | None:
+        return self._observe_tombstone(
+            target_group=ack.target_group,
+            worker_id=ack.worker_id,
+            request_id=ack.request_id,
+            tombstone_output=ack.tombstone_output,
+        )
+
+    def _observe_tombstone(
+        self,
+        *,
+        target_group: str,
+        worker_id: str,
+        request_id: str,
+        tombstone_output: bool,
+    ) -> ControlPlaneLeafDrainReadyEvent | None:
+        # Terminal-only semantics: leaf ready-to-drain can be emitted only for output tombstone.
+        if not tombstone_output:
+            return None
+        if self._already_emitted(target_group, request_id):
+            return None
+        return self._emit_ready(
+            target_group=target_group,
+            worker_id=worker_id,
+            request_id=request_id,
+            tombstone_output=tombstone_output,
         )
 
     def _seen_request_ids(self) -> set[str]:
@@ -172,6 +203,7 @@ class InMemoryControlPlaneLeafShutdownReadinessService(ControlPlaneLeafShutdownR
             request_id=request_id,
             tombstone_output=tombstone_output,
         )
+
 
 def _ready_dedupe_key(target_group: str, request_id: str) -> str:
     normalized_group = target_group.strip() if isinstance(target_group, str) else ""

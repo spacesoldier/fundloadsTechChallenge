@@ -161,13 +161,28 @@ class LocalExecutionWorkerLifecycleService(ExecutionWorkerLifecycleService):
         if handle is None:
             return False
         process = handle.process
-        _ = terminate_timeout_seconds
         if handle.stop_event is not None:
             setter = getattr(handle.stop_event, "set", None)
             if callable(setter):
                 setter()
         if process.is_alive():
             process.join(timeout=max(0.0, float(graceful_timeout_seconds)))
+        if process.is_alive():
+            terminate = getattr(process, "terminate", None)
+            if callable(terminate):
+                try:
+                    terminate()
+                except Exception:
+                    pass
+            process.join(timeout=max(0.0, float(terminate_timeout_seconds)))
+        if process.is_alive():
+            kill = getattr(process, "kill", None)
+            if callable(kill):
+                try:
+                    kill()
+                except Exception:
+                    pass
+                process.join(timeout=max(0.0, float(terminate_timeout_seconds)))
         if process.is_alive():
             return False
         try:

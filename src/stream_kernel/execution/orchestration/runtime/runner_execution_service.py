@@ -42,6 +42,7 @@ class RunnerExecutionService:
             nodes=nodes,
             run_id=run_id,
             scenario_id=scenario_id,
+            process_group="supervisor",
             full_context_nodes=set(full_context_nodes or ()),
             ordered_sink_mode=ordered_sink_mode,
         )
@@ -80,6 +81,7 @@ class RunnerExecutionService:
             nodes=nodes,
             run_id=run_id,
             scenario_id=scenario_id,
+            process_group="supervisor",
             full_context_nodes=set(full_context_nodes or ()),
             ordered_sink_mode=ordered_sink_mode,
         )

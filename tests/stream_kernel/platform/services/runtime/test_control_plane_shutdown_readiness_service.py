@@ -4,6 +4,7 @@ from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafBoundaryOutputsEvent,
     ControlPlaneLeafDrainReadyEvent,
+    ControlPlaneLeafSinkDispatchAckEvent,
 )
 from stream_kernel.platform.services.runtime.control_plane_shutdown_readiness import (
     InMemoryControlPlaneLeafShutdownReadinessService,
@@ -151,4 +152,40 @@ def test_leaf_shutdown_readiness_ignores_input_only_tombstone() -> None:
             tombstone_output=False,
         )
     )
+    assert no_event is None
+
+
+def test_leaf_shutdown_readiness_emits_drain_ready_from_sink_ack_tombstone() -> None:
+    service = InMemoryControlPlaneLeafShutdownReadinessService(store=InMemoryKvStore())
+
+    drain_ready = service.observe_sink_dispatch_ack(
+        ControlPlaneLeafSinkDispatchAckEvent(
+            target_group="execution.alpha",
+            worker_id="execution.alpha#1",
+            request_id="req-ack-tombstone",
+            source_target="source:source",
+            payload_class="Envelope",
+            tombstone_output=True,
+        )
+    )
+
+    assert isinstance(drain_ready, ControlPlaneLeafDrainReadyEvent)
+    assert drain_ready.target_group == "execution.alpha"
+    assert drain_ready.worker_id == "execution.alpha#1"
+
+
+def test_leaf_shutdown_readiness_ignores_non_tombstone_sink_ack() -> None:
+    service = InMemoryControlPlaneLeafShutdownReadinessService(store=InMemoryKvStore())
+
+    no_event = service.observe_sink_dispatch_ack(
+        ControlPlaneLeafSinkDispatchAckEvent(
+            target_group="execution.alpha",
+            worker_id="execution.alpha#1",
+            request_id="req-ack-non-terminal",
+            source_target="source:source",
+            payload_class="Envelope",
+            tombstone_output=False,
+        )
+    )
+
     assert no_event is None

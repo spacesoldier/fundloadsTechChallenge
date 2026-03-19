@@ -223,6 +223,189 @@ def test_runner_propagates_parent_and_current_span_ids_across_messages() -> None
     assert observer._seen_parent_by_node["n2"] == "span-n1"
 
 
+@pytest.mark.parametrize("runner_kind", ["sync", "async"])
+def test_runner_resolves_span_id_from_trace_span_state(
+    runner_kind: str,
+) -> None:
+    @dataclass(frozen=True, slots=True)
+    class Event:
+        value: str
+
+    class _SpanObserver:
+        def __init__(self) -> None:
+            self.parents: dict[str, str | None] = {}
+
+        def before_node(self, *, node_name: str, payload: object, ctx: dict[str, object], trace_id: str | None):
+            _ = (payload, trace_id)
+            parent = ctx.get("__parent_span_id")
+            self.parents[node_name] = parent if isinstance(parent, str) else None
+            return SimpleNamespace(trace_span=SimpleNamespace(span_id=f"trace-span-{node_name}"))
+
+        def after_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            outputs: list[object],
+            state: object | None,
+        ) -> None:
+            _ = (node_name, payload, ctx, trace_id, outputs, state)
+
+        def on_node_error(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            error: Exception,
+            state: object | None,
+        ) -> None:
+            _ = (node_name, payload, ctx, trace_id, error, state)
+
+        def on_run_end(self) -> None:
+            return None
+
+    observer = _SpanObserver()
+    registry = InMemoryConsumerRegistry({Event: ["n2"]})
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="seed", target="n1", trace_id="t1", span_id="upstream-parent"))
+
+    if runner_kind == "async":
+        async def n1(payload: object, ctx: dict[str, object]) -> list[object]:
+            _ = (payload, ctx)
+            return [Event(value="x")]
+
+        async def n2(payload: object, ctx: dict[str, object]) -> list[object]:
+            _ = (payload, ctx)
+            return []
+
+        runner = AsyncRunner(
+            nodes={"n1": n1, "n2": n2},
+            work_queue=queue,
+            context_service=InMemoryKvContextService(InMemoryKvStore()),
+            router=RoutingService(registry=registry, strict=True),
+            observability=observer,
+        )
+    else:
+        def n1(payload: object, ctx: dict[str, object]) -> list[object]:
+            _ = (payload, ctx)
+            return [Event(value="x")]
+
+        def n2(payload: object, ctx: dict[str, object]) -> list[object]:
+            _ = (payload, ctx)
+            return []
+
+        runner = SyncRunner(
+            nodes={"n1": n1, "n2": n2},
+            work_queue=queue,
+            context_service=InMemoryKvContextService(InMemoryKvStore()),
+            router=RoutingService(registry=registry, strict=True),
+            observability=observer,
+        )
+
+    runner.run()
+    assert observer.parents["n1"] == "upstream-parent"
+    assert observer.parents["n2"] == "trace-span-n1"
+
+
+@pytest.mark.parametrize("runner_kind", ["sync", "async"])
+def test_runner_observability_ctx_keeps_internal_route_markers_for_business_nodes(
+    runner_kind: str,
+) -> None:
+    seen_observer_ctx: list[dict[str, object]] = []
+    seen_node_ctx: list[dict[str, object]] = []
+
+    class _Observer:
+        def before_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+        ) -> object | None:
+            _ = (node_name, payload, trace_id)
+            seen_observer_ctx.append(dict(ctx))
+            return None
+
+        def after_node(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            outputs: list[object],
+            state: object | None,
+        ) -> None:
+            _ = (node_name, payload, ctx, trace_id, outputs, state)
+
+        def on_node_error(
+            self,
+            *,
+            node_name: str,
+            payload: object,
+            ctx: dict[str, object],
+            trace_id: str | None,
+            error: Exception,
+            state: object | None,
+        ) -> None:
+            _ = (node_name, payload, ctx, trace_id, error, state)
+
+        def on_run_end(self) -> None:
+            return None
+
+    store = InMemoryKvStore()
+    store.set(
+        "t1",
+        {
+            "k": "v",
+            "__process_group": "execution.transform",
+            "__handoff_from": "execution.ingress",
+            "__route_hop": 3,
+        },
+    )
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="seed", target="worker", trace_id="t1"))
+
+    if runner_kind == "async":
+        async def worker(payload: object, ctx: dict[str, object]) -> list[object]:
+            _ = payload
+            seen_node_ctx.append(dict(ctx))
+            return []
+
+        runner = AsyncRunner(
+            nodes={"worker": worker},
+            work_queue=queue,
+            context_service=InMemoryKvContextService(store),
+            router=RoutingService(registry=InMemoryConsumerRegistry(), strict=True),
+            observability=_Observer(),
+        )
+    else:
+        def worker(payload: object, ctx: dict[str, object]) -> list[object]:
+            _ = payload
+            seen_node_ctx.append(dict(ctx))
+            return []
+
+        runner = SyncRunner(
+            nodes={"worker": worker},
+            work_queue=queue,
+            context_service=InMemoryKvContextService(store),
+            router=RoutingService(registry=InMemoryConsumerRegistry(), strict=True),
+            observability=_Observer(),
+        )
+
+    runner.run()
+    assert seen_node_ctx == [{"k": "v"}]
+    assert len(seen_observer_ctx) == 1
+    assert seen_observer_ctx[0].get("__process_group") == "execution.transform"
+    assert seen_observer_ctx[0].get("__handoff_from") == "execution.ingress"
+    assert seen_observer_ctx[0].get("__route_hop") == 3
+
+
 def test_runner_routes_observability_service_outputs_via_router_queue() -> None:
     # OBS-L-01: service outputs returned by observability callbacks must be routed by runner rails.
     routed: list[object] = []

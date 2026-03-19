@@ -284,7 +284,9 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
         return events or None
 
     def on_run_end(self) -> None:
-        self._stop_dispatch_worker()
+        worker_stopped = self._stop_dispatch_worker()
+        if worker_stopped:
+            self._drain_dispatch_queue_sync()
         for sink in [
             *self.trace_sinks,
             *self.log_sinks,
@@ -922,18 +924,30 @@ class DispatchingObservabilityService(ObservabilityPipelineService):
             )
             self._dispatch_thread.start()
 
-    def _stop_dispatch_worker(self) -> None:
+    def _stop_dispatch_worker(self) -> bool:
         thread: Thread | None = None
         with self._dispatch_condition:
             if not isinstance(self._dispatch_thread, Thread):
-                return
+                return True
             self._dispatch_stopping = True
             self._dispatch_condition.notify_all()
             thread = self._dispatch_thread
         if isinstance(thread, Thread) and thread.is_alive():
             thread.join(timeout=max(0.1, float(self._dispatch_queue_drain_timeout_seconds)))
+        alive_after_join = bool(isinstance(thread, Thread) and thread.is_alive())
         with self._dispatch_condition:
             self._dispatch_thread = None
+        return not alive_after_join
+
+    def _drain_dispatch_queue_sync(self) -> None:
+        while True:
+            batch = self._dequeue_dispatch_batch(
+                max_items=max(1, int(self._dispatch_queue_batch_max_items)),
+                timeout_seconds=0.0,
+            )
+            if not batch:
+                return
+            self._dispatch_batch(batch)
 
     def _enqueue_dispatch(self, item: _QueuedDispatch) -> None:
         with self._dispatch_condition:

@@ -19,7 +19,7 @@ runtime:
       dispatch_queue:
         max_items: 131072
         drop_policy: non_block
-        forward_batch_max_items: 20
+        forward_batch_max_items: 40
         forward_flush_interval_ms: 20
         drain_timeout_seconds: 5
       exporters:
@@ -45,7 +45,7 @@ runtime:
             flush_every_n: 100
             trace_slice: platform_internals
         - kind: otel_otlp_topology
-          enabled: true
+          enabled: false
           settings:
             otlp:
               endpoint: http://127.0.0.1:4318/v1/traces
@@ -184,6 +184,10 @@ runtime:
       fallback_graceful_timeout_seconds: 0.0
     execution_ipc:
       transport: ipc_local
+      buffer:
+        enabled: true
+        batch_max_items: 40
+        flush_interval_ms: 10
       flow_control:
         mode: credits
         credits:
@@ -194,7 +198,7 @@ runtime:
         kdf: hkdf_sha256
         ttl_seconds: 30
         nonce_cache_size: 100000
-      max_payload_bytes: 1048576
+      max_payload_bytes: 65536
     bootstrap:
       mode: process_supervisor
     boundary_dispatch:

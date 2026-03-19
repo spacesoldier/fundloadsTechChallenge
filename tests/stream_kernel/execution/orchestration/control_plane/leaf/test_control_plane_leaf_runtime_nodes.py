@@ -103,18 +103,31 @@ class _RunnerControl:
 
 @dataclass(slots=True)
 class _Readiness:
-    seen: list[ControlPlaneLeafBoundaryOutputsEvent] = field(default_factory=list)
+    seen_boundary: list[ControlPlaneLeafBoundaryOutputsEvent] = field(default_factory=list)
+    seen_ack: list[ControlPlaneLeafSinkDispatchAckEvent] = field(default_factory=list)
 
     def observe_boundary_outputs(
         self,
         boundary_result: ControlPlaneLeafBoundaryOutputsEvent,
     ) -> ControlPlaneLeafDrainReadyEvent:
-        self.seen.append(boundary_result)
+        self.seen_boundary.append(boundary_result)
         return ControlPlaneLeafDrainReadyEvent(
             target_group=boundary_result.target_group,
             worker_id=boundary_result.worker_id,
             request_id=boundary_result.request_id,
             tombstone_output=boundary_result.tombstone_output,
+        )
+
+    def observe_sink_dispatch_ack(
+        self,
+        ack: ControlPlaneLeafSinkDispatchAckEvent,
+    ) -> ControlPlaneLeafDrainReadyEvent:
+        self.seen_ack.append(ack)
+        return ControlPlaneLeafDrainReadyEvent(
+            target_group=ack.target_group,
+            worker_id=ack.worker_id,
+            request_id=ack.request_id,
+            tombstone_output=ack.tombstone_output,
         )
 
 
@@ -620,7 +633,47 @@ def test_leaf_tombstone_finalize_node_emits_drain_ready_event() -> None:
     drain_ready = produced[0]
     assert isinstance(drain_ready, ControlPlaneLeafDrainReadyEvent)
     assert drain_ready.tombstone_output is True
-    assert len(readiness.seen) == 1
+    assert len(readiness.seen_boundary) == 1
+    assert len(readiness.seen_ack) == 0
+
+
+def test_leaf_tombstone_finalize_node_uses_sink_ack_for_source_driven_tombstone() -> None:
+    readiness = _Readiness()
+    node = ControlPlaneLeafTombstoneFinalizeNode(readiness=readiness)  # type: ignore[arg-type]
+    ack = ControlPlaneLeafSinkDispatchAckEvent(
+        target_group="execution.alpha",
+        worker_id="execution.alpha#1",
+        request_id="req-terminal-tombstone",
+        source_target="source:source",
+        payload_class="Envelope",
+        tombstone_output=True,
+    )
+
+    produced = node(ack, {"__leaf_session": _session()})
+
+    assert len(produced) == 1
+    assert isinstance(produced[0], ControlPlaneLeafDrainReadyEvent)
+    assert len(readiness.seen_boundary) == 0
+    assert len(readiness.seen_ack) == 1
+
+
+def test_leaf_tombstone_finalize_node_waits_for_sink_ack_when_source_target_present() -> None:
+    readiness = _Readiness()
+    node = ControlPlaneLeafTombstoneFinalizeNode(readiness=readiness)  # type: ignore[arg-type]
+    boundary_result = ControlPlaneLeafBoundaryOutputsEvent(
+        target_group="execution.alpha",
+        worker_id="execution.alpha#1",
+        request_id="req-terminal-tombstone",
+        outputs=(Envelope(payload={"x": 1}, target="sink:sink", tombstone=True),),
+        source_target="source:source",
+        tombstone_output=True,
+    )
+
+    produced = node(boundary_result, {"__leaf_session": _session()})
+
+    assert produced == []
+    assert len(readiness.seen_boundary) == 0
+    assert len(readiness.seen_ack) == 0
 
 
 def test_leaf_boundary_execute_node_drops_reply_when_finalize_false() -> None:

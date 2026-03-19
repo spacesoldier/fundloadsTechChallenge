@@ -445,6 +445,9 @@ def _build_leaf_runner(
     run_id = runtime.get("__run_id")
     if not isinstance(run_id, str) or not run_id:
         run_id = "run"
+    process_group = runtime.get("__process_group")
+    if not isinstance(process_group, str) or not process_group:
+        process_group = None
     full_context_nodes = getattr(child, "full_context_nodes", set())
     if not isinstance(full_context_nodes, set):
         full_context_nodes = set()
@@ -461,6 +464,7 @@ def _build_leaf_runner(
             nodes=nodes,
             run_id=run_id,
             scenario_id=scenario_id,
+            process_group=process_group,
             full_context_nodes=set(full_context_nodes),
             ordered_sink_mode=sink_mode,
             runtime_debug_buffer=debug_buffer,
@@ -469,6 +473,7 @@ def _build_leaf_runner(
         nodes=nodes,
         run_id=run_id,
         scenario_id=scenario_id,
+        process_group=process_group,
         full_context_nodes=set(full_context_nodes),
         ordered_sink_mode=sink_mode,
         runtime_debug_buffer=debug_buffer,

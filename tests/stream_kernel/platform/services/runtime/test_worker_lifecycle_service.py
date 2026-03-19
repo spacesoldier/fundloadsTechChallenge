@@ -203,6 +203,127 @@ def test_worker_lifecycle_stop_releases_registry_and_resources() -> None:
     assert worker_registry.get("group:cleanup") is None
 
 
+def test_worker_lifecycle_stop_terminates_process_after_graceful_timeout() -> None:
+    class _Process:
+        def __init__(self) -> None:
+            self.alive = True
+            self.join_calls: list[float | None] = []
+            self.terminate_calls = 0
+            self.kill_calls = 0
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def join(self, timeout: float | None = None) -> None:
+            self.join_calls.append(timeout)
+
+        def terminate(self) -> None:
+            self.terminate_calls += 1
+            self.alive = False
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+            self.alive = False
+
+    class _Closable:
+        def __init__(self) -> None:
+            self.closed = 0
+            self.set_calls = 0
+
+        def set(self) -> None:
+            self.set_calls += 1
+
+        def close(self) -> None:
+            self.closed += 1
+
+    context = mp.get_context("spawn")
+    worker_registry = InMemoryKvStore()
+    service = LocalExecutionWorkerLifecycleService(
+        worker_registry=worker_registry,
+        execution_ipc=_IpcTransport(context=context, endpoint_registry=InMemoryKvStore()),
+        context=context,
+    )
+    process = _Process()
+    stop_event = _Closable()
+    control_parent = _Closable()
+    worker_registry.set(
+        "group:terminate",
+        ExecutionWorkerHandle(
+            target_id="group:terminate",
+            process=process,  # type: ignore[arg-type]
+            stop_event=stop_event,
+            control_parent=control_parent,
+        ),
+    )
+
+    assert service.stop_worker("group:terminate", graceful_timeout_seconds=0.01, terminate_timeout_seconds=0.2) is True
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 0
+    assert stop_event.closed == 1
+    assert control_parent.closed == 1
+    assert worker_registry.get("group:terminate") is None
+
+
+def test_worker_lifecycle_stop_kills_process_when_terminate_is_insufficient() -> None:
+    class _Process:
+        def __init__(self) -> None:
+            self.alive = True
+            self.join_calls: list[float | None] = []
+            self.terminate_calls = 0
+            self.kill_calls = 0
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def join(self, timeout: float | None = None) -> None:
+            self.join_calls.append(timeout)
+
+        def terminate(self) -> None:
+            self.terminate_calls += 1
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+            self.alive = False
+
+    class _Closable:
+        def __init__(self) -> None:
+            self.closed = 0
+            self.set_calls = 0
+
+        def set(self) -> None:
+            self.set_calls += 1
+
+        def close(self) -> None:
+            self.closed += 1
+
+    context = mp.get_context("spawn")
+    worker_registry = InMemoryKvStore()
+    service = LocalExecutionWorkerLifecycleService(
+        worker_registry=worker_registry,
+        execution_ipc=_IpcTransport(context=context, endpoint_registry=InMemoryKvStore()),
+        context=context,
+    )
+    process = _Process()
+    stop_event = _Closable()
+    control_parent = _Closable()
+    worker_registry.set(
+        "group:kill",
+        ExecutionWorkerHandle(
+            target_id="group:kill",
+            process=process,  # type: ignore[arg-type]
+            stop_event=stop_event,
+            control_parent=control_parent,
+        ),
+    )
+
+    assert service.stop_worker("group:kill", graceful_timeout_seconds=0.01, terminate_timeout_seconds=0.2) is True
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 1
+    assert stop_event.closed == 1
+    assert control_parent.closed == 1
+    assert worker_registry.get("group:kill") is None
+
+
 def test_worker_lifecycle_insert_arg_preserves_position_for_none_placeholder() -> None:
     args = ["bundle", "worker_id"]
 

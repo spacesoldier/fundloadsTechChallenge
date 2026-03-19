@@ -41,6 +41,7 @@ class _RunnerStub:
     nodes: dict[str, object]
     run_id: str
     scenario_id: str
+    process_group: str | None
     full_context_nodes: set[str]
     ordered_sink_mode: str
     work_queue: object = "default-queue"

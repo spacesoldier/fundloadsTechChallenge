@@ -57,12 +57,22 @@ def test_root_stop_node_emits_leaf_stop_requests_and_requests_runner_stop() -> N
 
     stop_requests = [item for item in produced if isinstance(item, ControlPlaneRootLeafStopRequestEvent)]
     cancel_commands = [item for item in produced if isinstance(item, PlatformSchedulerCancelCommand)]
-    assert len(stop_requests) == 1
-    assert stop_requests[0].worker_id == "execution.ingress#1"
-    assert stop_requests[0].command_id == "runtime-stop:execution.ingress#1"
-    assert len(cancel_commands) == 2
-    assert all(
-        command.job_id.startswith("cp.root.leaf_ingress:source:system.cp.root_leaf_ingress:execution.ingress#1:")
+    assert sorted(item.worker_id for item in stop_requests) == [
+        "execution.ingress#1",
+        "execution.policy#1",
+    ]
+    assert sorted(item.command_id for item in stop_requests) == [
+        "runtime-stop:execution.ingress#1",
+        "runtime-stop:execution.policy#1",
+    ]
+    assert len(cancel_commands) == 4
+    assert {
+        command.job_id
         for command in cancel_commands
-    )
+    } == {
+        "cp.root.leaf_ingress:source:system.cp.root_leaf_ingress:execution.ingress#1:control",
+        "cp.root.leaf_ingress:source:system.cp.root_leaf_ingress:execution.ingress#1:data",
+        "cp.root.leaf_ingress:source:system.cp.root_leaf_ingress:execution.policy#1:control",
+        "cp.root.leaf_ingress:source:system.cp.root_leaf_ingress:execution.policy#1:data",
+    }
     assert runner_control.requests == 1

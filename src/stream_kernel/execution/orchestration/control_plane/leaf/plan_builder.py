@@ -288,6 +288,7 @@ def build_leaf_control_plane_system_plan(
             ],
             ControlPlaneLeafSinkDispatchAckEvent: [
                 "system.cp.leaf_source_poll_from_sink_ack",
+                "system.cp.leaf_tombstone_finalize",
             ],
             ControlPlaneLeafStopCommand: ["system.cp.leaf_stop"],
             ControlPlaneLeafHelloEvent: ["system.cp.leaf_reply_dispatch"],

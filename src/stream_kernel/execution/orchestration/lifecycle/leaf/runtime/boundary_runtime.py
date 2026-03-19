@@ -238,6 +238,7 @@ def execute_child_boundary_loop(
             "router": router,
             "context_service": context_service,
             "observability": observability,
+            "process_group": child.process_group,
             "full_context_nodes": full_context_nodes,
             "allow_external_deliveries": True,
             "boundary_outputs": emitted,

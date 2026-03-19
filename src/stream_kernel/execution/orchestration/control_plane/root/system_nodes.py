@@ -1002,7 +1002,7 @@ class ControlPlaneRootStopNode:
         seen: set[str] = set()
         for group_name, worker_id in _spawned_workers_for_shutdown(
             events=events,
-            expected_groups=payload.expected_groups,
+            expected_groups=None,
         ):
             if worker_id in seen:
                 continue
@@ -1016,7 +1016,7 @@ class ControlPlaneRootStopNode:
                 )
             )
         cancel_commands = _root_leaf_ingress_scheduler_cancel_commands(
-            expected_groups=payload.expected_groups,
+            expected_groups=None,
             events=events,
         )
         self.runner_control.request_stop()
@@ -1025,7 +1025,7 @@ class ControlPlaneRootStopNode:
 
 def _root_leaf_ingress_scheduler_cancel_commands(
     *,
-    expected_groups: tuple[str, ...],
+    expected_groups: tuple[str, ...] | None,
     events: list[object],
 ) -> list[PlatformSchedulerCancelCommand]:
     lanes = (
@@ -1289,9 +1289,9 @@ def _latest_worker_statuses_for_start_work(
 def _spawned_workers_for_shutdown(
     *,
     events: list[object],
-    expected_groups: tuple[str, ...],
+    expected_groups: tuple[str, ...] | None,
 ) -> list[tuple[str, str]]:
-    expected = set(expected_groups) if expected_groups else None
+    expected = set(expected_groups) if isinstance(expected_groups, tuple) and expected_groups else None
     seen: set[str] = set()
     pairs: list[tuple[str, str]] = []
     for event in events:
