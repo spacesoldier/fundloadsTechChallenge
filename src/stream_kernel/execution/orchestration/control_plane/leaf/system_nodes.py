@@ -484,7 +484,7 @@ class ControlPlaneLeafCommandIngressSourceNode:
         ControlPlaneLeafDrainReadyEvent,
         ControlPlaneLeafStopAckEvent,
     ],
-    emits=[ControlPlaneLeafSinkDispatchAckEvent, ControlPlaneLeafReplyDispatchDiagEvent],
+    emits=[ControlPlaneLeafSinkDispatchAckEvent],
 )
 @dataclass
 class ControlPlaneLeafReplyDispatchNode:
@@ -525,8 +525,9 @@ class ControlPlaneLeafReplyDispatchNode:
                         target_group=payload.target_group,
                         request_id=payload.request_id,
                     )
-                return [diag] if diag is not None else []
-            return [diag] if diag is not None else []
+            if diag is not None:
+                self.reply_dispatch.dispatch_reply(worker_id=worker_id, payload=diag)
+            return []
         produced: list[object] = []
         all_required_dispatched = True
         source_group = worker_id.rsplit("#", 1)[0] if "#" in worker_id else None
