@@ -1,8 +1,109 @@
+[supervisor]: [DEBUG]: control-plane root loop started | event=control_plane.runtime.root_loop_started idle_timeout_seconds=0.1 inputs=1 poll_timeout_seconds=0.01
 [supervisor]: [INFO]: control-plane lifecycle spawn requested for group 'execution.ingress' | event=control_plane.lifecycle.spawn_requested group_name=execution.ingress node_count=3 nodes=['source:source', 'ingress_line_bridge', 'parse_load_attempt'] workers=1
 [supervisor]: [INFO]: control-plane lifecycle spawn requested for group 'execution.features' | event=control_plane.lifecycle.spawn_requested group_name=execution.features node_count=3 nodes=['compute_time_keys', 'idempotency_gate', 'compute_features'] workers=1
 [supervisor]: [INFO]: control-plane lifecycle spawn requested for group 'execution.policy' | event=control_plane.lifecycle.spawn_requested group_name=execution.policy node_count=2 nodes=['evaluate_policies', 'update_windows'] workers=1
 [supervisor]: [INFO]: control-plane lifecycle spawn requested for group 'execution.egress' | event=control_plane.lifecycle.spawn_requested group_name=execution.egress node_count=3 nodes=['format_output', 'egress_line_bridge', 'sink:sink'] workers=1
 [supervisor]: [INFO]: control-plane lifecycle spawn requested for group 'system.observability' | event=control_plane.lifecycle.spawn_requested group_name=system.observability node_count=4 nodes=['system.obs.trace_dispatch', 'system.obs.log_dispatch', 'system.obs.monitor_dispatch', 'system.obs.monitoring_metrics_dispatch'] workers=1
-[supervisor]: [INFO]: control-plane lifecycle startup ready for group 'system.observability' | event=control_plane.lifecycle.group_startup_ready group_name=system.observability worker_ids=['system.observability#1'] workers=1
-/home/sol/.pyenv/versions/3.13.2/lib/python3.13/multiprocessing/resource_tracker.py:277: UserWarning: resource_tracker: There appear to be 25 leaked semaphore objects to clean up at shutdown: {'/mp-wyeujl4d', '/mp-2meun2fx', '/mp-gqr_hioq', '/mp-n57d4_s5', '/mp-lng6v7j2', '/mp-84hl8gcg', '/mp-wqx9hyvc', '/mp-r24k9ls3', '/mp-1_uf6ofx', '/mp-qv5gsfxg', '/mp-2hih82b_', '/mp-q_pea_f_', '/mp-kcivhd7v', '/mp-nmkcab27', '/mp-412iu2in', '/mp-lbzg4o1j', '/mp-6i0s5sjm', '/mp-1pwyx05i', '/mp-4ogl8cvp', '/mp-960jwjap', '/mp-uk73gxyz', '/mp-k59_i22z', '/mp-ifxx5ljl', '/mp-5s5i1p9o', '/mp-tgvgmoze'}
+[supervisor]: [DEBUG]: control-plane leaf ingress hello received | event=control_plane.leaf_ingress.hello_received startup_protocol_revision=3 target_group=execution.egress
+[supervisor]: [DEBUG]: control-plane leaf ingress sending discovery snapshot | event=control_plane.leaf_ingress.discovery_snapshot_sending request_id=execution.egress#1:discover-snapshot:1774299207456 required_nodes_count=3 snapshot_records_count=2 target_group=execution.egress
+[supervisor]: [DEBUG]: control-plane leaf ingress control command sent | event=control_plane.leaf_ingress.control_command_sent outbound_queue_depth=1 payload_type=ControlPlaneLeafDiscoverySnapshotEvent pending_outbound=None queue_depth=0 target_id=execution.egress#1
+[supervisor]: [DEBUG]: control-plane leaf ingress worker reply dispatched | event=control_plane.leaf_ingress.worker_reply_dispatched lane=None payload_type=ControlPlaneLeafHelloEvent
+[execution.egress#1-2826069]: [INFO]: leaf worker connected to root control-plane | event=control_plane.root.leaf_connected runner_profile=async target_group=execution.egress
+[supervisor]: [DEBUG]: control-plane leaf ingress hello received | event=control_plane.leaf_ingress.hello_received startup_protocol_revision=3 target_group=system.observability
+[supervisor]: [DEBUG]: control-plane leaf ingress sending discovery snapshot | event=control_plane.leaf_ingress.discovery_snapshot_sending request_id=system.observability#1:discover-snapshot:1774299207498 required_nodes_count=4 snapshot_records_count=0 target_group=system.observability
+[supervisor]: [DEBUG]: control-plane leaf ingress control command sent | event=control_plane.leaf_ingress.control_command_sent outbound_queue_depth=1 payload_type=ControlPlaneLeafDiscoverySnapshotEvent pending_outbound=None queue_depth=0 target_id=system.observability#1
+[supervisor]: [DEBUG]: control-plane leaf ingress worker reply dispatched | event=control_plane.leaf_ingress.worker_reply_dispatched lane=None payload_type=ControlPlaneLeafHelloEvent
+[system.observability#1-2826070]: [INFO]: leaf worker connected to root control-plane | event=control_plane.root.leaf_connected runner_profile=async target_group=system.observability
+[supervisor]: [DEBUG]: control-plane leaf ingress hello received | event=control_plane.leaf_ingress.hello_received startup_protocol_revision=3 target_group=execution.ingress
+[supervisor]: [DEBUG]: control-plane leaf ingress sending discovery snapshot | event=control_plane.leaf_ingress.discovery_snapshot_sending request_id=execution.ingress#1:discover-snapshot:1774299207559 required_nodes_count=3 snapshot_records_count=2 target_group=execution.ingress
+[supervisor]: [DEBUG]: control-plane leaf ingress control command sent | event=control_plane.leaf_ingress.control_command_sent outbound_queue_depth=1 payload_type=ControlPlaneLeafDiscoverySnapshotEvent pending_outbound=None queue_depth=0 target_id=execution.ingress#1
+[supervisor]: [DEBUG]: control-plane leaf ingress worker reply dispatched | event=control_plane.leaf_ingress.worker_reply_dispatched lane=None payload_type=ControlPlaneLeafHelloEvent
+[execution.ingress#1-2826066]: [INFO]: leaf worker connected to root control-plane | event=control_plane.root.leaf_connected runner_profile=async target_group=execution.ingress
+[supervisor]: [DEBUG]: control-plane leaf ingress hello received | event=control_plane.leaf_ingress.hello_received startup_protocol_revision=3 target_group=execution.policy
+[supervisor]: [DEBUG]: control-plane leaf ingress sending discovery snapshot | event=control_plane.leaf_ingress.discovery_snapshot_sending request_id=execution.policy#1:discover-snapshot:1774299207693 required_nodes_count=2 snapshot_records_count=2 target_group=execution.policy
+[supervisor]: [DEBUG]: control-plane leaf ingress control command sent | event=control_plane.leaf_ingress.control_command_sent outbound_queue_depth=1 payload_type=ControlPlaneLeafDiscoverySnapshotEvent pending_outbound=None queue_depth=0 target_id=execution.policy#1
+[supervisor]: [DEBUG]: control-plane leaf ingress worker reply dispatched | event=control_plane.leaf_ingress.worker_reply_dispatched lane=None payload_type=ControlPlaneLeafHelloEvent
+[execution.policy#1-2826068]: [INFO]: leaf worker connected to root control-plane | event=control_plane.root.leaf_connected runner_profile=async target_group=execution.policy
+[supervisor]: [DEBUG]: control-plane leaf ingress hello received | event=control_plane.leaf_ingress.hello_received startup_protocol_revision=3 target_group=execution.features
+[supervisor]: [DEBUG]: control-plane leaf ingress sending discovery snapshot | event=control_plane.leaf_ingress.discovery_snapshot_sending request_id=execution.features#1:discover-snapshot:1774299207750 required_nodes_count=3 snapshot_records_count=3 target_group=execution.features
+[supervisor]: [DEBUG]: control-plane leaf ingress control command sent | event=control_plane.leaf_ingress.control_command_sent outbound_queue_depth=1 payload_type=ControlPlaneLeafDiscoverySnapshotEvent pending_outbound=None queue_depth=0 target_id=execution.features#1
+[supervisor]: [DEBUG]: control-plane leaf ingress worker reply dispatched | event=control_plane.leaf_ingress.worker_reply_dispatched lane=None payload_type=ControlPlaneLeafHelloEvent
+[execution.features#1-2826067]: [INFO]: leaf worker connected to root control-plane | event=control_plane.root.leaf_connected runner_profile=async target_group=execution.features
+[system.observability#1]: [INFO]: leaf reported drain ready | event=control_plane.root.leaf_drain_ready request_id=runner-tombstone:system.observability#1:run@20260323T205325952428Z-pid2826030:source:998:sink:sink target_group=system.observability tombstone_output=True
+[supervisor]: [DEBUG]: control-plane leaf ingress sending config card from discovery ack | config_id=system.observability#1:cfg:1 event=control_plane.leaf_ingress.config_card_sending node_count=4 target_group=system.observability
+[supervisor]: [DEBUG]: control-plane leaf ingress control command sent | event=control_plane.leaf_ingress.control_command_sent outbound_queue_depth=1 payload_type=ControlPlaneLeafConfigCardEvent pending_outbound=None queue_depth=0 target_id=system.observability#1
+[supervisor]: [DEBUG]: control-plane leaf ingress worker reply dispatched | event=control_plane.leaf_ingress.worker_reply_dispatched lane=None payload_type=ControlPlaneLeafDiscoveryAckEvent
+[system.observability#1]: [INFO]: leaf discovery acknowledged | discovered_nodes=['system.obs.trace_dispatch', 'system.obs.log_dispatch', 'system.obs.monitor_dispatch', 'system.obs.monitoring_metrics_dispatch'] error=None event=control_plane.root.leaf_discovery_ack missing_nodes=[] request_id=system.observability#1:discover-snapshot:1774299207498 status=accepted target_group=system.observability
+Process sk:system.observability#1:
+Traceback (most recent call last):
+  File "/home/sol/projects/dev/it_startups/IT Startups/job_search/nov2025 applications/TaxDome/tech_challenge/fund_load_tech_challenge/src/stream_kernel/execution/runtime/runner.py", line 1980, in _run_async_blocking
+    asyncio.get_running_loop()
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^
+RuntimeError: no running event loop
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/sol/.pyenv/versions/3.13.2/lib/python3.13/multiprocessing/process.py", line 313, in _bootstrap
+    self.run()
+    ~~~~~~~~^^
+  File "/home/sol/.pyenv/versions/3.13.2/lib/python3.13/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sol/projects/dev/it_startups/IT Startups/job_search/nov2025 applications/TaxDome/tech_challenge/fund_load_tech_challenge/src/stream_kernel/execution/orchestration/lifecycle/leaf/command/control_plane_service.py", line 253, in leaf_worker_process_entry
+    orchestrator.run(
+    ~~~~~~~~~~~~~~~~^
+        session=session,
+        ^^^^^^^^^^^^^^^^
+    ...<5 lines>...
+        boundary_control_poll_seconds=boundary_control_poll_seconds,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/sol/projects/dev/it_startups/IT Startups/job_search/nov2025 applications/TaxDome/tech_challenge/fund_load_tech_challenge/src/stream_kernel/execution/orchestration/lifecycle/leaf/command/control_plane_service.py", line 161, in run
+    runner.run_until_stopped(
+    ~~~~~~~~~~~~~~~~~~~~~~~~^
+        poll_timeout_seconds=max(0.0, float(boundary_control_poll_seconds)),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        idle_timeout_seconds=None,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/sol/projects/dev/it_startups/IT Startups/job_search/nov2025 applications/TaxDome/tech_challenge/fund_load_tech_challenge/src/stream_kernel/execution/runtime/runner.py", line 1326, in run_until_stopped
+    _run_async_blocking(
+    ~~~~~~~~~~~~~~~~~~~^
+        self.run_until_stopped_async(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<2 lines>...
+        )
+        ^
+    )
+    ^
+  File "/home/sol/projects/dev/it_startups/IT Startups/job_search/nov2025 applications/TaxDome/tech_challenge/fund_load_tech_challenge/src/stream_kernel/execution/runtime/runner.py", line 1982, in _run_async_blocking
+    return asyncio.run(coro)
+           ~~~~~~~~~~~^^^^^^
+  File "/home/sol/.pyenv/versions/3.13.2/lib/python3.13/asyncio/runners.py", line 195, in run
+    return runner.run(main)
+           ~~~~~~~~~~^^^^^^
+  File "/home/sol/.pyenv/versions/3.13.2/lib/python3.13/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/home/sol/.pyenv/versions/3.13.2/lib/python3.13/asyncio/base_events.py", line 725, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/home/sol/projects/dev/it_startups/IT Startups/job_search/nov2025 applications/TaxDome/tech_challenge/fund_load_tech_challenge/src/stream_kernel/execution/runtime/runner.py", line 1607, in run_until_stopped_async
+    await self.run_async()
+  File "/home/sol/projects/dev/it_startups/IT Startups/job_search/nov2025 applications/TaxDome/tech_challenge/fund_load_tech_challenge/src/stream_kernel/execution/runtime/runner.py", line 1538, in run_async
+    routing_result = router.route([output], source=node_name)
+  File "/home/sol/projects/dev/it_startups/IT Startups/job_search/nov2025 applications/TaxDome/tech_challenge/fund_load_tech_challenge/src/stream_kernel/application_context/inject_debug.py", line 78, in _wrapped
+    result = attr(*args, **kwargs)
+  File "/home/sol/projects/dev/it_startups/IT Startups/job_search/nov2025 applications/TaxDome/tech_challenge/fund_load_tech_challenge/src/stream_kernel/routing/routing_service.py", line 24, in route
+    return router.route(outputs, source=source)
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sol/projects/dev/it_startups/IT Startups/job_search/nov2025 applications/TaxDome/tech_challenge/fund_load_tech_challenge/src/stream_kernel/routing/router.py", line 103, in route
+    raise RoutingError(
+    ...<2 lines>...
+    )
+stream_kernel.routing.errors.RoutingError: Self-loop for 'ControlPlaneLeafReplyDispatchDiagEvent' requires explicit target
+/home/sol/.pyenv/versions/3.13.2/lib/python3.13/multiprocessing/resource_tracker.py:277: UserWarning: resource_tracker: There appear to be 25 leaked semaphore objects to clean up at shutdown: {'/mp-562999uc', '/mp-4w2a_p69', '/mp-s_1_c7ld', '/mp-jjf98ul4', '/mp-2ujmfx37', '/mp-ucmzge40', '/mp-q9j0s_j_', '/mp-5l7syssi', '/mp-390c6jql', '/mp-06xrctpf', '/mp-5iz22kx7', '/mp-vh8uahyj', '/mp-gc470jjw', '/mp-rckbb_eh', '/mp-3i_bffqa', '/mp-amcfmvq6', '/mp-htn5q3s3', '/mp-p_h1awbj', '/mp-4a3b2d37', '/mp-mnyfobxg', '/mp-sl0f5xnf', '/mp-b6u74jjz', '/mp-4rhpwug9', '/mp-7hh0t6t2', '/mp-hzlehxkj'}
   warnings.warn(

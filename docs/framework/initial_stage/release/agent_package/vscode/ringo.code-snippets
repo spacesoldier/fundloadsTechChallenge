@@ -1,0 +1,52 @@
+{
+  "Ringo Node": {
+    "prefix": "ringo-node",
+    "body": [
+      "@node(name=\"$1\", consumes=[$2], emits=[$3])",
+      "@dataclass(frozen=True, slots=True)",
+      "class $4:",
+      "    def __call__(self, payload: $2, _ctx: object | None) -> list[$3]:",
+      "        $0",
+      "        return []"
+    ],
+    "description": "stream_kernel node template"
+  },
+  "Ringo Service": {
+    "prefix": "ringo-service",
+    "body": [
+      "@service(name=\"$1\")",
+      "@dataclass(slots=True)",
+      "class $2:",
+      "    port: $3 = inject.stream($3)",
+      "",
+      "    def $4(self, *args, **kwargs):",
+      "        $0",
+      "        raise NotImplementedError"
+    ],
+    "description": "stream_kernel service template with port injection"
+  },
+  "Ringo Adapter": {
+    "prefix": "ringo-adapter",
+    "body": [
+      "@adapter(",
+      "    name=\"$1\",",
+      "    kind=\"$2\",",
+      "    consumes=[$3],",
+      "    emits=[$4],",
+      "    binds=[(\"stream\", $5)],",
+      "    execution_mode=\"sync\",",
+      ")",
+      "def $6(settings: dict[str, object]) -> $5:",
+      "    $0",
+      "    raise NotImplementedError"
+    ],
+    "description": "stream_kernel adapter factory template"
+  },
+  "Ringo Node Config": {
+    "prefix": "ringo-config",
+    "body": [
+      "$1: $2 = config.value(\"$3\", default=$4)"
+    ],
+    "description": "Node config.value template"
+  }
+}

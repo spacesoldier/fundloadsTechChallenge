@@ -37,6 +37,7 @@ from stream_kernel.routing.router import RoutingResult
 from stream_kernel.routing.routing_service import RoutingService
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneDeferredMessageHoldEvent,
+    ControlPlaneLeafRunnerTombstoneEvent,
 )
 
 _ORDERED_SINK_MODES = {"completion", "source_seq"}
@@ -47,6 +48,7 @@ _LEAF_COMMAND_INGRESS_SOURCE_NODE_NAME = "source:system.cp.command_ingress"
 _LEAF_COMMAND_INGRESS_SOURCE_PREFIX = "source:system.cp.command_ingress:"
 _LEAF_RUNTIME_INGRESS_SOURCE_NODE_NAME = "source:system.ipc.ingress"
 _LEAF_RUNTIME_INGRESS_SOURCE_PREFIX = "source:system.ipc.ingress:"
+_LEAF_TOMBSTONE_FINALIZE_NODE_NAME = "system.cp.leaf_tombstone_finalize"
 
 
 @dataclass(slots=True)
@@ -72,6 +74,7 @@ class SyncRunner:
     run_id: str = "run"
     scenario_id: str = "scenario"
     process_group: str | None = None
+    worker_id: str | None = None
     # Service/system nodes can request full metadata, regular nodes receive filtered view.
     full_context_nodes: set[str] = field(default_factory=set)
     # Sink delivery ordering mode: `completion` (default) or `source_seq`.
@@ -91,6 +94,7 @@ class SyncRunner:
     _stop_requested: bool = field(default=False, init=False)
     _last_seen_by_trace: dict[str, float] = field(default_factory=dict, init=False)
     _source_trace_seq_by_node: dict[str, int] = field(default_factory=dict, init=False)
+    _leaf_tombstone_expected_nodes_cache: tuple[str, ...] | None = field(default=None, init=False)
 
     def request_stop(self) -> None:
         # Graceful stop signal: runner finishes inflight queue when drain_on_stop=True.
@@ -236,7 +240,6 @@ class SyncRunner:
                 work_queue=work_queue,
                 router=router,
             )
-
             # Router translates outputs to concrete `(target_node, payload)` deliveries.
             # Envelope trace_id emitted by node output overrides current trace_id if present.
             for output in outputs:
@@ -357,6 +360,12 @@ class SyncRunner:
                         source_node=node_name,
                         stage="router.local_delivery",
                     )
+            self._enqueue_runner_tombstone_quorum_event(
+                node_name=node_name,
+                envelope=envelope,
+                full_ctx=full_ctx,
+                work_queue=work_queue,
+            )
 
     def on_run_end(self) -> None:
         # Finalize observability lifecycle once run loop is completed.
@@ -499,6 +508,44 @@ class SyncRunner:
             return int(depth) if isinstance(depth, int) else None
         except Exception:
             return None
+
+    def _publish_runner_tombstone_diag(
+        self,
+        *,
+        event: str,
+        envelope: Envelope,
+        node_name: str,
+        reason: str | None = None,
+        worker_id: str | None = None,
+        request_id: str | None = None,
+        expected_nodes: tuple[str, ...] | None = None,
+        target_group: str | None = None,
+    ) -> None:
+        buffer = self._runtime_debug_buffer()
+        if buffer is None:
+            return
+        fields: dict[str, object] = {
+            "node_name": node_name,
+            "process_group": self.process_group,
+            "worker_id": worker_id,
+            "reason": reason,
+            "request_id": request_id,
+            "target_group": target_group,
+            "expected_nodes": list(expected_nodes or ()),
+            "trace_id": envelope.trace_id,
+            "reply_to": envelope.reply_to,
+            "span_id": envelope.span_id,
+            "payload_model": payload_model_name(envelope.payload),
+            "tombstone": bool(envelope.tombstone),
+        }
+        publish_runtime_debug(
+            buffer=buffer,
+            event=event,
+            source="stream_kernel.execution.runtime.runner",
+            fields=fields,
+            trace_id=envelope.trace_id,
+            force=True,
+        )
 
     @staticmethod
     def _node_role(node_name: str | None) -> str:
@@ -974,7 +1021,10 @@ class SyncRunner:
         try:
             routing_result = router.route([hold_event], source=source_node)
         except RoutingError as exc:
-            if exc.code == RoutingErrorCode.NO_CONSUMERS:
+            if exc.code in (
+                RoutingErrorCode.NO_CONSUMERS,
+                RoutingErrorCode.SELF_LOOP_REQUIRES_EXPLICIT_TARGET,
+            ):
                 return False
             raise
         deliveries = SyncRunner._local_deliveries(routing_result)
@@ -1053,6 +1103,154 @@ class SyncRunner:
             observability_ctx["__parent_span_id"] = envelope.span_id
         return observability_ctx
 
+    def _enqueue_runner_tombstone_quorum_event(
+        self,
+        *,
+        node_name: str,
+        envelope: Envelope,
+        full_ctx: dict[str, object],
+        work_queue: QueuePort,
+    ) -> None:
+        if not envelope.tombstone:
+            return
+        self._publish_runner_tombstone_diag(
+            event="runtime.runner.tombstone_quorum.observed",
+            envelope=envelope,
+            node_name=node_name,
+        )
+        if not isinstance(self.process_group, str) or not self.process_group:
+            self._publish_runner_tombstone_diag(
+                event="runtime.runner.tombstone_quorum.skipped",
+                envelope=envelope,
+                node_name=node_name,
+                reason="missing_process_group",
+            )
+            return
+        if self.process_group == "supervisor":
+            self._publish_runner_tombstone_diag(
+                event="runtime.runner.tombstone_quorum.skipped",
+                envelope=envelope,
+                node_name=node_name,
+                reason="supervisor_process",
+            )
+            return
+        expected_nodes = self._leaf_tombstone_expected_nodes()
+        if not expected_nodes:
+            self._publish_runner_tombstone_diag(
+                event="runtime.runner.tombstone_quorum.skipped",
+                envelope=envelope,
+                node_name=node_name,
+                reason="no_expected_nodes",
+            )
+            return
+        if node_name not in expected_nodes:
+            self._publish_runner_tombstone_diag(
+                event="runtime.runner.tombstone_quorum.skipped",
+                envelope=envelope,
+                node_name=node_name,
+                reason="node_not_in_expected",
+                expected_nodes=expected_nodes,
+            )
+            return
+        worker_id = self._resolve_runner_worker_id(full_ctx=full_ctx)
+        if not isinstance(worker_id, str) or not worker_id:
+            self._publish_runner_tombstone_diag(
+                event="runtime.runner.tombstone_quorum.skipped",
+                envelope=envelope,
+                node_name=node_name,
+                reason="missing_worker_id",
+                expected_nodes=expected_nodes,
+            )
+            return
+        trace_id_value = envelope.trace_id if isinstance(envelope.trace_id, str) else "none"
+        request_id = f"runner-tombstone:{worker_id}:{trace_id_value}:{node_name}"
+        event = ControlPlaneLeafRunnerTombstoneEvent(
+            target_group=self.process_group,
+            worker_id=worker_id,
+            request_id=request_id,
+            observed_node=node_name,
+            expected_nodes=expected_nodes,
+            tombstone_output=True,
+        )
+        self._queue_push(
+            work_queue=work_queue,
+            envelope=Envelope(
+                payload=event,
+                target=_LEAF_TOMBSTONE_FINALIZE_NODE_NAME,
+                trace_id=envelope.trace_id,
+                reply_to=envelope.reply_to,
+                span_id=envelope.span_id,
+                tombstone=False,
+            ),
+            source_node=node_name,
+            stage="runner.tombstone_quorum",
+        )
+        self._publish_runner_tombstone_diag(
+            event="runtime.runner.tombstone_quorum.enqueued",
+            envelope=envelope,
+            node_name=node_name,
+            worker_id=worker_id,
+            request_id=request_id,
+            expected_nodes=expected_nodes,
+            target_group=self.process_group,
+        )
+
+    def _leaf_tombstone_expected_nodes(self) -> tuple[str, ...]:
+        cached = self._leaf_tombstone_expected_nodes_cache
+        if cached is not None:
+            return cached
+        expected = tuple(
+            sorted(name for name in self.nodes.keys() if self._is_leaf_tombstone_candidate(name))
+        )
+        if not expected:
+            # Some groups (ingress/transform/policy) can have no explicit sink:* nodes.
+            # In this case use all non-system nodes as quorum candidates.
+            expected = tuple(
+                sorted(name for name in self.nodes.keys() if self._is_leaf_tombstone_fallback_candidate(name))
+            )
+        self._leaf_tombstone_expected_nodes_cache = expected
+        return expected
+
+    @staticmethod
+    def _is_leaf_tombstone_candidate(node_name: str) -> bool:
+        if not isinstance(node_name, str) or not node_name:
+            return False
+        if node_name == _LEAF_TOMBSTONE_FINALIZE_NODE_NAME:
+            return False
+        if node_name.startswith("system."):
+            return False
+        if node_name.startswith("source:system."):
+            return False
+        if node_name.startswith("sink:system."):
+            return False
+        return node_name.startswith("sink:")
+
+    @staticmethod
+    def _is_leaf_tombstone_fallback_candidate(node_name: str) -> bool:
+        if not isinstance(node_name, str) or not node_name:
+            return False
+        if node_name == _LEAF_TOMBSTONE_FINALIZE_NODE_NAME:
+            return False
+        if node_name.startswith("system."):
+            return False
+        if node_name.startswith("source:"):
+            return False
+        if node_name.startswith("source:system."):
+            return False
+        if node_name.startswith("sink:system."):
+            return False
+        return True
+
+    def _resolve_runner_worker_id(self, *, full_ctx: dict[str, object]) -> str | None:
+        if isinstance(self.worker_id, str) and self.worker_id:
+            return self.worker_id
+        candidate = full_ctx.get("__worker_id")
+        if isinstance(candidate, str) and candidate:
+            return candidate
+        if isinstance(self.process_group, str) and self.process_group:
+            return f"{self.process_group}#1"
+        return None
+
     def run_until_stopped(
         self,
         *,
@@ -1102,6 +1300,7 @@ class AsyncRunner:
     run_id: str = "run"
     scenario_id: str = "scenario"
     process_group: str | None = None
+    worker_id: str | None = None
     full_context_nodes: set[str] = field(default_factory=set)
     ordered_sink_mode: str = "completion"
     allow_external_deliveries: bool = False
@@ -1113,6 +1312,7 @@ class AsyncRunner:
     _stop_requested: bool = field(default=False, init=False)
     _last_seen_by_trace: dict[str, float] = field(default_factory=dict, init=False)
     _source_trace_seq_by_node: dict[str, int] = field(default_factory=dict, init=False)
+    _leaf_tombstone_expected_nodes_cache: tuple[str, ...] | None = field(default=None, init=False)
 
     def run(self) -> None:
         _run_async_blocking(self.run_async())
@@ -1264,7 +1464,6 @@ class AsyncRunner:
                 work_queue=work_queue,
                 router=router,
             )
-
             for output in outputs:
                 resolved_trace_id = self._resolve_output_trace_id(
                     node_name=node_name,
@@ -1383,6 +1582,12 @@ class AsyncRunner:
                         source_node=node_name,
                         stage="async.router.local_delivery",
                     )
+            self._enqueue_runner_tombstone_quorum_event(
+                node_name=node_name,
+                envelope=envelope,
+                full_ctx=full_ctx,
+                work_queue=work_queue,
+            )
 
     async def run_until_stopped_async(
         self,
@@ -1481,6 +1686,30 @@ class AsyncRunner:
 
     def _queue_depth_safe(self) -> int | None:
         return SyncRunner._queue_depth_safe(self)
+
+    def _publish_runner_tombstone_diag(
+        self,
+        *,
+        event: str,
+        envelope: Envelope,
+        node_name: str,
+        reason: str | None = None,
+        worker_id: str | None = None,
+        request_id: str | None = None,
+        expected_nodes: tuple[str, ...] | None = None,
+        target_group: str | None = None,
+    ) -> None:
+        SyncRunner._publish_runner_tombstone_diag(
+            self,
+            event=event,
+            envelope=envelope,
+            node_name=node_name,
+            reason=reason,
+            worker_id=worker_id,
+            request_id=request_id,
+            expected_nodes=expected_nodes,
+            target_group=target_group,
+        )
 
     def _queue_push(
         self,
@@ -1697,6 +1926,36 @@ class AsyncRunner:
             full_ctx=full_ctx,
             envelope=envelope,
         )
+
+    def _enqueue_runner_tombstone_quorum_event(
+        self,
+        *,
+        node_name: str,
+        envelope: Envelope,
+        full_ctx: dict[str, object],
+        work_queue: QueuePort,
+    ) -> None:
+        SyncRunner._enqueue_runner_tombstone_quorum_event(
+            self,  # type: ignore[arg-type]
+            node_name=node_name,
+            envelope=envelope,
+            full_ctx=full_ctx,
+            work_queue=work_queue,
+        )
+
+    def _leaf_tombstone_expected_nodes(self) -> tuple[str, ...]:
+        return SyncRunner._leaf_tombstone_expected_nodes(self)  # type: ignore[misc]
+
+    @staticmethod
+    def _is_leaf_tombstone_candidate(node_name: str) -> bool:
+        return SyncRunner._is_leaf_tombstone_candidate(node_name)
+
+    @staticmethod
+    def _is_leaf_tombstone_fallback_candidate(node_name: str) -> bool:
+        return SyncRunner._is_leaf_tombstone_fallback_candidate(node_name)
+
+    def _resolve_runner_worker_id(self, *, full_ctx: dict[str, object]) -> str | None:
+        return SyncRunner._resolve_runner_worker_id(self, full_ctx=full_ctx)  # type: ignore[misc]
 
 async def _coerce_node_outputs(raw: object) -> list[object]:
     resolved = await _maybe_await(raw)

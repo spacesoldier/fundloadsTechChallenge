@@ -1,0 +1,70 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Agent Gates: stream_kernel tests",
+      "type": "shell",
+      "command": ".venv/bin/python -m pytest -q tests/stream_kernel",
+      "group": "test",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Agent Gates: architecture tests",
+      "type": "shell",
+      "command": ".venv/bin/python -m pytest -q tests/architecture",
+      "group": "test",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Agent Gates: smoke tests",
+      "type": "shell",
+      "command": ".venv/bin/python -m pytest -q tests/smoke",
+      "group": "test",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Agent Gates: control-plane targeted",
+      "type": "shell",
+      "command": ".venv/bin/python -m pytest -q tests/stream_kernel/execution/orchestration/control_plane && .venv/bin/python -m pytest -q tests/stream_kernel/execution/orchestration/lifecycle",
+      "group": "test",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Agent Gates: runtime smoke 15s",
+      "type": "shell",
+      "command": "./scripts/run_3x_check.sh --config src/fund_load/experiment_config_newgen_multiprocess_jaeger.yml --runs 1 --debug-run 0 --timeout 15",
+      "group": "test",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Agent Gates: full local",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "Agent Gates: stream_kernel tests",
+        "Agent Gates: architecture tests",
+        "Agent Gates: smoke tests",
+        "Agent Gates: control-plane targeted"
+      ]
+    }
+  ]
+}

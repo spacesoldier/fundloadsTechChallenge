@@ -194,7 +194,7 @@
 {"id":"16516","customer_id":"766","accepted":true}
 {"id":"7755","customer_id":"562","accepted":false}
 {"id":"11694","customer_id":"681","accepted":true}
-{"id":"29417","customer_id":"681","accepted":false}
+{"id":"29417","customer_id":"681","accepted":true}
 {"id":"2370","customer_id":"239","accepted":true}
 {"id":"20476","customer_id":"307","accepted":true}
 {"id":"8825","customer_id":"783","accepted":true}
@@ -353,7 +353,7 @@
 {"id":"13865","customer_id":"715","accepted":true}
 {"id":"2192","customer_id":"35","accepted":true}
 {"id":"23481","customer_id":"647","accepted":true}
-{"id":"25684","customer_id":"647","accepted":false}
+{"id":"25684","customer_id":"647","accepted":true}
 {"id":"28467","customer_id":"579","accepted":true}
 {"id":"28306","customer_id":"426","accepted":true}
 {"id":"24527","customer_id":"273","accepted":true}
@@ -558,7 +558,7 @@
 {"id":"21721","customer_id":"698","accepted":true}
 {"id":"15677","customer_id":"732","accepted":false}
 {"id":"1849","customer_id":"103","accepted":true}
-{"id":"29831","customer_id":"103","accepted":false}
+{"id":"29831","customer_id":"103","accepted":true}
 {"id":"7118","customer_id":"596","accepted":true}
 {"id":"4105","customer_id":"52","accepted":false}
 {"id":"23233","customer_id":"630","accepted":false}
@@ -977,7 +977,7 @@
 {"id":"27723","customer_id":"562","accepted":true}
 {"id":"24693","customer_id":"324","accepted":true}
 {"id":"19017","customer_id":"341","accepted":true}
-{"id":"23807","customer_id":"341","accepted":false}
+{"id":"23807","customer_id":"341","accepted":true}
 {"id":"10470","customer_id":"341","accepted":true}
 {"id":"8069","customer_id":"596","accepted":false}
 {"id":"20021","customer_id":"545","accepted":true}

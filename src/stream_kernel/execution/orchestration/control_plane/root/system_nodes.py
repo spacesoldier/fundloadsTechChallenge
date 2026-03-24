@@ -13,6 +13,9 @@ from stream_kernel.execution.orchestration.control_plane.root.runtime_bootstrap_
 from stream_kernel.execution.transport.ipc.ipc_transport import (
     EXECUTION_IPC_LANE_CONTROL,
     EXECUTION_IPC_LANE_DATA,
+    EXECUTION_IPC_LANE_LOG,
+    EXECUTION_IPC_LANE_METRIC,
+    EXECUTION_IPC_LANE_TRACE,
     ExecutionIpcKvStreamPort,
     compose_execution_ipc_worker_target_id,
 )
@@ -62,8 +65,11 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLaunchPlanEvent,
     ControlPlaneStartWorkEvent,
     ControlPlaneLeafBoundaryExecuteCommand,
+    ControlPlaneLeafDiscoveryAckEvent,
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafConfigCardEvent,
+    ControlPlaneLeafReplyDispatchDiagEvent,
+    ControlPlaneLeafDrainReadyEvent,
     ControlPlaneLeafHelloEvent,
     ControlPlaneRootLeafStartWorkCommand,
     ControlPlaneLeafStartWorkEvent,
@@ -429,6 +435,121 @@ class ControlPlaneGroupStartupWaitNode:
         )
         if hasattr(factory, "group_startup_ready"):
             return [factory.group_startup_ready(event=latest_spawn, worker_ids=worker_ids)]
+        return []
+
+
+@node(
+    name="system.cp.root_leaf_event_log_bridge",
+    consumes=[
+        ControlPlaneLeafHelloEvent,
+        ControlPlaneLeafDiscoveryAckEvent,
+        ControlPlaneLeafConfigAckEvent,
+        ControlPlaneLeafReplyDispatchDiagEvent,
+        ControlPlaneLeafDrainReadyEvent,
+        ControlPlaneLeafStopAckEvent,
+    ],
+    emits=[LogMessage],
+)
+@dataclass
+class ControlPlaneRootLeafEventLogBridgeNode:
+    def __call__(self, msg: object, _ctx: object | None) -> list[object]:
+        payload = msg.payload if isinstance(msg, Envelope) else msg
+        if isinstance(payload, ControlPlaneLeafHelloEvent):
+            return [
+                LogMessage(
+                    level="info",
+                    message="leaf worker connected to root control-plane",
+                    fields={
+                        "event": "control_plane.root.leaf_connected",
+                        "target_group": payload.target_group,
+                        "worker_id": payload.worker_id,
+                        "pid": payload.pid,
+                        "runner_profile": payload.runner_profile,
+                    },
+                )
+            ]
+        if isinstance(payload, ControlPlaneLeafDiscoveryAckEvent):
+            level = "info" if payload.status == "accepted" else "warning"
+            return [
+                LogMessage(
+                    level=level,
+                    message="leaf discovery acknowledged",
+                    fields={
+                        "event": "control_plane.root.leaf_discovery_ack",
+                        "target_group": payload.target_group,
+                        "worker_id": payload.worker_id,
+                        "request_id": payload.request_id,
+                        "status": payload.status,
+                        "discovered_nodes": list(payload.discovered_nodes),
+                        "missing_nodes": list(payload.missing_nodes),
+                        "error": payload.error,
+                    },
+                )
+            ]
+        if isinstance(payload, ControlPlaneLeafConfigAckEvent):
+            level = "info" if payload.status == "applied" else "warning"
+            return [
+                LogMessage(
+                    level=level,
+                    message="leaf config acknowledged",
+                    fields={
+                        "event": "control_plane.root.leaf_config_ack",
+                        "target_group": payload.target_group,
+                        "worker_id": payload.worker_id,
+                        "config_id": payload.config_id,
+                        "status": payload.status,
+                        "resolved_nodes": list(payload.resolved_nodes),
+                        "error": payload.error,
+                    },
+                )
+            ]
+        if isinstance(payload, ControlPlaneLeafReplyDispatchDiagEvent):
+            level = "info" if payload.status == "accepted" else "warning"
+            return [
+                LogMessage(
+                    level=level,
+                    message="leaf reply-dispatch diagnostic",
+                    fields={
+                        "event": "control_plane.root.leaf_reply_dispatch_diag",
+                        "target_group": payload.target_group,
+                        "worker_id": payload.worker_id,
+                        "request_id": payload.request_id,
+                        "stage": payload.stage,
+                        "payload_type": payload.payload_type,
+                        "status": payload.status,
+                        "detail": payload.detail,
+                    },
+                )
+            ]
+        if isinstance(payload, ControlPlaneLeafDrainReadyEvent):
+            return [
+                LogMessage(
+                    level="info",
+                    message="leaf reported drain ready",
+                    fields={
+                        "event": "control_plane.root.leaf_drain_ready",
+                        "target_group": payload.target_group,
+                        "worker_id": payload.worker_id,
+                        "request_id": payload.request_id,
+                        "tombstone_output": payload.tombstone_output,
+                    },
+                )
+            ]
+        if isinstance(payload, ControlPlaneLeafStopAckEvent):
+            level = "info" if payload.status == "accepted" else "warning"
+            return [
+                LogMessage(
+                    level=level,
+                    message="leaf stop acknowledged",
+                    fields={
+                        "event": "control_plane.root.leaf_stop_ack",
+                        "target_group": payload.target_group,
+                        "worker_id": payload.worker_id,
+                        "command_id": payload.command_id,
+                        "status": payload.status,
+                    },
+                )
+            ]
         return []
 
 
@@ -943,6 +1064,26 @@ class ControlPlaneRootLeafDrainReadyNode:
     shutdown_readiness: ControlPlaneShutdownReadinessService = inject.service(
         ControlPlaneShutdownReadinessService
     )
+    control_lane_ipc: ExecutionIpcKvStreamPort = inject.kv_stream(
+        ExecutionIpcKvStreamPort,
+        qualifier=EXECUTION_IPC_LANE_CONTROL,
+    )
+    data_lane_ipc: ExecutionIpcKvStreamPort = inject.kv_stream(
+        ExecutionIpcKvStreamPort,
+        qualifier=EXECUTION_IPC_LANE_DATA,
+    )
+    trace_lane_ipc: ExecutionIpcKvStreamPort = inject.kv_stream(
+        ExecutionIpcKvStreamPort,
+        qualifier=EXECUTION_IPC_LANE_TRACE,
+    )
+    log_lane_ipc: ExecutionIpcKvStreamPort = inject.kv_stream(
+        ExecutionIpcKvStreamPort,
+        qualifier=EXECUTION_IPC_LANE_LOG,
+    )
+    metric_lane_ipc: ExecutionIpcKvStreamPort = inject.kv_stream(
+        ExecutionIpcKvStreamPort,
+        qualifier=EXECUTION_IPC_LANE_METRIC,
+    )
 
     def __call__(self, msg: object, _ctx: object | None) -> list[object]:
         from stream_kernel.platform.services.runtime.control_plane_events import (
@@ -950,7 +1091,44 @@ class ControlPlaneRootLeafDrainReadyNode:
         )
 
         payload = msg.payload if isinstance(msg, Envelope) else msg
+        if isinstance(payload, ControlPlaneLeafDrainReadyEvent):
+            return self._handle_leaf_drain_ready(payload)
+        return []
+
+    def _handle_leaf_drain_ready(self, payload: object) -> list[object]:
+        from stream_kernel.platform.services.runtime.control_plane_events import (
+            ControlPlaneLeafDrainReadyEvent,
+        )
+
         if not isinstance(payload, ControlPlaneLeafDrainReadyEvent):
+            return []
+        events = self.state.events()
+        if _leaf_ready_already_marked_for_worker(events, payload.worker_id):
+            return []
+        channel_backlog = _snapshot_worker_channel_backlog(
+            worker_id=payload.worker_id,
+            control_lane_ipc=self.control_lane_ipc,
+            data_lane_ipc=self.data_lane_ipc,
+            trace_lane_ipc=self.trace_lane_ipc,
+            log_lane_ipc=self.log_lane_ipc,
+            metric_lane_ipc=self.metric_lane_ipc,
+        )
+        return self._finalize_leaf_ready(payload=payload, channel_backlog=channel_backlog)
+
+    def _finalize_leaf_ready(
+        self,
+        *,
+        payload: object,
+        channel_backlog: dict[str, dict[str, int]],
+    ) -> list[object]:
+        from stream_kernel.platform.services.runtime.control_plane_events import (
+            ControlPlaneLeafDrainReadyEvent,
+        )
+
+        if not isinstance(payload, ControlPlaneLeafDrainReadyEvent):
+            return []
+        events = self.state.events()
+        if _leaf_ready_already_marked_for_worker(events, payload.worker_id):
             return []
         emit_shutdown, snapshot = self.shutdown_readiness.mark_leaf_ready(payload)
         self.state.append_event(
@@ -962,29 +1140,43 @@ class ControlPlaneRootLeafDrainReadyNode:
                 "tombstone_output": payload.tombstone_output,
                 "ready_groups": list(snapshot.ready_groups),
                 "missing_groups": list(snapshot.missing_groups),
+                "ipc_backlog": channel_backlog,
             }
         )
-        if not emit_shutdown:
-            return []
-        event = ControlPlaneShutdownReadyEvent(
-            expected_groups=snapshot.expected_groups,
-            ready_groups=snapshot.ready_groups,
-        )
-        self.state.append_event(event)
-        self.state.append_event(
-            {
-                "kind": "control_plane.shutdown.all_ready",
-                "expected_groups": list(snapshot.expected_groups),
-                "ready_groups": list(snapshot.ready_groups),
-            }
-        )
-        return [event]
+        produced: list[object] = []
+        if emit_shutdown:
+            current_events = self.state.events()
+            for target_group, worker_id in _ready_workers_for_shutdown(current_events):
+                if _stop_request_already_issued_for_worker(current_events, worker_id):
+                    continue
+                produced.append(
+                    ControlPlaneRootLeafStopRequestEvent(
+                        target_group=target_group,
+                        worker_id=worker_id,
+                        command_id=f"runtime-stop:{worker_id}",
+                        reason="control_plane.leaf_drain_ready",
+                    )
+                )
+            event = ControlPlaneShutdownReadyEvent(
+                expected_groups=snapshot.expected_groups,
+                ready_groups=snapshot.ready_groups,
+            )
+            self.state.append_event(event)
+            self.state.append_event(
+                {
+                    "kind": "control_plane.shutdown.all_ready",
+                    "expected_groups": list(snapshot.expected_groups),
+                    "ready_groups": list(snapshot.ready_groups),
+                }
+            )
+            produced.append(event)
+        return produced
 
 
 @node(
     name="system.cp.root_stop",
-    consumes=[ControlPlaneShutdownReadyEvent],
-    emits=[ControlPlaneRootLeafStopRequestEvent, PlatformSchedulerCancelCommand],
+    consumes=[ControlPlaneShutdownReadyEvent, ControlPlaneLeafStopAckEvent],
+    emits=[PlatformSchedulerCancelCommand],
 )
 @dataclass
 class ControlPlaneRootStopNode:
@@ -995,32 +1187,22 @@ class ControlPlaneRootStopNode:
 
     def __call__(self, msg: object, _ctx: object | None) -> list[object]:
         payload = msg.payload if isinstance(msg, Envelope) else msg
-        if not isinstance(payload, ControlPlaneShutdownReadyEvent):
+        if not isinstance(payload, (ControlPlaneShutdownReadyEvent, ControlPlaneLeafStopAckEvent)):
             return []
         events = self.state.events()
-        requests: list[ControlPlaneRootLeafStopRequestEvent] = []
-        seen: set[str] = set()
-        for group_name, worker_id in _spawned_workers_for_shutdown(
-            events=events,
-            expected_groups=None,
-        ):
-            if worker_id in seen:
-                continue
-            seen.add(worker_id)
-            requests.append(
-                ControlPlaneRootLeafStopRequestEvent(
-                    target_group=group_name,
-                    worker_id=worker_id,
-                    command_id=f"runtime-stop:{worker_id}",
-                    reason="control_plane.shutdown_ready",
-                )
-            )
+        if any(isinstance(event, _RootStopRequestedMarker) for event in events):
+            return []
+        if not _shutdown_ready_seen(events):
+            return []
+        if not _all_issued_stop_requests_acknowledged(events):
+            return []
         cancel_commands = _root_leaf_ingress_scheduler_cancel_commands(
             expected_groups=None,
             events=events,
         )
+        self.state.append_event(_RootStopRequestedMarker())
         self.runner_control.request_stop()
-        return [*requests, *cancel_commands]
+        return cancel_commands
 
 
 def _root_leaf_ingress_scheduler_cancel_commands(
@@ -1230,6 +1412,11 @@ class _StartWorkDispatchedMarker:
     worker_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class _RootStopRequestedMarker:
+    marker: str = "root_stop_requested"
+
+
 def _latest_launch_plan_from_state(events: list[object]) -> ControlPlaneLaunchPlan | None:
     for event in reversed(events):
         if isinstance(event, ControlPlaneLaunchPlanEvent):
@@ -1312,6 +1499,123 @@ def _spawned_workers_for_shutdown(
         seen.add(worker_id)
         pairs.append((group_name, worker_id))
     return pairs
+
+
+def _stop_request_already_issued_for_worker(events: list[object], worker_id: str) -> bool:
+    if not isinstance(worker_id, str) or not worker_id:
+        return True
+    for event in events:
+        if isinstance(event, ControlPlaneRootLeafStopRequestEvent) and event.worker_id == worker_id:
+            return True
+    return False
+
+
+def _shutdown_ready_seen(events: list[object]) -> bool:
+    return any(isinstance(event, ControlPlaneShutdownReadyEvent) for event in events)
+
+
+def _all_issued_stop_requests_acknowledged(events: list[object]) -> bool:
+    requested_workers = {
+        event.worker_id
+        for event in events
+        if isinstance(event, ControlPlaneRootLeafStopRequestEvent)
+        and isinstance(event.worker_id, str)
+        and event.worker_id
+    }
+    if not requested_workers:
+        return False
+    acknowledged_workers = {
+        event.worker_id
+        for event in events
+        if isinstance(event, ControlPlaneLeafStopAckEvent)
+        and isinstance(event.worker_id, str)
+        and event.worker_id
+        and event.status == "accepted"
+    }
+    return requested_workers.issubset(acknowledged_workers)
+
+
+def _snapshot_worker_channel_backlog(
+    *,
+    worker_id: str,
+    control_lane_ipc: object,
+    data_lane_ipc: object,
+    trace_lane_ipc: object,
+    log_lane_ipc: object,
+    metric_lane_ipc: object,
+) -> dict[str, dict[str, int]]:
+    adapters = {
+        EXECUTION_IPC_LANE_CONTROL: control_lane_ipc,
+        EXECUTION_IPC_LANE_DATA: data_lane_ipc,
+        EXECUTION_IPC_LANE_TRACE: trace_lane_ipc,
+        EXECUTION_IPC_LANE_LOG: log_lane_ipc,
+        EXECUTION_IPC_LANE_METRIC: metric_lane_ipc,
+    }
+    snapshot: dict[str, dict[str, int]] = {}
+    for lane, adapter in adapters.items():
+        metrics_fn = getattr(adapter, "metrics", None)
+        if not callable(metrics_fn):
+            continue
+        target_id = compose_execution_ipc_worker_target_id(worker_id, lane=lane)
+        try:
+            raw = metrics_fn(target_id)
+        except Exception:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        queue_depth = int(raw.get("queue_depth", 0)) if isinstance(raw.get("queue_depth"), int) else 0
+        outbound_queue_depth = (
+            int(raw.get("outbound_queue_depth", 0))
+            if isinstance(raw.get("outbound_queue_depth"), int)
+            else 0
+        )
+        pending_outbound = (
+            int(raw.get("pending_outbound", 0))
+            if isinstance(raw.get("pending_outbound"), int)
+            else 0
+        )
+        if queue_depth <= 0 and outbound_queue_depth <= 0 and pending_outbound <= 0:
+            continue
+        snapshot[lane] = {
+            "queue_depth": max(0, queue_depth),
+            "outbound_queue_depth": max(0, outbound_queue_depth),
+            "pending_outbound": max(0, pending_outbound),
+        }
+    return snapshot
+
+
+def _leaf_ready_already_marked_for_worker(events: list[object], worker_id: str) -> bool:
+    if not isinstance(worker_id, str) or not worker_id:
+        return False
+    for event in reversed(events):
+        if not isinstance(event, dict):
+            continue
+        if event.get("kind") != "control_plane.shutdown.leaf_ready":
+            continue
+        if event.get("worker_id") == worker_id:
+            return True
+    return False
+
+
+def _ready_workers_for_shutdown(events: list[object]) -> list[tuple[str, str]]:
+    ready: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("kind") != "control_plane.shutdown.leaf_ready":
+            continue
+        target_group = event.get("target_group")
+        worker_id = event.get("worker_id")
+        if not isinstance(target_group, str) or not target_group:
+            continue
+        if not isinstance(worker_id, str) or not worker_id:
+            continue
+        if worker_id in seen:
+            continue
+        seen.add(worker_id)
+        ready.append((target_group, worker_id))
+    return ready
 
 
 def _is_start_work_on_all_ready_enabled(config_store: ControlPlaneStartupConfigStore) -> bool:
@@ -1481,6 +1785,7 @@ __all__ = [
     "ControlPlaneDiscoveryPumpNode",
     "ControlPlaneGroupStartupWaitNode",
     "ControlPlaneInitPlanNode",
+    "ControlPlaneRootLeafEventLogBridgeNode",
     "ControlPlaneLogDispatchNode",
     "ControlPlaneSpawnDispatchNode",
     "ControlPlaneStartWorkReadinessNode",

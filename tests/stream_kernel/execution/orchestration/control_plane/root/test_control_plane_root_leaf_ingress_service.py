@@ -15,6 +15,7 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafDiscoverySnapshotEvent,
     ControlPlaneLeafConfigCardEvent,
     ControlPlaneLeafHelloEvent,
+    ControlPlaneLeafReplyDispatchDiagEvent,
 )
 from stream_kernel.platform.services.runtime.control_plane_state import (
     InMemoryControlPlaneStateService,
@@ -224,6 +225,39 @@ def test_root_leaf_ingress_service_registers_data_available_callback_for_lane_ta
 
     assert accepted is True
     assert data.callbacks == [("execution.alpha#1::data", callback)]
+
+
+def test_root_leaf_ingress_service_builds_dynamic_worker_lane_specs_from_launch_plan() -> None:
+    from stream_kernel.execution.orchestration.control_plane.root.leaf_ingress_service import (
+        DefaultControlPlaneRootLeafIngressService,
+    )
+
+    state = InMemoryControlPlaneStateService(store=InMemoryKvStore())
+    state.append_event(
+        ControlPlaneLaunchPlanEvent(
+            plan=ControlPlaneLaunchPlan(
+                groups=(
+                    ControlPlaneGroupSpec(
+                        group_name="execution.ingress",
+                        workers=1,
+                        nodes=("source:source",),
+                    ),
+                    ControlPlaneGroupSpec(
+                        group_name="system.observability",
+                        workers=1,
+                        nodes=("system.obs.log_dispatch",),
+                    ),
+                )
+            )
+        )
+    )
+    service = DefaultControlPlaneRootLeafIngressService(state=state, execution_ipc=_IpcPort())
+
+    specs = service.worker_lane_specs_for_polling()
+
+    assert ("execution.ingress#1", "control") in specs
+    assert ("system.observability#1", "control") in specs
+    assert ("system.observability#1", "data") in specs
 
 
 def test_root_leaf_ingress_service_processes_leaf_hello_and_sends_config_card() -> None:
@@ -630,3 +664,30 @@ def test_root_leaf_ingress_service_marks_leaf_rejected_when_dispatch_raises_on_h
     assert config_acks[0].worker_id == "execution.alpha#1"
     assert config_acks[0].status == "rejected"
     assert "dispatch failed" in (config_acks[0].error or "")
+
+
+def test_root_leaf_ingress_service_handles_reply_dispatch_diag_event() -> None:
+    from stream_kernel.execution.orchestration.control_plane.root.leaf_ingress_service import (
+        DefaultControlPlaneRootLeafIngressService,
+    )
+
+    state = InMemoryControlPlaneStateService(store=InMemoryKvStore())
+    service = DefaultControlPlaneRootLeafIngressService(state=state, execution_ipc=_IpcPort())
+    payload = ControlPlaneLeafReplyDispatchDiagEvent(
+        target_group="execution.ingress",
+        worker_id="execution.ingress#1",
+        request_id="diag-1",
+        stage="leaf_reply_dispatch",
+        payload_type="ControlPlaneLeafConfigAckEvent",
+        status="accepted",
+        detail="applied",
+    )
+
+    handled = service.dispatch_polled_leaf_ingress(
+        worker_id="execution.ingress#1",
+        payload=payload,
+        lane="control",
+    )
+
+    assert handled is True
+    assert payload in state.events()

@@ -68,6 +68,8 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLaunchPlanEvent,
     ControlPlaneLeafDiscoveryRequestEvent,
     ControlPlaneLeafDiscoverySnapshotEvent,
+    ControlPlaneLeafHelloEvent,
+    ControlPlaneLeafReplyDispatchDiagEvent,
     ControlPlaneLeafStartWorkEvent,
     ControlPlaneLeafConfigCardEvent,
     ControlPlaneLeafPulse,
@@ -75,6 +77,7 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneRootPulse,
     ControlPlaneShutdownReadyEvent,
 )
+from stream_kernel.observability.domain.logging import LogMessage
 from stream_kernel.platform.services.runtime.control_plane_startup_barrier import (
     ControlPlaneStartupBarrierService,
 )
@@ -279,6 +282,8 @@ def test_control_plane_system_plan_includes_root_config_stream_node() -> None:
     assert "system.cp.startup_barrier" in step_names
     assert "system.cp.shutdown_expected_groups" in step_names
     assert "system.cp.root_stop" in step_names
+    assert "system.cp.root_leaf_event_log_bridge" in step_names
+    assert "system.cp.log_dispatch" in step_names
     assert "system.cp.startup_barrier" in plan.system_consumers.get(
         ControlPlaneDiscoveryCompletedEvent, []
     )
@@ -297,6 +302,13 @@ def test_control_plane_system_plan_includes_root_config_stream_node() -> None:
     assert "system.cp.root_stop" in plan.system_consumers.get(
         ControlPlaneShutdownReadyEvent, []
     )
+    assert "system.cp.root_leaf_event_log_bridge" in plan.system_consumers.get(
+        ControlPlaneLeafHelloEvent, []
+    )
+    assert "system.cp.root_leaf_event_log_bridge" in plan.system_consumers.get(
+        ControlPlaneLeafReplyDispatchDiagEvent, []
+    )
+    assert "system.cp.log_dispatch" in plan.system_consumers.get(LogMessage, [])
     assert "system.cp.dag_assembly" in plan.system_consumers.get(
         ControlPlaneDagAssemblyRequestedEvent, []
     )

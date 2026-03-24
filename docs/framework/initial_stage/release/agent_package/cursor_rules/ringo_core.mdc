@@ -1,0 +1,19 @@
+---
+description: Ringo core architecture invariants
+globs:
+  - "src/**/*.py"
+  - "tests/**/*.py"
+alwaysApply: true
+---
+
+# Ringo Core Rules
+
+1. Keep runtime flow on-graph via nodes.
+2. Keep node/service/store boundaries explicit.
+3. No silent fallback routing.
+4. No direct transport calls from business services.
+5. Keep message contracts deterministic and serializable.
+
+If change touches control-plane/lifecycle:
+- add or update targeted tests
+- run control-plane/lifecycle pytest suites

@@ -170,3 +170,25 @@ def test_publish_runtime_debug_skips_scheduler_service_call_noise(monkeypatch) -
         trace_id=None,
     )
     assert buffer.items == []
+
+
+def test_publish_runtime_debug_force_bypasses_runtime_debug_env(monkeypatch) -> None:
+    monkeypatch.delenv("STREAM_KERNEL_INJECT_PORT_DEBUG_ENABLED", raising=False)
+
+    class _Buffer:
+        def __init__(self) -> None:
+            self.items: list[DebugMessage] = []
+
+        def publish(self, message: DebugMessage) -> None:
+            self.items.append(message)
+
+    buffer = _Buffer()
+    publish_runtime_debug(
+        buffer=buffer,
+        event="runtime.runner.tombstone_quorum.observed",
+        source="stream_kernel.execution.runtime.runner",
+        fields={"node_name": "sink:egress"},
+        trace_id="trace-force",
+        force=True,
+    )
+    assert len(buffer.items) == 1

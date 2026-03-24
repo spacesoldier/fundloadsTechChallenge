@@ -150,8 +150,9 @@ def publish_runtime_debug(
     source: str,
     fields: dict[str, object] | None = None,
     trace_id: str | None = None,
+    force: bool = False,
 ) -> None:
-    if not runtime_debug_enabled():
+    if not force and not runtime_debug_enabled():
         return
     normalized_fields = dict(fields or {})
     if _is_runtime_debug_scheduler_noise(

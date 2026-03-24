@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -7,9 +8,8 @@ from stream_kernel.application_context.inject import inject
 from stream_kernel.application_context.service import service
 from stream_kernel.integration.kv_store import KVStore
 from stream_kernel.platform.services.runtime.control_plane_events import (
-    ControlPlaneLeafBoundaryOutputsEvent,
     ControlPlaneLeafDrainReadyEvent,
-    ControlPlaneLeafSinkDispatchAckEvent,
+    ControlPlaneLeafRunnerTombstoneEvent,
 )
 
 _EXPECTED_GROUPS_KEY = "control_plane.shutdown.expected_groups"
@@ -17,7 +17,11 @@ _READY_GROUPS_KEY = "control_plane.shutdown.ready_groups"
 _SEEN_REQUEST_IDS_KEY = "control_plane.shutdown.seen_request_ids"
 _EMITTED_READY_KEY = "control_plane.shutdown.emitted_ready"
 
-_LEAF_SEEN_REQUESTS_KEY = "control_plane.leaf_shutdown.seen_requests"
+_LEAF_RUNNER_TOMBSTONE_EXPECTED_NODES_KEY = "control_plane.leaf_shutdown.runner.expected_nodes"
+_LEAF_RUNNER_TOMBSTONE_SEEN_NODES_KEY = "control_plane.leaf_shutdown.runner.seen_nodes"
+_LEAF_RUNNER_TOMBSTONE_EMITTED_READY_KEY = "control_plane.leaf_shutdown.runner.emitted_ready"
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class ControlPlaneShutdownReadinessStore(KVStore):
@@ -63,13 +67,8 @@ class ControlPlaneShutdownReadinessService(Protocol):
 
 @runtime_checkable
 class ControlPlaneLeafShutdownReadinessService(Protocol):
-    def observe_boundary_outputs(
-        self, boundary: ControlPlaneLeafBoundaryOutputsEvent
-    ) -> ControlPlaneLeafDrainReadyEvent | None:
-        raise NotImplementedError
-
-    def observe_sink_dispatch_ack(
-        self, ack: ControlPlaneLeafSinkDispatchAckEvent
+    def observe_runner_tombstone(
+        self, event: ControlPlaneLeafRunnerTombstoneEvent
     ) -> ControlPlaneLeafDrainReadyEvent | None:
         raise NotImplementedError
 
@@ -135,56 +134,102 @@ class InMemoryControlPlaneShutdownReadinessService(ControlPlaneShutdownReadiness
 class InMemoryControlPlaneLeafShutdownReadinessService(ControlPlaneLeafShutdownReadinessService):
     store: KVStore = inject.kv(ControlPlaneLeafShutdownReadinessStore)
 
-    def observe_boundary_outputs(
-        self, boundary: ControlPlaneLeafBoundaryOutputsEvent
+    def observe_runner_tombstone(
+        self, event: ControlPlaneLeafRunnerTombstoneEvent
     ) -> ControlPlaneLeafDrainReadyEvent | None:
-        return self._observe_tombstone(
-            target_group=boundary.target_group,
-            worker_id=boundary.worker_id,
-            request_id=boundary.request_id,
-            tombstone_output=boundary.tombstone_output,
-        )
-
-    def observe_sink_dispatch_ack(
-        self, ack: ControlPlaneLeafSinkDispatchAckEvent
-    ) -> ControlPlaneLeafDrainReadyEvent | None:
-        return self._observe_tombstone(
-            target_group=ack.target_group,
-            worker_id=ack.worker_id,
-            request_id=ack.request_id,
-            tombstone_output=ack.tombstone_output,
-        )
-
-    def _observe_tombstone(
-        self,
-        *,
-        target_group: str,
-        worker_id: str,
-        request_id: str,
-        tombstone_output: bool,
-    ) -> ControlPlaneLeafDrainReadyEvent | None:
-        # Terminal-only semantics: leaf ready-to-drain can be emitted only for output tombstone.
-        if not tombstone_output:
+        if not event.tombstone_output:
+            _LOGGER.info(
+                "leaf_shutdown_runner_tombstone_ignored",
+                extra={
+                    "target_group": event.target_group,
+                    "worker_id": event.worker_id,
+                    "request_id": event.request_id,
+                    "observed_node": event.observed_node,
+                    "reason": "tombstone_output_false",
+                },
+            )
             return None
-        if self._already_emitted(target_group, request_id):
+        if self.store.get(_LEAF_RUNNER_TOMBSTONE_EMITTED_READY_KEY) is True:
+            _LOGGER.info(
+                "leaf_shutdown_runner_tombstone_ignored",
+                extra={
+                    "target_group": event.target_group,
+                    "worker_id": event.worker_id,
+                    "request_id": event.request_id,
+                    "observed_node": event.observed_node,
+                    "reason": "already_emitted_ready",
+                },
+            )
             return None
+        expected_nodes = self._runner_expected_nodes()
+        expected_nodes.update(
+            name
+            for name in event.expected_nodes
+            if isinstance(name, str) and name
+        )
+        self.store.set(_LEAF_RUNNER_TOMBSTONE_EXPECTED_NODES_KEY, sorted(expected_nodes))
+        if not expected_nodes:
+            _LOGGER.warning(
+                "leaf_shutdown_runner_tombstone_expected_nodes_empty",
+                extra={
+                    "target_group": event.target_group,
+                    "worker_id": event.worker_id,
+                    "request_id": event.request_id,
+                    "observed_node": event.observed_node,
+                },
+            )
+            return None
+        seen_nodes = self._runner_seen_nodes()
+        if event.observed_node in expected_nodes:
+            seen_nodes.add(event.observed_node)
+            self.store.set(_LEAF_RUNNER_TOMBSTONE_SEEN_NODES_KEY, sorted(seen_nodes))
+        if not expected_nodes.issubset(seen_nodes):
+            _LOGGER.info(
+                "leaf_shutdown_runner_tombstone_pending",
+                extra={
+                    "target_group": event.target_group,
+                    "worker_id": event.worker_id,
+                    "request_id": event.request_id,
+                    "observed_node": event.observed_node,
+                    "expected_nodes": sorted(expected_nodes),
+                    "seen_nodes": sorted(seen_nodes),
+                },
+            )
+            return None
+        self.store.set(_LEAF_RUNNER_TOMBSTONE_EMITTED_READY_KEY, True)
+        _LOGGER.info(
+            "leaf_shutdown_runner_tombstone_quorum_reached",
+            extra={
+                "target_group": event.target_group,
+                "worker_id": event.worker_id,
+                "request_id": event.request_id,
+                "observed_node": event.observed_node,
+                "expected_nodes": sorted(expected_nodes),
+                "seen_nodes": sorted(seen_nodes),
+            },
+        )
         return self._emit_ready(
-            target_group=target_group,
-            worker_id=worker_id,
-            request_id=request_id,
-            tombstone_output=tombstone_output,
+            target_group=event.target_group,
+            worker_id=event.worker_id,
+            request_id=event.request_id,
+            tombstone_output=True,
         )
 
-    def _seen_request_ids(self) -> set[str]:
-        raw = self.store.get(_LEAF_SEEN_REQUESTS_KEY)
+    def _runner_expected_nodes(self) -> set[str]:
+        raw = self.store.get(_LEAF_RUNNER_TOMBSTONE_EXPECTED_NODES_KEY)
         if isinstance(raw, list):
             return {item for item in raw if isinstance(item, str) and item}
         if isinstance(raw, tuple):
             return {item for item in raw if isinstance(item, str) and item}
         return set()
 
-    def _already_emitted(self, target_group: str, request_id: str) -> bool:
-        return _ready_dedupe_key(target_group, request_id) in self._seen_request_ids()
+    def _runner_seen_nodes(self) -> set[str]:
+        raw = self.store.get(_LEAF_RUNNER_TOMBSTONE_SEEN_NODES_KEY)
+        if isinstance(raw, list):
+            return {item for item in raw if isinstance(item, str) and item}
+        if isinstance(raw, tuple):
+            return {item for item in raw if isinstance(item, str) and item}
+        return set()
 
     def _emit_ready(
         self,
@@ -194,9 +239,15 @@ class InMemoryControlPlaneLeafShutdownReadinessService(ControlPlaneLeafShutdownR
         request_id: str,
         tombstone_output: bool,
     ) -> ControlPlaneLeafDrainReadyEvent:
-        seen = self._seen_request_ids()
-        seen.add(_ready_dedupe_key(target_group, request_id))
-        self.store.set(_LEAF_SEEN_REQUESTS_KEY, sorted(seen))
+        _LOGGER.info(
+            "leaf_shutdown_emit_ready",
+            extra={
+                "target_group": target_group,
+                "worker_id": worker_id,
+                "request_id": request_id,
+                "tombstone_output": tombstone_output,
+            },
+        )
         return ControlPlaneLeafDrainReadyEvent(
             target_group=target_group,
             worker_id=worker_id,

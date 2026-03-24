@@ -74,6 +74,7 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafDiscoveryAckEvent,
     ControlPlaneLeafDrainReadyEvent,
     ControlPlaneLeafHelloEvent,
+    ControlPlaneLeafReplyDispatchDiagEvent,
     ControlPlaneLeafStopAckEvent,
     ControlPlaneNodeInitializeCommand,
     ControlPlaneNodeConfigAppliedEvent,
@@ -138,6 +139,7 @@ from .system_nodes import (
     ControlPlaneRootConfigStreamNode,
     ControlPlaneConsumerRegistryGroupPruneNode,
     ControlPlaneRootLeafDrainReadyNode,
+    ControlPlaneRootLeafEventLogBridgeNode,
     ControlPlaneRootLeafStartWorkDispatchNode,
     ControlPlaneRootLeafStopAckNode,
     ControlPlaneRootLeafStopDispatchNode,
@@ -298,6 +300,7 @@ def build_root_control_plane_system_plan(
     )
     root_leaf_ingress_source_names = [spec.name for spec in root_leaf_ingress_sources]
     root_reply_dispatch_sink = ControlPlaneRootLeafControlDispatchSinkNode()
+    root_leaf_event_log_bridge = ControlPlaneRootLeafEventLogBridgeNode()
     root_log_dispatch_sink = ControlPlaneLogDispatchSinkNode()
     root_payload_sink = ControlPlaneRootPayloadSinkNode()
     root_boundary_handoff_sink = ControlPlaneRootBoundaryHandoffSinkNode(
@@ -353,10 +356,12 @@ def build_root_control_plane_system_plan(
         contract=root_lifecycle_console_dispatch_contract(),
         method_name="publish",
     )
+    root_log_dispatch = ControlPlaneLogDispatchNode(
+        console_dispatch=lifecycle_console_dispatch,
+    )
     if (
         lifecycle_orchestration is not None
         and lifecycle_log_factory is not None
-        and lifecycle_console_dispatch is not None
     ):
         lifecycle_spawn_dispatch = ControlPlaneSpawnDispatchNode(
             lifecycle=lifecycle_orchestration,
@@ -370,13 +375,9 @@ def build_root_control_plane_system_plan(
             ),
             log_factory=lifecycle_log_factory,
         )
-        lifecycle_log_dispatch = ControlPlaneLogDispatchNode(
-            console_dispatch=lifecycle_console_dispatch,
-        )
         lifecycle_steps = [
             StepSpec(name="system.cp.spawn_dispatch", step=lifecycle_spawn_dispatch),
             StepSpec(name="system.cp.group_startup_wait", step=lifecycle_group_startup_wait),
-            StepSpec(name="system.cp.log_dispatch", step=lifecycle_log_dispatch),
         ]
         lifecycle_consumers = {
             ControlPlaneSpawnRequestedEvent: [
@@ -384,12 +385,10 @@ def build_root_control_plane_system_plan(
                 "system.cp.group_startup_wait",
             ],
             ControlPlaneLeafConfigAckEvent: ["system.cp.group_startup_wait"],
-            LogMessage: ["system.cp.log_dispatch"],
         }
         lifecycle_node_names = {
             "system.cp.spawn_dispatch",
             "system.cp.group_startup_wait",
-            "system.cp.log_dispatch",
         }
     root_steps = [
         *build_root_static_system_steps(
@@ -425,6 +424,8 @@ def build_root_control_plane_system_plan(
             start_work_dispatch=start_work_dispatch,
             start_work_command_dispatch=start_work_command_dispatch,
             root_stop_dispatch=root_stop_dispatch,
+            root_leaf_event_log_bridge=root_leaf_event_log_bridge,
+            root_log_dispatch=root_log_dispatch,
             root_log_dispatch_sink=root_log_dispatch_sink,
             root_payload_sink=root_payload_sink,
             leaf_drain_ready=leaf_drain_ready,
@@ -448,7 +449,7 @@ def build_root_control_plane_system_plan(
         ControlPlaneRootPulse: ["system.cp.root_bootstrap", "system.cp.root_config_stream"],
         PlatformSchedulerUpsertCommand: [SCHEDULER_COMMAND_NODE_NAME, SCHEDULER_TIMER_NODE_NAME],
         PlatformSchedulerCancelCommand: [SCHEDULER_COMMAND_NODE_NAME, SCHEDULER_TIMER_NODE_NAME],
-        PlatformSchedulerTickEvent: [SCHEDULER_TICK_NODE_NAME],
+        PlatformSchedulerTickEvent: [SCHEDULER_TICK_NODE_NAME, "system.cp.shutdown_leaf_ready"],
         ControlPlaneConsumerRegistryBindingsApplyEvent: [
             "system.cp.consumer_registry_bindings_apply",
         ],
@@ -459,12 +460,27 @@ def build_root_control_plane_system_plan(
             "system.cp.deferred_message_replay",
         ],
         BootstrapControl: root_leaf_ingress_source_names,
-        ControlPlaneLeafHelloEvent: [ROOT_LEAF_CONTROL_DISPATCH_SINK_NODE_NAME],
-        ControlPlaneLeafDiscoveryAckEvent: [ROOT_LEAF_CONTROL_DISPATCH_SINK_NODE_NAME],
+        ControlPlaneLeafHelloEvent: [
+            ROOT_LEAF_CONTROL_DISPATCH_SINK_NODE_NAME,
+            "system.cp.root_leaf_event_log_bridge",
+        ],
+        ControlPlaneLeafDiscoveryAckEvent: [
+            ROOT_LEAF_CONTROL_DISPATCH_SINK_NODE_NAME,
+            "system.cp.root_leaf_event_log_bridge",
+        ],
+        ControlPlaneLeafReplyDispatchDiagEvent: [
+            ROOT_LEAF_CONTROL_DISPATCH_SINK_NODE_NAME,
+            "system.cp.root_leaf_event_log_bridge",
+        ],
         ControlPlaneLeafConfigAckEvent: [
             "system.cp.start_work_readiness",
+            "system.cp.root_leaf_event_log_bridge",
         ],
-        ControlPlaneLeafStopAckEvent: ["system.cp.root_stop_ack_state"],
+        ControlPlaneLeafStopAckEvent: [
+            "system.cp.root_stop_ack_state",
+            "system.cp.root_stop",
+            "system.cp.root_leaf_event_log_bridge",
+        ],
         ControlPlaneStartWorkEvent: ["system.cp.start_work_dispatch"],
         ControlPlaneRootLeafStartWorkCommand: ["system.cp.start_work_command_dispatch"],
         ControlPlaneRootLeafStopRequestEvent: ["system.cp.root_stop_dispatch"],
@@ -499,6 +515,7 @@ def build_root_control_plane_system_plan(
             "system.cp.consumer_registry_group_prune",
         ],
         ControlPlaneSpawnRequestedEvent: ["system.cp.root_payload_sink"],
+        LogMessage: ["system.cp.log_dispatch"],
         LogDispatchEvent: ["system.cp.log_dispatch_sink"],
         ExecutionGroupConfigRecord: ["system.cp.root_payload_sink"],
         dict: ["system.cp.root_payload_sink"],
@@ -509,7 +526,10 @@ def build_root_control_plane_system_plan(
         float: ["system.cp.root_payload_sink"],
         bool: ["system.cp.root_payload_sink"],
         bytes: ["system.cp.root_payload_sink"],
-        ControlPlaneLeafDrainReadyEvent: ["system.cp.shutdown_leaf_ready"],
+        ControlPlaneLeafDrainReadyEvent: [
+            "system.cp.shutdown_leaf_ready",
+            "system.cp.root_leaf_event_log_bridge",
+        ],
         ControlPlaneShutdownReadyEvent: ["system.cp.root_stop"],
         ControlPlaneRootLeafIngressEnvelopeEvent: [ROOT_BOUNDARY_HANDOFF_SINK_NODE_NAME],
     }

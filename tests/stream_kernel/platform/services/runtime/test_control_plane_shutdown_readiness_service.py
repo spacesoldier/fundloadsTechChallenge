@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from stream_kernel.integration.kv_store import InMemoryKvStore
 from stream_kernel.platform.services.runtime.control_plane_events import (
-    ControlPlaneLeafBoundaryOutputsEvent,
     ControlPlaneLeafDrainReadyEvent,
-    ControlPlaneLeafSinkDispatchAckEvent,
+    ControlPlaneLeafRunnerTombstoneEvent,
 )
 from stream_kernel.platform.services.runtime.control_plane_shutdown_readiness import (
     InMemoryControlPlaneLeafShutdownReadinessService,
@@ -97,95 +96,43 @@ def test_shutdown_readiness_requires_observability_group_when_in_expected_quorum
     assert set(snapshot_2.ready_groups) == {"execution.ingress", "system.observability"}
 
 
-def test_leaf_shutdown_readiness_emits_drain_ready_on_terminal_tombstone() -> None:
+def test_leaf_shutdown_readiness_emits_drain_ready_from_runner_tombstone_quorum() -> None:
     service = InMemoryControlPlaneLeafShutdownReadinessService(store=InMemoryKvStore())
+    expected_nodes = ("source:ingress", "transform.features", "sink:egress")
 
-    drain_ready = service.observe_boundary_outputs(
-        ControlPlaneLeafBoundaryOutputsEvent(
+    first = service.observe_runner_tombstone(
+        ControlPlaneLeafRunnerTombstoneEvent(
             target_group="execution.alpha",
             worker_id="execution.alpha#1",
-            request_id="req-tomb-1",
-            outputs=(),
+            request_id="req-runner-1",
+            observed_node="source:ingress",
+            expected_nodes=expected_nodes,
+            tombstone_output=True,
+        )
+    )
+    second = service.observe_runner_tombstone(
+        ControlPlaneLeafRunnerTombstoneEvent(
+            target_group="execution.alpha",
+            worker_id="execution.alpha#1",
+            request_id="req-runner-2",
+            observed_node="transform.features",
+            expected_nodes=expected_nodes,
+            tombstone_output=True,
+        )
+    )
+    final = service.observe_runner_tombstone(
+        ControlPlaneLeafRunnerTombstoneEvent(
+            target_group="execution.alpha",
+            worker_id="execution.alpha#1",
+            request_id="req-runner-3",
+            observed_node="sink:egress",
+            expected_nodes=expected_nodes,
             tombstone_output=True,
         )
     )
 
-    assert isinstance(drain_ready, ControlPlaneLeafDrainReadyEvent)
-    assert drain_ready.target_group == "execution.alpha"
-    assert drain_ready.worker_id == "execution.alpha#1"
-
-
-def test_leaf_shutdown_readiness_dedupes_terminal_tombstone_by_request_id() -> None:
-    service = InMemoryControlPlaneLeafShutdownReadinessService(store=InMemoryKvStore())
-
-    first = service.observe_boundary_outputs(
-        ControlPlaneLeafBoundaryOutputsEvent(
-            target_group="execution.alpha",
-            worker_id="execution.alpha#1",
-            request_id="req-tomb-2",
-            outputs=(),
-            tombstone_output=True,
-        )
-    )
-    duplicate = service.observe_boundary_outputs(
-        ControlPlaneLeafBoundaryOutputsEvent(
-            target_group="execution.alpha",
-            worker_id="execution.alpha#1",
-            request_id="req-tomb-2",
-            outputs=(),
-            tombstone_output=True,
-        )
-    )
-
-    assert isinstance(first, ControlPlaneLeafDrainReadyEvent)
-    assert duplicate is None
-
-
-def test_leaf_shutdown_readiness_ignores_input_only_tombstone() -> None:
-    service = InMemoryControlPlaneLeafShutdownReadinessService(store=InMemoryKvStore())
-    no_event = service.observe_boundary_outputs(
-        ControlPlaneLeafBoundaryOutputsEvent(
-            target_group="execution.alpha",
-            worker_id="execution.alpha#1",
-            request_id="req-input-only",
-            outputs=(),
-            tombstone_output=False,
-        )
-    )
-    assert no_event is None
-
-
-def test_leaf_shutdown_readiness_emits_drain_ready_from_sink_ack_tombstone() -> None:
-    service = InMemoryControlPlaneLeafShutdownReadinessService(store=InMemoryKvStore())
-
-    drain_ready = service.observe_sink_dispatch_ack(
-        ControlPlaneLeafSinkDispatchAckEvent(
-            target_group="execution.alpha",
-            worker_id="execution.alpha#1",
-            request_id="req-ack-tombstone",
-            source_target="source:source",
-            payload_class="Envelope",
-            tombstone_output=True,
-        )
-    )
-
-    assert isinstance(drain_ready, ControlPlaneLeafDrainReadyEvent)
-    assert drain_ready.target_group == "execution.alpha"
-    assert drain_ready.worker_id == "execution.alpha#1"
-
-
-def test_leaf_shutdown_readiness_ignores_non_tombstone_sink_ack() -> None:
-    service = InMemoryControlPlaneLeafShutdownReadinessService(store=InMemoryKvStore())
-
-    no_event = service.observe_sink_dispatch_ack(
-        ControlPlaneLeafSinkDispatchAckEvent(
-            target_group="execution.alpha",
-            worker_id="execution.alpha#1",
-            request_id="req-ack-non-terminal",
-            source_target="source:source",
-            payload_class="Envelope",
-            tombstone_output=False,
-        )
-    )
-
-    assert no_event is None
+    assert first is None
+    assert second is None
+    assert isinstance(final, ControlPlaneLeafDrainReadyEvent)
+    assert final.target_group == "execution.alpha"
+    assert final.worker_id == "execution.alpha#1"

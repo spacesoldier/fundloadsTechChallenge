@@ -1,0 +1,36 @@
+name: agent-gates
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Poetry
+        run: pip install poetry
+
+      - name: Install dependencies
+        run: poetry install --no-interaction
+
+      - name: Gate baseline tests
+        run: poetry run python -m pytest -q tests/stream_kernel
+
+      - name: Architecture and smoke tests
+        run: |
+          poetry run python -m pytest -q tests/architecture
+          poetry run python -m pytest -q tests/smoke
+
+      - name: Control-plane targeted gates
+        run: |
+          poetry run python -m pytest -q tests/stream_kernel/execution/orchestration/control_plane
+          poetry run python -m pytest -q tests/stream_kernel/execution/orchestration/lifecycle
+

@@ -170,13 +170,13 @@ runtime:
     - fund_load
   platform:
     debug:
-      root_verbose_logging: false
-      leaf_debug_enabled: false
-      leaf_verbose_logging: false
-      leaf_debug_write_to_file: false
+      root_verbose_logging: true
+      leaf_debug_enabled: true
+      leaf_verbose_logging: true
+      leaf_debug_write_to_file: true
       leaf_debug_logs_dir: logs/leaf_debug
-      runtime_debug_enabled: false
-      runtime_debug_direct_dispatch: false
+      runtime_debug_enabled: true
+      runtime_debug_direct_dispatch: true
     lifecycle:
       graceful_timeout_seconds: 120
       drain_inflight: true
@@ -186,7 +186,7 @@ runtime:
       transport: ipc_local
       buffer:
         enabled: true
-        batch_max_items: 40
+        batch_max_items: 20
         flush_interval_ms: 10
       flow_control:
         mode: credits
@@ -204,13 +204,13 @@ runtime:
     boundary_dispatch:
       mode: stream
       control_poll_ms: 1.0
-      batch_max_items: 10
+      batch_max_items: 20
       stream_batch_max_items: 128
       timeout_seconds: 600.0
       inflight_idle_timeout_seconds: 5.0
     source_ingress:
       pacing_mode: batch
-      batch_size: 10
+      batch_size: 50
       advance_signal: sink_dispatch_ack
     process_groups:
       - name: execution.ingress

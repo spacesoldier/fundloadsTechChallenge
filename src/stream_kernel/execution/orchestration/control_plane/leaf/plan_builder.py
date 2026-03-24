@@ -33,10 +33,12 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneInitializationRequestedEvent,
     ControlPlaneLeafBoundaryExecuteCommand,
     ControlPlaneLeafBoundaryOutputsEvent,
+    ControlPlaneLeafRunnerTombstoneEvent,
     ControlPlaneLeafSinkDispatchAckEvent,
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafConfigCardEvent,
     ControlPlaneLeafDiscoveryAckEvent,
+    ControlPlaneLeafReplyDispatchDiagEvent,
     ControlPlaneLeafDiscoveryRequestEvent,
     ControlPlaneLeafDiscoverySnapshotEvent,
     ControlPlaneLeafDrainReadyEvent,
@@ -193,7 +195,7 @@ def build_leaf_control_plane_system_plan(
     leaf_shutdown_readiness = resolve_optional_service(
         scope=scenario_scope,
         contract=leaf_shutdown_readiness_contract(),
-        method_name="observe_boundary_outputs",
+        method_name="observe_runner_tombstone",
     ) or noop_leaf_shutdown_readiness_service()
     leaf_boundary = ControlPlaneLeafBoundaryExecuteNode(
         boundary_execution=resolve_required_service(
@@ -283,17 +285,19 @@ def build_leaf_control_plane_system_plan(
                 "system.cp.leaf_boundary_execute",
             ],
             ControlPlaneLeafBoundaryOutputsEvent: [
-                "system.cp.leaf_tombstone_finalize",
                 "system.cp.leaf_reply_dispatch",
             ],
             ControlPlaneLeafSinkDispatchAckEvent: [
                 "system.cp.leaf_source_poll_from_sink_ack",
+            ],
+            ControlPlaneLeafRunnerTombstoneEvent: [
                 "system.cp.leaf_tombstone_finalize",
             ],
             ControlPlaneLeafStopCommand: ["system.cp.leaf_stop"],
             ControlPlaneLeafHelloEvent: ["system.cp.leaf_reply_dispatch"],
             ControlPlaneLeafDiscoveryAckEvent: ["system.cp.leaf_reply_dispatch"],
             ControlPlaneLeafConfigAckEvent: ["system.cp.leaf_reply_dispatch"],
+            ControlPlaneLeafReplyDispatchDiagEvent: ["system.cp.leaf_reply_dispatch"],
             ControlPlaneLeafDrainReadyEvent: ["system.cp.leaf_reply_dispatch"],
             ControlPlaneLeafStopAckEvent: ["system.cp.leaf_reply_dispatch"],
         },

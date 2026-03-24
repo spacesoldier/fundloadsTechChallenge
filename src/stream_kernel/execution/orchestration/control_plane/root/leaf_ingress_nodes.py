@@ -28,6 +28,7 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafDiscoveryAckEvent,
     ControlPlaneLeafDrainReadyEvent,
     ControlPlaneLeafHelloEvent,
+    ControlPlaneLeafReplyDispatchDiagEvent,
     ControlPlaneLeafStopAckEvent,
 )
 from stream_kernel.observability.events import (
@@ -130,6 +131,7 @@ class ControlPlaneRootLeafIngressSourceNode:
             return []
         if payload.target != self.source_name:
             return []
+        self._register_data_wakeup()
         self._clear_wakeup_pending()
         stop_requested = getattr(self.runner_control, "stop_requested", None)
         if callable(stop_requested) and stop_requested():
@@ -140,9 +142,12 @@ class ControlPlaneRootLeafIngressSourceNode:
         poll_next_for_lane = getattr(candidate, "poll_next_leaf_ingress_for_worker_lane", None)
         specs = self._normalized_specs()
         if not specs:
+            if not self._wakeup_registered:
+                return [BootstrapControl(target=self.source_name)]
             return []
         budget = max(1, int(self.max_messages_per_poll))
         produced: list[object] = []
+        had_polled_payload = False
         for _ in range(budget):
             polled = await self._poll_one(
                 specs=specs,
@@ -152,6 +157,7 @@ class ControlPlaneRootLeafIngressSourceNode:
             )
             if polled is None:
                 break
+            had_polled_payload = True
             worker_id, lane, polled_payload = polled
             normalized = self._normalize_polled_payload(
                 worker_id=worker_id,
@@ -163,21 +169,42 @@ class ControlPlaneRootLeafIngressSourceNode:
             produced.append(normalized)
         if len(produced) >= budget:
             produced.append(BootstrapControl(target=self.source_name))
+        elif not produced and not had_polled_payload and not self._wakeup_registered:
+            # If callbacks are not registered yet (for example, worker specs become
+            # available only after launch plan), keep a lightweight bootstrap pulse
+            # alive so source can pick up fresh specs and register wakeups.
+            produced.append(BootstrapControl(target=self.source_name))
         return produced
 
     def _normalized_specs(self) -> tuple[tuple[str, str], ...]:
-        if self.ingress_specs:
-            resolved: list[tuple[str, str]] = []
-            for worker_id, lane in self.ingress_specs:
-                if not isinstance(worker_id, str) or not worker_id:
-                    continue
-                lane_name = lane.strip().lower() if isinstance(lane, str) and lane else EXECUTION_IPC_LANE_CONTROL
-                resolved.append((worker_id, lane_name))
-            return tuple(resolved)
-        if isinstance(self.worker_id, str) and self.worker_id:
-            lane_name = self.lane.strip().lower() if isinstance(self.lane, str) and self.lane else EXECUTION_IPC_LANE_CONTROL
-            return ((self.worker_id, lane_name),)
-        return ()
+        resolved: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+
+        def _append(worker_id: str, lane: str) -> None:
+            if not isinstance(worker_id, str) or not worker_id:
+                return
+            lane_name = lane.strip().lower() if isinstance(lane, str) and lane else EXECUTION_IPC_LANE_CONTROL
+            key = (worker_id, lane_name)
+            if key in seen:
+                return
+            seen.add(key)
+            resolved.append(key)
+
+        for worker_id, lane in self.ingress_specs:
+            _append(worker_id, lane)
+
+        if not resolved and isinstance(self.worker_id, str) and self.worker_id:
+            _append(self.worker_id, self.lane)
+
+        dynamic_specs = getattr(self.ingress, "worker_lane_specs_for_polling", None)
+        if callable(dynamic_specs):
+            try:
+                for worker_id, lane in dynamic_specs():
+                    _append(worker_id, lane)
+            except Exception:
+                pass
+
+        return tuple(resolved)
 
     def _register_data_wakeup(self) -> None:
         if self._wakeup_registered:
@@ -302,6 +329,7 @@ class ControlPlaneRootLeafIngressSourceNode:
     consumes=[
         ControlPlaneLeafHelloEvent,
         ControlPlaneLeafDiscoveryAckEvent,
+        ControlPlaneLeafReplyDispatchDiagEvent,
     ],
     emits=[],
 )
@@ -316,6 +344,7 @@ class ControlPlaneRootLeafControlDispatchSinkNode:
             (
                 ControlPlaneLeafHelloEvent,
                 ControlPlaneLeafDiscoveryAckEvent,
+                ControlPlaneLeafReplyDispatchDiagEvent,
             ),
         ):
             return []
@@ -377,6 +406,7 @@ _OBSERVABILITY_EVENT_TARGETS: dict[type[object], str] = {
 _ROOT_LEAF_INGRESS_ALLOWED_PAYLOAD_TYPES: tuple[type[object], ...] = (
     ControlPlaneLeafHelloEvent,
     ControlPlaneLeafDiscoveryAckEvent,
+    ControlPlaneLeafReplyDispatchDiagEvent,
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafStopAckEvent,
     ControlPlaneLeafDrainReadyEvent,

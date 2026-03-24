@@ -226,6 +226,48 @@ class ControlPlaneLeafConfigAckEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class ControlPlaneLeafReplyDispatchDiagEvent:
+    target_group: str
+    worker_id: str
+    request_id: str
+    stage: str
+    payload_type: str
+    status: str
+    detail: str | None = None
+    emitted_at_epoch_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str(
+            self.target_group,
+            "ControlPlaneLeafReplyDispatchDiagEvent.target_group",
+        )
+        _require_non_empty_str(
+            self.worker_id,
+            "ControlPlaneLeafReplyDispatchDiagEvent.worker_id",
+        )
+        _require_non_empty_str(
+            self.request_id,
+            "ControlPlaneLeafReplyDispatchDiagEvent.request_id",
+        )
+        _require_non_empty_str(
+            self.stage,
+            "ControlPlaneLeafReplyDispatchDiagEvent.stage",
+        )
+        _require_non_empty_str(
+            self.payload_type,
+            "ControlPlaneLeafReplyDispatchDiagEvent.payload_type",
+        )
+        _require_non_empty_str(
+            self.status,
+            "ControlPlaneLeafReplyDispatchDiagEvent.status",
+        )
+        if self.detail is not None and (not isinstance(self.detail, str) or not self.detail):
+            raise ValueError(
+                "ControlPlaneLeafReplyDispatchDiagEvent.detail must be a non-empty string when provided"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class ControlPlaneLeafStopCommand:
     target_group: str
     worker_id: str
@@ -313,6 +355,28 @@ class ControlPlaneLeafSinkDispatchAckEvent:
         _require_non_empty_str(self.payload_class, "ControlPlaneLeafSinkDispatchAckEvent.payload_class")
         if not isinstance(self.tombstone_output, bool):
             raise ValueError("ControlPlaneLeafSinkDispatchAckEvent.tombstone_output must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class ControlPlaneLeafRunnerTombstoneEvent:
+    target_group: str
+    worker_id: str
+    request_id: str
+    observed_node: str
+    expected_nodes: tuple[str, ...] = field(default_factory=tuple)
+    tombstone_output: bool = True
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str(self.target_group, "ControlPlaneLeafRunnerTombstoneEvent.target_group")
+        _require_non_empty_str(self.worker_id, "ControlPlaneLeafRunnerTombstoneEvent.worker_id")
+        _require_non_empty_str(self.request_id, "ControlPlaneLeafRunnerTombstoneEvent.request_id")
+        _require_non_empty_str(self.observed_node, "ControlPlaneLeafRunnerTombstoneEvent.observed_node")
+        if any(not isinstance(name, str) or not name for name in self.expected_nodes):
+            raise ValueError(
+                "ControlPlaneLeafRunnerTombstoneEvent.expected_nodes must contain non-empty strings"
+            )
+        if not isinstance(self.tombstone_output, bool):
+            raise ValueError("ControlPlaneLeafRunnerTombstoneEvent.tombstone_output must be a boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -907,11 +971,13 @@ __all__ = [
     "ControlPlaneLeafDiscoveryAckEvent",
     "ControlPlaneLeafConfigCardEvent",
     "ControlPlaneLeafConfigAckEvent",
+    "ControlPlaneLeafReplyDispatchDiagEvent",
     "ControlPlaneLeafStopCommand",
     "ControlPlaneLeafStopAckEvent",
     "ControlPlaneLeafBoundaryExecuteCommand",
     "ControlPlaneLeafBoundaryOutputsEvent",
     "ControlPlaneLeafSinkDispatchAckEvent",
+    "ControlPlaneLeafRunnerTombstoneEvent",
     "ControlPlaneLeafShutdownPrepareCommand",
     "ControlPlaneLeafDrainReadyEvent",
     "ControlPlaneShutdownReadyEvent",

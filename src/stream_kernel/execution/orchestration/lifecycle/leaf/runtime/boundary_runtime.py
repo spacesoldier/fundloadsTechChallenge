@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import inspect
+import os
 from collections.abc import Callable
 
+from stream_kernel.application_context import apply_injection
 from stream_kernel.application_context.injection_registry import (
     InjectionRegistryError,
     ScenarioScope,
@@ -65,6 +67,12 @@ class _StreamingBoundaryOutputs(list[Envelope]):
             if isinstance(item, Envelope) and item.tombstone:
                 return idx
         return len(self)
+
+
+_BOUNDARY_REQUIRED_CONTROL_PLANE_NODES: tuple[str, ...] = (
+    "system.cp.leaf_tombstone_finalize",
+    "system.cp.leaf_reply_dispatch",
+)
 
 
 def execute_child_boundary_loop_from_bundle(
@@ -226,12 +234,30 @@ def execute_child_boundary_loop(
                     nodes[node_name] = step
                 if node_name.startswith("system.debug."):
                     nodes[node_name] = step
+        # Boundary runner executes in an isolated queue. Keep shutdown/report rails local
+        # so quorum signals do not leak as external business deliveries.
+        _ensure_boundary_required_control_plane_rails(
+            child=child,
+            all_nodes=all_nodes,
+            debug_logging=debug_logging,
+        )
+        for node_name in _BOUNDARY_REQUIRED_CONTROL_PLANE_NODES:
+            nodes[node_name] = all_nodes[node_name]
 
         full_context_nodes = {
             node_name
             for node_name in child.full_context_nodes
             if node_name in nodes
         }
+        worker_id = None
+        child_runtime = child.runtime if isinstance(child.runtime, dict) else {}
+        runtime_worker_id = child_runtime.get("__worker_id")
+        if isinstance(runtime_worker_id, str) and runtime_worker_id:
+            worker_id = runtime_worker_id
+        else:
+            worker_id = os.environ.get("STREAM_KERNEL_WORKER_ID")
+        if not isinstance(worker_id, str) or not worker_id:
+            worker_id = None
         runner_kwargs = {
             "nodes": nodes,
             "work_queue": work_queue,
@@ -239,6 +265,7 @@ def execute_child_boundary_loop(
             "context_service": context_service,
             "observability": observability,
             "process_group": child.process_group,
+            "worker_id": worker_id,
             "full_context_nodes": full_context_nodes,
             "allow_external_deliveries": True,
             "boundary_outputs": emitted,
@@ -345,6 +372,72 @@ def _runtime_process_group_is_declared(
         if group.get("name") == process_group:
             return True
     return False
+
+
+def _ensure_boundary_required_control_plane_rails(
+    *,
+    child: ChildRuntimeBootstrap,
+    all_nodes: dict[str, object],
+    debug_logging: LeafLifecycleDebugLoggingService | None,
+) -> None:
+    for node_name in _BOUNDARY_REQUIRED_CONTROL_PLANE_NODES:
+        if node_name in all_nodes:
+            continue
+        leaf_debug_log(
+            event="leaf.boundary_runtime.missing_cp_rail",
+            service=debug_logging,
+            process_group=child.process_group,
+            node_name=node_name,
+        )
+        restored = _restore_boundary_control_plane_rail(
+            scope=child.scenario_scope,
+            node_name=node_name,
+        )
+        if restored is None:
+            raise ChildRuntimeBootstrapError(
+                f"child boundary missing required control-plane rail '{node_name}'"
+            )
+        all_nodes[node_name] = restored
+        leaf_debug_log(
+            event="leaf.boundary_runtime.cp_rail_restored",
+            service=debug_logging,
+            process_group=child.process_group,
+            node_name=node_name,
+        )
+
+
+def _restore_boundary_control_plane_rail(
+    *,
+    scope: ScenarioScope,
+    node_name: str,
+) -> object | None:
+    factory = _boundary_control_plane_rail_factory(node_name)
+    if factory is None:
+        return None
+    try:
+        step = factory()
+    except Exception:
+        return None
+    try:
+        apply_injection(step, scope, False)
+    except Exception:
+        return None
+    return step
+
+
+def _boundary_control_plane_rail_factory(
+    node_name: str,
+) -> Callable[[], object] | None:
+    from stream_kernel.execution.orchestration.control_plane.leaf.system_nodes import (
+        ControlPlaneLeafReplyDispatchNode,
+        ControlPlaneLeafTombstoneFinalizeNode,
+    )
+
+    if node_name == "system.cp.leaf_tombstone_finalize":
+        return ControlPlaneLeafTombstoneFinalizeNode
+    if node_name == "system.cp.leaf_reply_dispatch":
+        return ControlPlaneLeafReplyDispatchNode
+    return None
 
 
 def _resolve_context_service(scope: ScenarioScope) -> ContextService:

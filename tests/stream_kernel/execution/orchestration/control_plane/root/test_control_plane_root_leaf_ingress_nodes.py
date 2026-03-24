@@ -124,6 +124,14 @@ class _WakeIngressStub:
         return None
 
 
+@dataclass(slots=True)
+class _DynamicSpecsIngressStub(_WakeIngressStub):
+    dynamic_specs: tuple[tuple[str, str], ...] = (("execution.features#1", "control"),)
+
+    def worker_lane_specs_for_polling(self) -> tuple[tuple[str, str], ...]:
+        return self.dynamic_specs
+
+
 def test_root_leaf_ingress_source_node_emits_envelope_without_dispatch_call() -> None:
     source_name = root_leaf_ingress_source_node_name(
         worker_id="execution.ingress#1",
@@ -253,6 +261,51 @@ def test_root_leaf_ingress_source_node_drops_unknown_payload_without_rearm() -> 
     )
 
     assert outputs == []
+
+
+def test_root_leaf_ingress_source_node_self_rearms_when_specs_are_not_ready() -> None:
+    source_name = "source:system.cp.root_leaf_ingress"
+    ingress = _IngressStub(payload=None)
+    node = ControlPlaneRootLeafIngressSourceNode(
+        ingress=ingress,
+        runner_control=_RunnerControlStub(stopped=False),
+        worker_id=None,
+        lane="control",
+        ingress_specs=(),
+        source_name=source_name,
+    )
+
+    outputs = asyncio.run(
+        node(
+            Envelope(payload=BootstrapControl(target=source_name), target=source_name),
+            None,
+        )
+    )
+
+    assert len(outputs) == 1
+    assert isinstance(outputs[0], BootstrapControl)
+    assert outputs[0].target == source_name
+
+
+def test_root_leaf_ingress_source_initialize_registers_dynamic_wakeup_specs() -> None:
+    source_name = "source:system.cp.root_leaf_ingress"
+    ingress = _DynamicSpecsIngressStub()
+    node = ControlPlaneRootLeafIngressSourceNode(
+        ingress=ingress,  # type: ignore[arg-type]
+        runner_control=_RunnerControlStub(stopped=False),
+        worker_id=None,
+        lane="control",
+        ingress_specs=(),
+        source_name=source_name,
+        work_queue=_WakeQueue(),  # type: ignore[arg-type]
+    )
+
+    _ = node.initialize()
+
+    assert len(ingress.callbacks) == 1
+    worker_id, lane, _ = ingress.callbacks[0]
+    assert worker_id == "execution.features#1"
+    assert lane == "control"
 
 
 def test_root_leaf_ingress_source_node_emits_log_message_payload() -> None:

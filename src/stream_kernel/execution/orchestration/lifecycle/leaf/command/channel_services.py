@@ -25,6 +25,7 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafDiscoveryAckEvent,
     ControlPlaneLeafDrainReadyEvent,
     ControlPlaneLeafHelloEvent,
+    ControlPlaneLeafReplyDispatchDiagEvent,
     ControlPlaneLeafStopAckEvent,
 )
 from stream_kernel.observability.domain.logging import LogMessage
@@ -241,7 +242,10 @@ class DefaultLeafControlReplyDispatchService(LeafControlReplyDispatchService):
 
     def dispatch_reply(self, *, worker_id: str, payload: object) -> bool:
         try:
-            lane = _resolve_reply_lane(payload=payload, lane_routing=self.lane_routing_service)
+            lane = _resolve_reply_lane_for_dispatch(
+                payload=payload,
+                lane_routing=self.lane_routing_service,
+            )
             target_id = compose_execution_ipc_worker_target_id(worker_id, lane=lane)
             _lane_adapter(self, lane).send(target_id, payload, no_reply=True)
             return True
@@ -303,6 +307,32 @@ def _resolve_reply_lane(*, payload: object, lane_routing: ExecutionIpcLaneRoutin
     )
 
 
+def _resolve_reply_lane_for_dispatch(
+    *,
+    payload: object,
+    lane_routing: ExecutionIpcLaneRoutingService,
+) -> str:
+    # Control-plane lifecycle replies must stay on control lane regardless of
+    # dynamic lane-routing overrides; otherwise startup handshake can stall.
+    if _is_control_plane_reply_payload(payload):
+        return EXECUTION_IPC_LANE_CONTROL
+    return _resolve_reply_lane(payload=payload, lane_routing=lane_routing)
+
+
+def _is_control_plane_reply_payload(payload: object) -> bool:
+    return isinstance(
+        payload,
+        (
+            ControlPlaneLeafHelloEvent,
+            ControlPlaneLeafDiscoveryAckEvent,
+            ControlPlaneLeafConfigAckEvent,
+            ControlPlaneLeafReplyDispatchDiagEvent,
+            ControlPlaneLeafStopAckEvent,
+            ControlPlaneLeafDrainReadyEvent,
+        ),
+    )
+
+
 def _lane_adapter(
     service: DefaultLeafControlReplyDispatchService,
     lane: str,
@@ -340,6 +370,7 @@ def _default_reply_lane(*, payload: object) -> str:
             ControlPlaneLeafHelloEvent,
             ControlPlaneLeafDiscoveryAckEvent,
             ControlPlaneLeafConfigAckEvent,
+            ControlPlaneLeafReplyDispatchDiagEvent,
             ControlPlaneLeafStopAckEvent,
             ControlPlaneLeafDrainReadyEvent,
         ),

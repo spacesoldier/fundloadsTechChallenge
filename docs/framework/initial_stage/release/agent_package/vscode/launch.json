@@ -1,0 +1,20 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run fund_load (module)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "fund_load",
+      "justMyCode": true,
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src"
+      },
+      "args": [
+        "--config", "src/fund_load/experiment_config_newgen_multiprocess_jaeger.yml"
+      ]
+    }
+  ]
+}

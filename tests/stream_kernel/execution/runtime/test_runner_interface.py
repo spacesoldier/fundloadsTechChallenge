@@ -20,6 +20,7 @@ from stream_kernel.routing.envelope import Envelope
 from stream_kernel.platform.services.messaging.reply_waiter import TerminalEvent
 from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneDeferredMessageHoldEvent,
+    ControlPlaneLeafRunnerTombstoneEvent,
 )
 from stream_kernel.execution.runtime.runner_ingress import enqueue_runner_input_sync
 from stream_kernel.execution.orchestration.source_ingress import BootstrapControl
@@ -315,6 +316,134 @@ def test_sync_runner_source_bootstrap_trace_does_not_collapse_generated_business
     assert all(trace_id != "bootstrap-trace" for trace_id in obs.sink_trace_ids)
 
 
+def test_sync_runner_emits_runner_tombstone_quorum_event_for_leaf_nodes() -> None:
+    seen_events: list[ControlPlaneLeafRunnerTombstoneEvent] = []
+
+    def business_node(payload: object, _ctx: dict[str, object]) -> list[object]:
+        _ = payload
+        return []
+
+    def finalize_node(payload: object, _ctx: dict[str, object]) -> list[object]:
+        if isinstance(payload, ControlPlaneLeafRunnerTombstoneEvent):
+            seen_events.append(payload)
+        return []
+
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="done", target="sink:egress", trace_id="t1", tombstone=True))
+    runner = SyncRunner(
+        nodes={
+            "sink:egress": business_node,
+            "system.cp.leaf_tombstone_finalize": finalize_node,
+        },
+        work_queue=queue,
+        context_service=InMemoryKvContextService(InMemoryKvStore()),
+        router=RoutingService(registry=InMemoryConsumerRegistry({}), strict=True),
+        observability=NoOpObservabilityService(),
+        process_group="execution.features",
+        worker_id="execution.features#1",
+    )
+
+    runner.run()
+
+    assert len(seen_events) == 1
+    event = seen_events[0]
+    assert event.target_group == "execution.features"
+    assert event.worker_id == "execution.features#1"
+    assert event.observed_node == "sink:egress"
+    assert event.expected_nodes == ("sink:egress",)
+
+
+def test_sync_runner_uses_non_system_fallback_when_group_has_no_sink_nodes() -> None:
+    seen_events: list[ControlPlaneLeafRunnerTombstoneEvent] = []
+
+    def business_node(payload: object, _ctx: dict[str, object]) -> list[object]:
+        _ = payload
+        return []
+
+    def finalize_node(payload: object, _ctx: dict[str, object]) -> list[object]:
+        if isinstance(payload, ControlPlaneLeafRunnerTombstoneEvent):
+            seen_events.append(payload)
+        return []
+
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="done", target="business.transform", trace_id="t-fallback", tombstone=True))
+    runner = SyncRunner(
+        nodes={
+            "business.transform": business_node,
+            "source:ingress": business_node,
+            "system.cp.leaf_tombstone_finalize": finalize_node,
+        },
+        work_queue=queue,
+        context_service=InMemoryKvContextService(InMemoryKvStore()),
+        router=RoutingService(registry=InMemoryConsumerRegistry({}), strict=True),
+        observability=NoOpObservabilityService(),
+        process_group="execution.transform_1",
+        worker_id="execution.transform_1#1",
+    )
+
+    runner.run()
+
+    assert len(seen_events) == 1
+    event = seen_events[0]
+    assert event.target_group == "execution.transform_1"
+    assert event.worker_id == "execution.transform_1#1"
+    assert event.observed_node == "business.transform"
+    assert event.expected_nodes == ("business.transform",)
+
+
+def test_async_runner_uses_non_system_fallback_when_group_has_no_sink_nodes() -> None:
+    seen_events: list[ControlPlaneLeafRunnerTombstoneEvent] = []
+
+    def business_node(payload: object, _ctx: dict[str, object]) -> list[object]:
+        _ = payload
+        return []
+
+    def finalize_node(payload: object, _ctx: dict[str, object]) -> list[object]:
+        if isinstance(payload, ControlPlaneLeafRunnerTombstoneEvent):
+            seen_events.append(payload)
+        return []
+
+    queue = InMemoryQueue()
+    queue.push(Envelope(payload="done", target="business.transform", trace_id="t-async-fallback", tombstone=True))
+    runner = AsyncRunner(
+        nodes={
+            "business.transform": business_node,
+            "source:ingress": business_node,
+            "system.cp.leaf_tombstone_finalize": finalize_node,
+        },
+        work_queue=queue,
+        context_service=InMemoryKvContextService(InMemoryKvStore()),
+        router=RoutingService(registry=InMemoryConsumerRegistry({}), strict=True),
+        observability=NoOpObservabilityService(),
+        process_group="execution.transform_1",
+        worker_id="execution.transform_1#1",
+    )
+
+    runner.run()
+
+    assert len(seen_events) == 1
+    event = seen_events[0]
+    assert event.target_group == "execution.transform_1"
+    assert event.worker_id == "execution.transform_1#1"
+    assert event.observed_node == "business.transform"
+    assert event.expected_nodes == ("business.transform",)
+
+
+def test_sync_runner_tombstone_quorum_uses_runner_worker_id_over_context_worker_id() -> None:
+    runner = SyncRunner(
+        nodes={},
+        work_queue=InMemoryQueue(),
+        context_service=InMemoryKvContextService(InMemoryKvStore()),
+        router=RoutingService(registry=InMemoryConsumerRegistry({}), strict=True),
+        observability=NoOpObservabilityService(),
+        process_group="execution.egress",
+        worker_id="execution.egress#1",
+    )
+
+    resolved = runner._resolve_runner_worker_id(full_ctx={"__worker_id": "system.observability#1"})
+    assert resolved == "execution.egress#1"
+
+
 def test_inmemory_kv_context_service_implements_context_service_contract() -> None:
     # SyncRunner depends on service contract, not storage adapter lifecycle.
     assert isinstance(InMemoryKvContextService(InMemoryKvStore()), ContextService)
@@ -564,6 +693,36 @@ def test_sync_runner_boundary_mode_collects_terminal_for_unroutable_outputs() ->
     assert len(terminal_outputs) == 1
     assert terminal_outputs[0].payload == "orphan-value"
     assert terminal_outputs[0].trace_id == "t1"
+
+
+def test_sync_runner_defer_unroutable_output_returns_false_on_self_loop_requirement() -> None:
+    queue = InMemoryQueue()
+    registry = InMemoryConsumerRegistry(
+        {
+            ControlPlaneDeferredMessageHoldEvent: ["n1"],
+        }
+    )
+    runner = SyncRunner(
+        nodes={"n1": (lambda _payload, _ctx: [])},
+        work_queue=queue,
+        context_service=InMemoryKvContextService(InMemoryKvStore()),
+        router=RoutingService(registry=registry, strict=True),
+        observability=NoOpObservabilityService(),
+    )
+
+    deferred = runner._defer_unroutable_output(
+        payload={"event": "x"},
+        source_node="n1",
+        trace_id="trace-self-loop",
+        reply_to=None,
+        span_id=None,
+        tombstone=False,
+        work_queue=queue,
+        router=runner.router,  # type: ignore[arg-type]
+    )
+
+    assert deferred is False
+    assert queue.size() == 0
 
 
 def test_async_runner_collects_external_deliveries_for_unknown_local_targets() -> None:

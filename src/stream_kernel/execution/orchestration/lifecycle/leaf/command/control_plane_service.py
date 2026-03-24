@@ -144,6 +144,7 @@ class DefaultLeafProcessEntryOrchestrationService(LeafProcessEntryOrchestrationS
         apply_injection(runner, session.child.scenario_scope, True)
         runner_control = self.runner_control
         runner_control.bind_runner_stop(runner.request_stop)
+        _start_stop_event_watcher(stop_event, runner_control)
         try:
             leaf_debug_log(
                 event="leaf.orchestrator.runner_loop.start",
@@ -321,6 +322,28 @@ def _resolve_child_endpoint_target_id(*, worker_id: str, endpoint_key: str) -> s
     return compose_execution_ipc_worker_target_id(worker_id, lane=endpoint_key)
 
 
+def _start_stop_event_watcher(stop_event: object | None, runner_control: object) -> None:
+    is_set_fn = getattr(stop_event, "is_set", None)
+    if not callable(is_set_fn):
+        return
+    request_stop_fn = getattr(runner_control, "request_stop", None)
+    if not callable(request_stop_fn):
+        return
+    import threading
+    import time
+
+    def _watch() -> None:
+        while not is_set_fn():
+            time.sleep(0.05)
+        try:
+            request_stop_fn()
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_watch, daemon=True)
+    t.start()
+
+
 def build_leaf_startup_runtime(
     *,
     session: "LeafWorkerRuntimeSession",
@@ -448,6 +471,9 @@ def _build_leaf_runner(
     process_group = runtime.get("__process_group")
     if not isinstance(process_group, str) or not process_group:
         process_group = None
+    worker_id = runtime.get("__worker_id")
+    if not isinstance(worker_id, str) or not worker_id:
+        worker_id = None
     full_context_nodes = getattr(child, "full_context_nodes", set())
     if not isinstance(full_context_nodes, set):
         full_context_nodes = set()
@@ -465,6 +491,7 @@ def _build_leaf_runner(
             run_id=run_id,
             scenario_id=scenario_id,
             process_group=process_group,
+            worker_id=worker_id,
             full_context_nodes=set(full_context_nodes),
             ordered_sink_mode=sink_mode,
             runtime_debug_buffer=debug_buffer,
@@ -474,6 +501,7 @@ def _build_leaf_runner(
         run_id=run_id,
         scenario_id=scenario_id,
         process_group=process_group,
+        worker_id=worker_id,
         full_context_nodes=set(full_context_nodes),
         ordered_sink_mode=sink_mode,
         runtime_debug_buffer=debug_buffer,

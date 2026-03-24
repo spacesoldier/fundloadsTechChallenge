@@ -30,6 +30,7 @@ from stream_kernel.execution.transport.ipc.ipc_transport import (
     compose_execution_ipc_worker_target_id,
 )
 from stream_kernel.platform.services.runtime.control_plane_events import (
+    ControlPlaneLaunchPlanEvent,
     ControlPlaneLeafDrainReadyEvent,
     ControlPlaneLeafDiscoveryAckEvent,
     ControlPlaneLeafDiscoveryRequestEvent,
@@ -37,6 +38,7 @@ from stream_kernel.platform.services.runtime.control_plane_events import (
     ControlPlaneLeafConfigAckEvent,
     ControlPlaneLeafConfigCardEvent,
     ControlPlaneLeafHelloEvent,
+    ControlPlaneLeafReplyDispatchDiagEvent,
     ControlPlaneLeafStopAckEvent,
 )
 from stream_kernel.platform.services.runtime.control_plane_state import (
@@ -93,6 +95,9 @@ class ControlPlaneRootLeafIngressService(Protocol):
     def configure_verbose_logging(self, enabled: bool) -> None:
         raise NotImplementedError
 
+    def worker_lane_specs_for_polling(self) -> tuple[tuple[str, str], ...]:
+        raise NotImplementedError
+
 
 @service(name="control_plane_root_leaf_ingress_service")
 @dataclass(slots=True)
@@ -143,6 +148,47 @@ class DefaultControlPlaneRootLeafIngressService(ControlPlaneRootLeafIngressServi
 
     def configure_verbose_logging(self, enabled: bool) -> None:
         self.verbose_logging = bool(enabled)
+
+    def worker_lane_specs_for_polling(self) -> tuple[tuple[str, str], ...]:
+        events = self._state().events()
+        seen: set[tuple[str, str]] = set()
+        specs: list[tuple[str, str]] = []
+
+        def _add(worker_id: str, lane: str) -> None:
+            key = (worker_id, lane)
+            if key in seen:
+                return
+            seen.add(key)
+            specs.append(key)
+
+        for event in reversed(events):
+            if not isinstance(event, ControlPlaneLaunchPlanEvent):
+                continue
+            for group in event.plan.groups:
+                group_name = getattr(group, "group_name", None)
+                if not isinstance(group_name, str) or not group_name:
+                    continue
+                workers = getattr(group, "workers", 1)
+                worker_count = workers if isinstance(workers, int) and workers > 0 else 1
+                is_observability = group_name.strip().lower().startswith("system.observability")
+                for index in range(worker_count):
+                    worker_id = f"{group_name}#{index + 1}"
+                    _add(worker_id, EXECUTION_IPC_LANE_CONTROL)
+                    if is_observability:
+                        _add(worker_id, EXECUTION_IPC_LANE_DATA)
+            break
+
+        if specs:
+            return tuple(specs)
+
+        for event in events:
+            worker_id = getattr(event, "worker_id", None)
+            if not isinstance(worker_id, str) or not worker_id:
+                continue
+            _add(worker_id, EXECUTION_IPC_LANE_CONTROL)
+            if worker_id.strip().lower().startswith("system.observability#"):
+                _add(worker_id, EXECUTION_IPC_LANE_DATA)
+        return tuple(specs)
 
     def configure_poll_timeout_seconds(self, timeout_seconds: float) -> None:
         if isinstance(timeout_seconds, (int, float)) and float(timeout_seconds) >= 0:
@@ -395,6 +441,23 @@ class DefaultControlPlaneRootLeafIngressService(ControlPlaneRootLeafIngressServi
                     "config_id": payload.config_id,
                     "status": payload.status,
                     "error": payload.error,
+                },
+            )
+            return True
+        if isinstance(payload, ControlPlaneLeafReplyDispatchDiagEvent):
+            self._state().append_event(payload)
+            self._emit_debug_log(
+                level="debug",
+                message="control-plane leaf reply-dispatch diagnostic received",
+                fields={
+                    "event": "control_plane.leaf_ingress.reply_dispatch_diag",
+                    "worker_id": payload.worker_id,
+                    "target_group": payload.target_group,
+                    "request_id": payload.request_id,
+                    "stage": payload.stage,
+                    "payload_type": payload.payload_type,
+                    "status": payload.status,
+                    "detail": payload.detail,
                 },
             )
             return True
